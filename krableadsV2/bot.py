@@ -3455,52 +3455,18 @@ async def _submit_lead_from_review(message, context, user_id, data):
         await message.reply_text("❌ Could not save lead.")
         return ConversationHandler.END
 
-    raw_driver_ids = data.get("selected_driver_ids") or []
-    driver_id_set = {str(x).strip() for x in raw_driver_ids if str(x).strip()}
-    all_drivers_now = _get_all_drivers_cached()
-    drivers_list = [d for d in all_drivers_now if str(d.get("id")) in driver_id_set]
-
-    # Safety net: never store an empty driver set in dispatch_pending. If the
-    # user never opened the driver picker (or all picked IDs went stale),
-    # fall back to every active, non-suspended driver assigned to the group.
-    if not drivers_list:
-        try:
-            suspended = _get_suspended_driver_ids()
-        except Exception:
-            suspended = set()
-        if not is_all_groups and group:
-            try:
-                gd_rows = (
-                    db.client.table("group_drivers")
-                    .select("driver_id")
-                    .eq("group_id", group.get("id"))
-                    .execute()
-                )
-                gd_ids = {str(r.get("driver_id")) for r in (gd_rows.data or []) if r.get("driver_id")}
-            except Exception:
-                gd_ids = set()
-            drivers_list = [
-                d
-                for d in all_drivers_now
-                if record_is_active(d)
-                and str(d.get("id")) not in suspended
-                and (not gd_ids or str(d.get("id")) in gd_ids)
-            ]
-        else:
-            drivers_list = [
-                d
-                for d in all_drivers_now
-                if record_is_active(d) and str(d.get("id")) not in suspended
-            ]
-        logger.info(
-            "submit_lead_from_review: empty selected_driver_ids; falling back to "
-            "%d eligible drivers (group=%s)",
-            len(drivers_list),
-            (group or {}).get("group_name"),
-        )
+    drivers_list: list = []
+    try:
+        raw_driver_ids = data.get("selected_driver_ids") or []
+        driver_id_set = {str(x).strip() for x in raw_driver_ids if str(x).strip()}
+        all_drivers_now = _get_all_drivers_cached() or []
+        drivers_list = [d for d in all_drivers_now if str(d.get("id")) in driver_id_set]
+    except Exception as e:
+        logger.warning("submit_lead_from_review: resolving picked drivers failed: %s", e)
+        drivers_list = []
 
     logger.info(
-        "submit_lead_from_review: lead=%s ref=%s group=%s selected_drivers=%s",
+        "submit_lead_from_review: lead=%s ref=%s group=%s picked=%s",
         lead.get("id"),
         ref_id,
         (group or {}).get("group_name"),
@@ -3558,6 +3524,39 @@ async def _submit_lead_from_review(message, context, user_id, data):
                 pass
     else:
         await _post_single_group_approval(context, lead, group)
+
+    # Safety net: only run AFTER the group approval has been posted, so any
+    # failure here can never block the group from receiving the lead.
+    if not drivers_list:
+        try:
+            try:
+                suspended = _get_suspended_driver_ids()
+            except Exception:
+                suspended = set()
+            fallback_pool: list = []
+            if not is_all_groups and group:
+                try:
+                    linked = db.get_group_driver_rows_for_group(group.get("id"))
+                except Exception:
+                    linked = []
+                fallback_pool = linked or _get_all_drivers_cached() or []
+            else:
+                fallback_pool = _get_all_drivers_cached() or []
+            drivers_list = [
+                d
+                for d in fallback_pool
+                if d
+                and record_is_active(d)
+                and str(d.get("id")) not in suspended
+            ]
+            logger.info(
+                "submit_lead_from_review: empty selected drivers; fallback resolved %d eligible drivers (group=%s)",
+                len(drivers_list),
+                (group or {}).get("group_name"),
+            )
+        except Exception as e:
+            logger.warning("submit_lead_from_review: driver fallback failed: %s", e)
+            drivers_list = []
 
     _store_issuer_await_group_accept(
         user_id,
