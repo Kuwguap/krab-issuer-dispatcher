@@ -1133,7 +1133,10 @@ def _set_full_name(state_data: dict, first: str, last: str) -> None:
 
 
 def _format_phase1_field_lines(state_data: dict) -> str:
-    """Plain-text list of all Phase 1 fields (same labels as the edit picker)."""
+    """Plain-text list of all Phase 1 fields (same labels as the edit picker).
+    Mirrors _phase1_edit_fields_keyboard so the post-process review and the edit
+    picker always show the same set of fields — including Phone, Price, Issuer
+    note, and Driver note (with `-` when empty)."""
     first, last = _name_parts_from_full(state_data.get("name"))
     lines = [
         f"First name: {first}",
@@ -1148,15 +1151,11 @@ def _format_phase1_field_lines(state_data: dict) -> str:
         f"Insurance company: {state_data.get('insurance_company') or '-'}",
         f"Insurance policy #: {state_data.get('insurance_policy_number') or '-'}",
         f"Delivery Date/Time & Notes: {state_data.get('extra_info') or '-'}",
+        f"Phone: {state_data.get('pending_phone_number') or '-'}",
+        f"Price: {state_data.get('pending_price') or '-'}",
+        f"Issuer note: {state_data.get('special_request_issuers') or '-'}",
+        f"Driver note: {state_data.get('special_request_drivers') or '-'}",
     ]
-    if state_data.get("pending_phone_number"):
-        lines.append(f"Phone: {state_data['pending_phone_number']}")
-    if state_data.get("pending_price"):
-        lines.append(f"Price: {state_data['pending_price']}")
-    if state_data.get("special_request_issuers"):
-        lines.append(f"Issuer note: {state_data['special_request_issuers']}")
-    if state_data.get("special_request_drivers"):
-        lines.append(f"Driver note: {state_data['special_request_drivers']}")
     return "\n".join(lines)
 
 
@@ -5468,10 +5467,12 @@ async def handle_accept_group_offer(update: Update, context: ContextTypes.DEFAUL
     else:
         # Multi-group broadcast: offers exist; issuer picks drivers only after a team accepts.
         if offers:
+            issuer_dispatch_ok = False
             try:
                 await _issuer_open_driver_selection_after_group_accept(
                     context, str(lead_id), lead_for_files
                 )
+                issuer_dispatch_ok = True
             except Exception as e:
                 logger.warning("Could not notify issuer after group accept: %s", e)
             try:
@@ -5485,6 +5486,54 @@ async def handle_accept_group_offer(update: Update, context: ContextTypes.DEFAUL
                 )
             except Exception as e:
                 logger.warning("Could not post full lead to group after broadcast accept: %s", e)
+
+            # Safety net: if the issuer-side dispatch path didn't actually create
+            # any driver assignments (issuer state expired, no selected_driver_ids,
+            # bot restart between create + accept, etc.) fall back to broadcasting
+            # to the winning group's drivers so the lead never gets stuck.
+            try:
+                if not db.lead_has_assignments(lead_id):
+                    logger.warning(
+                        "accept_group_offer fallback: no assignments after issuer "
+                        "dispatch (lead=%s ok=%s); broadcasting to group drivers.",
+                        lead_id,
+                        issuer_dispatch_ok,
+                    )
+                    count, driver_names, fail_reason, driver_scope = (
+                        await _send_driver_requests_for_group(
+                            context, lead_for_files, winner_group,
+                        )
+                    )
+                    chat_id_w = _parse_chat_id(winner_group.get("group_telegram_id"))
+                    if count > 0:
+                        try:
+                            if chat_id_w:
+                                await context.bot.send_message(
+                                    chat_id=chat_id_w,
+                                    text=(
+                                        f"🚗 Sent to driver(s): **{driver_names}**\n"
+                                        f"Reference: `{reference_id}`"
+                                    ),
+                                    parse_mode="Markdown",
+                                )
+                        except Exception as e:
+                            logger.warning("group dispatch confirm msg: %s", e)
+                    else:
+                        try:
+                            if chat_id_w:
+                                await context.bot.send_message(
+                                    chat_id=chat_id_w,
+                                    text=_group_accept_notify_fail_text(
+                                        reference_id, fail_reason, driver_scope
+                                    ),
+                                    parse_mode="Markdown",
+                                )
+                        except Exception as e:
+                            logger.warning("group dispatch fail msg: %s", e)
+            except Exception as e:
+                logger.error(
+                    "accept_group_offer driver fallback failed: %s", e, exc_info=True
+                )
         else:
             count, driver_names, fail_reason, driver_scope = await _send_driver_requests_for_group(
                 context, lead, winner_group,
