@@ -2486,6 +2486,28 @@ def _phase1_has_phone_and_price(state_data: dict) -> bool:
     )
 
 
+async def _safe_delete_chat_message(context: ContextTypes.DEFAULT_TYPE, chat_id, message_id) -> None:
+    """Best-effort delete; ignore Telegram restrictions (already gone, too old, etc.)."""
+    if not chat_id or not message_id:
+        return
+    try:
+        await context.bot.delete_message(chat_id=chat_id, message_id=message_id)
+    except Exception:
+        pass
+
+
+async def _delete_pending_file_prompts(context: ContextTypes.DEFAULT_TYPE, chat_id) -> None:
+    """Remove the "Do you want to add files?" / "Send the file" / "Send another?" prompt
+    messages so the chat ends up clean once the user uploads or declines."""
+    for key in (
+        "add_files_prompt_msg_id",
+        "send_file_prompt_msg_id",
+        "another_file_prompt_msg_id",
+    ):
+        mid = context.user_data.pop(key, None)
+        await _safe_delete_chat_message(context, chat_id, mid)
+
+
 async def _ask_add_files(message, context: ContextTypes.DEFAULT_TYPE) -> int:
     """Ask user if they want to add files; returns STATE_ADD_FILES."""
     context.user_data["phase1_attached_files"] = []
@@ -2493,7 +2515,9 @@ async def _ask_add_files(message, context: ContextTypes.DEFAULT_TYPE) -> int:
         [InlineKeyboardButton("Yes", callback_data="add_files_yes")],
         [InlineKeyboardButton("No", callback_data="add_files_no")],
     ])
-    await message.reply_text("Do you want to add files?", reply_markup=keyboard)
+    sent = await message.reply_text("Do you want to add files?", reply_markup=keyboard)
+    if sent is not None:
+        context.user_data["add_files_prompt_msg_id"] = sent.message_id
     return STATE_ADD_FILES
 
 
@@ -2520,16 +2544,36 @@ async def handle_add_files_callback(update: Update, context: ContextTypes.DEFAUL
     query = update.callback_query
     await _safe_answer_callback_query(query)
     user_id = update.effective_user.id
+    chat_id = query.message.chat_id if query.message else None
+
+    # Whichever button was pressed, the prompt has served its purpose.
+    context.user_data.pop("add_files_prompt_msg_id", None)
+    if query.message is not None:
+        try:
+            await query.message.delete()
+        except Exception:
+            pass
+
     if query.data == "add_files_no":
         state = db.get_user_state(user_id)
         if state and state.get("data"):
             data = state["data"]
             if _phase1_has_phone_and_price(data):
                 return await _submit_lead_from_review(query.message, context, user_id, data)
-        await query.message.reply_text(PHASE2_INTRO_MESSAGE)
+        if chat_id:
+            await context.bot.send_message(chat_id=chat_id, text=PHASE2_INTRO_MESSAGE)
+        else:
+            await query.message.reply_text(PHASE2_INTRO_MESSAGE)
         return STATE_PHASE2
     # add_files_yes
-    await query.message.reply_text("📎 Send the file (photo or document).")
+    if chat_id:
+        sent = await context.bot.send_message(
+            chat_id=chat_id, text="📎 Send the file (photo or document)."
+        )
+    else:
+        sent = await query.message.reply_text("📎 Send the file (photo or document).")
+    if sent is not None:
+        context.user_data["send_file_prompt_msg_id"] = sent.message_id
     return STATE_WAITING_FILE
 
 
@@ -2550,22 +2594,25 @@ async def handle_add_files_stray_message(update: Update, context: ContextTypes.D
         [InlineKeyboardButton("Yes", callback_data="another_file_yes")],
         [InlineKeyboardButton("No", callback_data="another_file_no")],
     ])
-    if msg.document:
-        files.append({"type": "document", "file_id": msg.document.file_id})
-        await msg.reply_text(
+    chat_id = msg.chat_id
+
+    if msg.document or msg.photo:
+        # User uploaded directly — drop the now-redundant prompt so the chat
+        # only shows the user's file + the next confirmation.
+        await _delete_pending_file_prompts(context, chat_id)
+        if msg.document:
+            files.append({"type": "document", "file_id": msg.document.file_id})
+        else:
+            files.append({"type": "photo", "file_id": msg.photo[-1].file_id})
+        sent = await msg.reply_text(
             "✅ File received. Send another if needed, or tap **No** to continue.",
             parse_mode="Markdown",
             reply_markup=keyboard,
         )
+        if sent is not None:
+            context.user_data["another_file_prompt_msg_id"] = sent.message_id
         return STATE_WAITING_FILE
-    if msg.photo:
-        files.append({"type": "photo", "file_id": msg.photo[-1].file_id})
-        await msg.reply_text(
-            "✅ File received. Send another if needed, or tap **No** to continue.",
-            parse_mode="Markdown",
-            reply_markup=keyboard,
-        )
-        return STATE_WAITING_FILE
+
     await msg.reply_text(
         "Please tap **Yes** to attach files (then send your PDF or photo), or **No** to continue without files.",
         parse_mode="Markdown",
@@ -2602,12 +2649,19 @@ async def handle_file_upload(update: Update, context: ContextTypes.DEFAULT_TYPE)
         await msg.reply_text("Please send a photo or document file.")
         return STATE_WAITING_FILE
     context.user_data["phase1_attached_files"] = files
+
+    # Now that the user has uploaded, drop any leftover "Send the file" /
+    # "Send another?" prompt + buttons so only the document remains visible.
+    await _delete_pending_file_prompts(context, msg.chat_id)
+
     keyboard = InlineKeyboardMarkup([
         [InlineKeyboardButton("Yes", callback_data="another_file_yes")],
         [InlineKeyboardButton("No", callback_data="another_file_no")],
     ])
     try:
-        await msg.reply_text("Do you want to send another file?", reply_markup=keyboard)
+        sent = await msg.reply_text("Do you want to send another file?", reply_markup=keyboard)
+        if sent is not None:
+            context.user_data["another_file_prompt_msg_id"] = sent.message_id
     except Exception as e:
         logger.error("handle_file_upload reply failed: %s", e, exc_info=True)
         await msg.reply_text("File saved. Tap Yes/No on the previous keyboard if you still see it, or send /cancel and /start.")
@@ -2619,6 +2673,16 @@ async def handle_another_file_callback(update: Update, context: ContextTypes.DEF
     query = update.callback_query
     await _safe_answer_callback_query(query)
     user_id = update.effective_user.id
+    chat_id = query.message.chat_id if query.message else None
+
+    # Either choice retires the "Send another?" prompt + buttons.
+    context.user_data.pop("another_file_prompt_msg_id", None)
+    if query.message is not None:
+        try:
+            await query.message.delete()
+        except Exception:
+            pass
+
     if query.data == "another_file_no":
         state = db.get_user_state(user_id)
         if state and state.get("data"):
@@ -2627,9 +2691,19 @@ async def handle_another_file_callback(update: Update, context: ContextTypes.DEF
             db.set_user_state(user_id, "phase1", d)
             if _phase1_has_phone_and_price(d):
                 return await _submit_lead_from_review(query.message, context, user_id, d)
-            await query.message.reply_text(PHASE2_INTRO_MESSAGE)
+            if chat_id:
+                await context.bot.send_message(chat_id=chat_id, text=PHASE2_INTRO_MESSAGE)
+            else:
+                await query.message.reply_text(PHASE2_INTRO_MESSAGE)
             return STATE_PHASE2
-    await query.message.reply_text("📎 Send the file (photo or document).")
+    if chat_id:
+        sent = await context.bot.send_message(
+            chat_id=chat_id, text="📎 Send the file (photo or document)."
+        )
+    else:
+        sent = await query.message.reply_text("📎 Send the file (photo or document).")
+    if sent is not None:
+        context.user_data["send_file_prompt_msg_id"] = sent.message_id
     return STATE_WAITING_FILE
 
 
