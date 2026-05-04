@@ -2545,27 +2545,32 @@ async def handle_add_files_callback(update: Update, context: ContextTypes.DEFAUL
     await _safe_answer_callback_query(query)
     user_id = update.effective_user.id
     chat_id = query.message.chat_id if query.message else None
-
-    # Whichever button was pressed, the prompt has served its purpose.
-    context.user_data.pop("add_files_prompt_msg_id", None)
-    if query.message is not None:
-        try:
-            await query.message.delete()
-        except Exception:
-            pass
+    # We delete the prompt *after* downstream code finishes using `query.message`
+    # for replies — deleting it first can make `reply_text` fail silently.
+    prompt_msg_id = context.user_data.pop("add_files_prompt_msg_id", None) or (
+        query.message.message_id if query.message else None
+    )
 
     if query.data == "add_files_no":
         state = db.get_user_state(user_id)
         if state and state.get("data"):
             data = state["data"]
             if _phase1_has_phone_and_price(data):
-                return await _submit_lead_from_review(query.message, context, user_id, data)
+                try:
+                    return await _submit_lead_from_review(
+                        query.message, context, user_id, data
+                    )
+                finally:
+                    await _safe_delete_chat_message(context, chat_id, prompt_msg_id)
+        await _safe_delete_chat_message(context, chat_id, prompt_msg_id)
         if chat_id:
             await context.bot.send_message(chat_id=chat_id, text=PHASE2_INTRO_MESSAGE)
         else:
             await query.message.reply_text(PHASE2_INTRO_MESSAGE)
         return STATE_PHASE2
+
     # add_files_yes
+    await _safe_delete_chat_message(context, chat_id, prompt_msg_id)
     if chat_id:
         sent = await context.bot.send_message(
             chat_id=chat_id, text="📎 Send the file (photo or document)."
@@ -2674,14 +2679,11 @@ async def handle_another_file_callback(update: Update, context: ContextTypes.DEF
     await _safe_answer_callback_query(query)
     user_id = update.effective_user.id
     chat_id = query.message.chat_id if query.message else None
-
-    # Either choice retires the "Send another?" prompt + buttons.
-    context.user_data.pop("another_file_prompt_msg_id", None)
-    if query.message is not None:
-        try:
-            await query.message.delete()
-        except Exception:
-            pass
+    # Defer deletion until *after* downstream replies so reply_text on
+    # query.message keeps working even though the prompt vanishes visually.
+    prompt_msg_id = context.user_data.pop("another_file_prompt_msg_id", None) or (
+        query.message.message_id if query.message else None
+    )
 
     if query.data == "another_file_no":
         state = db.get_user_state(user_id)
@@ -2690,12 +2692,20 @@ async def handle_another_file_callback(update: Update, context: ContextTypes.DEF
             d["attached_files"] = context.user_data.get("phase1_attached_files") or []
             db.set_user_state(user_id, "phase1", d)
             if _phase1_has_phone_and_price(d):
-                return await _submit_lead_from_review(query.message, context, user_id, d)
+                try:
+                    return await _submit_lead_from_review(
+                        query.message, context, user_id, d
+                    )
+                finally:
+                    await _safe_delete_chat_message(context, chat_id, prompt_msg_id)
+            await _safe_delete_chat_message(context, chat_id, prompt_msg_id)
             if chat_id:
                 await context.bot.send_message(chat_id=chat_id, text=PHASE2_INTRO_MESSAGE)
             else:
                 await query.message.reply_text(PHASE2_INTRO_MESSAGE)
             return STATE_PHASE2
+
+    await _safe_delete_chat_message(context, chat_id, prompt_msg_id)
     if chat_id:
         sent = await context.bot.send_message(
             chat_id=chat_id, text="📎 Send the file (photo or document)."
