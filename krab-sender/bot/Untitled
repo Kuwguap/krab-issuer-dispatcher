@@ -1,0 +1,55 @@
+@dataclass
+class SmtpEmailProvider:
+    host: str
+    port: int
+    username: str
+    password: str
+    from_address: str
+    to_address: str
+
+    async def send_transaction_email(
+        self,
+        tx: Transaction,
+        attachment_bytes: Optional[bytes],
+        attachment_filename: Optional[str],
+    ) -> None:
+        subject = "CLIENT"
+        body = (
+           f"Timestamp (UTC): {tx.timestamp.isoformat()}"
+        )
+
+        msg = EmailMessage()
+        msg["Subject"] = subject
+        msg["From"] = self.from_address
+        msg["To"] = self.to_address
+        msg.set_content(body)
+
+        if attachment_bytes is not None and attachment_filename:
+            msg.add_attachment(
+                attachment_bytes,
+                maintype="application",
+                subtype="octet-stream",
+                filename=attachment_filename,
+            )
+
+        # Rodney: This part below is what changed to fix the 'Connection Closed' error
+        try:
+            if self.port == 465:
+                # Use SSL for Port 465
+                server = smtplib.SMTP_SSL(self.host, self.port, timeout=10)
+            else:
+                # Use STARTTLS for Port 587
+                server = smtplib.SMTP(self.host, self.port, timeout=10)
+                server.starttls()
+            
+            with server:
+                server.login(self.username, self.password)
+                server.send_message(msg)
+                print(f"✅ Email sent successfully to {self.to_address}")
+
+        except smtplib.SMTPServerDisconnected:
+            print("❌ Error: Server disconnected. Usually means Port 587 is blocked or you need to use Port 465.")
+        except smtplib.SMTPAuthenticationError:
+            print("❌ Error: Login failed. Check your App Password.")
+        except Exception as e:
+            print(f"❌ Unexpected Email Error: {e}")

@@ -1,0 +1,94 @@
+# Render Blueprint — 3 independent services (set env vars on each separately)
+#
+#  1. krab-issuer-admin    (Web)    — Flask admin dashboard API
+#  2. krab-issuer-bot      (Worker) — Krab Issuer Telegram bot (1 instance only)
+#  3. paper-investigator  (Worker) — Paper Investigator Telegram bot (1 instance only)
+#
+# All three share the same Supabase database. Each has its own env vars.
+previews:
+  generation: off
+
+services:
+  # ── 1. Admin Dashboard (Flask web) ────────────────────────────────────
+  - type: web
+    name: krab-issuer-admin
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: python admin_dashboard.py
+    envVars:
+      - key: SUPABASE_URL
+        sync: false
+      - key: SUPABASE_KEY
+        sync: false
+
+  # ── 2. Krab Issuer bot (single worker) ─────────────────────────────────
+  - type: worker
+    name: krab-issuer-bot
+    runtime: python
+    numInstances: 1
+    maxShutdownDelaySeconds: 60
+    buildCommand: pip install -r requirements.txt
+    startCommand: python bot.py
+    envVars:
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false
+      - key: MONDAY_API_KEY
+        sync: false
+      - key: MONDAY_BOARD_ID
+        sync: false
+      - key: ONETIMESECRET_USERNAME
+        sync: false
+      - key: ONETIMESECRET_API_KEY
+        sync: false
+      - key: ONETIMESECRET_URL
+        sync: false
+      - key: ONETIMESECRET_LINK_BASE
+        sync: false
+      - key: ONETIMESECRET_PASSPHRASE
+        sync: false
+      - key: SUPABASE_URL
+        sync: false
+      - key: SUPABASE_KEY
+        sync: false
+      - key: DRIVER_TELEGRAM_ID
+        sync: false
+      - key: GROUP_TELEGRAM_ID
+        sync: false
+      - key: SUPERVISORY_TELEGRAM_ID
+        sync: false
+      - key: OPENAI_API_KEY
+        sync: false
+      - key: OPENAI_VISION_MODEL
+        sync: false
+      - key: RECEIPT_DETECTION_MODE
+        sync: false
+      - key: API_NINJAS_API_KEY
+        sync: false
+      - key: VIN_PROVIDER
+        sync: false
+
+  # ── 3. Paper Investigator Bot (single worker) ────────────────────────
+  - type: worker
+    name: paper-investigator-bot
+    runtime: python
+    numInstances: 1
+    maxShutdownDelaySeconds: 30
+    rootDir: paper_investigator
+    # Explicit pytz: some dashboards skip subfolder builds or run stale images; runtime pip is a safety net.
+    buildCommand: pip install --upgrade pip && pip install -r requirements.txt "pytz>=2024.1"
+    startCommand: python -m pip install -q "pytz>=2024.1" && python bot.py
+    envVars:
+      - key: PAPER_BOT_TOKEN
+        sync: false
+      - key: PAPER_SUPERVISOR_TELEGRAM_ID
+        sync: false
+      - key: PAPER_GIRL_TELEGRAM_ID
+        sync: false
+      - key: SUPABASE_URL
+        sync: false
+      - key: SUPABASE_KEY
+        sync: false
+      - key: OPENAI_API_KEY
+        sync: false
+      - key: OPENAI_MODEL
+        sync: false

@@ -1,0 +1,48 @@
+services:
+  # Telegram Bot Service (Background Worker)
+  - type: worker
+    name: krab-dispatch-bot
+    env: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: python -m bot.main
+    envVars:
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false
+      - key: EMAIL_PROVIDER
+        value: smtp
+      - key: EMAIL_FROM_ADDRESS
+        sync: false
+      - key: EMAIL_TO_ADDRESS
+        sync: false
+      - key: EMAIL_SMTP_HOST
+        sync: false
+      - key: EMAIL_SMTP_PORT
+        value: 587
+      - key: EMAIL_SMTP_USERNAME
+        sync: false
+      - key: EMAIL_SMTP_PASSWORD
+        sync: false
+      - key: ADMIN_PASSWORD
+        sync: false
+      - key: DATABASE_URL
+        sync: false
+      - key: API_BASE_URL
+        sync: false
+      - key: ISSUER_GROUP_CHAT_ID
+        sync: false
+
+  # Backend API Service (Optional - if you want to deploy the API too)
+  - type: web
+    name: krab-dispatch-api
+    env: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn backend.api:app --host 0.0.0.0 --port $PORT
+    envVars:
+      - key: ADMIN_PASSWORD
+        sync: false
+      - key: DATABASE_URL
+        sync: false
+    healthCheckPath: /health
+
+
+

@@ -1,0 +1,58 @@
+# ============================================================================
+# Monorepo .gitignore — Krab Issuer + Krab Dispatch
+# Excludes secrets, build artifacts, and local state from commits.
+# ============================================================================
+
+# --- Secrets & env ----------------------------------------------------------
+.env
+.env.*
+*.env
+!*.env.example
+!config.example.env.txt
+
+# Vercel local link / OIDC tokens (KEEP .vercel/project.json OUT of commits)
+.vercel/
+
+# --- Python -----------------------------------------------------------------
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+ENV/
+.venv/
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+pip-log.txt
+
+# --- Local databases & compiled state --------------------------------------
+*.sqlite
+*.sqlite3
+*.db
+krab_sender.db
+
+# --- Node (if anything creeps in) ------------------------------------------
+node_modules/
+dist/
+.next/
+.turbo/
+
+# --- Editors / OS ----------------------------------------------------------
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# --- Logs & local lockfiles ------------------------------------------------
+*.log
+debug.log
+.start_bots.lock
+
+# --- Keep explicit config examples in-repo ---------------------------------
+!krab-sender/config.example.env.txt

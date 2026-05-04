@@ -1,0 +1,7 @@
+{
+  "functions": {
+    "pages/api/backend/[[...segments]].js": {
+      "maxDuration": 60
+    }
+  }
+}

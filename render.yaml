@@ -1,0 +1,206 @@
+# ============================================================================
+# Render Blueprint — deploys the entire monorepo (Krab Dispatch + Krab Issuer)
+# in one go. Add each service's env vars in the Render dashboard after import.
+#
+# Services provisioned:
+#   1. krab-dispatch-api     (Web)    FastAPI backend + /admin static dashboard
+#   2. krab-dispatch-bot     (Worker) Krab Dispatch Telegram bot
+#   3. krab-issuer-admin     (Web)    Flask admin dashboard (legacy UI, optional)
+#   4. krab-issuer-bot       (Worker) Krab Issuer Telegram bot
+#   5. paper-investigator    (Worker) Paper Investigator Telegram bot
+#
+# Import:
+#   1. Push this repo to GitHub.
+#   2. Render → New + → Blueprint → pick this repo.
+#   3. Render reads `render.yaml` and creates all services.
+#   4. Open each service → Environment and fill the `sync: false` vars.
+# ============================================================================
+
+previews:
+  generation: off
+
+services:
+  # --------------------------------------------------------------------------
+  # 1) Krab Dispatch API (FastAPI) + admin dashboard at /admin
+  # --------------------------------------------------------------------------
+  - type: web
+    name: krab-dispatch-api
+    runtime: python
+    rootDir: krab-sender
+    plan: starter
+    healthCheckPath: /health
+    buildCommand: pip install --upgrade pip && pip install -r requirements.txt
+    startCommand: uvicorn backend.api:app --host 0.0.0.0 --port $PORT
+    envVars:
+      - key: ADMIN_PASSWORD
+        sync: false
+      - key: DATABASE_URL
+        sync: false
+      # Shared Supabase (Krab Issuer project) — enables cross-bot reference
+      # resolution and receipt thumbnails on the unified Transactions tab.
+      - key: SUPABASE_URL
+        sync: false
+      - key: SUPABASE_SERVICE_ROLE_KEY
+        sync: false
+      # Optional OpenAI tie-breaker for fuzzy reference matching + summary Q&A.
+      - key: OPENAI_API_KEY
+        sync: false
+      - key: OPENAI_MODELS
+        sync: false
+      # CORS: comma-separated origins allowed to hit the API. Regex is
+      # pre-configured in code to allow Vercel previews + localhost.
+      - key: CORS_ORIGINS
+        sync: false
+      - key: CORS_ORIGIN_REGEX
+        sync: false
+
+  # --------------------------------------------------------------------------
+  # 2) Krab Dispatch Telegram bot (background worker)
+  # --------------------------------------------------------------------------
+  - type: worker
+    name: krab-dispatch-bot
+    runtime: python
+    rootDir: krab-sender
+    plan: starter
+    numInstances: 1
+    maxShutdownDelaySeconds: 60
+    buildCommand: pip install --upgrade pip && pip install -r requirements.txt
+    startCommand: python -m bot.main
+    envVars:
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false
+      - key: EMAIL_PROVIDER
+        value: gmail_smtp
+      - key: EMAIL_FROM_ADDRESS
+        sync: false
+      - key: EMAIL_TO_ADDRESS
+        sync: false
+      - key: EMAIL_SMTP_HOST
+        value: smtp.gmail.com
+      - key: EMAIL_SMTP_PORT
+        value: "587"
+      - key: EMAIL_SMTP_USERNAME
+        sync: false
+      - key: EMAIL_SMTP_PASSWORD
+        sync: false
+      - key: ADMIN_PASSWORD
+        sync: false
+      - key: DATABASE_URL
+        sync: false
+      # Bot calls the API service above (use the Render-generated URL).
+      - key: API_BASE_URL
+        sync: false
+      - key: ISSUER_GROUP_CHAT_ID
+        sync: false
+      - key: HIGHKAGE_TEAM_CHAT_ID
+        sync: false
+      - key: SENSEI_GROUP_HANDLES
+        sync: false
+      - key: HIGHKAGE_GROUP_HANDLES
+        sync: false
+      # Same Supabase project as Krab Issuer so reference IDs resolve.
+      - key: SUPABASE_URL
+        sync: false
+      - key: SUPABASE_SERVICE_ROLE_KEY
+        sync: false
+      - key: OPENAI_API_KEY
+        sync: false
+
+  # --------------------------------------------------------------------------
+  # 3) Krab Issuer admin dashboard (Flask)
+  #    Optional — the unified dashboard at krab-dispatch-api:/admin covers this
+  #    via the Issuer tab. Keep if you want the legacy Flask UI too.
+  # --------------------------------------------------------------------------
+  - type: web
+    name: krab-issuer-admin
+    runtime: python
+    rootDir: krableadsV2
+    plan: starter
+    buildCommand: pip install --upgrade pip && pip install -r requirements.txt
+    startCommand: python admin_dashboard.py
+    envVars:
+      - key: SUPABASE_URL
+        sync: false
+      - key: SUPABASE_KEY
+        sync: false
+      # Allow the new unified admin page to embed the Flask admin in an iframe.
+      - key: ADMIN_FRAME_ANCESTORS
+        sync: false
+
+  # --------------------------------------------------------------------------
+  # 4) Krab Issuer Telegram bot (background worker)
+  # --------------------------------------------------------------------------
+  - type: worker
+    name: krab-issuer-bot
+    runtime: python
+    rootDir: krableadsV2
+    plan: starter
+    numInstances: 1
+    maxShutdownDelaySeconds: 60
+    buildCommand: pip install --upgrade pip && pip install -r requirements.txt
+    startCommand: python bot.py
+    envVars:
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false
+      - key: MONDAY_API_KEY
+        sync: false
+      - key: MONDAY_BOARD_ID
+        sync: false
+      - key: ONETIMESECRET_USERNAME
+        sync: false
+      - key: ONETIMESECRET_API_KEY
+        sync: false
+      - key: ONETIMESECRET_URL
+        sync: false
+      - key: ONETIMESECRET_LINK_BASE
+        sync: false
+      - key: ONETIMESECRET_PASSPHRASE
+        sync: false
+      - key: SUPABASE_URL
+        sync: false
+      - key: SUPABASE_KEY
+        sync: false
+      - key: DRIVER_TELEGRAM_ID
+        sync: false
+      - key: GROUP_TELEGRAM_ID
+        sync: false
+      - key: SUPERVISORY_TELEGRAM_ID
+        sync: false
+      - key: OPENAI_API_KEY
+        sync: false
+      - key: OPENAI_VISION_MODEL
+        sync: false
+      - key: RECEIPT_DETECTION_MODE
+        sync: false
+      - key: API_NINJAS_API_KEY
+        sync: false
+      - key: VIN_PROVIDER
+        sync: false
+
+  # --------------------------------------------------------------------------
+  # 5) Paper Investigator Telegram bot (background worker)
+  # --------------------------------------------------------------------------
+  - type: worker
+    name: paper-investigator-bot
+    runtime: python
+    rootDir: krableadsV2/paper_investigator
+    plan: starter
+    numInstances: 1
+    maxShutdownDelaySeconds: 30
+    buildCommand: pip install --upgrade pip && pip install -r requirements.txt "pytz>=2024.1"
+    startCommand: python bot.py
+    envVars:
+      - key: PAPER_BOT_TOKEN
+        sync: false
+      - key: PAPER_SUPERVISOR_TELEGRAM_ID
+        sync: false
+      - key: PAPER_GIRL_TELEGRAM_ID
+        sync: false
+      - key: SUPABASE_URL
+        sync: false
+      - key: SUPABASE_KEY
+        sync: false
+      - key: OPENAI_API_KEY
+        sync: false
+      - key: OPENAI_MODEL
+        sync: false
