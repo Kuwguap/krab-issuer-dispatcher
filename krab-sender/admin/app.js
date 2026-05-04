@@ -431,39 +431,49 @@ function _txnDriverCell(row) {
 }
 
 function _txnIssuerCell(row) {
+  // The Issuer column shows just the group the lead was issued to.
   const grp = (row && row.issuer_group) || "";
-  const handle = (row && row.issuer_submitter_handle) || "";
-  const telegramId = (row && row.issuer_submitter_telegram_id) || "";
-  const lines = [];
-  lines.push(
-    `<div>${
-      grp ? `<strong>${escapeIssuerText(grp)}</strong>` : '<span class="muted">—</span>'
-    }</div>`
-  );
-  if (handle) {
-    lines.push(
-      `<div class="small muted">via @${escapeIssuerText(handle)}</div>`
-    );
-  } else if (telegramId) {
-    lines.push(
-      `<div class="small muted">via ${escapeIssuerText(telegramId)}</div>`
-    );
-  }
-  return lines.join("");
+  if (!grp) return '<span class="muted">—</span>';
+  return `<strong>${escapeIssuerText(grp)}</strong>`;
 }
 
 function _txnDispatcherCell(row) {
-  const name = (row && row.dispatcher_name) || "";
-  const handle = (row && row.dispatcher_handle) || "";
-  if (!name && !handle) return '<span class="muted">—</span>';
-  const parts = [];
-  if (name) parts.push(`<strong>${escapeIssuerText(name)}</strong>`);
-  if (handle) {
-    parts.push(
-      `<span class="small muted">@${escapeIssuerText(handle)}</span>`
-    );
+  // The Dispatcher column shows the user who CREATED the lead
+  // (the assistant on Krab Issuer bot whose telegram_username is on the lead).
+  // If we don't have Issuer data, fall back to the Dispatch DB sender.
+  const issuerHandle = (row && row.issuer_submitter_handle) || "";
+  const issuerTgId = (row && row.issuer_submitter_telegram_id) || "";
+  const fallbackName = (row && row.dispatcher_name) || "";
+  const fallbackHandle = (row && row.dispatcher_handle) || "";
+
+  if (issuerHandle) {
+    const parts = [`<strong>@${escapeIssuerText(issuerHandle)}</strong>`];
+    if (issuerTgId) {
+      parts.push(
+        `<span class="small muted">${escapeIssuerText(issuerTgId)}</span>`
+      );
+    }
+    return parts.join(" ");
   }
-  return parts.join(" ");
+
+  if (issuerTgId) {
+    return `<strong>${escapeIssuerText(issuerTgId)}</strong>`;
+  }
+
+  if (fallbackName || fallbackHandle) {
+    const parts = [];
+    if (fallbackName) {
+      parts.push(`<strong>${escapeIssuerText(fallbackName)}</strong>`);
+    }
+    if (fallbackHandle) {
+      parts.push(
+        `<span class="small muted">@${escapeIssuerText(fallbackHandle)}</span>`
+      );
+    }
+    return parts.join(" ");
+  }
+
+  return '<span class="muted">—</span>';
 }
 
 function _txnReceiptCell(row) {
