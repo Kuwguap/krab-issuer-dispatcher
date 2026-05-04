@@ -1134,9 +1134,8 @@ def _set_full_name(state_data: dict, first: str, last: str) -> None:
 
 def _format_phase1_field_lines(state_data: dict) -> str:
     """Plain-text list of all Phase 1 fields (same labels as the edit picker).
-    Mirrors _phase1_edit_fields_keyboard so the post-process review and the edit
-    picker always show the same set of fields — including Phone, Price, Issuer
-    note, and Driver note (with `-` when empty)."""
+    Always renders Issuer note / Driver note so the summary matches the edit menu.
+    """
     first, last = _name_parts_from_full(state_data.get("name"))
     lines = [
         f"First name: {first}",
@@ -3456,8 +3455,57 @@ async def _submit_lead_from_review(message, context, user_id, data):
         await message.reply_text("❌ Could not save lead.")
         return ConversationHandler.END
 
-    driver_ids = data.get("selected_driver_ids", [])
-    drivers_list = [d for d in _get_all_drivers_cached() if str(d.get("id")) in driver_ids]
+    raw_driver_ids = data.get("selected_driver_ids") or []
+    driver_id_set = {str(x).strip() for x in raw_driver_ids if str(x).strip()}
+    all_drivers_now = _get_all_drivers_cached()
+    drivers_list = [d for d in all_drivers_now if str(d.get("id")) in driver_id_set]
+
+    # Safety net: never store an empty driver set in dispatch_pending. If the
+    # user never opened the driver picker (or all picked IDs went stale),
+    # fall back to every active, non-suspended driver assigned to the group.
+    if not drivers_list:
+        try:
+            suspended = _get_suspended_driver_ids()
+        except Exception:
+            suspended = set()
+        if not is_all_groups and group:
+            try:
+                gd_rows = (
+                    db.client.table("group_drivers")
+                    .select("driver_id")
+                    .eq("group_id", group.get("id"))
+                    .execute()
+                )
+                gd_ids = {str(r.get("driver_id")) for r in (gd_rows.data or []) if r.get("driver_id")}
+            except Exception:
+                gd_ids = set()
+            drivers_list = [
+                d
+                for d in all_drivers_now
+                if record_is_active(d)
+                and str(d.get("id")) not in suspended
+                and (not gd_ids or str(d.get("id")) in gd_ids)
+            ]
+        else:
+            drivers_list = [
+                d
+                for d in all_drivers_now
+                if record_is_active(d) and str(d.get("id")) not in suspended
+            ]
+        logger.info(
+            "submit_lead_from_review: empty selected_driver_ids; falling back to "
+            "%d eligible drivers (group=%s)",
+            len(drivers_list),
+            (group or {}).get("group_name"),
+        )
+
+    logger.info(
+        "submit_lead_from_review: lead=%s ref=%s group=%s selected_drivers=%s",
+        lead.get("id"),
+        ref_id,
+        (group or {}).get("group_name"),
+        [d.get("driver_name") for d in drivers_list],
+    )
 
     # Send group approval (single group) or broadcast offers (all groups).
     if is_all_groups:
@@ -5467,12 +5515,10 @@ async def handle_accept_group_offer(update: Update, context: ContextTypes.DEFAUL
     else:
         # Multi-group broadcast: offers exist; issuer picks drivers only after a team accepts.
         if offers:
-            issuer_dispatch_ok = False
             try:
                 await _issuer_open_driver_selection_after_group_accept(
                     context, str(lead_id), lead_for_files
                 )
-                issuer_dispatch_ok = True
             except Exception as e:
                 logger.warning("Could not notify issuer after group accept: %s", e)
             try:
@@ -5486,54 +5532,6 @@ async def handle_accept_group_offer(update: Update, context: ContextTypes.DEFAUL
                 )
             except Exception as e:
                 logger.warning("Could not post full lead to group after broadcast accept: %s", e)
-
-            # Safety net: if the issuer-side dispatch path didn't actually create
-            # any driver assignments (issuer state expired, no selected_driver_ids,
-            # bot restart between create + accept, etc.) fall back to broadcasting
-            # to the winning group's drivers so the lead never gets stuck.
-            try:
-                if not db.lead_has_assignments(lead_id):
-                    logger.warning(
-                        "accept_group_offer fallback: no assignments after issuer "
-                        "dispatch (lead=%s ok=%s); broadcasting to group drivers.",
-                        lead_id,
-                        issuer_dispatch_ok,
-                    )
-                    count, driver_names, fail_reason, driver_scope = (
-                        await _send_driver_requests_for_group(
-                            context, lead_for_files, winner_group,
-                        )
-                    )
-                    chat_id_w = _parse_chat_id(winner_group.get("group_telegram_id"))
-                    if count > 0:
-                        try:
-                            if chat_id_w:
-                                await context.bot.send_message(
-                                    chat_id=chat_id_w,
-                                    text=(
-                                        f"🚗 Sent to driver(s): **{driver_names}**\n"
-                                        f"Reference: `{reference_id}`"
-                                    ),
-                                    parse_mode="Markdown",
-                                )
-                        except Exception as e:
-                            logger.warning("group dispatch confirm msg: %s", e)
-                    else:
-                        try:
-                            if chat_id_w:
-                                await context.bot.send_message(
-                                    chat_id=chat_id_w,
-                                    text=_group_accept_notify_fail_text(
-                                        reference_id, fail_reason, driver_scope
-                                    ),
-                                    parse_mode="Markdown",
-                                )
-                        except Exception as e:
-                            logger.warning("group dispatch fail msg: %s", e)
-            except Exception as e:
-                logger.error(
-                    "accept_group_offer driver fallback failed: %s", e, exc_info=True
-                )
         else:
             count, driver_names, fail_reason, driver_scope = await _send_driver_requests_for_group(
                 context, lead, winner_group,
