@@ -369,6 +369,29 @@ function escapeIssuerText(s) {
 let _txnRows = [];
 let _txnLoading = false;
 
+function _mapBasicTxToUnifiedRows(items) {
+  const arr = Array.isArray(items) ? items : [];
+  return arr.map((tx) => ({
+    id: tx && tx.id,
+    reference_id: (tx && tx.reference_id) || null,
+    timestamp_ny: (tx && tx.timestamp_ny) || "",
+    filename: (tx && tx.filename) || "",
+    delivery_status: (tx && tx.delivery_status) || "",
+    tag_name: (tx && tx.lead_client_name) || null,
+    price: null,
+    receipt_image_url: (tx && tx.receipt_image_url) || null,
+    issuer_group: (tx && tx.issuer_group) || "",
+    issuer_submitter_handle: null,
+    issuer_submitter_telegram_id: null,
+    dispatcher_name: (tx && tx.telegram_name) || "",
+    dispatcher_handle: (tx && tx.telegram_handle) || "",
+    driver_selected_name: (tx && tx.recipient_name) || "",
+    driver_recipient_email: (tx && tx.recipient_email) || "",
+    driver_accepted: null,
+    driver_history: [],
+  }));
+}
+
 function setTxnBanner(msg) {
   const el = document.getElementById("txn-banner");
   if (!el) return;
@@ -431,44 +454,47 @@ function _txnDriverCell(row) {
 }
 
 function _txnIssuerCell(row) {
-  // The Issuer column shows just the group the lead was issued to.
-  const grp = (row && row.issuer_group) || "";
-  if (!grp) return '<span class="muted">—</span>';
-  return `<strong>${escapeIssuerText(grp)}</strong>`;
-}
+  // Issuer = who actually sent the tag through Krab Dispatch.
+  const senderName = ((row && row.dispatcher_name) || "").trim();
+  const senderHandle = ((row && row.dispatcher_handle) || "").trim();
 
-function _txnDispatcherCell(row) {
-  // The Dispatcher column shows the user who CREATED the lead
-  // (the assistant on Krab Issuer bot whose telegram_username is on the lead).
-  // If we don't have Issuer data, fall back to the Dispatch DB sender.
-  const issuerHandle = (row && row.issuer_submitter_handle) || "";
-  const issuerTgId = (row && row.issuer_submitter_telegram_id) || "";
-  const fallbackName = (row && row.dispatcher_name) || "";
-  const fallbackHandle = (row && row.dispatcher_handle) || "";
-
-  if (issuerHandle) {
-    const parts = [`<strong>@${escapeIssuerText(issuerHandle)}</strong>`];
-    if (issuerTgId) {
-      parts.push(
-        `<span class="small muted">${escapeIssuerText(issuerTgId)}</span>`
-      );
+  if (senderName || senderHandle) {
+    const parts = [];
+    if (senderName) {
+      parts.push(`<strong>${escapeIssuerText(senderName)}</strong>`);
+    }
+    if (senderHandle) {
+      parts.push(`<span class="small muted">@${escapeIssuerText(senderHandle)}</span>`);
     }
     return parts.join(" ");
   }
 
-  if (issuerTgId) {
-    return `<strong>${escapeIssuerText(issuerTgId)}</strong>`;
+  // Older/partial rows fallback to Issuer-side submitter identity.
+  const issuerHandle = ((row && row.issuer_submitter_handle) || "").trim();
+  if (issuerHandle && issuerHandle.toLowerCase() !== "unknown") {
+    return `<strong>@${escapeIssuerText(issuerHandle)}</strong>`;
+  }
+  return '<span class="muted">—</span>';
+}
+
+function _txnDispatcherCell(row) {
+  // Dispatcher = who created the lead in Krab Issuer.
+  const issuerHandle = ((row && row.issuer_submitter_handle) || "").trim();
+  const creatorName = ((row && row.dispatcher_name) || "").trim();
+  const creatorHandle = ((row && row.dispatcher_handle) || "").trim();
+
+  if (issuerHandle && issuerHandle.toLowerCase() !== "unknown") {
+    return `<strong>@${escapeIssuerText(issuerHandle)}</strong>`;
   }
 
-  if (fallbackName || fallbackHandle) {
+  // Fallback for old rows without Issuer lead creator fields.
+  if (creatorName || creatorHandle) {
     const parts = [];
-    if (fallbackName) {
-      parts.push(`<strong>${escapeIssuerText(fallbackName)}</strong>`);
+    if (creatorName) {
+      parts.push(`<strong>${escapeIssuerText(creatorName)}</strong>`);
     }
-    if (fallbackHandle) {
-      parts.push(
-        `<span class="small muted">@${escapeIssuerText(fallbackHandle)}</span>`
-      );
+    if (creatorHandle) {
+      parts.push(`<span class="small muted">@${escapeIssuerText(creatorHandle)}</span>`);
     }
     return parts.join(" ");
   }
@@ -480,12 +506,7 @@ function _txnReceiptCell(row) {
   const url = (row && row.receipt_image_url) || "";
   if (!url) return '<span class="muted">—</span>';
   const safe = escapeIssuerText(url);
-  return (
-    `<a href="${safe}" target="_blank" rel="noopener noreferrer" title="Open receipt">` +
-    `<img src="${safe}" alt="receipt" style="height:44px;max-width:64px;border-radius:6px;object-fit:cover;border:1px solid var(--border-subtle);" ` +
-    "onerror=\"this.replaceWith(Object.assign(document.createElement('span'),{className:'small',textContent:'View'}))\">" +
-    "</a>"
-  );
+  return `<a href="${safe}" target="_blank" rel="noopener noreferrer" title="Open receipt">View</a>`;
 }
 
 function _txnPriceCell(row) {
@@ -584,21 +605,20 @@ function renderUnifiedTransactions() {
     tr.innerHTML =
       `<td>${idx + 1}</td>` +
       `<td class="small">${escapeIssuerText(formatNy(r.timestamp_ny))}</td>` +
-      `<td>${
-        r.reference_id
-          ? `<code>${escapeIssuerText(r.reference_id)}</code>`
-          : '<span class="muted">—</span>'
-      }</td>` +
       `<td style="text-align:left;max-width:12rem;white-space:normal;">${
         r.tag_name
           ? escapeIssuerText(r.tag_name)
           : `<span class="muted">${escapeIssuerText(r.filename || "—")}</span>`
       }</td>` +
-      `<td>${_txnReceiptCell(r)}</td>` +
       `<td>${_txnPriceCell(r)}</td>` +
       `<td style="text-align:left;max-width:14rem;white-space:normal;">${_txnIssuerCell(r)}</td>` +
       `<td style="text-align:left;max-width:14rem;white-space:normal;">${_txnDriverCell(r)}</td>` +
       `<td style="text-align:left;white-space:normal;">${_txnDispatcherCell(r)}</td>` +
+      `<td>${
+        r.reference_id
+          ? `<code>${escapeIssuerText(r.reference_id)}</code>`
+          : '<span class="muted">—</span>'
+      }</td>` +
       `<td>${_txnStatusCell(r)}</td>`;
     tbody.appendChild(tr);
   });
@@ -608,14 +628,14 @@ function renderUnifiedTransactions() {
   totalTr.className = "txn-total-row";
   const countText = priceCount > 0 ? `${priceCount} priced` : "0 priced";
   totalTr.innerHTML =
-    `<td colspan="5" style="text-align:right;font-weight:600;letter-spacing:0.03em;">` +
+    `<td colspan="3" style="text-align:right;font-weight:600;letter-spacing:0.03em;">` +
     `TOTAL <span class="muted" style="font-weight:400;">(${escapeIssuerText(
       countText
     )} of ${rows.length})</span></td>` +
     `<td style="font-weight:700;color:var(--success);">${escapeIssuerText(
       _txnFormatUsd(priceSum)
     )}</td>` +
-    `<td colspan="4"></td>`;
+    `<td colspan="5"></td>`;
   tbody.appendChild(totalTr);
 
   const statusEl = document.getElementById("txn-status");
@@ -664,6 +684,14 @@ async function refreshUnifiedTransactions() {
     return;
   }
   _txnRows = Array.isArray(res.data) ? res.data : [];
+  if (_txnRows.length === 0) {
+    // Forward-step validation fallback: if unified join returns empty, retry with
+    // base transactions so dashboard still shows latest activity.
+    const basic = await requestWithAdminJson("/transactions?limit=200");
+    if (basic.ok) {
+      _txnRows = _mapBasicTxToUnifiedRows(basic.data);
+    }
+  }
   setTxnStatus(
     _txnRows.length
       ? `Showing ${_txnRows.length} most recent transactions.`
@@ -1652,26 +1680,6 @@ function renderTransactions(items) {
     tdClient.innerHTML = `<strong>${tx.filename}</strong>`;
     tr.appendChild(tdClient);
 
-    const tdRef = document.createElement("td");
-    tdRef.textContent = (tx.reference_id && String(tx.reference_id).trim()) || "—";
-    tr.appendChild(tdRef);
-
-    const tdNotes = document.createElement("td");
-    tdNotes.className = "small";
-    tdNotes.textContent = truncateNotes(tx.client_details, 80);
-    tr.appendChild(tdNotes);
-
-    const tdLeadKl = document.createElement("td");
-    tdLeadKl.className = "small";
-    tdLeadKl.textContent =
-      (tx.lead_client_name && String(tx.lead_client_name).trim()) || "—";
-    tr.appendChild(tdLeadKl);
-
-    const tdRec = document.createElement("td");
-    tdRec.className = "small";
-    tdRec.innerHTML = receiptLinkHtml(tx.receipt_image_url);
-    tr.appendChild(tdRec);
-
     const tdTelegram = document.createElement("td");
     tdTelegram.textContent = tx.telegram_name || "—";
     tr.appendChild(tdTelegram);
@@ -1683,6 +1691,10 @@ function renderTransactions(items) {
       tdDriver.textContent = "Not recorded";
     }
     tr.appendChild(tdDriver);
+
+    const tdRef = document.createElement("td");
+    tdRef.textContent = (tx.reference_id && String(tx.reference_id).trim()) || "—";
+    tr.appendChild(tdRef);
 
     const tdStatus = document.createElement("td");
     tdStatus.className = "status";
@@ -1884,7 +1896,7 @@ function renderSummaryTable(summary) {
   if (items.length === 0) {
     const tr = document.createElement("tr");
     const td = document.createElement("td");
-    td.colSpan = 14;
+    td.colSpan = 13;
     td.className = "muted";
     td.textContent = "No transmissions in this summary window.";
     tr.appendChild(td);
@@ -1914,26 +1926,6 @@ function renderSummaryTable(summary) {
     const tdPdf = document.createElement("td");
     tdPdf.textContent = it.filename || "—";
     tr.appendChild(tdPdf);
-
-    const tdRef = document.createElement("td");
-    tdRef.textContent = (it.reference_id && String(it.reference_id).trim()) || "—";
-    tr.appendChild(tdRef);
-
-    const tdNotes = document.createElement("td");
-    tdNotes.className = "small";
-    tdNotes.textContent = truncateNotes(it.client_details, 80);
-    tr.appendChild(tdNotes);
-
-    const tdLeadKl = document.createElement("td");
-    tdLeadKl.className = "small";
-    tdLeadKl.textContent =
-      (it.lead_client_name && String(it.lead_client_name).trim()) || "—";
-    tr.appendChild(tdLeadKl);
-
-    const tdRec = document.createElement("td");
-    tdRec.className = "small";
-    tdRec.innerHTML = receiptLinkHtml(it.receipt_image_url);
-    tr.appendChild(tdRec);
 
     const tdIssuerName = document.createElement("td");
     tdIssuerName.textContent = it.telegram_name || "—";
@@ -1976,6 +1968,20 @@ function renderSummaryTable(summary) {
     const tdDriverEmail = document.createElement("td");
     tdDriverEmail.textContent = it.recipient_email || "—";
     tr.appendChild(tdDriverEmail);
+
+    const tdRef = document.createElement("td");
+    tdRef.textContent = (it.reference_id && String(it.reference_id).trim()) || "—";
+    tr.appendChild(tdRef);
+
+    const tdPrice = document.createElement("td");
+    const p = it.price != null && String(it.price).trim() !== "" ? String(it.price).trim() : "";
+    tdPrice.textContent = p || "—";
+    tr.appendChild(tdPrice);
+
+    const tdReceipt = document.createElement("td");
+    tdReceipt.className = "small";
+    tdReceipt.innerHTML = receiptLinkHtml(it.receipt_image_url);
+    tr.appendChild(tdReceipt);
 
     tbody.appendChild(tr);
   }
@@ -2162,10 +2168,8 @@ function downloadSummaryCsv() {
       "Row",
       "TimeDate",
       "ClientPdfName",
-      "Reference",
       "Notes",
       "LeadIssuer",
-      "ReceiptUrl",
       "IssuerName",
       "DriverName",
       "Success",
@@ -2173,6 +2177,9 @@ function downloadSummaryCsv() {
       "Count",
       "IssuerUsername",
       "DriverEmail",
+      "Reference",
+      "Price",
+      "Receipt",
     ],
   ];
 
@@ -2184,11 +2191,18 @@ function downloadSummaryCsv() {
 
   for (let i = 0; i < lastSummary.items.length; i += 1) {
     const it = lastSummary.items[i];
+    const receiptUrl = (it.receipt_image_url && String(it.receipt_image_url).trim()) || "";
+    const receiptCsvValue = receiptUrl
+      ? `=HYPERLINK("${receiptUrl.replace(/"/g, '""')}","View")`
+      : "";
+    const priceStr =
+      it.price != null && String(it.price).trim() !== ""
+        ? String(it.price).trim()
+        : "";
     rows.push([
       i + 1,
       formatNy(it.timestamp_ny || ""),
       it.filename || "",
-      (it.reference_id && String(it.reference_id).trim()) || "",
       (() => {
         const s = String(it.client_details || "")
           .replace(/\s+/g, " ")
@@ -2197,7 +2211,6 @@ function downloadSummaryCsv() {
         return s.length > 500 ? s.slice(0, 500) + "…" : s;
       })(),
       (it.lead_client_name && String(it.lead_client_name).trim()) || "",
-      (it.receipt_image_url && String(it.receipt_image_url).trim()) || "",
       it.telegram_name || "",
       it.recipient_name || "Not recorded",
       (it.delivery_status || "").toUpperCase() === "DELIVERED" ? "YES" : "NO",
@@ -2205,6 +2218,9 @@ function downloadSummaryCsv() {
       issuerHandleCounts[normalizeHandle(it.telegram_handle) || "__unknown__"] || 0,
       formatHandleWithAt(it.telegram_handle),
       it.recipient_email || "",
+      (it.reference_id && String(it.reference_id).trim()) || "",
+      priceStr,
+      receiptCsvValue,
     ]);
   }
 

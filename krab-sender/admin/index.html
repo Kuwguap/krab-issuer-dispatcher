@@ -754,7 +754,7 @@
           aria-selected="false"
           data-tab="dispatch"
         >
-          Krab Dispatch
+          Krab Issuer
         </button>
         <button
           type="button"
@@ -764,7 +764,7 @@
           aria-selected="false"
           data-tab="issuer"
         >
-          Krab Issuer
+          Krab Dispatch
         </button>
       </nav>
       <div class="tab-panels">
@@ -804,19 +804,18 @@
                     <tr>
                       <th>#</th>
                       <th>Date (NY)</th>
-                      <th>Ref</th>
                       <th>Tag Name</th>
-                      <th>Receipt</th>
                       <th>Price</th>
                       <th>Issuer</th>
                       <th>Driver</th>
                       <th>Dispatcher</th>
+                      <th>Ref</th>
                       <th>Status</th>
                     </tr>
                   </thead>
                   <tbody id="txn-tbody">
                     <tr>
-                      <td colspan="10" class="muted">Loading…</td>
+                      <td colspan="9" class="muted">Loading…</td>
                     </tr>
                   </tbody>
                 </table>
@@ -899,18 +898,15 @@
                       <th>#</th>
                       <th>Time (NJ)</th>
                       <th>Client / File</th>
-                      <th>Reference</th>
-                      <th>Notes</th>
-                      <th>Lead (Issuer)</th>
-                      <th>Receipt</th>
                       <th>Issuer</th>
                       <th>Driver</th>
+                      <th>Reference</th>
                       <th>Status</th>
                     </tr>
                   </thead>
                   <tbody id="tx-body">
                     <tr>
-                      <td colspan="10" class="muted">
+                      <td colspan="7" class="muted">
                         Waiting for data... send a document through the bot.
                       </td>
                     </tr>
@@ -1062,10 +1058,6 @@
                           <th>#</th>
                           <th>Time Date</th>
                           <th>Client PDF Name</th>
-                          <th>Reference</th>
-                          <th>Notes</th>
-                          <th>Lead (Issuer)</th>
-                          <th>Receipt</th>
                           <th>Issuer Name</th>
                           <th>Driver Name</th>
                           <th>Success</th>
@@ -1073,11 +1065,14 @@
                           <th>Count</th>
                           <th>Issuer @Username</th>
                           <th>Driver Email</th>
+                          <th>Reference</th>
+                          <th>Price</th>
+                          <th>Receipt</th>
                         </tr>
                       </thead>
                       <tbody id="summary-tbody">
                         <tr>
-                          <td colspan="14" class="muted">
+                          <td colspan="13" class="muted">
                             Generate a summary to see grouped results by sender.
                           </td>
                         </tr>
