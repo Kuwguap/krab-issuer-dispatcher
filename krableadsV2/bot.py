@@ -566,9 +566,9 @@ def _supervisory_delivery_chat_ids(group_supervisory_raw: object) -> list:
 
 def _new_lead_supervisory_notice_text(
     reference_id: str,
-    group_name: str,
-    driver_names: str,
-    username: str,
+    group_display: str,
+    driver_display: str,
+    issuer_display: str,
     *,
     client_name: str = "—",
     source_label: Optional[str] = None,
@@ -589,15 +589,15 @@ def _new_lead_supervisory_notice_text(
         return (s or "").replace("\n", " ").replace("\r", " ").strip() or "N/A"
 
     ref = one_line(str(reference_id))
-    gn = one_line(group_name)
-    dn = one_line(driver_names)
+    gn = (group_display or "").strip() or "N/A"
+    dn = (driver_display or "").strip() or "N/A"
     cn = one_line(client_name)
     if source_label and str(source_label).strip():
         src = one_line(str(source_label))
     else:
         src = "—"
     if driver_count is None:
-        parts = [p.strip() for p in (driver_names or "").split(",") if p.strip()]
+        parts = [p.strip() for p in re.split(r",|•", re.sub(r"<[^>]+>", "", dn)) if p.strip()]
         n = len(parts)
     else:
         n = int(driver_count)
@@ -607,11 +607,7 @@ def _new_lead_supervisory_notice_text(
         send_mode = "Send Mode: 1 Driver"
     else:
         send_mode = "Send Mode: Multiple Drivers"
-    un = (username or "").strip()
-    if un and un != "Unknown":
-        by_line = un if un.startswith("@") else f"@{un}"
-    else:
-        by_line = "Unknown"
+    by_line = (issuer_display or "").strip() or "Unknown"
     lines = [
         "📬 New lead sent",
         "",
@@ -625,6 +621,40 @@ def _new_lead_supervisory_notice_text(
     if include_lead_issuer:
         lines.append(f"Lead issued by: {by_line}")
     return "\n".join(lines)
+
+
+def _telegram_user_link_html(user_id: object, label: str) -> str:
+    """Clickable Telegram user mention for supervisory lines."""
+    uid = str(user_id or "").strip()
+    txt = html.escape((label or "").strip() or uid or "Unknown", quote=False)
+    if uid.lstrip("-").isdigit():
+        return f'<a href="tg://user?id={uid}">{txt}</a>'
+    return txt
+
+
+def _telegram_chat_link_html(chat_id: object, label: str) -> str:
+    """Best-effort chat link for group/supergroup IDs."""
+    cid = str(chat_id or "").strip()
+    txt = html.escape((label or "").strip() or cid or "N/A", quote=False)
+    if not cid:
+        return txt
+    if cid.startswith("-100") and cid[4:].isdigit():
+        return f'<a href="https://t.me/c/{cid[4:]}">{txt}</a>'
+    if cid.lstrip("-").isdigit():
+        return f'<a href="tg://user?id={cid}">{txt}</a>'
+    return txt
+
+
+def _issuer_display_html_from_lead(lead: dict) -> str:
+    """Lead issuer line with username first, then Telegram-ID fallback."""
+    un = (lead.get("telegram_username") or "").strip()
+    uid = lead.get("user_id")
+    if un and un.lower() != "unknown":
+        label = un if un.startswith("@") else f"@{un}"
+        return _telegram_user_link_html(uid, label)
+    if uid is not None:
+        return _telegram_user_link_html(uid, str(uid))
+    return "Unknown"
 
 
 _TELEGRAM_FILE_API_MARKER = "https://api.telegram.org/file/bot"
@@ -1853,6 +1883,9 @@ def _lead_issuer_display_from_lead(lead: dict) -> str:
     un = (lead.get("telegram_username") or "").strip()
     if un and un.lower() != "unknown":
         return un if un.startswith("@") else f"@{un}"
+    uid = str(lead.get("user_id") or "").strip()
+    if uid:
+        return uid
     return "Unknown"
 
 
@@ -4529,11 +4562,39 @@ async def _send_supervisory_new_lead_notices(
     lead_row = db.get_lead_by_id(lead_id)
     client_nm = _client_display_name_from_lead(lead_row) if lead_row else "—"
     src_raw = (lead_row.get("contact_info_source") or "").strip() if lead_row else ""
+    lead = lead_row or {}
+    group_row = None
+    if lead and lead.get("group_id"):
+        group_row = db.get_group_by_id(lead["group_id"])
+
+    group_label = (group_name or "").strip() or "N/A"
+    group_chat_id = group_row.get("group_telegram_id") if group_row else None
+    group_display = _telegram_chat_link_html(group_chat_id, group_label)
+
+    driver_display = html.escape((driver_names or "").strip() or "N/A", quote=False)
+    st = db.get_lead_assignment_status(lead_id) if lead_id else None
+    if st and st.get("driver_id"):
+        drow = next(
+            (d for d in _get_all_drivers_cached() if str(d.get("id")) == str(st.get("driver_id"))),
+            None,
+        )
+        if drow:
+            driver_display = _telegram_user_link_html(
+                drow.get("telegram_id"),
+                str(drow.get("driver_name") or driver_names or "Driver"),
+            )
+
+    issuer_display = _issuer_display_html_from_lead(lead) if lead else (
+        html.escape(uname if uname.startswith("@") else f"@{uname}", quote=False)
+        if uname and uname.lower() != "unknown"
+        else "Unknown"
+    )
+
     body_supervisory = _new_lead_supervisory_notice_text(
         reference_id,
-        group_name,
-        driver_names,
-        uname,
+        group_display,
+        driver_display,
+        issuer_display,
         client_name=client_nm,
         source_label=src_raw or None,
         include_lead_issuer=True,
@@ -4541,20 +4602,16 @@ async def _send_supervisory_new_lead_notices(
     )
     body_st_only = _new_lead_supervisory_notice_text(
         reference_id,
-        group_name,
-        driver_names,
-        uname,
+        group_display,
+        driver_display,
+        issuer_display,
         client_name=client_nm,
         source_label=src_raw or None,
         include_lead_issuer=False,
         driver_count=driver_count,
     )
-    sup_text_supervisory = _prefix_supervisory_message(body_supervisory)
-    sup_text_st = _prefix_supervisory_message(body_st_only)
-    lead = lead_row
-    group_row = None
-    if lead and lead.get("group_id"):
-        group_row = db.get_group_by_id(lead["group_id"])
+    sup_text_supervisory = _prefix_supervisory_html(body_supervisory)
+    sup_text_st = _prefix_supervisory_html(body_st_only)
     sup_raw = group_row.get("supervisory_telegram_id") if group_row else None
     sup_targets = _supervisory_delivery_chat_ids(sup_raw)
     seen_norm: set = set()
@@ -4566,7 +4623,7 @@ async def _send_supervisory_new_lead_notices(
             await context.bot.send_message(
                 chat_id=sup_cid,
                 text=sup_text_supervisory,
-                parse_mode=None,
+                parse_mode="HTML",
             )
         except Exception as e:
             logger.warning("Could not send new-lead notice to supervisory chat %s: %s", sup_cid, e)
@@ -4579,7 +4636,7 @@ async def _send_supervisory_new_lead_notices(
                 await context.bot.send_message(
                     chat_id=st_cid,
                     text=sup_text_st,
-                    parse_mode=None,
+                    parse_mode="HTML",
                 )
             except Exception as e:
                 logger.warning("Could not send new-lead notice to ST chat %s: %s", st_cid, e)
