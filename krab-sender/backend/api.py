@@ -328,6 +328,7 @@ def transactions_full(
                 "delivery_status": tx.delivery_status,
                 "tag_name": (ctx or {}).get("tag_name"),
                 "price": (ctx or {}).get("price"),
+                "receipt_price": (ctx or {}).get("receipt_price"),
                 "receipt_image_url": (ctx or {}).get("receipt_image_url"),
                 "issuer_group": (ctx or {}).get("group_name") or tx.issuer_group,
                 "issuer_submitter_handle": (ctx or {}).get("submitted_by_handle"),

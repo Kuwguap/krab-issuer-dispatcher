@@ -378,7 +378,8 @@ function _mapBasicTxToUnifiedRows(items) {
     filename: (tx && tx.filename) || "",
     delivery_status: (tx && tx.delivery_status) || "",
     tag_name: (tx && tx.lead_client_name) || null,
-    price: null,
+    price: (tx && tx.price) || null,
+    receipt_price: (tx && tx.receipt_price) || null,
     receipt_image_url: (tx && tx.receipt_image_url) || null,
     issuer_group: (tx && tx.issuer_group) || "",
     issuer_submitter_handle: null,
@@ -505,12 +506,17 @@ function _txnDispatcherCell(row) {
 function _txnReceiptCell(row) {
   const url = (row && row.receipt_image_url) || "";
   if (!url) return '<span class="muted">—</span>';
-  const safe = escapeIssuerText(url);
-  return `<a href="${safe}" target="_blank" rel="noopener noreferrer" title="Open receipt">View</a>`;
+  return receiptLinkHtml(url);
 }
 
 function _txnPriceCell(row) {
   const raw = (row && row.price) || "";
+  if (!raw) return '<span class="muted">—</span>';
+  return escapeIssuerText(raw);
+}
+
+function _txnReceiptPriceCell(row) {
+  const raw = (row && row.receipt_price) || "";
   if (!raw) return '<span class="muted">—</span>';
   return escapeIssuerText(raw);
 }
@@ -555,6 +561,7 @@ function _txnMatches(row, qLower) {
     row.reference_id,
     row.tag_name,
     row.price,
+    row.receipt_price,
     row.issuer_group,
     row.issuer_submitter_handle,
     row.dispatcher_name,
@@ -584,7 +591,7 @@ function renderUnifiedTransactions() {
   if (rows.length === 0) {
     const tr = document.createElement("tr");
     const td = document.createElement("td");
-    td.colSpan = 10;
+    td.colSpan = 11;
     td.className = "muted";
     td.textContent = _txnLoading
       ? "Loading…"
@@ -595,12 +602,19 @@ function renderUnifiedTransactions() {
   }
   let priceSum = 0;
   let priceCount = 0;
+  let receiptPriceSum = 0;
+  let receiptPriceCount = 0;
   rows.forEach((r, idx) => {
     const tr = document.createElement("tr");
     const parsed = _txnParsePrice(r && r.price);
     if (parsed > 0) {
       priceSum += parsed;
       priceCount += 1;
+    }
+    const parsedReceipt = _txnParsePrice(r && r.receipt_price);
+    if (parsedReceipt > 0) {
+      receiptPriceSum += parsedReceipt;
+      receiptPriceCount += 1;
     }
     tr.innerHTML =
       `<td>${idx + 1}</td>` +
@@ -610,7 +624,6 @@ function renderUnifiedTransactions() {
           ? escapeIssuerText(r.tag_name)
           : `<span class="muted">${escapeIssuerText(r.filename || "—")}</span>`
       }</td>` +
-      `<td>${_txnPriceCell(r)}</td>` +
       `<td style="text-align:left;max-width:14rem;white-space:normal;">${_txnIssuerCell(r)}</td>` +
       `<td style="text-align:left;max-width:14rem;white-space:normal;">${_txnDriverCell(r)}</td>` +
       `<td style="text-align:left;white-space:normal;">${_txnDispatcherCell(r)}</td>` +
@@ -619,23 +632,32 @@ function renderUnifiedTransactions() {
           ? `<code>${escapeIssuerText(r.reference_id)}</code>`
           : '<span class="muted">—</span>'
       }</td>` +
+      `<td>${_txnPriceCell(r)}</td>` +
+      `<td>${_txnReceiptPriceCell(r)}</td>` +
+      `<td>${_txnReceiptCell(r)}</td>` +
       `<td>${_txnStatusCell(r)}</td>`;
     tbody.appendChild(tr);
   });
 
-  // Spreadsheet-style totals row: Price column sums visible rows.
+  // Spreadsheet-style totals row: sum lead Price and Receipt Price for visible rows.
   const totalTr = document.createElement("tr");
   totalTr.className = "txn-total-row";
-  const countText = priceCount > 0 ? `${priceCount} priced` : "0 priced";
+  const countText =
+    priceCount > 0 || receiptPriceCount > 0
+      ? `${priceCount} lead price · ${receiptPriceCount} receipt price`
+      : "0 priced";
   totalTr.innerHTML =
-    `<td colspan="3" style="text-align:right;font-weight:600;letter-spacing:0.03em;">` +
+    `<td colspan="7" style="text-align:right;font-weight:600;letter-spacing:0.03em;">` +
     `TOTAL <span class="muted" style="font-weight:400;">(${escapeIssuerText(
       countText
-    )} of ${rows.length})</span></td>` +
+    )} of ${rows.length} rows)</span></td>` +
     `<td style="font-weight:700;color:var(--success);">${escapeIssuerText(
       _txnFormatUsd(priceSum)
     )}</td>` +
-    `<td colspan="5"></td>`;
+    `<td style="font-weight:700;color:var(--accent);">${escapeIssuerText(
+      _txnFormatUsd(receiptPriceSum)
+    )}</td>` +
+    `<td colspan="2"></td>`;
   tbody.appendChild(totalTr);
 
   const statusEl = document.getElementById("txn-status");
@@ -644,7 +666,7 @@ function renderUnifiedTransactions() {
       rows.length === _txnRows.length
         ? `Showing ${rows.length} transactions`
         : `Showing ${rows.length} of ${_txnRows.length} transactions`;
-    statusEl.textContent = `${shownLabel} · Price total: ${_txnFormatUsd(priceSum)}`;
+    statusEl.textContent = `${shownLabel} · Lead price total: ${_txnFormatUsd(priceSum)} · Receipt price total: ${_txnFormatUsd(receiptPriceSum)}`;
   }
 }
 

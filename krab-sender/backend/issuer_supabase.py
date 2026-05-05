@@ -518,6 +518,7 @@ def fetch_full_lead_context_by_references(
         "lead_id": str,
         "tag_name": str,                 # first nonblank line of vehicle_details
         "price": str,                    # raw price string from lead
+        "receipt_price": str | None,     # parsed / stored receipt total when driver uploads
         "receipt_image_url": str | None,
         "submitted_by_handle": str,      # telegram_username from lead
         "submitted_by_telegram_id": str, # user_id (Issuer bot submitter)
@@ -558,7 +559,7 @@ def fetch_full_lead_context_by_references(
         in_list = ",".join(batch)
         params = {
             "select": (
-                "id,reference_id,vehicle_details,price,receipt_image_url,"
+                "id,reference_id,vehicle_details,price,receipt_price,receipt_image_url,"
                 "user_id,telegram_username,group_id,created_at"
             ),
             "reference_id": f"in.({in_list})",
@@ -653,6 +654,8 @@ def fetch_full_lead_context_by_references(
         grp = groups_by_id.get(gid) if gid else None
         price_raw = lead.get("price")
         price_str = "" if price_raw is None else str(price_raw).strip()
+        rcp_raw = lead.get("receipt_price")
+        receipt_price_str = "" if rcp_raw is None else str(rcp_raw).strip()
 
         history: list[dict[str, Any]] = []
         accepted: dict[str, Any] | None = None
@@ -677,6 +680,7 @@ def fetch_full_lead_context_by_references(
             "lead_id": lid or None,
             "tag_name": _first_nonblank_line(vd) or None,
             "price": price_str or None,
+            "receipt_price": receipt_price_str or None,
             "receipt_image_url": (lead.get("receipt_image_url") or "").strip() or None,
             "submitted_by_handle": (lead.get("telegram_username") or "").strip() or None,
             "submitted_by_telegram_id": str(lead.get("user_id") or "").strip() or None,
