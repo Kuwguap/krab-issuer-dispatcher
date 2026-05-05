@@ -1,4 +1,7 @@
-from fastapi import Depends, FastAPI, Header, HTTPException, status
+from datetime import datetime, timedelta, timezone
+from typing import Optional
+
+from fastapi import Depends, FastAPI, Header, HTTPException, Query, status
 from fastapi.responses import RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
@@ -28,6 +31,32 @@ from .issuer_admin_api import router as issuer_admin_router
 
 
 NY_TZ = ZoneInfo("America/New_York")
+
+_TXN_PERIOD_DAYS = {
+    "1w": 7,
+    "2w": 14,
+    "3w": 21,
+    "1m": 30,
+    "3m": 90,
+    "6m": 180,
+    "12m": 365,
+}
+
+
+def _transactions_since_utc_for_period(period: Optional[str]) -> Optional[datetime]:
+    """Return timezone-aware UTC lower bound for rolling windows, or None for all-time."""
+    if not period:
+        return None
+    key = str(period).strip().lower()
+    if key in ("", "all"):
+        return None
+    days = _TXN_PERIOD_DAYS.get(key)
+    if days is None:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Invalid period. Use: 1w, 2w, 3w, 1m, 3m, 6m, 12m, all",
+        )
+    return datetime.now(timezone.utc) - timedelta(days=days)
 
 
 def _enrich_tx_rows_with_lead_meta(config: ApiConfig, rows: list[dict]) -> list[dict]:
@@ -231,12 +260,14 @@ def transactions_latest(config: ApiConfig = Depends(get_api_config)):
 def transactions(
     limit: int = 100,
     offset: int = 0,
+    period: Optional[str] = Query(None, description="1w|2w|3w|1m|3m|6m|12m|all"),
     config: ApiConfig = Depends(get_api_config),
 ):
     """
     Paginated list of transactions for the dashboard data table.
     """
-    items = list_transactions(limit=limit, offset=offset)
+    since = _transactions_since_utc_for_period(period)
+    items = list_transactions(limit=limit, offset=offset, since_utc=since)
     result = []
     for tx in items:
         ts_ny = tx.timestamp.astimezone(NY_TZ)
@@ -263,6 +294,7 @@ def transactions(
 def transactions_full(
     limit: int = 200,
     offset: int = 0,
+    period: Optional[str] = Query(None, description="1w|2w|3w|1m|3m|6m|12m|all"),
     config: ApiConfig = Depends(get_api_config),
 ):
     """
@@ -282,10 +314,10 @@ def transactions_full(
       - Dispatcher (this DB `telegram_name` / handle)
       - Timestamp (this DB `timestamp`, NY ISO)
     """
-    safe_limit = max(1, min(int(limit or 200), 500))
+    safe_limit = max(1, min(int(limit or 200), 2000))
     safe_offset = max(0, int(offset or 0))
-
-    items = list_transactions(limit=safe_limit, offset=safe_offset)
+    since = _transactions_since_utc_for_period(period)
+    items = list_transactions(limit=safe_limit, offset=safe_offset, since_utc=since)
     if not items:
         return []
 

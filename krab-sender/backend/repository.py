@@ -63,18 +63,21 @@ def save_transaction(tx: Transaction) -> None:
         session.flush()  # Ensure the ORM is added before commit
 
 
-def list_transactions(limit: int = 100, offset: int = 0) -> List[Transaction]:
+def list_transactions(
+    limit: int = 100,
+    offset: int = 0,
+    since_utc: Optional[datetime] = None,
+) -> List[Transaction]:
     """
     Fetch a window of transactions ordered by most recent first.
+
+    If ``since_utc`` is set, only rows with ``timestamp_utc >= since_utc`` are returned.
     """
     with get_session() as session:
-        rows: Iterable[TransactionORM] = (
-            session.query(TransactionORM)
-            .order_by(TransactionORM.timestamp_utc.desc())
-            .offset(offset)
-            .limit(limit)
-            .all()
-        )
+        q = session.query(TransactionORM).order_by(TransactionORM.timestamp_utc.desc())
+        if since_utc is not None:
+            q = q.filter(TransactionORM.timestamp_utc >= since_utc)
+        rows: Iterable[TransactionORM] = q.offset(offset).limit(limit).all()
 
         # Build Transaction objects while the session is still open to avoid
         # DetachedInstanceError when accessing attributes later.

@@ -368,6 +368,23 @@ function escapeIssuerText(s) {
 
 let _txnRows = [];
 let _txnLoading = false;
+const KRAB_TXN_PERIOD_KEY = "krab_txn_period";
+let txnUnifiedZoomScale = 1;
+
+function txnPeriodApiValue() {
+  const sel = document.getElementById("txn-period-select");
+  const v = sel ? String(sel.value || "all").trim().toLowerCase() : "all";
+  const allowed = new Set(["1w", "2w", "3w", "1m", "3m", "6m", "12m", "all"]);
+  return allowed.has(v) ? v : "all";
+}
+
+function txnTransactionsUrl(path, limitNum) {
+  const p = new URLSearchParams();
+  p.set("limit", String(limitNum));
+  const period = txnPeriodApiValue();
+  if (period && period !== "all") p.set("period", period);
+  return `${path}?${p.toString()}`;
+}
 
 function _mapBasicTxToUnifiedRows(items) {
   const arr = Array.isArray(items) ? items : [];
@@ -406,6 +423,12 @@ function setTxnStatus(msg) {
   el.textContent = msg || "";
 }
 
+function _txnDriverEmailSuffix(row) {
+  const e = ((row && row.driver_recipient_email) || "").trim();
+  if (!e) return "";
+  return ` <span class="small muted">${escapeIssuerText(e)}</span>`;
+}
+
 function _txnDriverCell(row) {
   const parts = [];
   const accepted = row && row.driver_accepted;
@@ -413,10 +436,11 @@ function _txnDriverCell(row) {
   const history = Array.isArray(row && row.driver_history)
     ? row.driver_history
     : [];
+  const emailSuf = _txnDriverEmailSuffix(row);
 
   if (accepted && accepted.driver_name) {
     parts.push(
-      `<div><strong>${escapeIssuerText(accepted.driver_name)}</strong>` +
+      `<div><strong>${escapeIssuerText(accepted.driver_name)}</strong>${emailSuf}` +
         (accepted.accepted_at
           ? ` <span class="small muted">· accepted ${escapeIssuerText(
               formatNy(accepted.accepted_at)
@@ -425,9 +449,13 @@ function _txnDriverCell(row) {
         "</div>"
     );
   } else if (selected) {
-    parts.push(`<div><strong>${escapeIssuerText(selected)}</strong></div>`);
+    parts.push(
+      `<div><strong>${escapeIssuerText(selected)}</strong>${emailSuf}</div>`
+    );
   } else if (history.length > 0 && history[0].driver_name) {
-    parts.push(`<div>${escapeIssuerText(history[0].driver_name)}</div>`);
+    parts.push(
+      `<div><strong>${escapeIssuerText(history[0].driver_name)}</strong>${emailSuf}</div>`
+    );
   } else {
     parts.push('<div class="muted">—</div>');
   }
@@ -567,6 +595,7 @@ function _txnMatches(row, qLower) {
     row.dispatcher_name,
     row.dispatcher_handle,
     row.driver_selected_name,
+    row.driver_recipient_email,
     row.driver_accepted && row.driver_accepted.driver_name,
     row.filename,
   ];
@@ -662,11 +691,16 @@ function renderUnifiedTransactions() {
 
   const statusEl = document.getElementById("txn-status");
   if (statusEl && !_txnLoading) {
+    const periodSel = document.getElementById("txn-period-select");
+    const rangeLabel =
+      periodSel && periodSel.selectedOptions && periodSel.selectedOptions[0]
+        ? periodSel.selectedOptions[0].textContent.trim()
+        : "";
     const shownLabel =
       rows.length === _txnRows.length
         ? `Showing ${rows.length} transactions`
         : `Showing ${rows.length} of ${_txnRows.length} transactions`;
-    statusEl.textContent = `${shownLabel} · Lead price total: ${_txnFormatUsd(priceSum)} · Receipt price total: ${_txnFormatUsd(receiptPriceSum)}`;
+    statusEl.textContent = `${shownLabel}${rangeLabel ? ` · ${rangeLabel}` : ""} · Lead price total: ${_txnFormatUsd(priceSum)} · Receipt price total: ${_txnFormatUsd(receiptPriceSum)}`;
   }
 }
 
@@ -689,7 +723,9 @@ async function refreshUnifiedTransactions() {
   _txnLoading = true;
   setTxnStatus("Loading unified transactions…");
   renderUnifiedTransactions();
-  const res = await requestWithAdminJson("/transactions/full?limit=200");
+  const res = await requestWithAdminJson(
+    txnTransactionsUrl("/transactions/full", 2000)
+  );
   _txnLoading = false;
   if (!res.ok) {
     const err = res.error || ("HTTP_" + (res.status || 0));
@@ -709,14 +745,23 @@ async function refreshUnifiedTransactions() {
   if (_txnRows.length === 0) {
     // Forward-step validation fallback: if unified join returns empty, retry with
     // base transactions so dashboard still shows latest activity.
-    const basic = await requestWithAdminJson("/transactions?limit=200");
+    const basic = await requestWithAdminJson(
+      txnTransactionsUrl("/transactions", 200)
+    );
     if (basic.ok) {
       _txnRows = _mapBasicTxToUnifiedRows(basic.data);
     }
   }
+  const periodSel = document.getElementById("txn-period-select");
+  const rangeLabel =
+    periodSel && periodSel.selectedOptions && periodSel.selectedOptions[0]
+      ? periodSel.selectedOptions[0].textContent.trim()
+      : "";
   setTxnStatus(
     _txnRows.length
-      ? `Showing ${_txnRows.length} most recent transactions.`
+      ? `Showing ${_txnRows.length} transactions${
+          rangeLabel ? ` · ${rangeLabel}` : ""
+        }.`
       : ""
   );
   renderUnifiedTransactions();
@@ -729,6 +774,29 @@ function maybeRefreshTxnTab() {
 }
 
 function setupTxnEvents() {
+  const periodSel = document.getElementById("txn-period-select");
+  if (periodSel) {
+    try {
+      const saved = localStorage.getItem(KRAB_TXN_PERIOD_KEY);
+      const allowed = new Set([
+        "1w",
+        "2w",
+        "3w",
+        "1m",
+        "3m",
+        "6m",
+        "12m",
+        "all",
+      ]);
+      if (saved && allowed.has(saved)) periodSel.value = saved;
+    } catch (_) {}
+    periodSel.addEventListener("change", () => {
+      try {
+        localStorage.setItem(KRAB_TXN_PERIOD_KEY, periodSel.value);
+      } catch (_) {}
+      refreshUnifiedTransactions();
+    });
+  }
   const refresh = document.getElementById("txn-refresh-btn");
   if (refresh) {
     refresh.addEventListener("click", () => refreshUnifiedTransactions());
@@ -1908,6 +1976,28 @@ function applyTxZoom(scale) {
   }
 }
 
+function clampTxnUnifiedZoom(next) {
+  return Math.max(0.05, Math.min(2.5, next));
+}
+
+function applyTxnUnifiedZoom(scale) {
+  txnUnifiedZoomScale = clampTxnUnifiedZoom(scale);
+  const table = document.querySelector("#txn-ledger-wrapper table");
+  if (table) {
+    table.style.zoom = String(txnUnifiedZoomScale);
+  }
+  const resetBtn = document.getElementById("txn-ledger-zoom-reset-btn");
+  if (resetBtn) {
+    resetBtn.textContent = `${Math.round(txnUnifiedZoomScale * 100)}%`;
+  }
+  const resetBtnExpanded = document.getElementById(
+    "txn-ledger-expanded-zoom-reset-btn"
+  );
+  if (resetBtnExpanded) {
+    resetBtnExpanded.textContent = `${Math.round(txnUnifiedZoomScale * 100)}%`;
+  }
+}
+
 function renderSummaryTable(summary) {
   const tbody = document.getElementById("summary-tbody");
   if (!tbody) return;
@@ -2580,6 +2670,22 @@ function setupEvents() {
   const txExpandedZoomOutBtn = document.getElementById("tx-expanded-zoom-out-btn");
   const txExpandedZoomResetBtn = document.getElementById("tx-expanded-zoom-reset-btn");
   const txExpandedCloseBtn = document.getElementById("tx-expanded-close-btn");
+  const txnLedgerExpandBtn = document.getElementById("txn-ledger-expand-btn");
+  const txnLedgerZoomInBtn = document.getElementById("txn-ledger-zoom-in-btn");
+  const txnLedgerZoomOutBtn = document.getElementById("txn-ledger-zoom-out-btn");
+  const txnLedgerZoomResetBtn = document.getElementById("txn-ledger-zoom-reset-btn");
+  const txnLedgerExpandedZoomInBtn = document.getElementById(
+    "txn-ledger-expanded-zoom-in-btn"
+  );
+  const txnLedgerExpandedZoomOutBtn = document.getElementById(
+    "txn-ledger-expanded-zoom-out-btn"
+  );
+  const txnLedgerExpandedZoomResetBtn = document.getElementById(
+    "txn-ledger-expanded-zoom-reset-btn"
+  );
+  const txnLedgerExpandedCloseBtn = document.getElementById(
+    "txn-ledger-expanded-close-btn"
+  );
   const summaryAiInput = document.getElementById("summary-ai-input");
   const summaryAiAskBtn = document.getElementById("summary-ai-ask-btn");
   const summaryAiAnswer = document.getElementById("summary-ai-answer");
@@ -2673,6 +2779,28 @@ function setupEvents() {
     });
   }
 
+  if (txnLedgerExpandBtn) {
+    txnLedgerExpandBtn.addEventListener("click", () => {
+      const wrapper = document.getElementById("txn-ledger-wrapper");
+      if (!wrapper) return;
+      const expanded = wrapper.classList.toggle("expanded");
+      txnLedgerExpandBtn.innerHTML = expanded
+        ? "🗕<span>Collapse</span>"
+        : "⤢<span>Expand</span>";
+    });
+  }
+
+  if (txnLedgerExpandedCloseBtn) {
+    txnLedgerExpandedCloseBtn.addEventListener("click", () => {
+      const wrapper = document.getElementById("txn-ledger-wrapper");
+      if (!wrapper) return;
+      wrapper.classList.remove("expanded");
+      if (txnLedgerExpandBtn) {
+        txnLedgerExpandBtn.innerHTML = "⤢<span>Expand</span>";
+      }
+    });
+  }
+
   if (summaryZoomInBtn) {
     summaryZoomInBtn.addEventListener("click", () => {
       applySummaryZoom(summaryZoomScale + 0.1);
@@ -2735,6 +2863,37 @@ function setupEvents() {
     });
   }
 
+  if (txnLedgerZoomInBtn) {
+    txnLedgerZoomInBtn.addEventListener("click", () => {
+      applyTxnUnifiedZoom(txnUnifiedZoomScale + 0.1);
+    });
+  }
+  if (txnLedgerZoomOutBtn) {
+    txnLedgerZoomOutBtn.addEventListener("click", () => {
+      applyTxnUnifiedZoom(txnUnifiedZoomScale - 0.1);
+    });
+  }
+  if (txnLedgerZoomResetBtn) {
+    txnLedgerZoomResetBtn.addEventListener("click", () => {
+      applyTxnUnifiedZoom(1);
+    });
+  }
+  if (txnLedgerExpandedZoomInBtn) {
+    txnLedgerExpandedZoomInBtn.addEventListener("click", () => {
+      applyTxnUnifiedZoom(txnUnifiedZoomScale + 0.1);
+    });
+  }
+  if (txnLedgerExpandedZoomOutBtn) {
+    txnLedgerExpandedZoomOutBtn.addEventListener("click", () => {
+      applyTxnUnifiedZoom(txnUnifiedZoomScale - 0.1);
+    });
+  }
+  if (txnLedgerExpandedZoomResetBtn) {
+    txnLedgerExpandedZoomResetBtn.addEventListener("click", () => {
+      applyTxnUnifiedZoom(1);
+    });
+  }
+
   const summaryTableWrap = document.querySelector("#summary-table");
   if (summaryTableWrap) {
     let pinchStartDistance = 0;
@@ -2792,6 +2951,38 @@ function setupEvents() {
           const distance = Math.hypot(dx, dy);
           const ratio = distance / pinchStartDistance;
           applyTxZoom(pinchStartScale * ratio);
+          ev.preventDefault();
+        }
+      },
+      { passive: false }
+    );
+  }
+
+  const txnLedgerTableWrap = document.querySelector("#txn-table-wrap");
+  if (txnLedgerTableWrap) {
+    let pinchStartDistance = 0;
+    let pinchStartScale = 1;
+    txnLedgerTableWrap.addEventListener(
+      "touchstart",
+      (ev) => {
+        if (ev.touches.length === 2) {
+          const dx = ev.touches[0].clientX - ev.touches[1].clientX;
+          const dy = ev.touches[0].clientY - ev.touches[1].clientY;
+          pinchStartDistance = Math.hypot(dx, dy);
+          pinchStartScale = txnUnifiedZoomScale;
+        }
+      },
+      { passive: true }
+    );
+    txnLedgerTableWrap.addEventListener(
+      "touchmove",
+      (ev) => {
+        if (ev.touches.length === 2 && pinchStartDistance > 0) {
+          const dx = ev.touches[0].clientX - ev.touches[1].clientX;
+          const dy = ev.touches[0].clientY - ev.touches[1].clientY;
+          const distance = Math.hypot(dx, dy);
+          const ratio = distance / pinchStartDistance;
+          applyTxnUnifiedZoom(pinchStartScale * ratio);
           ev.preventDefault();
         }
       },
@@ -3014,6 +3205,7 @@ function setupEvents() {
 
   applySummaryZoom(1);
   applyTxZoom(1);
+  applyTxnUnifiedZoom(1);
 }
 
 window.addEventListener("DOMContentLoaded", () => {

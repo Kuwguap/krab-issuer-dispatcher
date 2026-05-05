@@ -491,6 +491,50 @@
         flex-wrap: wrap;
       }
 
+      /* Unified Transactions tab — same expand + zoom UX as Summary */
+      .txn-ledger-wrapper {
+        position: relative;
+      }
+
+      .txn-ledger-wrapper.expanded {
+        position: fixed;
+        inset: 1rem;
+        z-index: 1200;
+        margin: 0 !important;
+        padding: 0.75rem;
+        border-radius: 0.9rem;
+        border: 1px solid var(--border-subtle);
+        background: rgba(2, 6, 23, 0.96);
+        box-shadow: 0 24px 80px rgba(0, 0, 0, 0.65);
+      }
+
+      .txn-ledger-wrapper.expanded .txn-ledger-table-wrap {
+        max-height: calc(100vh - 5.5rem) !important;
+      }
+
+      .txn-expanded-controls {
+        display: none;
+      }
+
+      .txn-ledger-wrapper.expanded .txn-expanded-controls {
+        display: flex;
+        justify-content: flex-end;
+        gap: 0.35rem;
+        margin-bottom: 0.5rem;
+        flex-wrap: wrap;
+      }
+
+      .txn-zoom-controls {
+        display: inline-flex;
+        gap: 0.35rem;
+        align-items: center;
+      }
+
+      .txn-zoom-controls .secondary {
+        padding: 0.25rem 0.6rem;
+        font-size: 0.74rem;
+      }
+
       .summary-zoom-controls {
         display: inline-flex;
         gap: 0.35rem;
@@ -779,6 +823,21 @@
               <div class="panel-header" style="margin-bottom: 1rem">
                 <div class="panel-title">Transactions (unified ledger)</div>
                 <div style="display:flex;align-items:center;gap:0.4rem;flex-wrap:wrap;justify-content:flex-end">
+                  <select
+                    id="txn-period-select"
+                    class="secondary"
+                    title="Time range"
+                    style="border-radius:999px;padding:0.35rem 0.6rem;background:transparent;color:var(--text-main);border:1px solid var(--border-subtle);"
+                  >
+                    <option value="1w">1 week</option>
+                    <option value="2w">2 weeks</option>
+                    <option value="3w">3 weeks</option>
+                    <option value="1m">1 month</option>
+                    <option value="3m">3 months</option>
+                    <option value="6m">6 months</option>
+                    <option value="12m">12 months</option>
+                    <option value="all" selected>All time</option>
+                  </select>
                   <input
                     type="text"
                     id="txn-search-input"
@@ -789,6 +848,15 @@
                     ⟳
                     <span>Refresh</span>
                   </button>
+                  <button id="txn-ledger-expand-btn" class="secondary" type="button">
+                    ⤢
+                    <span>Expand</span>
+                  </button>
+                  <span class="txn-zoom-controls">
+                    <button id="txn-ledger-zoom-out-btn" class="secondary" type="button">－</button>
+                    <button id="txn-ledger-zoom-reset-btn" class="secondary" type="button">100%</button>
+                    <button id="txn-ledger-zoom-in-btn" class="secondary" type="button">＋</button>
+                  </span>
                 </div>
               </div>
               <div id="txn-no-auth" class="issuer-muted-block" style="display: none; color: var(--text-muted); font-size: 0.85rem; margin-bottom: 0.7rem;">
@@ -798,29 +866,37 @@
               <div id="txn-status" class="small" style="margin-bottom: 0.5rem">
                 Loading unified transactions…
               </div>
-              <div class="table-wrap" id="txn-table-wrap" style="max-height: 70vh;">
-                <table>
-                  <thead>
-                    <tr>
-                      <th>#</th>
-                      <th>Date (NY)</th>
-                      <th>Tag Name</th>
-                      <th>Issuer</th>
-                      <th>Driver</th>
-                      <th>Dispatcher</th>
-                      <th>Ref</th>
-                      <th>Price</th>
-                      <th>Receipt Price</th>
-                      <th>Receipt</th>
-                      <th>Status</th>
-                    </tr>
-                  </thead>
-                  <tbody id="txn-tbody">
-                    <tr>
-                      <td colspan="11" class="muted">Loading…</td>
-                    </tr>
-                  </tbody>
-                </table>
+              <div id="txn-ledger-wrapper" class="txn-ledger-wrapper">
+                <div class="txn-expanded-controls">
+                  <button id="txn-ledger-expanded-zoom-out-btn" class="secondary" type="button">－</button>
+                  <button id="txn-ledger-expanded-zoom-reset-btn" class="secondary" type="button">100%</button>
+                  <button id="txn-ledger-expanded-zoom-in-btn" class="secondary" type="button">＋</button>
+                  <button id="txn-ledger-expanded-close-btn" class="secondary" type="button">Close</button>
+                </div>
+                <div class="table-wrap txn-ledger-table-wrap" id="txn-table-wrap" style="max-height: 70vh;">
+                  <table>
+                    <thead>
+                      <tr>
+                        <th>#</th>
+                        <th>Date (NY)</th>
+                        <th>Tag Name</th>
+                        <th>Issuer</th>
+                        <th>Driver</th>
+                        <th>Dispatcher</th>
+                        <th>Ref</th>
+                        <th>Price</th>
+                        <th>Receipt Price</th>
+                        <th>Receipt</th>
+                        <th>Status</th>
+                      </tr>
+                    </thead>
+                    <tbody id="txn-tbody">
+                      <tr>
+                        <td colspan="11" class="muted">Loading…</td>
+                      </tr>
+                    </tbody>
+                  </table>
+                </div>
               </div>
               <p class="small" style="margin-top: 0.6rem;">
                 Each row joins Dispatcher (this service) → Issuer lead (Supabase) → Driver assignments by <code>reference_id</code>. If a step is missing, its cell shows “—”.
