@@ -6159,8 +6159,19 @@ async def handle_receipt_image(update: Update, context: ContextTypes.DEFAULT_TYP
         )
         return STATE_WAITING_RECEIPT_IMAGE
 
+    receipt_price: str | None = None
+    if Config.is_ai_vision_configured():
+        try:
+            amounts = await asyncio.to_thread(
+                lambda: ai_vision.extract_receipt_amounts_usd(image_bytes, mime_type=mime_for_ai)
+            )
+            if amounts:
+                receipt_price = str(max(amounts))
+        except Exception as e:
+            logger.warning("receipt amount extraction failed (lead_id=%s): %s", lead_id, e)
+
     # Update lead with receipt URL (prefer durable Supabase Storage public URL)
-    success = db.update_lead_receipt(lead_id, stored_url)
+    success = db.update_lead_receipt(lead_id, stored_url, receipt_price=receipt_price)
     if not success:
         logger.error("update_lead_receipt failed lead_id=%s ref=%s", lead_id, reference_id)
 

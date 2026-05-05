@@ -447,7 +447,7 @@ def fetch_lead_meta_by_references(
     reference_ids: list[str],
 ) -> dict[str, dict[str, Any]]:
     """
-    For each reference_id, return { lead_client_name, receipt_image_url, price } (best effort).
+    For each reference_id, return { lead_client_name, receipt_image_url, price, receipt_price } (best effort).
     """
     base = (base_url or "").strip().rstrip("/")
     key = (service_key or "").strip()
@@ -466,7 +466,7 @@ def fetch_lead_meta_by_references(
         chunk = uniq[i : i + chunk_size]
         in_list = ",".join(chunk)
         params = {
-            "select": "reference_id,vehicle_details,receipt_image_url,price",
+            "select": "reference_id,vehicle_details,receipt_image_url,price,receipt_price",
             "reference_id": f"in.({in_list})",
         }
         try:
@@ -488,10 +488,17 @@ def fetch_lead_meta_by_references(
                     if raw_price is not None and str(raw_price).strip()
                     else None
                 )
+                raw_receipt_price = row.get("receipt_price")
+                receipt_price_str = (
+                    str(raw_receipt_price).strip()
+                    if raw_receipt_price is not None and str(raw_receipt_price).strip()
+                    else None
+                )
                 out[ref] = {
                     "lead_client_name": _first_nonblank_line(vd) or "—",
                     "receipt_image_url": (row.get("receipt_image_url") or "").strip() or None,
                     "price": price_str,
+                    "receipt_price": receipt_price_str,
                 }
         except Exception as e:
             logger.warning("fetch_lead_meta_by_references: %s", e)

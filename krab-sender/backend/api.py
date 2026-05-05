@@ -37,6 +37,7 @@ def _enrich_tx_rows_with_lead_meta(config: ApiConfig, rows: list[dict]) -> list[
             r.setdefault("lead_client_name", None)
             r.setdefault("receipt_image_url", None)
             r.setdefault("price", None)
+            r.setdefault("receipt_price", None)
         return rows
     refs = [(r.get("reference_id") or "").strip() for r in rows if (r.get("reference_id") or "").strip()]
     meta = (
@@ -50,16 +51,19 @@ def _enrich_tx_rows_with_lead_meta(config: ApiConfig, rows: list[dict]) -> list[
             r["lead_client_name"] = None
             r["receipt_image_url"] = None
             r["price"] = None
+            r["receipt_price"] = None
             continue
         m = meta.get(ref)
         if not m:
             r["lead_client_name"] = None
             r["receipt_image_url"] = None
             r["price"] = None
+            r["receipt_price"] = None
         else:
             r["lead_client_name"] = m.get("lead_client_name")
             r["receipt_image_url"] = m.get("receipt_image_url")
             r["price"] = m.get("price")
+            r["receipt_price"] = m.get("receipt_price")
     return rows
 
 

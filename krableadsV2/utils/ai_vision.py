@@ -21,6 +21,65 @@ class ReceiptValidationResult:
     accept: bool
     message: str  # User-facing when accept is False; empty when accept is True
 
+
+def extract_receipt_amounts_usd(
+    image_bytes: bytes,
+    mime_type: str = "image/jpeg",
+) -> list[float]:
+    """
+    Best-effort extraction of USD amounts from a receipt image.
+
+    Uses the same vision JSON schema as receipt validation. Returns [] when the
+    AI model is unavailable or cannot parse amounts.
+    """
+    from config import Config
+
+    if not image_bytes:
+        return []
+    if not Config.OPENAI_API_KEY or not str(Config.OPENAI_API_KEY).strip():
+        return []
+
+    b64 = base64.standard_b64encode(image_bytes).decode("ascii")
+    data_url = f"data:{mime_type};base64,{b64}"
+    try:
+        from openai import OpenAI
+
+        client = OpenAI(api_key=str(Config.OPENAI_API_KEY).strip(), max_retries=0)
+        model = getattr(Config, "OPENAI_VISION_MODEL", None) or "gpt-4o"
+        response = client.chat.completions.create(
+            model=model,
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": RECEIPT_VISION_PROMPT},
+                        {"type": "image_url", "image_url": {"url": data_url}},
+                    ],
+                }
+            ],
+            max_tokens=500,
+        )
+        raw = (response.choices[0].message.content or "").strip()
+    except Exception as e:
+        logger.warning("extract_receipt_amounts_usd: API error: %s", e)
+        return []
+
+    data = _parse_json_from_model(raw)
+    if not isinstance(data, dict):
+        return []
+
+    amounts_raw = data.get("amounts_usd") or []
+    out: list[float] = []
+    if isinstance(amounts_raw, list):
+        for x in amounts_raw:
+            try:
+                v = float(x)
+                if v > 0:
+                    out.append(v)
+            except (TypeError, ValueError):
+                continue
+    return out
+
 # Number of required lines for Phase 1 structured output
 PHASE1_LINE_COUNT = 11
 

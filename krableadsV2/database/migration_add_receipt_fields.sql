@@ -12,6 +12,9 @@ ALTER TABLE leads ADD COLUMN IF NOT EXISTS reference_id VARCHAR(20);
 -- Add receipt_image_url column
 ALTER TABLE leads ADD COLUMN IF NOT EXISTS receipt_image_url TEXT;
 
+-- Add receipt_total/paid amount (as read from receipt image)
+ALTER TABLE leads ADD COLUMN IF NOT EXISTS receipt_price TEXT;
+
 -- Add extra_info column to store additional notes from Phase 1
 ALTER TABLE leads ADD COLUMN IF NOT EXISTS extra_info TEXT;
 

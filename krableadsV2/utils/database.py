@@ -269,13 +269,23 @@ class Database:
             logger.warning("upload_receipt_to_storage failed (bucket missing or RLS?): %s", e)
             return None
     
-    def update_lead_receipt(self, lead_id: str, receipt_image_url: str) -> bool:
-        """Update lead with receipt image URL and set status to Paid."""
+    def update_lead_receipt(
+        self, lead_id: str, receipt_image_url: str, receipt_price: str | None = None
+    ) -> bool:
+        """Update lead with receipt image URL (and optional receipt_price) and set status to Paid."""
         if not self._check_tables_exist():
             return False
         # Persist URL first so a failing monday_status/constraint does not block the receipt.
-        if not self.update_lead(lead_id, {"receipt_image_url": receipt_image_url}):
-            return False
+        updates = {"receipt_image_url": receipt_image_url}
+        if receipt_price is not None and str(receipt_price).strip():
+            updates["receipt_price"] = str(receipt_price).strip()
+        if not self.update_lead(lead_id, updates):
+            # Forward-step: if the DB doesn't have receipt_price yet, retry with URL only.
+            if "receipt_price" in updates:
+                if not self.update_lead(lead_id, {"receipt_image_url": receipt_image_url}):
+                    return False
+            else:
+                return False
         self.update_lead(lead_id, {"monday_status": "Paid"})
         return True
     

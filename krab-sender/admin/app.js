@@ -1978,6 +1978,14 @@ function renderSummaryTable(summary) {
     tdPrice.textContent = p || "—";
     tr.appendChild(tdPrice);
 
+    const tdReceiptPrice = document.createElement("td");
+    const rp =
+      it.receipt_price != null && String(it.receipt_price).trim() !== ""
+        ? String(it.receipt_price).trim()
+        : "";
+    tdReceiptPrice.textContent = rp || "—";
+    tr.appendChild(tdReceiptPrice);
+
     const tdReceipt = document.createElement("td");
     tdReceipt.className = "small";
     tdReceipt.innerHTML = receiptLinkHtml(it.receipt_image_url);
@@ -2179,6 +2187,7 @@ function downloadSummaryCsv() {
       "DriverEmail",
       "Reference",
       "Price",
+      "ReceiptPrice",
       "Receipt",
     ],
   ];
@@ -2198,6 +2207,10 @@ function downloadSummaryCsv() {
     const priceStr =
       it.price != null && String(it.price).trim() !== ""
         ? String(it.price).trim()
+        : "";
+    const receiptPriceStr =
+      it.receipt_price != null && String(it.receipt_price).trim() !== ""
+        ? String(it.receipt_price).trim()
         : "";
     rows.push([
       i + 1,
@@ -2220,6 +2233,7 @@ function downloadSummaryCsv() {
       it.recipient_email || "",
       (it.reference_id && String(it.reference_id).trim()) || "",
       priceStr,
+      receiptPriceStr,
       receiptCsvValue,
     ]);
   }
