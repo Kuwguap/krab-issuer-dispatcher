@@ -860,7 +860,7 @@
                 </div>
               </div>
               <div id="txn-no-auth" class="issuer-muted-block" style="display: none; color: var(--text-muted); font-size: 0.85rem; margin-bottom: 0.7rem;">
-                Unlock on the <strong>Krab Dispatch</strong> tab first. The unified transactions ledger uses the same admin password.
+                Unlock with the admin password on <strong>Krab Dispatch</strong> or <strong>Krab Issuer</strong> (Unlock on either tab). The ledger uses the same credentials.
               </div>
               <div id="txn-banner" class="error-text" style="display: none; margin-bottom: 0.6rem"></div>
               <div id="txn-status" class="small" style="margin-bottom: 0.5rem">
@@ -1269,7 +1269,22 @@
                 </button>
               </div>
               <div id="issuer-no-auth" class="issuer-muted-block" style="display: none">
-                Enter your admin password on the <strong>Krab Dispatch</strong> tab first. The same password is used for Issuer data (Supabase).
+                <p style="margin: 0 0 0.65rem">
+                  Use the same admin password as Krab Dispatch. Unlock here or on the
+                  <strong>Krab Dispatch</strong> tab — no need to switch tabs just to add drivers.
+                </p>
+                <div class="field-row">
+                  <input
+                    type="password"
+                    id="issuer-admin-password-input"
+                    placeholder="Admin password"
+                    autocomplete="current-password"
+                  />
+                  <button id="issuer-login-btn" type="button">Unlock</button>
+                </div>
+                <div id="issuer-auth-error" class="error-text" style="display: none; margin-top: 0.45rem">
+                  Invalid password. Try again.
+                </div>
               </div>
               <div id="issuer-main-wrap" style="display: none">
                 <div id="issuer-banner" class="error-text" style="display: none; margin-bottom: 0.75rem"></div>

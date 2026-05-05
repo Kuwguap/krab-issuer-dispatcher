@@ -1416,6 +1416,27 @@ function setupIssuerAdminEvents() {
     refreshBtn.addEventListener("click", () => refreshIssuerAdmin());
   }
 
+  const issuerPwdInput = document.getElementById("issuer-admin-password-input");
+  const issuerLoginBtn = document.getElementById("issuer-login-btn");
+  const issuerAuthErr = document.getElementById("issuer-auth-error");
+  async function doIssuerTabUnlock() {
+    if (!issuerPwdInput) return;
+    if (issuerAuthErr) issuerAuthErr.style.display = "none";
+    const ok = await unlockAdminWithPasswordFromInputs(issuerPwdInput.value, () => {
+      if (issuerAuthErr) issuerAuthErr.style.display = "block";
+    });
+    if (ok) issuerPwdInput.value = "";
+    updateIssuerAuthGate();
+  }
+  if (issuerLoginBtn) {
+    issuerLoginBtn.addEventListener("click", () => doIssuerTabUnlock());
+  }
+  if (issuerPwdInput) {
+    issuerPwdInput.addEventListener("keydown", (ev) => {
+      if (ev.key === "Enter") doIssuerTabUnlock();
+    });
+  }
+
   const btnAssist = document.getElementById("issuer-toggle-assistants-mode");
   if (btnAssist) {
     btnAssist.addEventListener("click", async () => {
@@ -2621,16 +2642,38 @@ function applyLoggedInUI(loggedIn) {
   logoutBtn.style.display = loggedIn ? "inline-flex" : "none";
 }
 
-async function tryInitialLogin() {
-  const pw = getStoredPassword();
-  if (!pw) return;
+async function validateAdminSessionWithBackend() {
+  await refreshTransactions();
+  await refreshLatest();
+  await refreshSummary();
+  applyLoggedInUI(true);
+}
+
+/**
+ * Store password and confirm it with the same calls as the Dispatch tab.
+ * On failure clears storage and hides the dashboard.
+ */
+async function unlockAdminWithPasswordFromInputs(plainPassword, onFailure) {
+  const trimmed = String(plainPassword || "").trim();
+  if (!trimmed) return false;
+  storePassword(trimmed);
   try {
-    await refreshTransactions();
-    await refreshLatest();
-    await refreshSummary();
-    applyLoggedInUI(true);
+    await validateAdminSessionWithBackend();
+    return true;
+  } catch (e) {
+    console.error(e);
+    storePassword("");
+    applyLoggedInUI(false);
+    if (typeof onFailure === "function") onFailure(e);
+    return false;
+  }
+}
+
+async function tryInitialLogin() {
+  if (!getStoredPassword()) return;
+  try {
+    await validateAdminSessionWithBackend();
   } catch {
-    // stored password invalid
     storePassword("");
     applyLoggedInUI(false);
   }
@@ -2695,19 +2738,12 @@ function setupEvents() {
   async function doLogin() {
     const pw = input.value.trim();
     if (!pw) return;
-    storePassword(pw);
     err.style.display = "none";
-    try {
-      await refreshTransactions();
-      await refreshLatest();
-      await refreshSummary();
-      applyLoggedInUI(true);
-      // Recipients will be refreshed by the modified applyLoggedInUI
-    } catch (e) {
-      console.error(e);
-      storePassword("");
+    const ok = await unlockAdminWithPasswordFromInputs(pw, () => {
       err.style.display = "block";
-    }
+    });
+    if (!ok) return;
+    // Recipients / Issuer refresh via wrapped applyLoggedInUI
   }
 
   loginBtn.addEventListener("click", doLogin);
