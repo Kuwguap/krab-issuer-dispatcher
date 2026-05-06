@@ -1580,6 +1580,33 @@
                 </div>
               </div>
 
+              <div
+                id="issuer-ai-chat-wrap"
+                class="panel summary-ai"
+                style="display: none"
+                aria-hidden="true"
+              >
+                <div class="panel-title" style="margin-bottom: 0.35rem">AI Data Q&amp;A</div>
+                <div class="issuer-muted-block" style="margin-bottom: 0.5rem">
+                  Same assistant as Dispatch. Answers use rolling summary plus Issuer snapshot and
+                  <code>reference_id</code> links to Supabase leads.
+                </div>
+                <div id="issuer-ai-log" class="summary-ai-log">
+                  <div class="summary-ai-msg assistant">
+                    Ask across Krab Issuer and Krab Dispatch (shared references).
+                  </div>
+                </div>
+                <div class="field-row">
+                  <input
+                    type="text"
+                    id="issuer-ai-input"
+                    placeholder="Ask: which groups have the most assignments?"
+                  />
+                  <button id="issuer-ai-ask-btn" type="button">Ask</button>
+                </div>
+                <div id="issuer-ai-answer" class="small"></div>
+              </div>
+
               <div id="issuer-private-wrap">
               <div id="issuer-no-auth" class="issuer-muted-block" style="display: none">
                 Enter your admin password on the <strong>Krab Dispatch</strong> tab first. The same password is used for Issuer data (Supabase).
@@ -1777,33 +1804,6 @@
                       </tbody>
                     </table>
                   </div>
-                </div>
-
-                <div
-                  id="issuer-ai-chat-wrap"
-                  class="panel summary-ai"
-                  style="display: none"
-                  aria-hidden="true"
-                >
-                  <div class="panel-title" style="margin-bottom: 0.35rem">AI Data Q&amp;A</div>
-                  <div class="issuer-muted-block" style="margin-bottom: 0.5rem">
-                    Same assistant as Dispatch. Answers use rolling summary plus Issuer snapshot and
-                    <code>reference_id</code> links to Supabase leads.
-                  </div>
-                  <div id="issuer-ai-log" class="summary-ai-log">
-                    <div class="summary-ai-msg assistant">
-                      Ask across Krab Issuer and Krab Dispatch (shared references).
-                    </div>
-                  </div>
-                  <div class="field-row">
-                    <input
-                      type="text"
-                      id="issuer-ai-input"
-                      placeholder="Ask: which groups have the most assignments?"
-                    />
-                    <button id="issuer-ai-ask-btn" type="button">Ask</button>
-                  </div>
-                  <div id="issuer-ai-answer" class="small"></div>
                 </div>
 
                 <div class="panel">
