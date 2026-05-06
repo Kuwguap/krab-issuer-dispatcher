@@ -115,7 +115,7 @@ function setupAdminTabs() {
     } else if (id === "transactions") {
       refreshUnifiedTransactions();
     } else if (id === "dispatch") {
-      refreshDispatchDriversList();
+      refreshRecipients();
     }
   };
 
@@ -1146,77 +1146,6 @@ function renderIssuerDrivers(drivers) {
     tr.appendChild(act);
     tb.appendChild(tr);
   });
-}
-
-function renderDispatchDrivers(drivers) {
-  const tb = document.getElementById("dispatch-drivers-tbody");
-  if (!tb) return;
-  tb.innerHTML = "";
-  const list = Array.isArray(drivers) ? drivers : [];
-  if (list.length === 0) {
-    const tr = document.createElement("tr");
-    const td = document.createElement("td");
-    td.colSpan = 5;
-    td.className = "muted";
-    td.textContent = "No drivers.";
-    tr.appendChild(td);
-    tb.appendChild(tr);
-    return;
-  }
-  list.forEach((d) => {
-    const tr = document.createElement("tr");
-    const nm = document.createElement("td");
-    nm.textContent = d.driver_name || "—";
-    nm.style.textAlign = "left";
-    const tg = document.createElement("td");
-    tg.innerHTML = "<code>" + escapeIssuerText(d.driver_telegram_id || "") + "</code>";
-    const ph = document.createElement("td");
-    ph.textContent = d.phone_number || "—";
-    const st = document.createElement("td");
-    st.textContent = d.is_active === false ? "Inactive" : "Active";
-    const act = document.createElement("td");
-    const btn = document.createElement("button");
-    btn.type = "button";
-    btn.className = "btn-danger-issuer";
-    btn.textContent = d.is_active === false ? "Activate" : "Deactivate";
-    btn.dataset.toggleDispatchDriver = d.id;
-    act.appendChild(btn);
-    tr.appendChild(nm);
-    tr.appendChild(tg);
-    tr.appendChild(ph);
-    tr.appendChild(st);
-    tr.appendChild(act);
-    tb.appendChild(tr);
-  });
-}
-
-async function refreshDispatchDriversList() {
-  const tb = document.getElementById("dispatch-drivers-tbody");
-  if (!tb) return;
-  if (!hasAdminPassword()) {
-    tb.innerHTML =
-      '<tr><td colspan="5" class="muted">Unlock to view drivers.</td></tr>';
-    return;
-  }
-  try {
-    const res = await fetch(API_BASE + "/dispatch-drivers/ui");
-    if (res.status === 503) {
-      tb.innerHTML =
-        '<tr><td colspan="5" class="muted">Issuer database not configured on API.</td></tr>';
-      return;
-    }
-    if (!res.ok) {
-      tb.innerHTML =
-        '<tr><td colspan="5" class="muted">Could not load drivers.</td></tr>';
-      return;
-    }
-    const drivers = await res.json();
-    renderDispatchDrivers(drivers);
-  } catch (e) {
-    console.error(e);
-    tb.innerHTML =
-      '<tr><td colspan="5" class="muted">Failed to load drivers.</td></tr>';
-  }
 }
 
 function renderIssuerAssistants(groups, assistantsByGroup) {
@@ -2875,10 +2804,9 @@ function applyLoggedInUI(loggedIn) {
   const txnPageTitle = document.getElementById("txn-page-title");
   const txnAuthArea = document.getElementById("txn-auth-area");
   const issuerPageTitle = document.getElementById("issuer-page-title");
-  const issuerAddDriverWrap = document.getElementById("issuer-add-driver-wrap");
   const issuerPrivateWrap = document.getElementById("issuer-private-wrap");
-  const dispatchDriversListWrap = document.getElementById(
-    "dispatch-drivers-list-wrap"
+  const issuerSupabaseDriverStack = document.getElementById(
+    "issuer-supabase-driver-stack"
   );
   const dispatchAiChatWrap = document.getElementById("dispatch-ai-chat-wrap");
   const issuerAiChatWrap = document.getElementById("issuer-ai-chat-wrap");
@@ -2902,18 +2830,14 @@ function applyLoggedInUI(loggedIn) {
   if (txnPrivateWrap) txnPrivateWrap.style.display = loggedIn ? "block" : "none";
   if (txnToolbarPrivate) txnToolbarPrivate.style.display = loggedIn ? "contents" : "none";
 
-  // Krab Issuer tab: when locked, show Access + Add driver.
+  // Krab Issuer tab: when locked, show Access only; Telegram drivers + list after unlock.
   if (issuerPageTitle) issuerPageTitle.style.display = loggedIn ? "block" : "none";
   if (issuerAuthArea) issuerAuthArea.style.display = loggedIn ? "none" : "block";
   if (issuerPrivateWrap) issuerPrivateWrap.style.display = loggedIn ? "block" : "none";
   if (issuerToolbarPrivate) issuerToolbarPrivate.style.display = loggedIn ? "contents" : "none";
-  // Keep add-driver visible even when locked (list stays hidden until unlocked).
-  if (issuerAddDriverWrap) issuerAddDriverWrap.style.display = "block";
-
-  // Krab Dispatch: Telegram drivers list mirrors Issuer (private until unlocked).
-  if (dispatchDriversListWrap) {
-    dispatchDriversListWrap.style.display = loggedIn ? "block" : "none";
-    dispatchDriversListWrap.setAttribute(
+  if (issuerSupabaseDriverStack) {
+    issuerSupabaseDriverStack.style.display = loggedIn ? "block" : "none";
+    issuerSupabaseDriverStack.setAttribute(
       "aria-hidden",
       loggedIn ? "false" : "true"
     );
@@ -3072,74 +2996,6 @@ function setupEvents() {
       if (b) b.addEventListener("click", () => doAdminLogout());
     }
   );
-
-  const dispatchAddDriverBtn = document.getElementById("dispatch-add-driver-btn");
-  if (dispatchAddDriverBtn) {
-    dispatchAddDriverBtn.addEventListener("click", async () => {
-      const name = (document.getElementById("dispatch-driver-name") || {}).value || "";
-      const tid = (document.getElementById("dispatch-driver-chat-id") || {}).value || "";
-      const phoneRaw =
-        (document.getElementById("dispatch-driver-phone") || {}).value || "";
-      const msg = document.getElementById("dispatch-add-driver-msg");
-      const driver_name = String(name).trim();
-      const driver_telegram_id = String(tid).trim();
-      const phone_number = String(phoneRaw || "").trim();
-      if (!driver_name || !driver_telegram_id) {
-        if (msg) msg.textContent = "Driver name and Telegram chat/user ID are required.";
-        return;
-      }
-      if (msg) msg.textContent = "Adding…";
-      try {
-        const body = { driver_name, driver_telegram_id };
-        if (phone_number) body.phone_number = phone_number;
-        const res = await fetch(API_BASE + "/dispatch-drivers/ui", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify(body),
-        });
-        if (res.status === 409) {
-          if (msg) msg.textContent = "Driver already exists for this Telegram ID.";
-          return;
-        }
-        if (!res.ok) {
-          const txt = await res.text().catch(() => "");
-          throw new Error("HTTP_" + res.status + (txt ? ": " + txt : ""));
-        }
-        (document.getElementById("dispatch-driver-name") || {}).value = "";
-        (document.getElementById("dispatch-driver-chat-id") || {}).value = "";
-        (document.getElementById("dispatch-driver-phone") || {}).value = "";
-        if (msg) msg.textContent = "Driver added.";
-        refreshDispatchDriversList();
-      } catch (e) {
-        console.error(e);
-        if (msg) msg.textContent = "Failed to add driver. Please try again.";
-      }
-    });
-  }
-
-  const dispatchDriversTb = document.getElementById("dispatch-drivers-tbody");
-  if (dispatchDriversTb) {
-    dispatchDriversTb.addEventListener("click", async (ev) => {
-      const btn = ev.target.closest("[data-toggle-dispatch-driver]");
-      if (!btn) return;
-      const id = btn.getAttribute("data-toggle-dispatch-driver");
-      if (!id) return;
-      try {
-        const res = await fetch(
-          API_BASE + "/dispatch-drivers/ui/" + encodeURIComponent(id) + "/toggle",
-          { method: "POST" }
-        );
-        if (!res.ok) {
-          alert("Could not toggle driver.");
-          return;
-        }
-        await refreshDispatchDriversList();
-      } catch (e) {
-        console.error(e);
-        alert("Could not toggle driver.");
-      }
-    });
-  }
 
   refreshTableBtn.addEventListener("click", () => {
     refreshTransactions();
@@ -3685,12 +3541,10 @@ function setupEvents() {
       refreshRecipients();
       maybeRefreshIssuerTab();
       maybeRefreshTxnTab();
-      refreshDispatchDriversList();
     } else {
       updateIssuerAuthGate();
       updateTxnAuthGate();
       updateRecipientConfidentialUI();
-      refreshDispatchDriversList();
     }
   };
 
@@ -3712,7 +3566,7 @@ window.addEventListener("DOMContentLoaded", async () => {
   setupEvents();
   updateTxnAuthGate();
   renderUnifiedTransactions();
-  refreshDispatchDriversList();
+  refreshRecipients();
   await tryInitialLogin();
   // If the Transactions tab is active on first load and we already have a
   // stored password, kick off the joined fetch immediately so the spreadsheet
