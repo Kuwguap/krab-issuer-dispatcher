@@ -259,6 +259,64 @@
         justify-content: center;
       }
 
+      /* Right column: stack Access + Add driver as a centered block (inputs no longer flex-fill). */
+      #panel-dispatch .dispatch-side-panel {
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        text-align: center;
+      }
+
+      #panel-dispatch .dispatch-side-panel > .panel-header {
+        width: 100%;
+        justify-content: center;
+      }
+
+      #panel-dispatch .dispatch-side-panel #auth-area,
+      #panel-dispatch .dispatch-side-panel #dispatch-add-driver-wrap {
+        width: 100%;
+        max-width: 22rem;
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        text-align: center;
+      }
+
+      #panel-dispatch .dispatch-side-panel #auth-area .field-row,
+      #panel-dispatch .dispatch-side-panel #dispatch-add-driver-wrap .field-row {
+        width: 100%;
+        max-width: 22rem;
+        justify-content: center;
+        flex-wrap: wrap;
+        gap: 0.5rem;
+      }
+
+      #panel-dispatch .dispatch-side-panel #auth-area input[type="password"],
+      #panel-dispatch .dispatch-side-panel #dispatch-add-driver-wrap input[type="text"] {
+        flex: 0 1 auto;
+        width: 100%;
+        max-width: 100%;
+        min-width: 0;
+      }
+
+      #panel-dispatch .dispatch-side-panel #auth-area .access-unlock-btn,
+      #panel-dispatch .dispatch-side-panel #dispatch-add-driver-wrap #dispatch-add-driver-btn {
+        flex-shrink: 0;
+      }
+
+      #panel-dispatch .dispatch-side-panel #dispatch-add-driver-wrap .panel-title {
+        width: 100%;
+        text-align: center;
+      }
+
+      /* Logged-in dashboard/tables: use full width of the grid cell. */
+      #panel-dispatch .dispatch-side-panel #dashboard-area {
+        align-self: stretch;
+        width: 100%;
+        max-width: none;
+        text-align: center;
+      }
+
       #panel-dispatch #auth-area,
       #panel-dispatch #dashboard-area,
       #panel-dispatch #dispatch-add-driver-wrap {
@@ -1113,7 +1171,7 @@
           </section>
 
           <!-- Right: Auth + latest + summary -->
-          <section class="panel">
+          <section class="panel dispatch-side-panel">
             <!-- Auth -->
             <div class="panel-header">
               <div class="panel-title">Access</div>
