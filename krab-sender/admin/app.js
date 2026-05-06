@@ -236,7 +236,7 @@ function issuerGroupFromHandle(rawHandle) {
 
 function getStoredPassword() {
   try {
-    return localStorage.getItem("krab_admin_password") || "";
+    return String(localStorage.getItem("krab_admin_password") || "").trim();
   } catch {
     return "";
   }
@@ -250,8 +250,16 @@ function storePassword(pw) {
   }
 }
 
+// Increments whenever a login batch (initial or manual) successfully validates against the API.
+// tryInitialLogin uses this so a stale in-flight failure cannot clear the password after the user unlocked.
+let _adminAuthSuccessGeneration = 0;
+
+function bumpAdminAuthSuccessGeneration() {
+  _adminAuthSuccessGeneration += 1;
+}
+
 function hasAdminPassword() {
-  return !!String(getStoredPassword() || "").trim();
+  return !!getStoredPassword();
 }
 
 function syncAdminPasswordInputs(value) {
@@ -759,7 +767,7 @@ async function refreshUnifiedTransactions() {
     const err = res.error || ("HTTP_" + (res.status || 0));
     setTxnBanner(
       err === "UNAUTHORIZED"
-        ? "Session expired. Unlock on the Krab Dispatch tab."
+        ? "Unauthorized — re-enter admin password or unlock from Krab Dispatch."
         : err === "NO_PASSWORD"
         ? "Unlock on the Krab Dispatch tab first."
         : "Failed to load: " + err
@@ -2732,15 +2740,18 @@ function applyLoggedInUI(loggedIn) {
 }
 
 async function tryInitialLogin() {
-  const pw = getStoredPassword();
-  if (!pw) return;
+  const genAtStart = _adminAuthSuccessGeneration;
+  if (!hasAdminPassword()) return;
   try {
     await refreshTransactions();
     await refreshLatest();
     await refreshSummary();
+    bumpAdminAuthSuccessGeneration();
     applyLoggedInUI(true);
   } catch {
-    // stored password invalid
+    if (_adminAuthSuccessGeneration !== genAtStart) {
+      return;
+    }
     storePassword("");
     applyLoggedInUI(false);
   }
@@ -2817,6 +2828,7 @@ function setupEvents() {
       await refreshTransactions();
       await refreshLatest();
       await refreshSummary();
+      bumpAdminAuthSuccessGeneration();
       applyLoggedInUI(true);
       // Recipients will be refreshed by the modified applyLoggedInUI
     } catch (e) {
