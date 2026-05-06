@@ -49,6 +49,9 @@
       }
 
       .tab-strip {
+        /* Expanded ledger/summary overlays use z-index ~1200; keep tabs reachable */
+        position: relative;
+        z-index: 1300;
         display: flex;
         flex-direction: row;
         align-items: flex-end;
