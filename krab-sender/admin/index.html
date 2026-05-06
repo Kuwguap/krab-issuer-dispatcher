@@ -215,6 +215,19 @@
         background: rgba(248, 113, 113, 0.12);
       }
 
+      #panel-dispatch .dispatch-drivers-panel button.btn-danger-issuer {
+        background: transparent;
+        color: var(--danger);
+        border: 1px solid rgba(248, 113, 113, 0.45);
+        box-shadow: none;
+        padding: 0.28rem 0.65rem;
+        font-size: 0.74rem;
+      }
+
+      #panel-dispatch .dispatch-drivers-panel button.btn-danger-issuer:hover {
+        background: rgba(248, 113, 113, 0.12);
+      }
+
       .shell {
         width: 100%;
         max-width: 1100px;
@@ -334,6 +347,19 @@
         width: 100%;
         max-width: none;
         text-align: center;
+      }
+
+      /* Drivers list — same compact table look as Krab Issuer tab */
+      #panel-dispatch .dispatch-drivers-panel {
+        align-self: stretch;
+        width: 100%;
+        margin-top: 1rem;
+        text-align: left;
+      }
+
+      #panel-dispatch .dispatch-drivers-panel .panel-title {
+        text-align: center;
+        margin-bottom: 0.5rem;
       }
 
       #panel-dispatch #auth-area,
@@ -1225,6 +1251,28 @@
                 </div>
                 <button id="dispatch-add-driver-btn" type="button">Add driver</button>
                 <div id="dispatch-add-driver-msg" class="small" style="margin-top: 0.5rem"></div>
+              </div>
+            </div>
+
+            <div class="panel dispatch-drivers-panel">
+              <div class="panel-title">Drivers</div>
+              <div class="table-wrap" style="max-height: 240px">
+                <table>
+                  <thead>
+                    <tr>
+                      <th>Name</th>
+                      <th>Telegram ID</th>
+                      <th>Phone</th>
+                      <th>Status</th>
+                      <th></th>
+                    </tr>
+                  </thead>
+                  <tbody id="dispatch-drivers-tbody">
+                    <tr>
+                      <td colspan="5" class="muted">Loading…</td>
+                    </tr>
+                  </tbody>
+                </table>
               </div>
             </div>
 

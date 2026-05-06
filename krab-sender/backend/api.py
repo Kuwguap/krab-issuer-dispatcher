@@ -567,6 +567,23 @@ def _issuer_db_open(config: ApiConfig) -> IssuerAdminDatabase:
     return IssuerAdminDatabase(config.supabase_url, config.supabase_service_role_key)
 
 
+@app.get("/dispatch-drivers/ui")
+def dispatch_drivers_ui_list(config: ApiConfig = Depends(get_api_config)):
+    """
+    Open dashboard list — same Supabase drivers table used by Issuer admin.
+    """
+    db = _issuer_db_open(config)
+    return db.get_all_drivers()
+
+
+@app.post("/dispatch-drivers/ui/{driver_id}/toggle")
+def dispatch_drivers_ui_toggle(driver_id: str, config: ApiConfig = Depends(get_api_config)):
+    db = _issuer_db_open(config)
+    if db.toggle_driver_status(driver_id):
+        return {"success": True}
+    raise HTTPException(status_code=400, detail="Could not toggle driver")
+
+
 @app.post("/dispatch-drivers/ui")
 def dispatch_drivers_ui_create(body: DispatchDriverCreate, config: ApiConfig = Depends(get_api_config)):
     """
@@ -608,6 +625,11 @@ def options_recipients_ui_id(recipient_id: str):
 
 @app.options("/dispatch-drivers/ui")
 def options_dispatch_drivers_ui():
+    return {}
+
+
+@app.options("/dispatch-drivers/ui/{driver_id}/toggle")
+def options_dispatch_drivers_ui_toggle(driver_id: str):
     return {}
 
 

@@ -114,6 +114,8 @@ function setupAdminTabs() {
       refreshIssuerAdmin();
     } else if (id === "transactions") {
       refreshUnifiedTransactions();
+    } else if (id === "dispatch") {
+      refreshDispatchDriversList();
     }
   };
 
@@ -1143,6 +1145,72 @@ function renderIssuerDrivers(drivers) {
     tr.appendChild(act);
     tb.appendChild(tr);
   });
+}
+
+function renderDispatchDrivers(drivers) {
+  const tb = document.getElementById("dispatch-drivers-tbody");
+  if (!tb) return;
+  tb.innerHTML = "";
+  const list = Array.isArray(drivers) ? drivers : [];
+  if (list.length === 0) {
+    const tr = document.createElement("tr");
+    const td = document.createElement("td");
+    td.colSpan = 5;
+    td.className = "muted";
+    td.textContent = "No drivers.";
+    tr.appendChild(td);
+    tb.appendChild(tr);
+    return;
+  }
+  list.forEach((d) => {
+    const tr = document.createElement("tr");
+    const nm = document.createElement("td");
+    nm.textContent = d.driver_name || "—";
+    nm.style.textAlign = "left";
+    const tg = document.createElement("td");
+    tg.innerHTML = "<code>" + escapeIssuerText(d.driver_telegram_id || "") + "</code>";
+    const ph = document.createElement("td");
+    ph.textContent = d.phone_number || "—";
+    const st = document.createElement("td");
+    st.textContent = d.is_active === false ? "Inactive" : "Active";
+    const act = document.createElement("td");
+    const btn = document.createElement("button");
+    btn.type = "button";
+    btn.className = "btn-danger-issuer";
+    btn.textContent = d.is_active === false ? "Activate" : "Deactivate";
+    btn.dataset.toggleDispatchDriver = d.id;
+    act.appendChild(btn);
+    tr.appendChild(nm);
+    tr.appendChild(tg);
+    tr.appendChild(ph);
+    tr.appendChild(st);
+    tr.appendChild(act);
+    tb.appendChild(tr);
+  });
+}
+
+async function refreshDispatchDriversList() {
+  const tb = document.getElementById("dispatch-drivers-tbody");
+  if (!tb) return;
+  try {
+    const res = await fetch(API_BASE + "/dispatch-drivers/ui");
+    if (res.status === 503) {
+      tb.innerHTML =
+        '<tr><td colspan="5" class="muted">Issuer database not configured on API.</td></tr>';
+      return;
+    }
+    if (!res.ok) {
+      tb.innerHTML =
+        '<tr><td colspan="5" class="muted">Could not load drivers.</td></tr>';
+      return;
+    }
+    const drivers = await res.json();
+    renderDispatchDrivers(drivers);
+  } catch (e) {
+    console.error(e);
+    tb.innerHTML =
+      '<tr><td colspan="5" class="muted">Failed to load drivers.</td></tr>';
+  }
 }
 
 function renderIssuerAssistants(groups, assistantsByGroup) {
@@ -2909,9 +2977,34 @@ function setupEvents() {
         (document.getElementById("dispatch-driver-name") || {}).value = "";
         (document.getElementById("dispatch-driver-chat-id") || {}).value = "";
         if (msg) msg.textContent = "Driver added.";
+        refreshDispatchDriversList();
       } catch (e) {
         console.error(e);
         if (msg) msg.textContent = "Failed to add driver. Please try again.";
+      }
+    });
+  }
+
+  const dispatchDriversTb = document.getElementById("dispatch-drivers-tbody");
+  if (dispatchDriversTb) {
+    dispatchDriversTb.addEventListener("click", async (ev) => {
+      const btn = ev.target.closest("[data-toggle-dispatch-driver]");
+      if (!btn) return;
+      const id = btn.getAttribute("data-toggle-dispatch-driver");
+      if (!id) return;
+      try {
+        const res = await fetch(
+          API_BASE + "/dispatch-drivers/ui/" + encodeURIComponent(id) + "/toggle",
+          { method: "POST" }
+        );
+        if (!res.ok) {
+          alert("Could not toggle driver.");
+          return;
+        }
+        await refreshDispatchDriversList();
+      } catch (e) {
+        console.error(e);
+        alert("Could not toggle driver.");
       }
     });
   }
@@ -3436,6 +3529,7 @@ window.addEventListener("DOMContentLoaded", async () => {
   setupEvents();
   updateTxnAuthGate();
   renderUnifiedTransactions();
+  refreshDispatchDriversList();
   await tryInitialLogin();
   // If the Transactions tab is active on first load and we already have a
   // stored password, kick off the joined fetch immediately so the spreadsheet
