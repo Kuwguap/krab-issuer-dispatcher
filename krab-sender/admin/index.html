@@ -218,6 +218,70 @@
       .shell {
         width: 100%;
         max-width: 1100px;
+        margin-inline: auto;
+      }
+
+      /* Krab Dispatch: center main column (default .shell is full-bleed in flex tab panels). */
+      #panel-dispatch > .shell {
+        flex: 0 1 auto;
+        align-self: center;
+        width: min(100%, 1100px);
+        margin-inline: auto;
+      }
+
+      #panel-dispatch .header {
+        justify-content: center;
+        align-items: center;
+        flex-direction: column;
+        text-align: center;
+        gap: 0.85rem;
+      }
+
+      #panel-dispatch .header-main {
+        flex: 0 0 auto;
+        width: 100%;
+        max-width: 36rem;
+      }
+
+      #panel-dispatch .grid {
+        margin-inline: auto;
+        width: 100%;
+        max-width: 1100px;
+      }
+
+      #panel-dispatch .panel-header {
+        justify-content: center;
+        flex-wrap: wrap;
+        gap: 0.5rem;
+      }
+
+      #panel-dispatch .field-row {
+        justify-content: center;
+      }
+
+      #panel-dispatch #auth-area,
+      #panel-dispatch #dashboard-area,
+      #panel-dispatch #dispatch-add-driver-wrap {
+        text-align: center;
+      }
+
+      #panel-dispatch .summary-toolbar {
+        justify-content: center;
+      }
+
+      @media (min-width: 700px) {
+        #panel-dispatch .summary-section-header {
+          justify-content: center;
+          flex-wrap: wrap;
+        }
+        #panel-dispatch .summary-section-header .panel-title {
+          flex: 1 0 100%;
+          text-align: center;
+        }
+        #panel-dispatch .summary-toolbar {
+          flex: 1 1 100%;
+          justify-content: center;
+        }
       }
 
       .card {
