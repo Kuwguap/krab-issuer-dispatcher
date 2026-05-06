@@ -3087,9 +3087,29 @@ function setupEvents() {
   const saveRecipientBtn = document.getElementById("save-recipient-btn");
   const cancelRecipientBtn = document.getElementById("cancel-recipient-btn");
   const recipientError = document.getElementById("recipient-error");
+  const recipientListWrap = document.getElementById("recipient-list-wrap");
   const recipientsBody = document.getElementById("recipients-body");
 
+  function updateRecipientConfidentialUI() {
+    const hasPw = !!getStoredPassword();
+    if (recipientListWrap) {
+      recipientListWrap.style.display = hasPw ? "block" : "none";
+    }
+    if (!hasPw && recipientsBody) {
+      recipientsBody.innerHTML = `
+        <tr>
+          <td colspan="3" class="muted">Unlock to view saved driver emails.</td>
+        </tr>
+      `;
+    }
+  }
+
   async function refreshRecipients() {
+    // Confidentiality: allow adding without password, but hide the list until unlocked.
+    if (!getStoredPassword()) {
+      updateRecipientConfidentialUI();
+      return;
+    }
     try {
       const res = await fetch(API_BASE + "/recipients/ui");
       if (!res.ok) {
@@ -3108,6 +3128,8 @@ function setupEvents() {
   }
 
   function renderRecipients(recipients) {
+    updateRecipientConfidentialUI();
+    if (!getStoredPassword()) return;
     recipientsBody.innerHTML = "";
     if (!recipients || recipients.length === 0) {
       recipientsBody.innerHTML = `
@@ -3236,7 +3258,7 @@ function setupEvents() {
     } else {
       updateIssuerAuthGate();
       updateTxnAuthGate();
-      refreshRecipients();
+      updateRecipientConfidentialUI();
     }
   };
 
@@ -3246,7 +3268,7 @@ function setupEvents() {
   applySummaryZoom(1);
   applyTxZoom(1);
   applyTxnUnifiedZoom(1);
-  refreshRecipients();
+  updateRecipientConfidentialUI();
 }
 
 window.addEventListener("DOMContentLoaded", () => {
