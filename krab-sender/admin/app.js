@@ -815,6 +815,7 @@ function doAdminLogout() {
   storePassword("");
   syncAdminPasswordInputs("");
   clearAdminAuthErrorDisplays();
+  _issuerAiSnapshot = null;
   _txnLoading = false;
   _txnRows = [];
   setTxnBanner("");
@@ -1538,6 +1539,36 @@ async function refreshIssuerAdmin() {
   });
   renderIssuerAssistants(groups, assistantsByGroup);
 
+  _issuerAiSnapshot = {
+    source: "krab_issuer_admin",
+    group_count: groups.length,
+    driver_count: drivers.length,
+    assignment_count: assignments.length,
+    contact_source_count: contacts.length,
+    assistants_group_count: groups.filter(
+      (g) => (assistantsByGroup[g.id] || []).length > 0
+    ).length,
+    settings: {
+      assistants_choose_group: !!settings.assistants_choose_group,
+      receipt_detection_mode: settings.receipt_detection_mode || "",
+    },
+    stats_total_leads: stats.total_leads,
+    stats_drivers_headline: Array.isArray(stats.drivers)
+      ? stats.drivers.slice(0, 12)
+      : [],
+    debt_rows: Array.isArray(debts.drivers) ? debts.drivers.length : 0,
+    submitted_recent: submitted.length,
+    renewals_upcoming: renewals.length,
+    sample_group_names: groups
+      .slice(0, 15)
+      .map((g) => g.group_name || "")
+      .filter(Boolean),
+    sample_driver_names: drivers
+      .slice(0, 20)
+      .map((d) => d.driver_name || "")
+      .filter(Boolean),
+  };
+
   const warn = [dRes, setRes, aRes, cRes, bRes, stRes, rdRes, subRes, renRes].filter(
     (x) => !x.ok
   );
@@ -2024,10 +2055,15 @@ async function refreshLatest() {
 }
 
 let lastSummary = null;
+/** Last Issuer-admin compact snapshot for AI (Krab Issuer tab). Cleared on logout. */
+let _issuerAiSnapshot = null;
 let summaryZoomScale = 1;
 let txZoomScale = 1;
 const summaryAiHistory = [];
 const SUMMARY_AI_HISTORY_KEY = "krab_summary_ai_history";
+
+const issuerAiHistory = [];
+const ISSUER_AI_HISTORY_KEY = "krab_issuer_ai_history";
 
 function loadSummaryAiHistory() {
   try {
@@ -2060,6 +2096,58 @@ function saveSummaryAiHistory() {
   }
 }
 
+function loadIssuerAiHistory() {
+  try {
+    const raw = sessionStorage.getItem(ISSUER_AI_HISTORY_KEY);
+    if (!raw) return;
+    const parsed = JSON.parse(raw);
+    if (Array.isArray(parsed)) {
+      issuerAiHistory.length = 0;
+      for (const m of parsed.slice(-20)) {
+        if (!m || !m.role || !m.content) continue;
+        issuerAiHistory.push({
+          role: String(m.role),
+          content: String(m.content),
+        });
+      }
+    }
+  } catch {
+    // ignore
+  }
+}
+
+function saveIssuerAiHistory() {
+  try {
+    sessionStorage.setItem(
+      ISSUER_AI_HISTORY_KEY,
+      JSON.stringify(issuerAiHistory.slice(-20))
+    );
+  } catch {
+    // ignore
+  }
+}
+
+function renderIssuerAiLog() {
+  const log = document.getElementById("issuer-ai-log");
+  if (!log) return;
+  log.innerHTML = "";
+  if (!issuerAiHistory.length) {
+    const div = document.createElement("div");
+    div.className = "summary-ai-msg assistant";
+    div.textContent = "Ask across Krab Issuer and Krab Dispatch (shared references).";
+    log.appendChild(div);
+    return;
+  }
+  for (const m of issuerAiHistory.slice(-16)) {
+    const div = document.createElement("div");
+    div.className =
+      "summary-ai-msg " + (m.role === "user" ? "user" : "assistant");
+    div.textContent = m.content;
+    log.appendChild(div);
+  }
+  log.scrollTop = log.scrollHeight;
+}
+
 function renderSummaryAiLog() {
   const log = document.getElementById("summary-ai-log");
   if (!log) return;
@@ -2067,7 +2155,8 @@ function renderSummaryAiLog() {
   if (!summaryAiHistory.length) {
     const div = document.createElement("div");
     div.className = "summary-ai-msg assistant";
-    div.textContent = "Ask questions about current summary data.";
+    div.textContent =
+      "Ask across both bots—for example counts by driver, refs, or receipt status.";
     log.appendChild(div);
     return;
   }
@@ -2387,7 +2476,7 @@ function answerSummaryQuestion(question) {
   return "I can answer questions like: 'how many issuers made transactions today?' or 'how many does haru have?'";
 }
 
-async function askSummaryWithGpt(question) {
+async function askSummaryWithGpt(question, options = {}) {
   if (!lastSummary || !Array.isArray(lastSummary.items)) {
     return "Generate summary first so I can analyze the data.";
   }
@@ -2395,9 +2484,13 @@ async function askSummaryWithGpt(question) {
   if (!q) {
     return "Please ask a question.";
   }
+  const issuerSnap =
+    options && options.includeIssuerSnapshot && _issuerAiSnapshot
+      ? _issuerAiSnapshot
+      : null;
   const payload = {
     question: q,
-    history: summaryAiHistory.slice(-12),
+    history: options.historySlice || summaryAiHistory.slice(-12),
     window:
       (document.getElementById("summary-window") &&
         document.getElementById("summary-window").value) ||
@@ -2411,6 +2504,7 @@ async function askSummaryWithGpt(question) {
       failed: lastSummary.failed,
       items: (lastSummary.items || []).slice(0, 300),
     },
+    issuer_admin_snapshot: issuerSnap,
   };
   const res = await requestWithAdminJson("/ai/summary-ask", {
     method: "POST",
@@ -2786,6 +2880,8 @@ function applyLoggedInUI(loggedIn) {
   const dispatchDriversListWrap = document.getElementById(
     "dispatch-drivers-list-wrap"
   );
+  const dispatchAiChatWrap = document.getElementById("dispatch-ai-chat-wrap");
+  const issuerAiChatWrap = document.getElementById("issuer-ai-chat-wrap");
   const issuerToolbarPrivate = document.getElementById("issuer-toolbar-private");
   const issuerAuthArea = document.getElementById("issuer-auth-area");
 
@@ -2821,6 +2917,14 @@ function applyLoggedInUI(loggedIn) {
       "aria-hidden",
       loggedIn ? "false" : "true"
     );
+  }
+  if (dispatchAiChatWrap) {
+    dispatchAiChatWrap.style.display = loggedIn ? "block" : "none";
+    dispatchAiChatWrap.setAttribute("aria-hidden", loggedIn ? "false" : "true");
+  }
+  if (issuerAiChatWrap) {
+    issuerAiChatWrap.style.display = loggedIn ? "block" : "none";
+    issuerAiChatWrap.setAttribute("aria-hidden", loggedIn ? "false" : "true");
   }
 }
 
@@ -2900,8 +3004,13 @@ function setupEvents() {
   const summaryAiInput = document.getElementById("summary-ai-input");
   const summaryAiAskBtn = document.getElementById("summary-ai-ask-btn");
   const summaryAiAnswer = document.getElementById("summary-ai-answer");
+  const issuerAiInput = document.getElementById("issuer-ai-input");
+  const issuerAiAskBtn = document.getElementById("issuer-ai-ask-btn");
+  const issuerAiAnswer = document.getElementById("issuer-ai-answer");
   loadSummaryAiHistory();
   renderSummaryAiLog();
+  loadIssuerAiHistory();
+  renderIssuerAiLog();
 
   async function doLoginWithPassword(pwRaw, errEl) {
     const pw = String(pwRaw || "").trim();
@@ -3320,7 +3429,9 @@ function setupEvents() {
     saveSummaryAiHistory();
     renderSummaryAiLog();
     try {
-      const ai = await askSummaryWithGpt(q);
+      const ai = await askSummaryWithGpt(q, {
+        historySlice: summaryAiHistory.slice(-12),
+      });
       summaryAiAnswer.textContent = ai;
       summaryAiHistory.push({ role: "assistant", content: String(ai) });
       saveSummaryAiHistory();
@@ -3343,6 +3454,53 @@ function setupEvents() {
     summaryAiInput.addEventListener("keydown", (ev) => {
       if (ev.key === "Enter") {
         handleAiAsk();
+      }
+    });
+  }
+
+  async function handleIssuerAiAsk() {
+    if (!issuerAiAnswer) return;
+    const q = issuerAiInput ? issuerAiInput.value : "";
+    if (!String(q || "").trim()) {
+      issuerAiAnswer.textContent = "Please enter a question.";
+      return;
+    }
+    if (!lastSummary || !Array.isArray(lastSummary.items)) {
+      try {
+        await refreshSummary();
+      } catch {
+        // continue
+      }
+    }
+    issuerAiAnswer.textContent = "Thinking...";
+    issuerAiHistory.push({ role: "user", content: String(q) });
+    saveIssuerAiHistory();
+    renderIssuerAiLog();
+    try {
+      const ai = await askSummaryWithGpt(q, {
+        historySlice: issuerAiHistory.slice(-12),
+        includeIssuerSnapshot: true,
+      });
+      issuerAiAnswer.textContent = ai;
+      issuerAiHistory.push({ role: "assistant", content: String(ai) });
+      saveIssuerAiHistory();
+      renderIssuerAiLog();
+    } catch {
+      const msg = "AI unavailable right now. Please try again.";
+      issuerAiAnswer.textContent = msg;
+      issuerAiHistory.push({ role: "assistant", content: msg });
+      saveIssuerAiHistory();
+      renderIssuerAiLog();
+    }
+    if (issuerAiInput) issuerAiInput.value = "";
+  }
+  if (issuerAiAskBtn) {
+    issuerAiAskBtn.addEventListener("click", handleIssuerAiAsk);
+  }
+  if (issuerAiInput) {
+    issuerAiInput.addEventListener("keydown", (ev) => {
+      if (ev.key === "Enter") {
+        handleIssuerAiAsk();
       }
     });
   }

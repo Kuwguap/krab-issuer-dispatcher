@@ -355,6 +355,20 @@
         text-align: left;
       }
 
+      #panel-dispatch #dispatch-ai-chat-wrap {
+        align-self: stretch;
+        width: 100%;
+        text-align: left;
+      }
+
+      #panel-dispatch #dispatch-ai-chat-wrap .panel-title {
+        text-align: center;
+      }
+
+      #panel-issuer #issuer-ai-chat-wrap {
+        text-align: left;
+      }
+
       #panel-dispatch .dispatch-drivers-panel .panel-title {
         text-align: center;
         margin-bottom: 0.5rem;
@@ -1227,6 +1241,32 @@
                 </table>
               </div>
             </div>
+
+            <div
+              id="dispatch-ai-chat-wrap"
+              class="panel summary-ai"
+              style="display: none"
+              aria-hidden="true"
+            >
+              <div class="panel-title" style="margin-bottom: 0.35rem">AI Data Q&amp;A</div>
+              <div class="issuer-muted-block" style="margin-bottom: 0.5rem; text-align: center">
+                Dispatch transmissions and Issuer leads line up on <code>reference_id</code>. Uses the same time window as Summary (NJ) below.
+              </div>
+              <div id="summary-ai-log" class="summary-ai-log">
+                <div class="summary-ai-msg assistant">
+                  Ask across both bots—for example counts by driver, refs, or receipt status.
+                </div>
+              </div>
+              <div class="field-row">
+                <input
+                  type="text"
+                  id="summary-ai-input"
+                  placeholder="Ask: how do Issuer receipts relate to Dispatch rows?"
+                />
+                <button id="summary-ai-ask-btn" type="button">Ask</button>
+              </div>
+              <div id="summary-ai-answer" class="small"></div>
+            </div>
           </div>
 
           <!-- Transmissions -->
@@ -1443,23 +1483,6 @@
                       </tbody>
                     </table>
                   </div>
-                </div>
-                <div class="summary-ai">
-                  <div class="panel-title" style="margin-bottom: 0.35rem">AI Data Q&A</div>
-                  <div id="summary-ai-log" class="summary-ai-log">
-                    <div class="summary-ai-msg assistant">
-                      Ask questions about current summary data.
-                    </div>
-                  </div>
-                  <div class="field-row">
-                    <input
-                      type="text"
-                      id="summary-ai-input"
-                      placeholder="Ask: how many issuers made transactions today?"
-                    />
-                    <button id="summary-ai-ask-btn" type="button">Ask</button>
-                  </div>
-                  <div id="summary-ai-answer" class="small"></div>
                 </div>
               </div>
           </div>
@@ -1754,6 +1777,33 @@
                       </tbody>
                     </table>
                   </div>
+                </div>
+
+                <div
+                  id="issuer-ai-chat-wrap"
+                  class="panel summary-ai"
+                  style="display: none"
+                  aria-hidden="true"
+                >
+                  <div class="panel-title" style="margin-bottom: 0.35rem">AI Data Q&amp;A</div>
+                  <div class="issuer-muted-block" style="margin-bottom: 0.5rem">
+                    Same assistant as Dispatch. Answers use rolling summary plus Issuer snapshot and
+                    <code>reference_id</code> links to Supabase leads.
+                  </div>
+                  <div id="issuer-ai-log" class="summary-ai-log">
+                    <div class="summary-ai-msg assistant">
+                      Ask across Krab Issuer and Krab Dispatch (shared references).
+                    </div>
+                  </div>
+                  <div class="field-row">
+                    <input
+                      type="text"
+                      id="issuer-ai-input"
+                      placeholder="Ask: which groups have the most assignments?"
+                    />
+                    <button id="issuer-ai-ask-btn" type="button">Ask</button>
+                  </div>
+                  <div id="issuer-ai-answer" class="small"></div>
                 </div>
 
                 <div class="panel">

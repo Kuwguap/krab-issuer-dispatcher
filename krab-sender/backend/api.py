@@ -455,6 +455,8 @@ class SummaryAiAskRequest(BaseModel):
     summary: dict
     window: str | None = None
     history: list[dict] | None = None
+    # Optional Issuer-admin snapshot from the client (Krab Issuer tab) for chat context.
+    issuer_admin_snapshot: dict | None = None
 
 
 def _extract_openai_answer(data: dict) -> str:
@@ -643,10 +645,37 @@ def options_transactions_public():
     return {}
 
 
+def _compact_issuer_lead_ctx_for_ai(ctx: dict) -> dict:
+    """Shrink Supabase lead context for the AI prompt (token-safe)."""
+    if not isinstance(ctx, dict):
+        return {}
+    hist = ctx.get("driver_history") or []
+    if isinstance(hist, list):
+        hist = hist[:8]
+    ad = ctx.get("accepted_driver")
+    if isinstance(ad, dict):
+        ad = {k: ad.get(k) for k in ("driver_name", "driver_telegram_id", "accepted_at")}
+    return {
+        "lead_id": ctx.get("lead_id"),
+        "tag_name": ctx.get("tag_name"),
+        "price": ctx.get("price"),
+        "receipt_price": ctx.get("receipt_price"),
+        "receipt_image_url": bool(ctx.get("receipt_image_url")),
+        "submitted_by_handle": ctx.get("submitted_by_handle"),
+        "group_name": ctx.get("group_name"),
+        "driver_history": hist,
+        "accepted_driver": ad,
+    }
+
+
 @app.post("/ai/summary-ask", dependencies=[Depends(require_admin)])
-async def ai_summary_ask(payload: SummaryAiAskRequest):
+async def ai_summary_ask(
+    payload: SummaryAiAskRequest,
+    config: ApiConfig = Depends(get_api_config),
+):
     """
-    Ask GPT-5 questions about currently loaded summary data.
+    Ask GPT-5 questions about rolling summary data, with optional Issuer (Supabase)
+    lead context joined by reference_id (same linkage as the unified Transactions tab).
     """
     question = (payload.question or "").strip()
     if not question:
@@ -687,6 +716,47 @@ async def ai_summary_ask(payload: SummaryAiAskRequest):
         "items": compact_items,
     }
 
+    cross_bot: dict = {
+        "note": (
+            "Krab Dispatch rows (summary items) tie to Krab Issuer Supabase leads via "
+            "`reference_id` when present."
+        ),
+        "issuer_leads_by_reference_id": {},
+    }
+    refs: list[str] = []
+    seen_r: set[str] = set()
+    for it in compact_items:
+        if not isinstance(it, dict):
+            continue
+        r = str(it.get("reference_id") or "").strip()
+        if r and r not in seen_r:
+            seen_r.add(r)
+            refs.append(r)
+        if len(refs) >= 100:
+            break
+    if refs and config.supabase_configured():
+        try:
+            full_ctx = fetch_full_lead_context_by_references(
+                config.supabase_url,
+                config.supabase_service_role_key,
+                refs,
+            )
+            for ref in refs:
+                raw = full_ctx.get(ref) if isinstance(full_ctx, dict) else None
+                if isinstance(raw, dict):
+                    cross_bot["issuer_leads_by_reference_id"][ref] = (
+                        _compact_issuer_lead_ctx_for_ai(raw)
+                    )
+        except Exception:
+            pass
+
+    issuer_snap = payload.issuer_admin_snapshot
+    if isinstance(issuer_snap, dict) and issuer_snap:
+        # Bound size (client may send stats / driver lists).
+        cross_bot["issuer_admin_snapshot"] = (
+            issuer_snap if len(str(issuer_snap)) < 12000 else {"_truncated": True}
+        )
+
     history = payload.history or []
     compact_history = []
     for h in history[-12:]:
@@ -696,16 +766,20 @@ async def ai_summary_ask(payload: SummaryAiAskRequest):
             compact_history.append({"role": role, "content": content[:1000]})
 
     system_prompt = (
-        "You are a friendly analytics copilot for a logistics dashboard. "
-        "For data questions, use ONLY the provided summary JSON for factual claims. "
-        "For normal conversation (like greetings or 'how are you'), respond naturally as a friendly assistant. "
-        "If some specific detail is missing in data, provide the closest useful answer from available fields. "
-        "Keep responses concise and practical."
+        "You are a friendly analytics copilot for Krab Dispatch + Krab Issuer. "
+        "Krab Dispatch stores transmission rows (Telegram sends, drivers, delivery status). "
+        "Krab Issuer stores leads in Supabase (tag name, price, receipts, assignments). "
+        "When a row has reference_id, the two systems describe the same real-world lead—use "
+        "cross_bot.issuer_leads_by_reference_id together with summary items to reason across both. "
+        "For factual claims use ONLY the provided JSON (summary, cross_bot, issuer_admin_snapshot). "
+        "For greetings or small talk, respond naturally. If data is missing, say so briefly. "
+        "Keep answers concise."
     )
     user_prompt = (
         f"Conversation history: {compact_history}\n\n"
         f"Question: {question}\n\n"
-        f"Summary JSON: {compact_summary}"
+        f"Summary JSON (Dispatch rolling window): {compact_summary}\n\n"
+        f"Cross-bot context (Issuer joined by reference_id): {cross_bot}"
     )
 
     errors: list[str] = []
@@ -726,7 +800,7 @@ async def ai_summary_ask(payload: SummaryAiAskRequest):
                             {"role": "system", "content": system_prompt},
                             {"role": "user", "content": user_content},
                         ],
-                        "max_output_tokens": 220,
+                        "max_output_tokens": 320,
                     },
                 )
         except Exception as e:
@@ -754,9 +828,10 @@ async def ai_summary_ask(payload: SummaryAiAskRequest):
         retry_user_prompt = (
             "Answer the question directly. "
             "If it is general conversation, respond conversationally. "
-            "If it is data-related, rely on summary JSON.\n\n"
+            "If it is data-related, rely on summary JSON and cross_bot context.\n\n"
             f"Question: {question}\n\n"
-            f"Summary JSON: {compact_summary}"
+            f"Summary JSON: {compact_summary}\n\n"
+            f"Cross-bot: {cross_bot}"
         )
         for model in models:
             answer, err = await _ask_once(model, retry_user_prompt)
