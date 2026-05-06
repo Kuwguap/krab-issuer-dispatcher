@@ -860,7 +860,7 @@
                 </div>
               </div>
               <div id="txn-no-auth" class="issuer-muted-block" style="display: none; color: var(--text-muted); font-size: 0.85rem; margin-bottom: 0.7rem;">
-                Unlock with the admin password on <strong>Krab Dispatch</strong> or <strong>Krab Issuer</strong> (Unlock on either tab). The ledger uses the same credentials.
+                Unlock on the <strong>Krab Dispatch</strong> tab first. The unified transactions ledger uses the same admin password.
               </div>
               <div id="txn-banner" class="error-text" style="display: none; margin-bottom: 0.6rem"></div>
               <div id="txn-status" class="small" style="margin-bottom: 0.5rem">
@@ -1202,12 +1202,31 @@
                   <div id="summary-ai-answer" class="small"></div>
                 </div>
               </div>
+            </div>
+          </section>
+        </div>
+      </div>
+    </div>
+        </div>
+        <div
+          id="panel-issuer"
+          class="tab-panel"
+          role="tabpanel"
+          aria-labelledby="tab-issuer"
+        >
+          <div class="shell issuer-tab-root">
+            <div class="card">
+              <div class="panel-header" style="margin-bottom: 1rem">
+                <div class="panel-title">Krab Issuer</div>
+                <button id="issuer-refresh-btn" type="button" class="secondary">
+                  Refresh
+                </button>
+              </div>
 
-              <!-- Recipient Management -->
-              <div style="margin-top: 1.5rem">
+              <div class="panel" style="margin-bottom: 1rem">
                 <div class="panel-header" style="margin-bottom: 0.35rem">
-                  <div class="panel-title">Email Recipients</div>
-                  <button id="add-recipient-btn">
+                  <div class="panel-title">Add driver</div>
+                  <button id="add-recipient-btn" type="button">
                     ➕
                     <span>Add</span>
                   </button>
@@ -1217,7 +1236,7 @@
                     <input
                       type="text"
                       id="recipient-name-input"
-                      placeholder="Recipient name"
+                      placeholder="Driver name"
                       style="flex: 1"
                     />
                     <input
@@ -1242,49 +1261,15 @@
                     </thead>
                     <tbody id="recipients-body">
                       <tr>
-                        <td colspan="3" class="muted">Loading recipients...</td>
+                        <td colspan="3" class="muted">Loading drivers…</td>
                       </tr>
                     </tbody>
                   </table>
                 </div>
               </div>
-            </div>
-          </section>
-        </div>
-      </div>
-    </div>
-        </div>
-        <div
-          id="panel-issuer"
-          class="tab-panel"
-          role="tabpanel"
-          aria-labelledby="tab-issuer"
-        >
-          <div class="shell issuer-tab-root">
-            <div class="card">
-              <div class="panel-header" style="margin-bottom: 1rem">
-                <div class="panel-title">Krab Issuer</div>
-                <button id="issuer-refresh-btn" type="button" class="secondary">
-                  Refresh
-                </button>
-              </div>
+
               <div id="issuer-no-auth" class="issuer-muted-block" style="display: none">
-                <p style="margin: 0 0 0.65rem">
-                  Use the same admin password as Krab Dispatch. Unlock here or on the
-                  <strong>Krab Dispatch</strong> tab — no need to switch tabs just to add drivers.
-                </p>
-                <div class="field-row">
-                  <input
-                    type="password"
-                    id="issuer-admin-password-input"
-                    placeholder="Admin password"
-                    autocomplete="current-password"
-                  />
-                  <button id="issuer-login-btn" type="button">Unlock</button>
-                </div>
-                <div id="issuer-auth-error" class="error-text" style="display: none; margin-top: 0.45rem">
-                  Invalid password. Try again.
-                </div>
+                Enter your admin password on the <strong>Krab Dispatch</strong> tab first. The same password is used for Issuer data (Supabase).
               </div>
               <div id="issuer-main-wrap" style="display: none">
                 <div id="issuer-banner" class="error-text" style="display: none; margin-bottom: 0.75rem"></div>
@@ -1399,7 +1384,7 @@
                 </div>
 
                 <div class="panel">
-                  <div class="panel-title" style="margin-bottom: 0.5rem">Add driver</div>
+                  <div class="panel-title" style="margin-bottom: 0.5rem">Driver (Telegram)</div>
                   <div class="field-row">
                     <input type="text" id="issuer-driver-name" placeholder="Driver name" />
                   </div>

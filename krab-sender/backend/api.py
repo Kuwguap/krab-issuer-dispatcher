@@ -527,6 +527,31 @@ def recipients_delete(recipient_id: str):
     return {"success": True}
 
 
+@app.get("/recipients/ui")
+def recipients_ui_list():
+    """
+    Same payload as /recipients/all for the static dashboard Add driver card.
+
+    Intentionally does not require admin auth so operators can manage dispatch
+    email targets from the Krab Issuer tab without unlocking with a password.
+    """
+    return list_recipients()
+
+
+@app.post("/recipients/ui")
+def recipients_ui_create(recipient: RecipientCreate):
+    """Create recipient — open auth path paired with GET /recipients/ui."""
+    return create_recipient(name=recipient.name, email=recipient.email)
+
+
+@app.delete("/recipients/ui/{recipient_id}")
+def recipients_ui_delete(recipient_id: str):
+    deleted = delete_recipient(recipient_id)
+    if not deleted:
+        raise HTTPException(status_code=404, detail="Recipient not found")
+    return {"success": True}
+
+
 @app.options("/recipients")
 def options_recipients():
     return {}
@@ -534,6 +559,16 @@ def options_recipients():
 
 @app.options("/recipients/all")
 def options_recipients_all():
+    return {}
+
+
+@app.options("/recipients/ui")
+def options_recipients_ui():
+    return {}
+
+
+@app.options("/recipients/ui/{recipient_id}")
+def options_recipients_ui_id(recipient_id: str):
     return {}
 
 

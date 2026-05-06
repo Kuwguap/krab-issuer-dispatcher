@@ -1416,27 +1416,6 @@ function setupIssuerAdminEvents() {
     refreshBtn.addEventListener("click", () => refreshIssuerAdmin());
   }
 
-  const issuerPwdInput = document.getElementById("issuer-admin-password-input");
-  const issuerLoginBtn = document.getElementById("issuer-login-btn");
-  const issuerAuthErr = document.getElementById("issuer-auth-error");
-  async function doIssuerTabUnlock() {
-    if (!issuerPwdInput) return;
-    if (issuerAuthErr) issuerAuthErr.style.display = "none";
-    const ok = await unlockAdminWithPasswordFromInputs(issuerPwdInput.value, () => {
-      if (issuerAuthErr) issuerAuthErr.style.display = "block";
-    });
-    if (ok) issuerPwdInput.value = "";
-    updateIssuerAuthGate();
-  }
-  if (issuerLoginBtn) {
-    issuerLoginBtn.addEventListener("click", () => doIssuerTabUnlock());
-  }
-  if (issuerPwdInput) {
-    issuerPwdInput.addEventListener("keydown", (ev) => {
-      if (ev.key === "Enter") doIssuerTabUnlock();
-    });
-  }
-
   const btnAssist = document.getElementById("issuer-toggle-assistants-mode");
   if (btnAssist) {
     btnAssist.addEventListener("click", async () => {
@@ -2642,38 +2621,16 @@ function applyLoggedInUI(loggedIn) {
   logoutBtn.style.display = loggedIn ? "inline-flex" : "none";
 }
 
-async function validateAdminSessionWithBackend() {
-  await refreshTransactions();
-  await refreshLatest();
-  await refreshSummary();
-  applyLoggedInUI(true);
-}
-
-/**
- * Store password and confirm it with the same calls as the Dispatch tab.
- * On failure clears storage and hides the dashboard.
- */
-async function unlockAdminWithPasswordFromInputs(plainPassword, onFailure) {
-  const trimmed = String(plainPassword || "").trim();
-  if (!trimmed) return false;
-  storePassword(trimmed);
-  try {
-    await validateAdminSessionWithBackend();
-    return true;
-  } catch (e) {
-    console.error(e);
-    storePassword("");
-    applyLoggedInUI(false);
-    if (typeof onFailure === "function") onFailure(e);
-    return false;
-  }
-}
-
 async function tryInitialLogin() {
-  if (!getStoredPassword()) return;
+  const pw = getStoredPassword();
+  if (!pw) return;
   try {
-    await validateAdminSessionWithBackend();
+    await refreshTransactions();
+    await refreshLatest();
+    await refreshSummary();
+    applyLoggedInUI(true);
   } catch {
+    // stored password invalid
     storePassword("");
     applyLoggedInUI(false);
   }
@@ -2738,12 +2695,19 @@ function setupEvents() {
   async function doLogin() {
     const pw = input.value.trim();
     if (!pw) return;
+    storePassword(pw);
     err.style.display = "none";
-    const ok = await unlockAdminWithPasswordFromInputs(pw, () => {
+    try {
+      await refreshTransactions();
+      await refreshLatest();
+      await refreshSummary();
+      applyLoggedInUI(true);
+      // Recipients will be refreshed by the modified applyLoggedInUI
+    } catch (e) {
+      console.error(e);
+      storePassword("");
       err.style.display = "block";
-    });
-    if (!ok) return;
-    // Recipients / Issuer refresh via wrapped applyLoggedInUI
+    }
   }
 
   loginBtn.addEventListener("click", doLogin);
@@ -3085,31 +3049,19 @@ function setupEvents() {
 
   async function refreshRecipients() {
     try {
-      const recipients = await fetchWithAdmin("/recipients/all");
+      const res = await fetch(API_BASE + "/recipients/ui");
+      if (!res.ok) {
+        throw new Error("HTTP_" + res.status);
+      }
+      const recipients = await res.json();
       renderRecipients(recipients);
     } catch (e) {
       console.error("Failed to fetch recipients:", e);
-      // Fallback path: public recipients endpoint still lets dashboard show names.
-      try {
-        const res = await fetch(API_BASE + "/recipients");
-        if (!res.ok) {
-          throw new Error("HTTP_" + res.status);
-        }
-        const publicRecipients = await res.json();
-        const normalized = (publicRecipients || []).map((r) => ({
-          id: r.id,
-          name: r.name,
-          email: "Unavailable (admin API issue)",
-        }));
-        renderRecipients(normalized);
-      } catch (e2) {
-        console.error("Fallback recipients fetch failed:", e2);
-        recipientsBody.innerHTML = `
+      recipientsBody.innerHTML = `
           <tr>
-            <td colspan="3" class="muted">Failed to load recipients.</td>
+            <td colspan="3" class="muted">Failed to load drivers. Is the API updated?</td>
           </tr>
         `;
-      }
     }
   }
 
@@ -3118,7 +3070,7 @@ function setupEvents() {
     if (!recipients || recipients.length === 0) {
       recipientsBody.innerHTML = `
         <tr>
-          <td colspan="3" class="muted">No recipients yet. Click "Add" to create one.</td>
+          <td colspan="3" class="muted">No drivers yet. Click Add to create one.</td>
         </tr>
       `;
       return;
@@ -3149,15 +3101,21 @@ function setupEvents() {
   }
 
   async function deleteRecipient(id) {
-    if (!confirm("Are you sure you want to delete this recipient?")) {
+    if (!confirm("Are you sure you want to delete this driver?")) {
       return;
     }
     try {
-      await fetchWithAdmin(`/recipients/${id}`, { method: "DELETE" });
+      const res = await fetch(
+        API_BASE + "/recipients/ui/" + encodeURIComponent(id),
+        { method: "DELETE" }
+      );
+      if (!res.ok) {
+        throw new Error("HTTP_" + res.status);
+      }
       await refreshRecipients();
     } catch (e) {
       console.error("Failed to delete recipient:", e);
-      alert("Failed to delete recipient. Please try again.");
+      alert("Failed to delete driver. Please try again.");
     }
   }
 
@@ -3180,18 +3138,21 @@ function setupEvents() {
     recipientError.style.display = "none";
 
     try {
-      await fetchWithAdmin("/recipients", {
+      const res = await fetch(API_BASE + "/recipients/ui", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ name, email }),
       });
+      if (!res.ok) {
+        throw new Error("HTTP_" + res.status);
+      }
       recipientNameInput.value = "";
       recipientEmailInput.value = "";
       recipientForm.style.display = "none";
       await refreshRecipients();
     } catch (e) {
       console.error("Failed to save recipient:", e);
-      recipientError.textContent = "Failed to save recipient. Please try again.";
+      recipientError.textContent = "Failed to save driver. Please try again.";
       recipientError.style.display = "block";
     }
   }
@@ -3222,7 +3183,7 @@ function setupEvents() {
     }
   });
 
-  // Refresh recipients when logged in
+  // Refresh recipients when logged in; Add driver card also loads without password.
   const originalApplyLoggedInUI = applyLoggedInUI;
   applyLoggedInUI = (loggedIn) => {
     originalApplyLoggedInUI(loggedIn);
@@ -3233,6 +3194,7 @@ function setupEvents() {
     } else {
       updateIssuerAuthGate();
       updateTxnAuthGate();
+      refreshRecipients();
     }
   };
 
@@ -3242,6 +3204,7 @@ function setupEvents() {
   applySummaryZoom(1);
   applyTxZoom(1);
   applyTxnUnifiedZoom(1);
+  refreshRecipients();
 }
 
 window.addEventListener("DOMContentLoaded", () => {
