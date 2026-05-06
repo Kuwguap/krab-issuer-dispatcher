@@ -769,9 +769,9 @@ async function refreshUnifiedTransactions() {
     const err = res.error || ("HTTP_" + (res.status || 0));
     setTxnBanner(
       err === "UNAUTHORIZED"
-        ? "Unauthorized — re-enter admin password or unlock from Krab Dispatch."
+        ? "Unauthorized — re-enter admin password or unlock from the Krab Issuer tab."
         : err === "NO_PASSWORD"
-        ? "Unlock on the Krab Dispatch tab first."
+        ? "Unlock on the Krab Issuer tab first."
         : "Failed to load: " + err
     );
     setTxnStatus("");
@@ -1427,7 +1427,7 @@ async function refreshIssuerAdmin() {
     (x) => !x.ok && x.status !== 503
   );
   if (softErr && softErr.status === 401) {
-    setIssuerBanner("Session expired. Re-enter password on the Dispatch tab.");
+    setIssuerBanner("Session expired. Re-enter password on the Krab Issuer tab.");
     return;
   }
   const drivers = dRes.ok && Array.isArray(dRes.data) ? dRes.data : [];
