@@ -2615,10 +2615,28 @@ function applyLoggedInUI(loggedIn) {
   const authArea = document.getElementById("auth-area");
   const dashArea = document.getElementById("dashboard-area");
   const logoutBtn = document.getElementById("logout-btn");
+  const dispatchHeaderWrap = document.getElementById("dispatch-header-wrap");
+  const dispatchTxPanel = document.getElementById("dispatch-transmissions-panel");
+  const txnPrivateWrap = document.getElementById("txn-private-wrap");
+  const txnToolbarPrivate = document.getElementById("txn-toolbar-private");
+  const issuerPrivateWrap = document.getElementById("issuer-private-wrap");
+  const issuerToolbarPrivate = document.getElementById("issuer-toolbar-private");
 
   authArea.style.display = loggedIn ? "none" : "block";
   dashArea.style.display = loggedIn ? "block" : "none";
   logoutBtn.style.display = loggedIn ? "inline-flex" : "none";
+
+  // Krab Dispatch tab: when locked, show ONLY the Access panel.
+  if (dispatchHeaderWrap) dispatchHeaderWrap.style.display = loggedIn ? "flex" : "none";
+  if (dispatchTxPanel) dispatchTxPanel.style.display = loggedIn ? "block" : "none";
+
+  // Transactions tab: when locked, show ONLY the Unlock controls in header.
+  if (txnPrivateWrap) txnPrivateWrap.style.display = loggedIn ? "block" : "none";
+  if (txnToolbarPrivate) txnToolbarPrivate.style.display = loggedIn ? "contents" : "none";
+
+  // Krab Issuer tab: when locked, show ONLY Unlock + Add driver.
+  if (issuerPrivateWrap) issuerPrivateWrap.style.display = loggedIn ? "block" : "none";
+  if (issuerToolbarPrivate) issuerToolbarPrivate.style.display = loggedIn ? "contents" : "none";
 }
 
 async function tryInitialLogin() {

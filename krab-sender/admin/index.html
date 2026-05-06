@@ -849,42 +849,45 @@
                     placeholder="Enter admin password"
                   />
                   <button id="txn-login-btn" class="secondary access-unlock-btn" type="button">Unlock</button>
-                  <select
-                    id="txn-period-select"
-                    class="secondary"
-                    title="Time range"
-                    style="border-radius:999px;padding:0.35rem 0.6rem;background:transparent;color:var(--text-main);border:1px solid var(--border-subtle);"
-                  >
-                    <option value="1w">1 week</option>
-                    <option value="2w">2 weeks</option>
-                    <option value="3w">3 weeks</option>
-                    <option value="1m">1 month</option>
-                    <option value="3m">3 months</option>
-                    <option value="6m">6 months</option>
-                    <option value="12m">12 months</option>
-                    <option value="all" selected>All time</option>
-                  </select>
-                  <input
-                    type="text"
-                    id="txn-search-input"
-                    placeholder="Search ref / tag / driver / dispatcher"
-                    style="min-width: 220px; border-radius: 999px; padding: 0.35rem 0.7rem; border: 1px solid var(--border-subtle); background: rgba(15, 23, 42, 0.85); color: var(--text-main); font-size: 0.82rem;"
-                  />
-                  <button id="txn-refresh-btn" type="button">
-                    ⟳
-                    <span>Refresh</span>
-                  </button>
-                  <button id="txn-ledger-expand-btn" class="secondary" type="button">
-                    ⤢
-                    <span>Expand</span>
-                  </button>
-                  <span class="txn-zoom-controls">
-                    <button id="txn-ledger-zoom-out-btn" class="secondary" type="button">－</button>
-                    <button id="txn-ledger-zoom-reset-btn" class="secondary" type="button">100%</button>
-                    <button id="txn-ledger-zoom-in-btn" class="secondary" type="button">＋</button>
+                  <span id="txn-toolbar-private" style="display: contents">
+                    <select
+                      id="txn-period-select"
+                      class="secondary"
+                      title="Time range"
+                      style="border-radius:999px;padding:0.35rem 0.6rem;background:transparent;color:var(--text-main);border:1px solid var(--border-subtle);"
+                    >
+                      <option value="1w">1 week</option>
+                      <option value="2w">2 weeks</option>
+                      <option value="3w">3 weeks</option>
+                      <option value="1m">1 month</option>
+                      <option value="3m">3 months</option>
+                      <option value="6m">6 months</option>
+                      <option value="12m">12 months</option>
+                      <option value="all" selected>All time</option>
+                    </select>
+                    <input
+                      type="text"
+                      id="txn-search-input"
+                      placeholder="Search ref / tag / driver / dispatcher"
+                      style="min-width: 220px; border-radius: 999px; padding: 0.35rem 0.7rem; border: 1px solid var(--border-subtle); background: rgba(15, 23, 42, 0.85); color: var(--text-main); font-size: 0.82rem;"
+                    />
+                    <button id="txn-refresh-btn" type="button">
+                      ⟳
+                      <span>Refresh</span>
+                    </button>
+                    <button id="txn-ledger-expand-btn" class="secondary" type="button">
+                      ⤢
+                      <span>Expand</span>
+                    </button>
+                    <span class="txn-zoom-controls">
+                      <button id="txn-ledger-zoom-out-btn" class="secondary" type="button">－</button>
+                      <button id="txn-ledger-zoom-reset-btn" class="secondary" type="button">100%</button>
+                      <button id="txn-ledger-zoom-in-btn" class="secondary" type="button">＋</button>
+                    </span>
                   </span>
                 </div>
               </div>
+              <div id="txn-private-wrap">
               <div id="txn-auth-error" class="error-text" style="display: none; margin-bottom: 0.6rem" data-auth-error>
                 Invalid password. Please try again.
               </div>
@@ -930,6 +933,7 @@
               <p class="small" style="margin-top: 0.6rem;">
                 Each row joins Dispatcher (this service) → Issuer lead (Supabase) → Driver assignments by <code>reference_id</code>. If a step is missing, its cell shows “—”.
               </p>
+              </div>
             </div>
           </div>
         </div>
@@ -941,7 +945,7 @@
         >
     <div class="shell">
       <div class="card">
-        <div class="header">
+        <div id="dispatch-header-wrap" class="header">
           <div class="header-main">
             <div class="header-brand">
               <div class="header-brand-title">👑Krab Dispatch Admin🦀</div>
@@ -972,7 +976,7 @@
 
         <div class="grid">
           <!-- Left: Data table -->
-          <section class="panel">
+          <section id="dispatch-transmissions-panel" class="panel">
             <div class="panel-header">
               <div class="panel-title">Transmissions</div>
               <div style="display:flex;align-items:center;gap:0.35rem;flex-wrap:wrap;justify-content:flex-end">
@@ -1256,9 +1260,11 @@
                     placeholder="Enter admin password"
                   />
                   <button id="issuer-login-btn" class="secondary access-unlock-btn" type="button">Unlock</button>
-                  <button id="issuer-refresh-btn" type="button" class="secondary">
-                    Refresh
-                  </button>
+                  <span id="issuer-toolbar-private" style="display: contents">
+                    <button id="issuer-refresh-btn" type="button" class="secondary">
+                      Refresh
+                    </button>
+                  </span>
                 </div>
               </div>
               <div id="issuer-auth-error" class="error-text" style="display: none; margin-bottom: 0.6rem" data-auth-error>
@@ -1310,6 +1316,7 @@
                 </div>
               </div>
 
+              <div id="issuer-private-wrap">
               <div id="issuer-no-auth" class="issuer-muted-block" style="display: none">
                 Enter your admin password on the <strong>Krab Dispatch</strong> tab first. The same password is used for Issuer data (Supabase).
               </div>
@@ -1581,6 +1588,7 @@
                     </table>
                   </div>
                 </div>
+              </div>
               </div>
             </div>
           </div>
