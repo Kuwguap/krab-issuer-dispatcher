@@ -823,6 +823,16 @@
               <div class="panel-header" style="margin-bottom: 1rem">
                 <div class="panel-title">Transactions (unified ledger)</div>
                 <div style="display:flex;align-items:center;gap:0.4rem;flex-wrap:wrap;justify-content:flex-end">
+                  <input
+                    type="password"
+                    id="txn-admin-password-input"
+                    placeholder="Password"
+                    style="min-width: 160px; border-radius: 999px; padding: 0.35rem 0.7rem; border: 1px solid var(--border-subtle); background: rgba(15, 23, 42, 0.85); color: var(--text-main); font-size: 0.82rem;"
+                  />
+                  <button id="txn-login-btn" class="secondary" type="button">
+                    🔓
+                    <span>Unlock</span>
+                  </button>
                   <select
                     id="txn-period-select"
                     class="secondary"
@@ -858,6 +868,9 @@
                     <button id="txn-ledger-zoom-in-btn" class="secondary" type="button">＋</button>
                   </span>
                 </div>
+              </div>
+              <div id="txn-auth-error" class="error-text" style="display: none; margin-bottom: 0.6rem" data-auth-error>
+                Invalid password. Please try again.
               </div>
               <div id="txn-no-auth" class="issuer-muted-block" style="display: none; color: var(--text-muted); font-size: 0.85rem; margin-bottom: 0.7rem;">
                 Unlock on the <strong>Krab Dispatch</strong> tab first. The unified transactions ledger uses the same admin password.
@@ -1218,9 +1231,24 @@
             <div class="card">
               <div class="panel-header" style="margin-bottom: 1rem">
                 <div class="panel-title">Krab Issuer</div>
-                <button id="issuer-refresh-btn" type="button" class="secondary">
-                  Refresh
-                </button>
+                <div style="display:flex;align-items:center;gap:0.4rem;flex-wrap:wrap;justify-content:flex-end">
+                  <input
+                    type="password"
+                    id="issuer-admin-password-input"
+                    placeholder="Password"
+                    style="min-width: 180px; border-radius: 999px; padding: 0.35rem 0.7rem; border: 1px solid var(--border-subtle); background: rgba(15, 23, 42, 0.85); color: var(--text-main); font-size: 0.82rem;"
+                  />
+                  <button id="issuer-login-btn" class="secondary" type="button">
+                    🔓
+                    <span>Unlock</span>
+                  </button>
+                  <button id="issuer-refresh-btn" type="button" class="secondary">
+                    Refresh
+                  </button>
+                </div>
+              </div>
+              <div id="issuer-auth-error" class="error-text" style="display: none; margin-bottom: 0.6rem" data-auth-error>
+                Invalid password. Please try again.
               </div>
 
               <div class="panel" style="margin-bottom: 1rem">

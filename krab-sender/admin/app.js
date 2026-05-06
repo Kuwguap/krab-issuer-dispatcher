@@ -2640,6 +2640,12 @@ function setupEvents() {
   const loginBtn = document.getElementById("login-btn");
   const input = document.getElementById("admin-password-input");
   const err = document.getElementById("auth-error");
+  const txnLoginBtn = document.getElementById("txn-login-btn");
+  const txnInput = document.getElementById("txn-admin-password-input");
+  const txnErr = document.getElementById("txn-auth-error");
+  const issuerLoginBtn = document.getElementById("issuer-login-btn");
+  const issuerInput = document.getElementById("issuer-admin-password-input");
+  const issuerErr = document.getElementById("issuer-auth-error");
   const logoutBtn = document.getElementById("logout-btn");
   const refreshTableBtn = document.getElementById("refresh-table-btn");
   const summaryBtn = document.getElementById("summary-btn");
@@ -2692,11 +2698,21 @@ function setupEvents() {
   loadSummaryAiHistory();
   renderSummaryAiLog();
 
-  async function doLogin() {
-    const pw = input.value.trim();
+  function _clearAuthErrors() {
+    const errs = document.querySelectorAll("[data-auth-error]");
+    errs.forEach((e) => {
+      if (e && e.style) e.style.display = "none";
+    });
+    if (err) err.style.display = "none";
+    if (txnErr) txnErr.style.display = "none";
+    if (issuerErr) issuerErr.style.display = "none";
+  }
+
+  async function doLoginWithPassword(pwRaw, errEl) {
+    const pw = String(pwRaw || "").trim();
     if (!pw) return;
     storePassword(pw);
-    err.style.display = "none";
+    _clearAuthErrors();
     try {
       await refreshTransactions();
       await refreshLatest();
@@ -2706,16 +2722,42 @@ function setupEvents() {
     } catch (e) {
       console.error(e);
       storePassword("");
-      err.style.display = "block";
+      if (errEl && errEl.style) {
+        errEl.style.display = "block";
+      } else if (err) {
+        err.style.display = "block";
+      }
     }
   }
 
-  loginBtn.addEventListener("click", doLogin);
-  input.addEventListener("keydown", (ev) => {
-    if (ev.key === "Enter") {
-      doLogin();
-    }
-  });
+  async function doLoginFromMain() {
+    return doLoginWithPassword(input && input.value, err);
+  }
+  async function doLoginFromTxn() {
+    return doLoginWithPassword(txnInput && txnInput.value, txnErr);
+  }
+  async function doLoginFromIssuer() {
+    return doLoginWithPassword(issuerInput && issuerInput.value, issuerErr);
+  }
+
+  if (loginBtn) loginBtn.addEventListener("click", doLoginFromMain);
+  if (input) {
+    input.addEventListener("keydown", (ev) => {
+      if (ev.key === "Enter") doLoginFromMain();
+    });
+  }
+  if (txnLoginBtn) txnLoginBtn.addEventListener("click", doLoginFromTxn);
+  if (txnInput) {
+    txnInput.addEventListener("keydown", (ev) => {
+      if (ev.key === "Enter") doLoginFromTxn();
+    });
+  }
+  if (issuerLoginBtn) issuerLoginBtn.addEventListener("click", doLoginFromIssuer);
+  if (issuerInput) {
+    issuerInput.addEventListener("keydown", (ev) => {
+      if (ev.key === "Enter") doLoginFromIssuer();
+    });
+  }
 
   logoutBtn.addEventListener("click", () => {
     storePassword("");
