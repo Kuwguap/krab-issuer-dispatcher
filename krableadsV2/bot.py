@@ -2895,7 +2895,7 @@ async def handle_phase1_ai_review_callback(update, context):
         suspended = _get_suspended_driver_ids()
         if data == "seldrv_all":
             selected = [d for d in active if str(d["id"]) not in suspended]
-            names = ", ".join(d.get("driver_name", "?") for d in selected)
+            names = "All Drivers"
             ids = [d["id"] for d in selected]
         else:
             driver_id = data.replace("seldrv_", "")
