@@ -28,6 +28,7 @@ from .issuer_supabase import (
     fetch_lead_meta_by_references,
 )
 from .issuer_admin_api import router as issuer_admin_router
+from .issuer_admin_db import IssuerAdminDatabase
 
 
 NY_TZ = ZoneInfo("America/New_York")
@@ -443,6 +444,11 @@ class RecipientCreate(BaseModel):
     email: str
 
 
+class DispatchDriverCreate(BaseModel):
+    driver_name: str
+    driver_telegram_id: str
+
+
 class SummaryAiAskRequest(BaseModel):
     question: str
     summary: dict
@@ -552,6 +558,34 @@ def recipients_ui_delete(recipient_id: str):
     return {"success": True}
 
 
+def _issuer_db_open(config: ApiConfig) -> IssuerAdminDatabase:
+    if not config.supabase_configured():
+        raise HTTPException(
+            status_code=503,
+            detail="Configure SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY for Krab Issuer admin.",
+        )
+    return IssuerAdminDatabase(config.supabase_url, config.supabase_service_role_key)
+
+
+@app.post("/dispatch-drivers/ui")
+def dispatch_drivers_ui_create(body: DispatchDriverCreate, config: ApiConfig = Depends(get_api_config)):
+    """
+    Open (no-admin-password) endpoint used by the dashboard to add a Dispatch driver
+    by Telegram chat/user ID. Stored in Issuer Supabase `drivers` table.
+    """
+    db = _issuer_db_open(config)
+    try:
+        ok = db.create_driver(body.driver_name, body.driver_telegram_id, None)
+    except Exception as e:
+        err = str(e).lower()
+        if any(x in err for x in ("unique", "duplicate", "23505", "violates")):
+            raise HTTPException(status_code=409, detail="A driver with this Telegram ID already exists.") from e
+        raise HTTPException(status_code=500, detail=str(e)) from e
+    if not ok:
+        raise HTTPException(status_code=500, detail="Could not add driver")
+    return {"success": True, "message": "Driver added"}
+
+
 @app.options("/recipients")
 def options_recipients():
     return {}
@@ -569,6 +603,11 @@ def options_recipients_ui():
 
 @app.options("/recipients/ui/{recipient_id}")
 def options_recipients_ui_id(recipient_id: str):
+    return {}
+
+
+@app.options("/dispatch-drivers/ui")
+def options_dispatch_drivers_ui():
     return {}
 
 

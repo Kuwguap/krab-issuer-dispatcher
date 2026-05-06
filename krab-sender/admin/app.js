@@ -2804,6 +2804,43 @@ function setupEvents() {
     applyLoggedInUI(false);
   });
 
+  const dispatchAddDriverBtn = document.getElementById("dispatch-add-driver-btn");
+  if (dispatchAddDriverBtn) {
+    dispatchAddDriverBtn.addEventListener("click", async () => {
+      const name = (document.getElementById("dispatch-driver-name") || {}).value || "";
+      const tid = (document.getElementById("dispatch-driver-chat-id") || {}).value || "";
+      const msg = document.getElementById("dispatch-add-driver-msg");
+      const driver_name = String(name).trim();
+      const driver_telegram_id = String(tid).trim();
+      if (!driver_name || !driver_telegram_id) {
+        if (msg) msg.textContent = "Driver name and Telegram chat/user ID are required.";
+        return;
+      }
+      if (msg) msg.textContent = "Adding…";
+      try {
+        const res = await fetch(API_BASE + "/dispatch-drivers/ui", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ driver_name, driver_telegram_id }),
+        });
+        if (res.status === 409) {
+          if (msg) msg.textContent = "Driver already exists for this Telegram ID.";
+          return;
+        }
+        if (!res.ok) {
+          const txt = await res.text().catch(() => "");
+          throw new Error("HTTP_" + res.status + (txt ? ": " + txt : ""));
+        }
+        (document.getElementById("dispatch-driver-name") || {}).value = "";
+        (document.getElementById("dispatch-driver-chat-id") || {}).value = "";
+        if (msg) msg.textContent = "Driver added.";
+      } catch (e) {
+        console.error(e);
+        if (msg) msg.textContent = "Failed to add driver. Please try again.";
+      }
+    });
+  }
+
   refreshTableBtn.addEventListener("click", () => {
     refreshTransactions();
     refreshLatest();
