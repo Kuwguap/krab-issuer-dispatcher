@@ -2820,7 +2820,7 @@ function applyLoggedInUI(loggedIn) {
     if (b) b.style.display = loggedIn ? "inline-flex" : "none";
   });
 
-  // Krab Dispatch tab: when locked, show ONLY the Access panel.
+  // Krab Dispatch tab: when locked, show Access + Add driver (chatID); full dashboard after unlock.
   if (dispatchHeaderWrap) dispatchHeaderWrap.style.display = loggedIn ? "flex" : "none";
   if (dispatchTxPanel) dispatchTxPanel.style.display = loggedIn ? "block" : "none";
 
@@ -2830,14 +2830,22 @@ function applyLoggedInUI(loggedIn) {
   if (txnPrivateWrap) txnPrivateWrap.style.display = loggedIn ? "block" : "none";
   if (txnToolbarPrivate) txnToolbarPrivate.style.display = loggedIn ? "contents" : "none";
 
-  // Krab Issuer tab: when locked, show Access only; Telegram drivers + list after unlock.
+  // Krab Issuer tab: when locked, show Access only; main Issuer tools (groups, etc.) after unlock.
   if (issuerPageTitle) issuerPageTitle.style.display = loggedIn ? "block" : "none";
   if (issuerAuthArea) issuerAuthArea.style.display = loggedIn ? "none" : "block";
   if (issuerPrivateWrap) issuerPrivateWrap.style.display = loggedIn ? "block" : "none";
   if (issuerToolbarPrivate) issuerToolbarPrivate.style.display = loggedIn ? "contents" : "none";
+  // Krab Dispatch: Add driver (chatID) always visible; Drivers table only after unlock.
+  const issuerDriversListPanel = document.getElementById(
+    "issuer-drivers-list-panel"
+  );
   if (issuerSupabaseDriverStack) {
-    issuerSupabaseDriverStack.style.display = loggedIn ? "block" : "none";
-    issuerSupabaseDriverStack.setAttribute(
+    issuerSupabaseDriverStack.style.display = "block";
+    issuerSupabaseDriverStack.setAttribute("aria-hidden", "false");
+  }
+  if (issuerDriversListPanel) {
+    issuerDriversListPanel.style.display = loggedIn ? "block" : "none";
+    issuerDriversListPanel.setAttribute(
       "aria-hidden",
       loggedIn ? "false" : "true"
     );

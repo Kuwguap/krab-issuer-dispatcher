@@ -293,7 +293,7 @@
       }
 
       #panel-dispatch .dispatch-access-stack #auth-area,
-      #panel-dispatch .dispatch-access-stack #dispatch-recipient-card {
+      #panel-dispatch .dispatch-access-stack #issuer-supabase-driver-stack {
         width: 100%;
         display: flex;
         flex-direction: column;
@@ -302,32 +302,68 @@
       }
 
       #panel-dispatch .dispatch-access-stack #auth-area .field-row,
-      #panel-dispatch .dispatch-access-stack #dispatch-recipient-card .field-row {
+      #panel-dispatch .dispatch-access-stack #issuer-supabase-driver-stack .field-row {
         width: 100%;
         justify-content: center;
         flex-wrap: wrap;
         gap: 0.5rem;
       }
 
-      #panel-dispatch .dispatch-access-stack #auth-area input[type="password"],
-      #panel-dispatch .dispatch-access-stack #dispatch-recipient-card input[type="text"],
-      #panel-dispatch .dispatch-access-stack #dispatch-recipient-card input[type="email"] {
+      #panel-dispatch .dispatch-access-stack #auth-area input[type="password"] {
         flex: 0 1 auto;
         width: 100%;
         max-width: 100%;
         min-width: 0;
       }
 
+      /* Recipient form (Krab Issuer tab): large touch-friendly inputs (stacked). */
+      #panel-issuer #dispatch-recipient-card #recipient-form {
+        width: 100%;
+        max-width: 26rem;
+        align-self: stretch;
+      }
+
+      #panel-issuer #dispatch-recipient-card #recipient-form .dispatch-recipient-fields {
+        display: flex;
+        flex-direction: column;
+        gap: 0.65rem;
+        width: 100%;
+        margin-bottom: 0.65rem;
+      }
+
+      #panel-issuer #dispatch-recipient-card #recipient-form .dispatch-recipient-input {
+        width: 100%;
+        min-height: 3rem;
+        font-size: 1.02rem;
+        padding: 0.65rem 0.95rem;
+        border-radius: 0.65rem;
+        border: 1px solid var(--border-subtle);
+        background: rgba(15, 23, 42, 0.85);
+        color: var(--text-main);
+        box-sizing: border-box;
+      }
+
+      #panel-issuer #dispatch-recipient-card #recipient-form .dispatch-recipient-actions {
+        justify-content: center;
+        gap: 0.6rem;
+        flex-wrap: wrap;
+      }
+
       #panel-dispatch .dispatch-access-stack #auth-area .access-unlock-btn {
         flex-shrink: 0;
       }
 
-      #panel-dispatch .dispatch-access-stack #dispatch-recipient-card .panel-header {
+      #panel-dispatch .dispatch-access-stack #issuer-supabase-driver-stack .panel-title {
+        width: 100%;
+        text-align: center;
+      }
+
+      #panel-issuer #dispatch-recipient-card .panel-header {
         width: 100%;
         justify-content: center;
       }
 
-      #panel-dispatch .dispatch-access-stack #dispatch-recipient-card .panel-title {
+      #panel-issuer #dispatch-recipient-card .panel-title {
         width: 100%;
         text-align: center;
       }
@@ -354,12 +390,15 @@
       }
 
       #panel-dispatch #auth-area,
-      #panel-dispatch #dashboard-area,
-      #panel-dispatch #dispatch-recipient-card {
+      #panel-dispatch #dashboard-area {
         text-align: center;
       }
 
-      #panel-dispatch #recipient-list-wrap {
+      #panel-issuer #dispatch-recipient-card {
+        text-align: center;
+      }
+
+      #panel-issuer #recipient-list-wrap {
         text-align: left;
         align-self: stretch;
         width: 100%;
@@ -975,16 +1014,6 @@
         </button>
         <button
           type="button"
-          id="tab-dispatch"
-          class="tab"
-          role="tab"
-          aria-selected="false"
-          data-tab="dispatch"
-        >
-          Krab Dispatch
-        </button>
-        <button
-          type="button"
           id="tab-issuer"
           class="tab"
           role="tab"
@@ -992,6 +1021,16 @@
           data-tab="issuer"
         >
           Krab Issuer
+        </button>
+        <button
+          type="button"
+          id="tab-dispatch"
+          class="tab"
+          role="tab"
+          aria-selected="false"
+          data-tab="dispatch"
+        >
+          Krab Dispatch
         </button>
       </nav>
       <div class="tab-panels">
@@ -1118,367 +1157,6 @@
           </div>
         </div>
         <div
-          id="panel-dispatch"
-          class="tab-panel"
-          role="tabpanel"
-          aria-labelledby="tab-dispatch"
-        >
-    <div class="shell">
-      <div class="card">
-        <div class="tab-session-bar" style="display:flex; justify-content:flex-end; margin-bottom:0.55rem;">
-          <button type="button" id="dispatch-tab-logout-btn" class="secondary access-unlock-btn" style="display:none">
-            Log out
-          </button>
-        </div>
-        <div id="dispatch-header-wrap" class="header">
-          <div class="header-main">
-            <div class="header-brand">
-              <div class="header-brand-title">👑Krab Dispatch Admin🦀</div>
-              <div>
-                <a
-                  href="https://t.me/krabsenderbot"
-                  target="_blank"
-                  rel="noopener noreferrer"
-                  >🤖https://t.me/krabsenderbot</a>
-              </div>
-              <div>
-                <a
-                  href="https://krabdispatch.vercel.app"
-                  target="_blank"
-                  rel="noopener noreferrer"
-                  >🌐https://krabdispatch.vercel.app</a>
-              </div>
-              <p class="header-brand-tagline">
-                📊Monitor Weekly Performance📈
-              </p>
-            </div>
-          </div>
-          <div id="status-pill" class="status-pill">
-            <span class="dot dot-bad"></span>
-            <span id="status-text">Checking bot health...</span>
-          </div>
-        </div>
-
-        <div class="grid dispatch-main-grid">
-          <div id="dispatch-unlock-stack" class="dispatch-unlock-stack">
-            <div class="dispatch-access-stack">
-              <div class="panel-header">
-                <div class="panel-title">Access</div>
-              </div>
-              <div id="auth-area">
-                <div class="field-row">
-                  <input
-                    type="password"
-                    id="admin-password-input"
-                    class="access-password-input"
-                    placeholder="Enter admin password"
-                  />
-                  <button id="login-btn" class="access-unlock-btn">Unlock</button>
-                </div>
-                <div id="auth-error" class="error-text" style="display: none" data-auth-error>
-                  Invalid password. Please try again.
-                </div>
-                <div class="small">
-                  Password is validated against the backend using
-                  <code>X-Admin-Password</code>.
-                </div>
-              </div>
-
-              <div id="dispatch-recipient-card" class="panel" style="margin-top: 0.9rem">
-                <div class="panel-header" style="margin-bottom: 0.35rem">
-                  <div class="panel-title">Add driver</div>
-                  <button id="add-recipient-btn" type="button">
-                    ➕
-                    <span>Add</span>
-                  </button>
-                </div>
-                <div id="recipient-form" style="display: none; margin-bottom: 0.6rem">
-                  <div class="field-row">
-                    <input
-                      type="text"
-                      id="recipient-name-input"
-                      placeholder="Driver name"
-                      style="flex: 1"
-                    />
-                    <input
-                      type="email"
-                      id="recipient-email-input"
-                      placeholder="Email address"
-                      style="flex: 1"
-                    />
-                    <button id="save-recipient-btn">Save</button>
-                    <button id="cancel-recipient-btn" class="secondary">Cancel</button>
-                  </div>
-                  <div id="recipient-error" class="error-text" style="display: none"></div>
-                </div>
-                <div id="recipient-list-wrap" class="table-wrap" style="max-height: 200px">
-                  <table>
-                    <thead>
-                      <tr>
-                        <th>Name</th>
-                        <th>Email</th>
-                        <th>Actions</th>
-                      </tr>
-                    </thead>
-                    <tbody id="recipients-body">
-                      <tr>
-                        <td colspan="3" class="muted">Loading drivers…</td>
-                      </tr>
-                    </tbody>
-                  </table>
-                </div>
-              </div>
-            </div>
-
-            <div
-              id="dispatch-ai-chat-wrap"
-              class="panel summary-ai"
-              style="display: none"
-              aria-hidden="true"
-            >
-              <div class="panel-title" style="margin-bottom: 0.35rem">AI Data Q&amp;A</div>
-              <div class="issuer-muted-block" style="margin-bottom: 0.5rem; text-align: center">
-                Dispatch transmissions and Issuer leads line up on <code>reference_id</code>. Uses the same rolling window as Summary (NJ time) in the next section.
-              </div>
-              <div id="summary-ai-log" class="summary-ai-log">
-                <div class="summary-ai-msg assistant">
-                  Ask across both bots—for example counts by driver, refs, or receipt status.
-                </div>
-              </div>
-              <div class="field-row">
-                <input
-                  type="text"
-                  id="summary-ai-input"
-                  placeholder="Ask: how do Issuer receipts relate to Dispatch rows?"
-                />
-                <button id="summary-ai-ask-btn" type="button">Ask</button>
-              </div>
-              <div id="summary-ai-answer" class="small"></div>
-            </div>
-          </div>
-
-          <div id="dashboard-area" style="display: none; margin-top: 1rem">
-              <!-- Latest item -->
-              <div style="margin-bottom: 1rem">
-                <div class="panel-title" style="margin-bottom: 0.35rem">
-                  Latest item
-                </div>
-                <div id="latest-tx" class="small">
-                  No transmissions yet. Send a document through Krab Dispatch.
-                </div>
-              </div>
-
-              <!-- Weekly summary -->
-              <div>
-                <div
-                  class="panel-header summary-section-header"
-                  style="margin-bottom: 0.35rem"
-                >
-                  <div class="panel-title">Summary (NJ time)</div>
-                  <div class="summary-toolbar">
-                    <select
-                      id="summary-window"
-                      class="secondary"
-                      style="border-radius:999px;padding:0.35rem 0.6rem;background:transparent;color:var(--text-main);border:1px solid var(--border-subtle);"
-                    >
-                      <option value="1w" selected>1 week</option>
-                      <option value="1m">1 month</option>
-                      <option value="3m">3 months</option>
-                      <option value="6m">6 months</option>
-                      <option value="1y">1 year</option>
-                      <option value="all">All time</option>
-                    </select>
-                    <button id="summary-btn" type="button">
-                      ⚡
-                      <span>Generate</span>
-                    </button>
-                    <button id="summary-download-btn" class="secondary" type="button">
-                      ⬇
-                      <span>Download CSV</span>
-                    </button>
-                    <button id="summary-expand-btn" class="secondary" type="button">
-                      ⤢
-                      <span>Expand</span>
-                    </button>
-                    <span class="summary-zoom-controls">
-                      <button id="summary-zoom-out-btn" class="secondary" type="button">－</button>
-                      <button id="summary-zoom-reset-btn" class="secondary" type="button">100%</button>
-                      <button id="summary-zoom-in-btn" class="secondary" type="button">＋</button>
-                    </span>
-                  </div>
-                </div>
-                <div id="summary-meta" class="small">
-                  Period: <span id="summary-period">–</span>
-                </div>
-                <div class="summary-metrics">
-                  <div class="metric">
-                    <div class="metric-label">Total</div>
-                    <div id="summary-total" class="metric-value">0</div>
-                  </div>
-                  <div class="metric">
-                    <div class="metric-label">Estimated Revenue</div>
-                    <div id="summary-revenue" class="metric-value">$0</div>
-                  </div>
-                  <div class="metric">
-                    <div class="metric-label">Delivered</div>
-                    <div
-                      id="summary-delivered"
-                      class="metric-value success"
-                    >
-                      0
-                    </div>
-                  </div>
-                  <div class="metric">
-                    <div class="metric-label">Pending / Failed</div>
-                    <div
-                      id="summary-pending-failed"
-                      class="metric-value warning"
-                    >
-                      0 / 0
-                    </div>
-                  </div>
-                </div>
-                <div
-                  class="summary-metrics summary-metrics-issuer"
-                  style="margin-top: 0.5rem"
-                >
-                  <div class="metric">
-                    <div class="metric-label">Sensei issued/sent</div>
-                    <div id="summary-sensei" class="metric-value">0 / 0</div>
-                  </div>
-                  <div class="metric">
-                    <div class="metric-label">Highkage issued/sent</div>
-                    <div id="summary-highkage" class="metric-value">0 / 0</div>
-                  </div>
-                </div>
-                <div id="summary-status" class="small" style="margin-top: 0.4rem;">
-                  Click “Generate” to view the last 7 NJ days.
-                </div>
-                <div
-                  id="summary-table-wrapper"
-                  class="summary-table-wrapper"
-                  style="margin-top: 0.6rem;"
-                >
-                  <div class="expanded-controls">
-                    <button id="summary-expanded-zoom-out-btn" class="secondary" type="button">－</button>
-                    <button id="summary-expanded-zoom-reset-btn" class="secondary" type="button">100%</button>
-                    <button id="summary-expanded-zoom-in-btn" class="secondary" type="button">＋</button>
-                    <button id="summary-expanded-close-btn" class="secondary" type="button">Close</button>
-                  </div>
-                  <div class="table-wrap summary-table-wrap" id="summary-table" style="max-height: 220px;">
-                    <table>
-                      <thead>
-                        <tr>
-                          <th>#</th>
-                          <th>Time Date</th>
-                          <th>Client PDF Name</th>
-                          <th>Issuer Name</th>
-                          <th>Driver Name</th>
-                          <th>Success</th>
-                          <th>Status</th>
-                          <th>Count</th>
-                          <th>Issuer @Username</th>
-                          <th>Driver Email</th>
-                          <th>Reference</th>
-                          <th>Price</th>
-                          <th>Receipt Price</th>
-                          <th>Receipt</th>
-                        </tr>
-                      </thead>
-                      <tbody id="summary-tbody">
-                        <tr>
-                          <td colspan="13" class="muted">
-                            Generate a summary to see grouped results by sender.
-                          </td>
-                        </tr>
-                      </tbody>
-                    </table>
-                  </div>
-                </div>
-                <div style="margin-top: 0.75rem">
-                  <div class="panel-title" style="margin-bottom: 0.35rem">
-                    Summary Per Issuer
-                  </div>
-                  <div class="table-wrap">
-                    <table>
-                      <thead>
-                        <tr>
-                          <th>Issuer</th>
-                          <th>@Username</th>
-                          <th>Delivered</th>
-                          <th>Pending</th>
-                          <th>Drivers</th>
-                        </tr>
-                      </thead>
-                      <tbody id="summary-issuer-tbody">
-                        <tr>
-                          <td colspan="5" class="muted">
-                            Generate a summary to view per-issuer totals.
-                          </td>
-                        </tr>
-                      </tbody>
-                    </table>
-                  </div>
-                </div>
-              </div>
-          </div>
-
-          <!-- Transmissions (last: driver stack → latest → summaries → transmissions) -->
-          <section id="dispatch-transmissions-panel" class="panel">
-            <div class="panel-header">
-              <div class="panel-title">Transmissions</div>
-              <div style="display:flex;align-items:center;gap:0.35rem;flex-wrap:wrap;justify-content:flex-end">
-                <button id="refresh-table-btn">
-                  ⟳
-                  <span>Refresh</span>
-                </button>
-                <button id="tx-expand-btn" class="secondary" type="button">
-                  ⤢
-                  <span>Expand</span>
-                </button>
-                <span class="tx-zoom-controls">
-                  <button id="tx-zoom-out-btn" class="secondary" type="button">－</button>
-                  <button id="tx-zoom-reset-btn" class="secondary" type="button">100%</button>
-                  <button id="tx-zoom-in-btn" class="secondary" type="button">＋</button>
-                </span>
-              </div>
-            </div>
-            <div id="tx-table-wrapper" class="tx-table-wrapper">
-              <div class="tx-expanded-controls">
-                <button id="tx-expanded-zoom-out-btn" class="secondary" type="button">－</button>
-                <button id="tx-expanded-zoom-reset-btn" class="secondary" type="button">100%</button>
-                <button id="tx-expanded-zoom-in-btn" class="secondary" type="button">＋</button>
-                <button id="tx-expanded-close-btn" class="secondary" type="button">Close</button>
-              </div>
-              <div class="table-wrap tx-table-wrap" id="tx-table">
-                <table>
-                  <thead>
-                    <tr>
-                      <th>#</th>
-                      <th>Time (NJ)</th>
-                      <th>Client / File</th>
-                      <th>Issuer</th>
-                      <th>Driver</th>
-                      <th>Reference</th>
-                      <th>Status</th>
-                    </tr>
-                  </thead>
-                  <tbody id="tx-body">
-                    <tr>
-                      <td colspan="7" class="muted">
-                        Waiting for data... send a document through the bot.
-                      </td>
-                    </tr>
-                  </tbody>
-                </table>
-              </div>
-            </div>
-          </section>
-        </div>
-      </div>
-    </div>
-        </div>
-        <div
           id="panel-issuer"
           class="tab-panel"
           role="tabpanel"
@@ -1523,44 +1201,52 @@
                 </div>
               </div>
 
-              <div
-                id="issuer-supabase-driver-stack"
-                style="display: none"
-                aria-hidden="true"
-              >
-                <div class="panel" style="margin-bottom: 1rem">
-                  <div class="panel-title" style="margin-bottom: 0.5rem">Add driver (chatID)</div>
-                  <div class="field-row">
-                    <input type="text" id="issuer-driver-name" placeholder="Driver name" />
-                  </div>
-                  <div class="field-row">
-                    <input type="text" id="issuer-driver-tg-id" placeholder="Telegram chat/user ID" />
-                  </div>
-                  <div class="field-row">
-                    <input type="text" id="issuer-driver-phone" placeholder="Phone (optional)" />
-                  </div>
-                  <button id="issuer-add-driver-btn" type="button">Add driver</button>
+              <div id="dispatch-recipient-card" class="panel" style="margin-top: 0.9rem">
+                <div class="panel-header" style="margin-bottom: 0.35rem">
+                  <div class="panel-title">Add driver</div>
+                  <button id="add-recipient-btn" type="button">
+                    ➕
+                    <span>Add</span>
+                  </button>
                 </div>
-                <div class="panel" style="margin-bottom: 1rem">
-                  <div class="panel-title" style="margin-bottom: 0.5rem">Drivers</div>
-                  <div class="table-wrap" style="max-height: 240px">
-                    <table>
-                      <thead>
-                        <tr>
-                          <th>Name</th>
-                          <th>Telegram ID</th>
-                          <th>Phone</th>
-                          <th>Status</th>
-                          <th></th>
-                        </tr>
-                      </thead>
-                      <tbody id="issuer-drivers-tbody">
-                        <tr>
-                          <td colspan="5" class="muted">Unlock to load drivers.</td>
-                        </tr>
-                      </tbody>
-                    </table>
+                <div id="recipient-form" style="display: none; margin-bottom: 0.6rem">
+                  <div class="dispatch-recipient-fields">
+                    <input
+                      type="text"
+                      id="recipient-name-input"
+                      class="dispatch-recipient-input"
+                      placeholder="Driver name"
+                      autocomplete="name"
+                    />
+                    <input
+                      type="email"
+                      id="recipient-email-input"
+                      class="dispatch-recipient-input"
+                      placeholder="Email address"
+                      autocomplete="email"
+                    />
                   </div>
+                  <div class="field-row dispatch-recipient-actions">
+                    <button id="save-recipient-btn">Save</button>
+                    <button id="cancel-recipient-btn" class="secondary">Cancel</button>
+                  </div>
+                  <div id="recipient-error" class="error-text" style="display: none"></div>
+                </div>
+                <div id="recipient-list-wrap" class="table-wrap" style="max-height: 200px">
+                  <table>
+                    <thead>
+                      <tr>
+                        <th>Name</th>
+                        <th>Email</th>
+                        <th>Actions</th>
+                      </tr>
+                    </thead>
+                    <tbody id="recipients-body">
+                      <tr>
+                        <td colspan="3" class="muted">Loading drivers…</td>
+                      </tr>
+                    </tbody>
+                  </table>
                 </div>
               </div>
 
@@ -1831,6 +1517,368 @@
               </div>
             </div>
           </div>
+        </div>
+        <div
+          id="panel-dispatch"
+          class="tab-panel"
+          role="tabpanel"
+          aria-labelledby="tab-dispatch"
+        >
+    <div class="shell">
+      <div class="card">
+        <div class="tab-session-bar" style="display:flex; justify-content:flex-end; margin-bottom:0.55rem;">
+          <button type="button" id="dispatch-tab-logout-btn" class="secondary access-unlock-btn" style="display:none">
+            Log out
+          </button>
+        </div>
+        <div id="dispatch-header-wrap" class="header">
+          <div class="header-main">
+            <div class="header-brand">
+              <div class="header-brand-title">👑Krab Dispatch Admin🦀</div>
+              <div>
+                <a
+                  href="https://t.me/krabdispatchbot"
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  >🤖https://t.me/krabdispatchbot</a>
+              </div>
+              <div>
+                <a
+                  href="https://krabdispatch.vercel.app"
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  >🌐https://krabdispatch.vercel.app</a>
+              </div>
+              <p class="header-brand-tagline">
+                📊Monitor Weekly Performance📈
+              </p>
+            </div>
+          </div>
+          <div id="status-pill" class="status-pill">
+            <span class="dot dot-bad"></span>
+            <span id="status-text">Checking bot health...</span>
+          </div>
+        </div>
+
+        <div class="grid dispatch-main-grid">
+          <div id="dispatch-unlock-stack" class="dispatch-unlock-stack">
+            <div class="dispatch-access-stack">
+              <div class="panel-header">
+                <div class="panel-title">Access</div>
+              </div>
+              <div id="auth-area">
+                <div class="field-row">
+                  <input
+                    type="password"
+                    id="admin-password-input"
+                    class="access-password-input"
+                    placeholder="Enter admin password"
+                  />
+                  <button id="login-btn" class="access-unlock-btn">Unlock</button>
+                </div>
+                <div id="auth-error" class="error-text" style="display: none" data-auth-error>
+                  Invalid password. Please try again.
+                </div>
+                <div class="small">
+                  Password is validated against the backend using
+                  <code>X-Admin-Password</code>.
+                </div>
+              </div>
+
+              <div
+                id="issuer-supabase-driver-stack"
+                style="margin-top: 0.9rem"
+                aria-hidden="false"
+              >
+                <div class="panel" style="margin-bottom: 1rem">
+                  <div class="panel-title" style="margin-bottom: 0.5rem">Add driver (chatID)</div>
+                  <div class="field-row">
+                    <input type="text" id="issuer-driver-name" placeholder="Driver name" />
+                  </div>
+                  <div class="field-row">
+                    <input type="text" id="issuer-driver-tg-id" placeholder="Telegram chat/user ID" />
+                  </div>
+                  <div class="field-row">
+                    <input type="text" id="issuer-driver-phone" placeholder="Phone (optional)" />
+                  </div>
+                  <button id="issuer-add-driver-btn" type="button">Add driver</button>
+                </div>
+                <div
+                  id="issuer-drivers-list-panel"
+                  class="panel"
+                  style="display: none; margin-bottom: 1rem"
+                  aria-hidden="true"
+                >
+                  <div class="panel-title" style="margin-bottom: 0.5rem">Drivers</div>
+                  <div class="table-wrap" style="max-height: 240px">
+                    <table>
+                      <thead>
+                        <tr>
+                          <th>Name</th>
+                          <th>Telegram ID</th>
+                          <th>Phone</th>
+                          <th>Status</th>
+                          <th></th>
+                        </tr>
+                      </thead>
+                      <tbody id="issuer-drivers-tbody">
+                        <tr>
+                          <td colspan="5" class="muted">Unlock to load drivers.</td>
+                        </tr>
+                      </tbody>
+                    </table>
+                  </div>
+                </div>
+              </div>
+            </div>
+
+            <div
+              id="dispatch-ai-chat-wrap"
+              class="panel summary-ai"
+              style="display: none"
+              aria-hidden="true"
+            >
+              <div class="panel-title" style="margin-bottom: 0.35rem">AI Data Q&amp;A</div>
+              <div class="issuer-muted-block" style="margin-bottom: 0.5rem; text-align: center">
+                Dispatch transmissions and Issuer leads line up on <code>reference_id</code>. Uses the same rolling window as Summary (NJ time) in the next section.
+              </div>
+              <div id="summary-ai-log" class="summary-ai-log">
+                <div class="summary-ai-msg assistant">
+                  Ask across both bots—for example counts by driver, refs, or receipt status.
+                </div>
+              </div>
+              <div class="field-row">
+                <input
+                  type="text"
+                  id="summary-ai-input"
+                  placeholder="Ask: how do Issuer receipts relate to Dispatch rows?"
+                />
+                <button id="summary-ai-ask-btn" type="button">Ask</button>
+              </div>
+              <div id="summary-ai-answer" class="small"></div>
+            </div>
+          </div>
+
+          <div id="dashboard-area" style="display: none; margin-top: 1rem">
+              <!-- Latest item -->
+              <div style="margin-bottom: 1rem">
+                <div class="panel-title" style="margin-bottom: 0.35rem">
+                  Latest item
+                </div>
+                <div id="latest-tx" class="small">
+                  No transmissions yet. Send a document through Krab Dispatch.
+                </div>
+              </div>
+
+              <!-- Weekly summary -->
+              <div>
+                <div
+                  class="panel-header summary-section-header"
+                  style="margin-bottom: 0.35rem"
+                >
+                  <div class="panel-title">Summary (NJ time)</div>
+                  <div class="summary-toolbar">
+                    <select
+                      id="summary-window"
+                      class="secondary"
+                      style="border-radius:999px;padding:0.35rem 0.6rem;background:transparent;color:var(--text-main);border:1px solid var(--border-subtle);"
+                    >
+                      <option value="1w" selected>1 week</option>
+                      <option value="1m">1 month</option>
+                      <option value="3m">3 months</option>
+                      <option value="6m">6 months</option>
+                      <option value="1y">1 year</option>
+                      <option value="all">All time</option>
+                    </select>
+                    <button id="summary-btn" type="button">
+                      ⚡
+                      <span>Generate</span>
+                    </button>
+                    <button id="summary-download-btn" class="secondary" type="button">
+                      ⬇
+                      <span>Download CSV</span>
+                    </button>
+                    <button id="summary-expand-btn" class="secondary" type="button">
+                      ⤢
+                      <span>Expand</span>
+                    </button>
+                    <span class="summary-zoom-controls">
+                      <button id="summary-zoom-out-btn" class="secondary" type="button">－</button>
+                      <button id="summary-zoom-reset-btn" class="secondary" type="button">100%</button>
+                      <button id="summary-zoom-in-btn" class="secondary" type="button">＋</button>
+                    </span>
+                  </div>
+                </div>
+                <div id="summary-meta" class="small">
+                  Period: <span id="summary-period">–</span>
+                </div>
+                <div class="summary-metrics">
+                  <div class="metric">
+                    <div class="metric-label">Total</div>
+                    <div id="summary-total" class="metric-value">0</div>
+                  </div>
+                  <div class="metric">
+                    <div class="metric-label">Estimated Revenue</div>
+                    <div id="summary-revenue" class="metric-value">$0</div>
+                  </div>
+                  <div class="metric">
+                    <div class="metric-label">Delivered</div>
+                    <div
+                      id="summary-delivered"
+                      class="metric-value success"
+                    >
+                      0
+                    </div>
+                  </div>
+                  <div class="metric">
+                    <div class="metric-label">Pending / Failed</div>
+                    <div
+                      id="summary-pending-failed"
+                      class="metric-value warning"
+                    >
+                      0 / 0
+                    </div>
+                  </div>
+                </div>
+                <div
+                  class="summary-metrics summary-metrics-issuer"
+                  style="margin-top: 0.5rem"
+                >
+                  <div class="metric">
+                    <div class="metric-label">Sensei issued/sent</div>
+                    <div id="summary-sensei" class="metric-value">0 / 0</div>
+                  </div>
+                  <div class="metric">
+                    <div class="metric-label">Highkage issued/sent</div>
+                    <div id="summary-highkage" class="metric-value">0 / 0</div>
+                  </div>
+                </div>
+                <div id="summary-status" class="small" style="margin-top: 0.4rem;">
+                  Click “Generate” to view the last 7 NJ days.
+                </div>
+                <div
+                  id="summary-table-wrapper"
+                  class="summary-table-wrapper"
+                  style="margin-top: 0.6rem;"
+                >
+                  <div class="expanded-controls">
+                    <button id="summary-expanded-zoom-out-btn" class="secondary" type="button">－</button>
+                    <button id="summary-expanded-zoom-reset-btn" class="secondary" type="button">100%</button>
+                    <button id="summary-expanded-zoom-in-btn" class="secondary" type="button">＋</button>
+                    <button id="summary-expanded-close-btn" class="secondary" type="button">Close</button>
+                  </div>
+                  <div class="table-wrap summary-table-wrap" id="summary-table" style="max-height: 220px;">
+                    <table>
+                      <thead>
+                        <tr>
+                          <th>#</th>
+                          <th>Time Date</th>
+                          <th>Client PDF Name</th>
+                          <th>Issuer Name</th>
+                          <th>Driver Name</th>
+                          <th>Success</th>
+                          <th>Status</th>
+                          <th>Count</th>
+                          <th>Issuer @Username</th>
+                          <th>Driver Email</th>
+                          <th>Reference</th>
+                          <th>Price</th>
+                          <th>Receipt Price</th>
+                          <th>Receipt</th>
+                        </tr>
+                      </thead>
+                      <tbody id="summary-tbody">
+                        <tr>
+                          <td colspan="13" class="muted">
+                            Generate a summary to see grouped results by sender.
+                          </td>
+                        </tr>
+                      </tbody>
+                    </table>
+                  </div>
+                </div>
+                <div style="margin-top: 0.75rem">
+                  <div class="panel-title" style="margin-bottom: 0.35rem">
+                    Summary Per Issuer
+                  </div>
+                  <div class="table-wrap">
+                    <table>
+                      <thead>
+                        <tr>
+                          <th>Issuer</th>
+                          <th>@Username</th>
+                          <th>Delivered</th>
+                          <th>Pending</th>
+                          <th>Drivers</th>
+                        </tr>
+                      </thead>
+                      <tbody id="summary-issuer-tbody">
+                        <tr>
+                          <td colspan="5" class="muted">
+                            Generate a summary to view per-issuer totals.
+                          </td>
+                        </tr>
+                      </tbody>
+                    </table>
+                  </div>
+                </div>
+              </div>
+          </div>
+
+          <!-- Transmissions (last: driver stack → latest → summaries → transmissions) -->
+          <section id="dispatch-transmissions-panel" class="panel">
+            <div class="panel-header">
+              <div class="panel-title">Transmissions</div>
+              <div style="display:flex;align-items:center;gap:0.35rem;flex-wrap:wrap;justify-content:flex-end">
+                <button id="refresh-table-btn">
+                  ⟳
+                  <span>Refresh</span>
+                </button>
+                <button id="tx-expand-btn" class="secondary" type="button">
+                  ⤢
+                  <span>Expand</span>
+                </button>
+                <span class="tx-zoom-controls">
+                  <button id="tx-zoom-out-btn" class="secondary" type="button">－</button>
+                  <button id="tx-zoom-reset-btn" class="secondary" type="button">100%</button>
+                  <button id="tx-zoom-in-btn" class="secondary" type="button">＋</button>
+                </span>
+              </div>
+            </div>
+            <div id="tx-table-wrapper" class="tx-table-wrapper">
+              <div class="tx-expanded-controls">
+                <button id="tx-expanded-zoom-out-btn" class="secondary" type="button">－</button>
+                <button id="tx-expanded-zoom-reset-btn" class="secondary" type="button">100%</button>
+                <button id="tx-expanded-zoom-in-btn" class="secondary" type="button">＋</button>
+                <button id="tx-expanded-close-btn" class="secondary" type="button">Close</button>
+              </div>
+              <div class="table-wrap tx-table-wrap" id="tx-table">
+                <table>
+                  <thead>
+                    <tr>
+                      <th>#</th>
+                      <th>Time (NJ)</th>
+                      <th>Client / File</th>
+                      <th>Issuer</th>
+                      <th>Driver</th>
+                      <th>Reference</th>
+                      <th>Status</th>
+                    </tr>
+                  </thead>
+                  <tbody id="tx-body">
+                    <tr>
+                      <td colspan="7" class="muted">
+                        Waiting for data... send a document through the bot.
+                      </td>
+                    </tr>
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          </section>
+        </div>
+      </div>
+    </div>
         </div>
       </div>
     </div>
