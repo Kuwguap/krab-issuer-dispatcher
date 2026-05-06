@@ -2619,23 +2619,27 @@ function applyLoggedInUI(loggedIn) {
   const dispatchTxPanel = document.getElementById("dispatch-transmissions-panel");
   const txnPrivateWrap = document.getElementById("txn-private-wrap");
   const txnToolbarPrivate = document.getElementById("txn-toolbar-private");
+  const txnPageTitle = document.getElementById("txn-page-title");
+  const issuerPageTitle = document.getElementById("issuer-page-title");
   const issuerAddDriverWrap = document.getElementById("issuer-add-driver-wrap");
   const issuerPrivateWrap = document.getElementById("issuer-private-wrap");
   const issuerToolbarPrivate = document.getElementById("issuer-toolbar-private");
 
-  authArea.style.display = loggedIn ? "none" : "block";
-  dashArea.style.display = loggedIn ? "block" : "none";
-  logoutBtn.style.display = loggedIn ? "inline-flex" : "none";
+  if (authArea) authArea.style.display = loggedIn ? "none" : "block";
+  if (dashArea) dashArea.style.display = loggedIn ? "block" : "none";
+  if (logoutBtn) logoutBtn.style.display = loggedIn ? "inline-flex" : "none";
 
   // Krab Dispatch tab: when locked, show ONLY the Access panel.
   if (dispatchHeaderWrap) dispatchHeaderWrap.style.display = loggedIn ? "flex" : "none";
   if (dispatchTxPanel) dispatchTxPanel.style.display = loggedIn ? "block" : "none";
 
   // Transactions tab: when locked, show ONLY the Unlock controls in header.
+  if (txnPageTitle) txnPageTitle.style.display = loggedIn ? "block" : "none";
   if (txnPrivateWrap) txnPrivateWrap.style.display = loggedIn ? "block" : "none";
   if (txnToolbarPrivate) txnToolbarPrivate.style.display = loggedIn ? "contents" : "none";
 
   // Krab Issuer tab: when locked, show ONLY Unlock + Add driver.
+  if (issuerPageTitle) issuerPageTitle.style.display = loggedIn ? "block" : "none";
   if (issuerPrivateWrap) issuerPrivateWrap.style.display = loggedIn ? "block" : "none";
   if (issuerToolbarPrivate) issuerToolbarPrivate.style.display = loggedIn ? "contents" : "none";
   // Update: when locked, show ONLY the unlock controls (hide add-driver too).
@@ -3301,15 +3305,18 @@ function setupEvents() {
   applyTxZoom(1);
   applyTxnUnifiedZoom(1);
   updateRecipientConfidentialUI();
+
+  // Initial lock layout: without this, first paint shows tables before any login attempt.
+  applyLoggedInUI(!!String(getStoredPassword() || "").trim());
 }
 
-window.addEventListener("DOMContentLoaded", () => {
+window.addEventListener("DOMContentLoaded", async () => {
   setupAdminTabs();
   checkHealth();
   setupEvents();
   updateTxnAuthGate();
   renderUnifiedTransactions();
-  tryInitialLogin();
+  await tryInitialLogin();
   // If the Transactions tab is active on first load and we already have a
   // stored password, kick off the joined fetch immediately so the spreadsheet
   // is populated without the user switching tabs.
