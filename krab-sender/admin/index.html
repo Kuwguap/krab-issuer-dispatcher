@@ -249,67 +249,86 @@
         max-width: 1100px;
       }
 
+      /* PC: one column so Transmissions is full width and Access sits below, centered on screen */
+      @media (min-width: 841px) {
+        #panel-dispatch .grid {
+          grid-template-columns: minmax(0, 1fr);
+        }
+      }
+
       #panel-dispatch .panel-header {
         justify-content: center;
         flex-wrap: wrap;
         gap: 0.5rem;
       }
 
+      #panel-dispatch #dispatch-transmissions-panel .panel-header {
+        justify-content: space-between;
+      }
+
       #panel-dispatch .field-row {
         justify-content: center;
       }
 
-      /* Right column: stack Access + Add driver as a centered block (inputs no longer flex-fill). */
       #panel-dispatch .dispatch-side-panel {
+        display: flex;
+        flex-direction: column;
+        align-items: stretch;
+        width: 100%;
+      }
+
+      /* Narrow column centered in viewport (was trapped in the right grid half on desktop) */
+      #panel-dispatch .dispatch-access-stack {
         display: flex;
         flex-direction: column;
         align-items: center;
         text-align: center;
+        width: 100%;
+        max-width: 26rem;
+        margin-inline: auto;
+        box-sizing: border-box;
       }
 
-      #panel-dispatch .dispatch-side-panel > .panel-header {
+      #panel-dispatch .dispatch-access-stack > .panel-header {
         width: 100%;
         justify-content: center;
       }
 
-      #panel-dispatch .dispatch-side-panel #auth-area,
-      #panel-dispatch .dispatch-side-panel #dispatch-add-driver-wrap {
+      #panel-dispatch .dispatch-access-stack #auth-area,
+      #panel-dispatch .dispatch-access-stack #dispatch-add-driver-wrap {
         width: 100%;
-        max-width: 22rem;
         display: flex;
         flex-direction: column;
         align-items: center;
         text-align: center;
       }
 
-      #panel-dispatch .dispatch-side-panel #auth-area .field-row,
-      #panel-dispatch .dispatch-side-panel #dispatch-add-driver-wrap .field-row {
+      #panel-dispatch .dispatch-access-stack #auth-area .field-row,
+      #panel-dispatch .dispatch-access-stack #dispatch-add-driver-wrap .field-row {
         width: 100%;
-        max-width: 22rem;
         justify-content: center;
         flex-wrap: wrap;
         gap: 0.5rem;
       }
 
-      #panel-dispatch .dispatch-side-panel #auth-area input[type="password"],
-      #panel-dispatch .dispatch-side-panel #dispatch-add-driver-wrap input[type="text"] {
+      #panel-dispatch .dispatch-access-stack #auth-area input[type="password"],
+      #panel-dispatch .dispatch-access-stack #dispatch-add-driver-wrap input[type="text"] {
         flex: 0 1 auto;
         width: 100%;
         max-width: 100%;
         min-width: 0;
       }
 
-      #panel-dispatch .dispatch-side-panel #auth-area .access-unlock-btn,
-      #panel-dispatch .dispatch-side-panel #dispatch-add-driver-wrap #dispatch-add-driver-btn {
+      #panel-dispatch .dispatch-access-stack #auth-area .access-unlock-btn,
+      #panel-dispatch .dispatch-access-stack #dispatch-add-driver-wrap #dispatch-add-driver-btn {
         flex-shrink: 0;
       }
 
-      #panel-dispatch .dispatch-side-panel #dispatch-add-driver-wrap .panel-title {
+      #panel-dispatch .dispatch-access-stack #dispatch-add-driver-wrap .panel-title {
         width: 100%;
         text-align: center;
       }
 
-      /* Logged-in dashboard/tables: use full width of the grid cell. */
       #panel-dispatch .dispatch-side-panel #dashboard-area {
         align-self: stretch;
         width: 100%;
@@ -1172,39 +1191,41 @@
 
           <!-- Right: Auth + latest + summary -->
           <section class="panel dispatch-side-panel">
-            <!-- Auth -->
-            <div class="panel-header">
-              <div class="panel-title">Access</div>
-            </div>
-            <div id="auth-area">
-              <div class="field-row">
-                <input
-                  type="password"
-                  id="admin-password-input"
-                  class="access-password-input"
-                  placeholder="Enter admin password"
-                />
-                <button id="login-btn" class="access-unlock-btn">Unlock</button>
+            <div class="dispatch-access-stack">
+              <!-- Auth -->
+              <div class="panel-header">
+                <div class="panel-title">Access</div>
               </div>
-              <div id="auth-error" class="error-text" style="display: none" data-auth-error>
-                Invalid password. Please try again.
+              <div id="auth-area">
+                <div class="field-row">
+                  <input
+                    type="password"
+                    id="admin-password-input"
+                    class="access-password-input"
+                    placeholder="Enter admin password"
+                  />
+                  <button id="login-btn" class="access-unlock-btn">Unlock</button>
+                </div>
+                <div id="auth-error" class="error-text" style="display: none" data-auth-error>
+                  Invalid password. Please try again.
+                </div>
+                <div class="small">
+                  Password is validated against the backend using
+                  <code>X-Admin-Password</code>.
+                </div>
               </div>
-              <div class="small">
-                Password is validated against the backend using
-                <code>X-Admin-Password</code>.
-              </div>
-            </div>
 
-            <div id="dispatch-add-driver-wrap" class="panel" style="margin-top: 0.9rem">
-              <div class="panel-title" style="margin-bottom: 0.5rem">Add driver (chatID)</div>
-              <div class="field-row">
-                <input type="text" id="dispatch-driver-name" placeholder="Driver name" />
+              <div id="dispatch-add-driver-wrap" class="panel" style="margin-top: 0.9rem">
+                <div class="panel-title" style="margin-bottom: 0.5rem">Add driver (chatID)</div>
+                <div class="field-row">
+                  <input type="text" id="dispatch-driver-name" placeholder="Driver name" />
+                </div>
+                <div class="field-row">
+                  <input type="text" id="dispatch-driver-chat-id" placeholder="Telegram chat/user ID" />
+                </div>
+                <button id="dispatch-add-driver-btn" type="button">Add driver</button>
+                <div id="dispatch-add-driver-msg" class="small" style="margin-top: 0.5rem"></div>
               </div>
-              <div class="field-row">
-                <input type="text" id="dispatch-driver-chat-id" placeholder="Telegram chat/user ID" />
-              </div>
-              <button id="dispatch-add-driver-btn" type="button">Add driver</button>
-              <div id="dispatch-add-driver-msg" class="small" style="margin-top: 0.5rem"></div>
             </div>
 
             <div id="dashboard-area" style="display: none; margin-top: 1rem">
