@@ -2619,6 +2619,7 @@ function applyLoggedInUI(loggedIn) {
   const dispatchTxPanel = document.getElementById("dispatch-transmissions-panel");
   const txnPrivateWrap = document.getElementById("txn-private-wrap");
   const txnToolbarPrivate = document.getElementById("txn-toolbar-private");
+  const issuerAddDriverWrap = document.getElementById("issuer-add-driver-wrap");
   const issuerPrivateWrap = document.getElementById("issuer-private-wrap");
   const issuerToolbarPrivate = document.getElementById("issuer-toolbar-private");
 
@@ -2637,6 +2638,8 @@ function applyLoggedInUI(loggedIn) {
   // Krab Issuer tab: when locked, show ONLY Unlock + Add driver.
   if (issuerPrivateWrap) issuerPrivateWrap.style.display = loggedIn ? "block" : "none";
   if (issuerToolbarPrivate) issuerToolbarPrivate.style.display = loggedIn ? "contents" : "none";
+  // Update: when locked, show ONLY the unlock controls (hide add-driver too).
+  if (issuerAddDriverWrap) issuerAddDriverWrap.style.display = loggedIn ? "block" : "none";
 }
 
 async function tryInitialLogin() {
