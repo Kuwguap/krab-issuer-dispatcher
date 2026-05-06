@@ -2620,10 +2620,12 @@ function applyLoggedInUI(loggedIn) {
   const txnPrivateWrap = document.getElementById("txn-private-wrap");
   const txnToolbarPrivate = document.getElementById("txn-toolbar-private");
   const txnPageTitle = document.getElementById("txn-page-title");
+  const txnAuthArea = document.getElementById("txn-auth-area");
   const issuerPageTitle = document.getElementById("issuer-page-title");
   const issuerAddDriverWrap = document.getElementById("issuer-add-driver-wrap");
   const issuerPrivateWrap = document.getElementById("issuer-private-wrap");
   const issuerToolbarPrivate = document.getElementById("issuer-toolbar-private");
+  const issuerAuthArea = document.getElementById("issuer-auth-area");
 
   if (authArea) authArea.style.display = loggedIn ? "none" : "block";
   if (dashArea) dashArea.style.display = loggedIn ? "block" : "none";
@@ -2635,15 +2637,17 @@ function applyLoggedInUI(loggedIn) {
 
   // Transactions tab: when locked, show ONLY the Unlock controls in header.
   if (txnPageTitle) txnPageTitle.style.display = loggedIn ? "block" : "none";
+  if (txnAuthArea) txnAuthArea.style.display = loggedIn ? "none" : "block";
   if (txnPrivateWrap) txnPrivateWrap.style.display = loggedIn ? "block" : "none";
   if (txnToolbarPrivate) txnToolbarPrivate.style.display = loggedIn ? "contents" : "none";
 
-  // Krab Issuer tab: when locked, show ONLY Unlock + Add driver.
+  // Krab Issuer tab: when locked, show Access + Add driver.
   if (issuerPageTitle) issuerPageTitle.style.display = loggedIn ? "block" : "none";
+  if (issuerAuthArea) issuerAuthArea.style.display = loggedIn ? "none" : "block";
   if (issuerPrivateWrap) issuerPrivateWrap.style.display = loggedIn ? "block" : "none";
   if (issuerToolbarPrivate) issuerToolbarPrivate.style.display = loggedIn ? "contents" : "none";
-  // Update: when locked, show ONLY the unlock controls (hide add-driver too).
-  if (issuerAddDriverWrap) issuerAddDriverWrap.style.display = loggedIn ? "block" : "none";
+  // Keep add-driver visible even when locked (list stays hidden until unlocked).
+  if (issuerAddDriverWrap) issuerAddDriverWrap.style.display = "block";
 }
 
 async function tryInitialLogin() {

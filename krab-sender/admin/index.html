@@ -842,13 +842,6 @@
               <div class="panel-header" style="margin-bottom: 1rem">
                 <div id="txn-page-title" class="panel-title">Transactions (unified ledger)</div>
                 <div style="display:flex;align-items:center;gap:0.4rem;flex-wrap:wrap;justify-content:flex-end">
-                  <input
-                    type="password"
-                    id="txn-admin-password-input"
-                    class="access-password-input"
-                    placeholder="Enter admin password"
-                  />
-                  <button id="txn-login-btn" class="secondary access-unlock-btn" type="button">Unlock</button>
                   <span id="txn-toolbar-private" style="display: contents">
                     <select
                       id="txn-period-select"
@@ -887,10 +880,28 @@
                   </span>
                 </div>
               </div>
-              <div id="txn-private-wrap">
-              <div id="txn-auth-error" class="error-text" style="display: none; margin-bottom: 0.6rem" data-auth-error>
-                Invalid password. Please try again.
+              <div id="txn-auth-area" style="margin-bottom: 0.75rem">
+                <div class="panel-header">
+                  <div class="panel-title">Access</div>
+                </div>
+                <div class="field-row">
+                  <input
+                    type="password"
+                    id="txn-admin-password-input"
+                    class="access-password-input"
+                    placeholder="Enter admin password"
+                  />
+                  <button id="txn-login-btn" class="access-unlock-btn">Unlock</button>
+                </div>
+                <div id="txn-auth-error" class="error-text" style="display: none" data-auth-error>
+                  Invalid password. Please try again.
+                </div>
+                <div class="small">
+                  Password is validated against the backend using
+                  <code>X-Admin-Password</code>.
+                </div>
               </div>
+              <div id="txn-private-wrap">
               <div id="txn-no-auth" class="issuer-muted-block" style="display: none; color: var(--text-muted); font-size: 0.85rem; margin-bottom: 0.7rem;">
                 Unlock on the <strong>Krab Dispatch</strong> tab first. The unified transactions ledger uses the same admin password.
               </div>
@@ -1253,13 +1264,6 @@
               <div class="panel-header" style="margin-bottom: 1rem">
                 <div id="issuer-page-title" class="panel-title">Krab Issuer</div>
                 <div style="display:flex;align-items:center;gap:0.4rem;flex-wrap:wrap;justify-content:flex-end">
-                  <input
-                    type="password"
-                    id="issuer-admin-password-input"
-                    class="access-password-input"
-                    placeholder="Enter admin password"
-                  />
-                  <button id="issuer-login-btn" class="secondary access-unlock-btn" type="button">Unlock</button>
                   <span id="issuer-toolbar-private" style="display: contents">
                     <button id="issuer-refresh-btn" type="button" class="secondary">
                       Refresh
@@ -1267,8 +1271,26 @@
                   </span>
                 </div>
               </div>
-              <div id="issuer-auth-error" class="error-text" style="display: none; margin-bottom: 0.6rem" data-auth-error>
-                Invalid password. Please try again.
+              <div id="issuer-auth-area" style="margin-bottom: 0.75rem">
+                <div class="panel-header">
+                  <div class="panel-title">Access</div>
+                </div>
+                <div class="field-row">
+                  <input
+                    type="password"
+                    id="issuer-admin-password-input"
+                    class="access-password-input"
+                    placeholder="Enter admin password"
+                  />
+                  <button id="issuer-login-btn" class="access-unlock-btn">Unlock</button>
+                </div>
+                <div id="issuer-auth-error" class="error-text" style="display: none" data-auth-error>
+                  Invalid password. Please try again.
+                </div>
+                <div class="small">
+                  Password is validated against the backend using
+                  <code>X-Admin-Password</code>.
+                </div>
               </div>
 
               <div id="issuer-add-driver-wrap" class="panel" style="margin-bottom: 1rem">
