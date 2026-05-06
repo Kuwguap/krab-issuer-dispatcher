@@ -447,6 +447,7 @@ class RecipientCreate(BaseModel):
 class DispatchDriverCreate(BaseModel):
     driver_name: str
     driver_telegram_id: str
+    phone_number: Optional[str] = None
 
 
 class SummaryAiAskRequest(BaseModel):
@@ -592,7 +593,11 @@ def dispatch_drivers_ui_create(body: DispatchDriverCreate, config: ApiConfig = D
     """
     db = _issuer_db_open(config)
     try:
-        ok = db.create_driver(body.driver_name, body.driver_telegram_id, None)
+        ok = db.create_driver(
+            body.driver_name,
+            body.driver_telegram_id,
+            (body.phone_number or "").strip() or None,
+        )
     except Exception as e:
         err = str(e).lower()
         if any(x in err for x in ("unique", "duplicate", "23505", "violates")):

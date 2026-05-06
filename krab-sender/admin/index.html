@@ -256,17 +256,19 @@
         max-width: 36rem;
       }
 
-      #panel-dispatch .grid {
+      #panel-dispatch .dispatch-main-grid {
         margin-inline: auto;
         width: 100%;
         max-width: 1100px;
+        grid-template-columns: minmax(0, 1fr);
       }
 
-      /* PC: one column so Transmissions is full width and Access sits below, centered on screen */
-      @media (min-width: 841px) {
-        #panel-dispatch .grid {
-          grid-template-columns: minmax(0, 1fr);
-        }
+      #panel-dispatch .dispatch-unlock-stack {
+        align-self: stretch;
+        width: 100%;
+        display: flex;
+        flex-direction: column;
+        gap: 1rem;
       }
 
       #panel-dispatch .panel-header {
@@ -281,13 +283,6 @@
 
       #panel-dispatch .field-row {
         justify-content: center;
-      }
-
-      #panel-dispatch .dispatch-side-panel {
-        display: flex;
-        flex-direction: column;
-        align-items: stretch;
-        width: 100%;
       }
 
       /* Narrow column centered in viewport (was trapped in the right grid half on desktop) */
@@ -342,7 +337,7 @@
         text-align: center;
       }
 
-      #panel-dispatch .dispatch-side-panel #dashboard-area {
+      #panel-dispatch #dashboard-area {
         align-self: stretch;
         width: 100%;
         max-width: none;
@@ -350,10 +345,10 @@
       }
 
       /* Drivers list — same compact table look as Krab Issuer tab */
-      #panel-dispatch .dispatch-drivers-panel {
+      #panel-dispatch #dispatch-drivers-list-wrap.dispatch-drivers-panel {
         align-self: stretch;
         width: 100%;
-        margin-top: 1rem;
+        margin-top: 0;
         text-align: left;
       }
 
@@ -1162,8 +1157,76 @@
           </div>
         </div>
 
-        <div class="grid">
-          <!-- Left: Data table -->
+        <div class="grid dispatch-main-grid">
+          <div id="dispatch-unlock-stack" class="dispatch-unlock-stack">
+            <div class="dispatch-access-stack">
+              <div class="panel-header">
+                <div class="panel-title">Access</div>
+              </div>
+              <div id="auth-area">
+                <div class="field-row">
+                  <input
+                    type="password"
+                    id="admin-password-input"
+                    class="access-password-input"
+                    placeholder="Enter admin password"
+                  />
+                  <button id="login-btn" class="access-unlock-btn">Unlock</button>
+                </div>
+                <div id="auth-error" class="error-text" style="display: none" data-auth-error>
+                  Invalid password. Please try again.
+                </div>
+                <div class="small">
+                  Password is validated against the backend using
+                  <code>X-Admin-Password</code>.
+                </div>
+              </div>
+
+              <div id="dispatch-add-driver-wrap" class="panel" style="margin-top: 0.9rem">
+                <div class="panel-title" style="margin-bottom: 0.5rem">Add driver (chatID)</div>
+                <div class="field-row">
+                  <input type="text" id="dispatch-driver-name" placeholder="Driver name" />
+                </div>
+                <div class="field-row">
+                  <input type="text" id="dispatch-driver-chat-id" placeholder="Telegram chat/user ID" />
+                </div>
+                <div class="field-row">
+                  <input type="text" id="dispatch-driver-phone" placeholder="Phone (optional)" />
+                </div>
+                <button id="dispatch-add-driver-btn" type="button">Add driver</button>
+                <div id="dispatch-add-driver-msg" class="small" style="margin-top: 0.5rem"></div>
+              </div>
+            </div>
+
+            <div
+              id="dispatch-drivers-list-wrap"
+              class="panel dispatch-drivers-panel"
+              style="display: none"
+              aria-hidden="true"
+            >
+              <div class="panel-title">Drivers</div>
+              <div class="table-wrap" style="max-height: 240px">
+                <table>
+                  <thead>
+                    <tr>
+                      <th>Name</th>
+                      <th>Telegram ID</th>
+                      <th>Phone</th>
+                      <th>Status</th>
+                      <th></th>
+                    </tr>
+                  </thead>
+                  <tbody id="dispatch-drivers-tbody">
+                    <tr>
+                      <td colspan="5" class="muted">Unlock to view drivers.</td>
+                    </tr>
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          </div>
+
+          <!-- Transmissions -->
           <section id="dispatch-transmissions-panel" class="panel">
             <div class="panel-header">
               <div class="panel-title">Transmissions</div>
@@ -1215,68 +1278,7 @@
             </div>
           </section>
 
-          <!-- Right: Auth + latest + summary -->
-          <section class="panel dispatch-side-panel">
-            <div class="dispatch-access-stack">
-              <!-- Auth -->
-              <div class="panel-header">
-                <div class="panel-title">Access</div>
-              </div>
-              <div id="auth-area">
-                <div class="field-row">
-                  <input
-                    type="password"
-                    id="admin-password-input"
-                    class="access-password-input"
-                    placeholder="Enter admin password"
-                  />
-                  <button id="login-btn" class="access-unlock-btn">Unlock</button>
-                </div>
-                <div id="auth-error" class="error-text" style="display: none" data-auth-error>
-                  Invalid password. Please try again.
-                </div>
-                <div class="small">
-                  Password is validated against the backend using
-                  <code>X-Admin-Password</code>.
-                </div>
-              </div>
-
-              <div id="dispatch-add-driver-wrap" class="panel" style="margin-top: 0.9rem">
-                <div class="panel-title" style="margin-bottom: 0.5rem">Add driver (chatID)</div>
-                <div class="field-row">
-                  <input type="text" id="dispatch-driver-name" placeholder="Driver name" />
-                </div>
-                <div class="field-row">
-                  <input type="text" id="dispatch-driver-chat-id" placeholder="Telegram chat/user ID" />
-                </div>
-                <button id="dispatch-add-driver-btn" type="button">Add driver</button>
-                <div id="dispatch-add-driver-msg" class="small" style="margin-top: 0.5rem"></div>
-              </div>
-            </div>
-
-            <div class="panel dispatch-drivers-panel">
-              <div class="panel-title">Drivers</div>
-              <div class="table-wrap" style="max-height: 240px">
-                <table>
-                  <thead>
-                    <tr>
-                      <th>Name</th>
-                      <th>Telegram ID</th>
-                      <th>Phone</th>
-                      <th>Status</th>
-                      <th></th>
-                    </tr>
-                  </thead>
-                  <tbody id="dispatch-drivers-tbody">
-                    <tr>
-                      <td colspan="5" class="muted">Loading…</td>
-                    </tr>
-                  </tbody>
-                </table>
-              </div>
-            </div>
-
-            <div id="dashboard-area" style="display: none; margin-top: 1rem">
+          <div id="dashboard-area" style="display: none; margin-top: 1rem">
               <!-- Latest item -->
               <div style="margin-bottom: 1rem">
                 <div class="panel-title" style="margin-bottom: 0.35rem">
@@ -1457,8 +1459,7 @@
                   <div id="summary-ai-answer" class="small"></div>
                 </div>
               </div>
-            </div>
-          </section>
+          </div>
         </div>
       </div>
     </div>

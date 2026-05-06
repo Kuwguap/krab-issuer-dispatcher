@@ -1192,6 +1192,11 @@ function renderDispatchDrivers(drivers) {
 async function refreshDispatchDriversList() {
   const tb = document.getElementById("dispatch-drivers-tbody");
   if (!tb) return;
+  if (!hasAdminPassword()) {
+    tb.innerHTML =
+      '<tr><td colspan="5" class="muted">Unlock to view drivers.</td></tr>';
+    return;
+  }
   try {
     const res = await fetch(API_BASE + "/dispatch-drivers/ui");
     if (res.status === 503) {
@@ -2778,6 +2783,9 @@ function applyLoggedInUI(loggedIn) {
   const issuerPageTitle = document.getElementById("issuer-page-title");
   const issuerAddDriverWrap = document.getElementById("issuer-add-driver-wrap");
   const issuerPrivateWrap = document.getElementById("issuer-private-wrap");
+  const dispatchDriversListWrap = document.getElementById(
+    "dispatch-drivers-list-wrap"
+  );
   const issuerToolbarPrivate = document.getElementById("issuer-toolbar-private");
   const issuerAuthArea = document.getElementById("issuer-auth-area");
 
@@ -2805,6 +2813,15 @@ function applyLoggedInUI(loggedIn) {
   if (issuerToolbarPrivate) issuerToolbarPrivate.style.display = loggedIn ? "contents" : "none";
   // Keep add-driver visible even when locked (list stays hidden until unlocked).
   if (issuerAddDriverWrap) issuerAddDriverWrap.style.display = "block";
+
+  // Krab Dispatch: Telegram drivers list mirrors Issuer (private until unlocked).
+  if (dispatchDriversListWrap) {
+    dispatchDriversListWrap.style.display = loggedIn ? "block" : "none";
+    dispatchDriversListWrap.setAttribute(
+      "aria-hidden",
+      loggedIn ? "false" : "true"
+    );
+  }
 }
 
 async function tryInitialLogin() {
@@ -2952,19 +2969,24 @@ function setupEvents() {
     dispatchAddDriverBtn.addEventListener("click", async () => {
       const name = (document.getElementById("dispatch-driver-name") || {}).value || "";
       const tid = (document.getElementById("dispatch-driver-chat-id") || {}).value || "";
+      const phoneRaw =
+        (document.getElementById("dispatch-driver-phone") || {}).value || "";
       const msg = document.getElementById("dispatch-add-driver-msg");
       const driver_name = String(name).trim();
       const driver_telegram_id = String(tid).trim();
+      const phone_number = String(phoneRaw || "").trim();
       if (!driver_name || !driver_telegram_id) {
         if (msg) msg.textContent = "Driver name and Telegram chat/user ID are required.";
         return;
       }
       if (msg) msg.textContent = "Adding…";
       try {
+        const body = { driver_name, driver_telegram_id };
+        if (phone_number) body.phone_number = phone_number;
         const res = await fetch(API_BASE + "/dispatch-drivers/ui", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ driver_name, driver_telegram_id }),
+          body: JSON.stringify(body),
         });
         if (res.status === 409) {
           if (msg) msg.textContent = "Driver already exists for this Telegram ID.";
@@ -2976,6 +2998,7 @@ function setupEvents() {
         }
         (document.getElementById("dispatch-driver-name") || {}).value = "";
         (document.getElementById("dispatch-driver-chat-id") || {}).value = "";
+        (document.getElementById("dispatch-driver-phone") || {}).value = "";
         if (msg) msg.textContent = "Driver added.";
         refreshDispatchDriversList();
       } catch (e) {
@@ -3504,10 +3527,12 @@ function setupEvents() {
       refreshRecipients();
       maybeRefreshIssuerTab();
       maybeRefreshTxnTab();
+      refreshDispatchDriversList();
     } else {
       updateIssuerAuthGate();
       updateTxnAuthGate();
       updateRecipientConfidentialUI();
+      refreshDispatchDriversList();
     }
   };
 
