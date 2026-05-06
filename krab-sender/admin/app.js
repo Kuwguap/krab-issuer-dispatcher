@@ -250,6 +250,30 @@ function storePassword(pw) {
   }
 }
 
+function hasAdminPassword() {
+  return !!String(getStoredPassword() || "").trim();
+}
+
+function syncAdminPasswordInputs(value) {
+  const v = String(value || "");
+  ["admin-password-input", "txn-admin-password-input", "issuer-admin-password-input"].forEach(
+    (id) => {
+      const el = document.getElementById(id);
+      if (el) el.value = v;
+    }
+  );
+}
+
+function clearAdminAuthErrorDisplays() {
+  document.querySelectorAll("[data-auth-error]").forEach((e) => {
+    if (e && e.style) e.style.display = "none";
+  });
+  ["auth-error", "txn-auth-error", "issuer-auth-error"].forEach((id) => {
+    const el = document.getElementById(id);
+    if (el && el.style) el.style.display = "none";
+  });
+}
+
 async function fetchWithAdmin(path, opts = {}) {
   const pw = getStoredPassword();
   if (!pw) {
@@ -726,6 +750,10 @@ async function refreshUnifiedTransactions() {
   const res = await requestWithAdminJson(
     txnTransactionsUrl("/transactions/full", 2000)
   );
+  if (!hasAdminPassword()) {
+    _txnLoading = false;
+    return;
+  }
   _txnLoading = false;
   if (!res.ok) {
     const err = res.error || ("HTTP_" + (res.status || 0));
@@ -748,9 +776,15 @@ async function refreshUnifiedTransactions() {
     const basic = await requestWithAdminJson(
       txnTransactionsUrl("/transactions", 200)
     );
+    if (!hasAdminPassword()) {
+      return;
+    }
     if (basic.ok) {
       _txnRows = _mapBasicTxToUnifiedRows(basic.data);
     }
+  }
+  if (!hasAdminPassword()) {
+    return;
   }
   const periodSel = document.getElementById("txn-period-select");
   const rangeLabel =
@@ -765,6 +799,19 @@ async function refreshUnifiedTransactions() {
       : ""
   );
   renderUnifiedTransactions();
+}
+
+function doAdminLogout() {
+  storePassword("");
+  syncAdminPasswordInputs("");
+  clearAdminAuthErrorDisplays();
+  _txnLoading = false;
+  _txnRows = [];
+  setTxnBanner("");
+  setTxnStatus("");
+  renderUnifiedTransactions();
+  setIssuerBanner("");
+  applyLoggedInUI(false);
 }
 
 function maybeRefreshTxnTab() {
@@ -1329,6 +1376,9 @@ async function refreshIssuerAdmin() {
     return;
   }
   const gRes = await issuerApiJson("/issuer-admin/groups");
+  if (!hasAdminPassword()) {
+    return;
+  }
   if (!gRes.ok) {
     setIssuerBanner(
       gRes.status === 503
@@ -1359,6 +1409,9 @@ async function refreshIssuerAdmin() {
     issuerApiJson("/issuer-admin/receipts/submitted?limit=80"),
     issuerApiJson("/issuer-admin/renewals/upcoming"),
   ]);
+  if (!hasAdminPassword()) {
+    return;
+  }
   const softErr = [dRes, setRes, aRes, cRes, bRes, stRes, rdRes, subRes, renRes].find(
     (x) => !x.ok && x.status !== 503
   );
@@ -1376,6 +1429,9 @@ async function refreshIssuerAdmin() {
   const submitted = subRes.ok && Array.isArray(subRes.data) ? subRes.data : [];
   const renewals = renRes.ok && Array.isArray(renRes.data) ? renRes.data : [];
 
+  if (!hasAdminPassword()) {
+    return;
+  }
   applyIssuerSettingsUi(settings);
   issuerFillAssignSelects(groups, drivers);
   renderIssuerBotUsage(botUsage);
@@ -1391,6 +1447,9 @@ async function refreshIssuerAdmin() {
   const asstResults = await Promise.all(
     groups.map((g) => issuerApiJson("/issuer-admin/groups/" + g.id + "/assistants"))
   );
+  if (!hasAdminPassword()) {
+    return;
+  }
   const assistantsByGroup = {};
   groups.forEach((g, i) => {
     const r = asstResults[i];
@@ -1810,6 +1869,9 @@ async function refreshTransactions() {
   const body = document.getElementById("tx-body");
   try {
     const data = await fetchWithAdmin("/transactions");
+    if (!hasAdminPassword()) {
+      return;
+    }
     renderTransactions(data);
   } catch (e) {
     console.error(e);
@@ -1836,6 +1898,9 @@ async function refreshLatest() {
   const el = document.getElementById("latest-tx");
   try {
     const data = await fetchWithAdmin("/transactions/latest");
+    if (!hasAdminPassword()) {
+      return;
+    }
     if (!data) {
       el.textContent = "No transmissions yet.";
       return;
@@ -2542,6 +2607,9 @@ async function refreshSummary() {
     const rollRes = await requestWithAdminJson(
       "/summaries/rolling?window=" + encodeURIComponent(windowKey)
     );
+    if (!hasAdminPassword()) {
+      return;
+    }
     let data = null;
     if (rollRes.ok) {
       data = rollRes.data;
@@ -2551,7 +2619,13 @@ async function refreshSummary() {
           "Rolling summary API unavailable, building summary locally (can be slow)...";
       }
       const allTx = await fetchAllAdminTransactions();
+      if (!hasAdminPassword()) {
+        return;
+      }
       data = buildClientWindowSummary(allTx, windowKey);
+    }
+    if (!hasAdminPassword()) {
+      return;
     }
     lastSummary = data;
     periodEl.textContent =
@@ -2614,7 +2688,11 @@ async function refreshSummary() {
 function applyLoggedInUI(loggedIn) {
   const authArea = document.getElementById("auth-area");
   const dashArea = document.getElementById("dashboard-area");
-  const logoutBtn = document.getElementById("logout-btn");
+  const tabLogoutIds = [
+    "txn-tab-logout-btn",
+    "dispatch-tab-logout-btn",
+    "issuer-tab-logout-btn",
+  ];
   const dispatchHeaderWrap = document.getElementById("dispatch-header-wrap");
   const dispatchTxPanel = document.getElementById("dispatch-transmissions-panel");
   const txnPrivateWrap = document.getElementById("txn-private-wrap");
@@ -2629,7 +2707,10 @@ function applyLoggedInUI(loggedIn) {
 
   if (authArea) authArea.style.display = loggedIn ? "none" : "block";
   if (dashArea) dashArea.style.display = loggedIn ? "block" : "none";
-  if (logoutBtn) logoutBtn.style.display = loggedIn ? "inline-flex" : "none";
+  tabLogoutIds.forEach((id) => {
+    const b = document.getElementById(id);
+    if (b) b.style.display = loggedIn ? "inline-flex" : "none";
+  });
 
   // Krab Dispatch tab: when locked, show ONLY the Access panel.
   if (dispatchHeaderWrap) dispatchHeaderWrap.style.display = loggedIn ? "flex" : "none";
@@ -2675,7 +2756,6 @@ function setupEvents() {
   const issuerLoginBtn = document.getElementById("issuer-login-btn");
   const issuerInput = document.getElementById("issuer-admin-password-input");
   const issuerErr = document.getElementById("issuer-auth-error");
-  const logoutBtn = document.getElementById("logout-btn");
   const refreshTableBtn = document.getElementById("refresh-table-btn");
   const summaryBtn = document.getElementById("summary-btn");
   const summaryDownloadBtn = document.getElementById(
@@ -2727,29 +2807,12 @@ function setupEvents() {
   loadSummaryAiHistory();
   renderSummaryAiLog();
 
-  function _clearAuthErrors() {
-    const errs = document.querySelectorAll("[data-auth-error]");
-    errs.forEach((e) => {
-      if (e && e.style) e.style.display = "none";
-    });
-    if (err) err.style.display = "none";
-    if (txnErr) txnErr.style.display = "none";
-    if (issuerErr) issuerErr.style.display = "none";
-  }
-
-  function _syncPasswordInputs(value) {
-    const v = String(value || "");
-    if (input) input.value = v;
-    if (txnInput) txnInput.value = v;
-    if (issuerInput) issuerInput.value = v;
-  }
-
   async function doLoginWithPassword(pwRaw, errEl) {
     const pw = String(pwRaw || "").trim();
     if (!pw) return;
     storePassword(pw);
-    _syncPasswordInputs(pw);
-    _clearAuthErrors();
+    syncAdminPasswordInputs(pw);
+    clearAdminAuthErrorDisplays();
     try {
       await refreshTransactions();
       await refreshLatest();
@@ -2759,7 +2822,7 @@ function setupEvents() {
     } catch (e) {
       console.error(e);
       storePassword("");
-      _syncPasswordInputs("");
+      syncAdminPasswordInputs("");
       if (errEl && errEl.style) {
         errEl.style.display = "block";
       } else if (err) {
@@ -2797,12 +2860,12 @@ function setupEvents() {
     });
   }
 
-  logoutBtn.addEventListener("click", () => {
-    storePassword("");
-    _syncPasswordInputs("");
-    _clearAuthErrors();
-    applyLoggedInUI(false);
-  });
+  ["txn-tab-logout-btn", "dispatch-tab-logout-btn", "issuer-tab-logout-btn"].forEach(
+    (id) => {
+      const b = document.getElementById(id);
+      if (b) b.addEventListener("click", () => doAdminLogout());
+    }
+  );
 
   const dispatchAddDriverBtn = document.getElementById("dispatch-add-driver-btn");
   if (dispatchAddDriverBtn) {
@@ -3193,6 +3256,10 @@ function setupEvents() {
         throw new Error("HTTP_" + res.status);
       }
       const recipients = await res.json();
+      if (!hasAdminPassword()) {
+        updateRecipientConfidentialUI();
+        return;
+      }
       renderRecipients(recipients);
     } catch (e) {
       console.error("Failed to fetch recipients:", e);
