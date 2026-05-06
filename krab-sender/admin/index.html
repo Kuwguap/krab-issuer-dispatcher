@@ -1250,7 +1250,7 @@
             >
               <div class="panel-title" style="margin-bottom: 0.35rem">AI Data Q&amp;A</div>
               <div class="issuer-muted-block" style="margin-bottom: 0.5rem; text-align: center">
-                Dispatch transmissions and Issuer leads line up on <code>reference_id</code>. Uses the same time window as Summary (NJ) below.
+                Dispatch transmissions and Issuer leads line up on <code>reference_id</code>. Uses the same rolling window as Summary (NJ time) in the next section.
               </div>
               <div id="summary-ai-log" class="summary-ai-log">
                 <div class="summary-ai-msg assistant">
@@ -1268,58 +1268,6 @@
               <div id="summary-ai-answer" class="small"></div>
             </div>
           </div>
-
-          <!-- Transmissions -->
-          <section id="dispatch-transmissions-panel" class="panel">
-            <div class="panel-header">
-              <div class="panel-title">Transmissions</div>
-              <div style="display:flex;align-items:center;gap:0.35rem;flex-wrap:wrap;justify-content:flex-end">
-                <button id="refresh-table-btn">
-                  ⟳
-                  <span>Refresh</span>
-                </button>
-                <button id="tx-expand-btn" class="secondary" type="button">
-                  ⤢
-                  <span>Expand</span>
-                </button>
-                <span class="tx-zoom-controls">
-                  <button id="tx-zoom-out-btn" class="secondary" type="button">－</button>
-                  <button id="tx-zoom-reset-btn" class="secondary" type="button">100%</button>
-                  <button id="tx-zoom-in-btn" class="secondary" type="button">＋</button>
-                </span>
-              </div>
-            </div>
-            <div id="tx-table-wrapper" class="tx-table-wrapper">
-              <div class="tx-expanded-controls">
-                <button id="tx-expanded-zoom-out-btn" class="secondary" type="button">－</button>
-                <button id="tx-expanded-zoom-reset-btn" class="secondary" type="button">100%</button>
-                <button id="tx-expanded-zoom-in-btn" class="secondary" type="button">＋</button>
-                <button id="tx-expanded-close-btn" class="secondary" type="button">Close</button>
-              </div>
-              <div class="table-wrap tx-table-wrap" id="tx-table">
-                <table>
-                  <thead>
-                    <tr>
-                      <th>#</th>
-                      <th>Time (NJ)</th>
-                      <th>Client / File</th>
-                      <th>Issuer</th>
-                      <th>Driver</th>
-                      <th>Reference</th>
-                      <th>Status</th>
-                    </tr>
-                  </thead>
-                  <tbody id="tx-body">
-                    <tr>
-                      <td colspan="7" class="muted">
-                        Waiting for data... send a document through the bot.
-                      </td>
-                    </tr>
-                  </tbody>
-                </table>
-              </div>
-            </div>
-          </section>
 
           <div id="dashboard-area" style="display: none; margin-top: 1rem">
               <!-- Latest item -->
@@ -1486,6 +1434,58 @@
                 </div>
               </div>
           </div>
+
+          <!-- Transmissions (last: driver stack → latest → summaries → transmissions) -->
+          <section id="dispatch-transmissions-panel" class="panel">
+            <div class="panel-header">
+              <div class="panel-title">Transmissions</div>
+              <div style="display:flex;align-items:center;gap:0.35rem;flex-wrap:wrap;justify-content:flex-end">
+                <button id="refresh-table-btn">
+                  ⟳
+                  <span>Refresh</span>
+                </button>
+                <button id="tx-expand-btn" class="secondary" type="button">
+                  ⤢
+                  <span>Expand</span>
+                </button>
+                <span class="tx-zoom-controls">
+                  <button id="tx-zoom-out-btn" class="secondary" type="button">－</button>
+                  <button id="tx-zoom-reset-btn" class="secondary" type="button">100%</button>
+                  <button id="tx-zoom-in-btn" class="secondary" type="button">＋</button>
+                </span>
+              </div>
+            </div>
+            <div id="tx-table-wrapper" class="tx-table-wrapper">
+              <div class="tx-expanded-controls">
+                <button id="tx-expanded-zoom-out-btn" class="secondary" type="button">－</button>
+                <button id="tx-expanded-zoom-reset-btn" class="secondary" type="button">100%</button>
+                <button id="tx-expanded-zoom-in-btn" class="secondary" type="button">＋</button>
+                <button id="tx-expanded-close-btn" class="secondary" type="button">Close</button>
+              </div>
+              <div class="table-wrap tx-table-wrap" id="tx-table">
+                <table>
+                  <thead>
+                    <tr>
+                      <th>#</th>
+                      <th>Time (NJ)</th>
+                      <th>Client / File</th>
+                      <th>Issuer</th>
+                      <th>Driver</th>
+                      <th>Reference</th>
+                      <th>Status</th>
+                    </tr>
+                  </thead>
+                  <tbody id="tx-body">
+                    <tr>
+                      <td colspan="7" class="muted">
+                        Waiting for data... send a document through the bot.
+                      </td>
+                    </tr>
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          </section>
         </div>
       </div>
     </div>
