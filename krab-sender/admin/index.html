@@ -155,6 +155,23 @@
         min-width: 520px;
       }
 
+      /* Access (password) UI — consistent across all tabs */
+      .access-password-input {
+        min-width: 180px;
+        border-radius: 999px;
+        padding: 0.35rem 0.7rem;
+        border: 1px solid var(--border-subtle);
+        background: rgba(15, 23, 42, 0.85);
+        color: var(--text-main);
+        font-size: 0.82rem;
+      }
+
+      .access-unlock-btn {
+        border-radius: 999px;
+        padding: 0.35rem 0.75rem;
+        font-size: 0.82rem;
+      }
+
       /* Spreadsheet-style totals row for the Transactions tab. */
       #panel-transactions .txn-total-row td {
         position: sticky;
@@ -828,13 +845,10 @@
                   <input
                     type="password"
                     id="txn-admin-password-input"
-                    placeholder="Password"
-                    style="min-width: 160px; border-radius: 999px; padding: 0.35rem 0.7rem; border: 1px solid var(--border-subtle); background: rgba(15, 23, 42, 0.85); color: var(--text-main); font-size: 0.82rem;"
+                    class="access-password-input"
+                    placeholder="Enter admin password"
                   />
-                  <button id="txn-login-btn" class="secondary" type="button">
-                    🔓
-                    <span>Unlock</span>
-                  </button>
+                  <button id="txn-login-btn" class="secondary access-unlock-btn" type="button">Unlock</button>
                   <select
                     id="txn-period-select"
                     class="secondary"
@@ -1023,11 +1037,12 @@
                 <input
                   type="password"
                   id="admin-password-input"
-                  placeholder="Enter admin password to unlock dashboard"
+                  class="access-password-input"
+                  placeholder="Enter admin password"
                 />
-                <button id="login-btn">Unlock</button>
+                <button id="login-btn" class="access-unlock-btn">Unlock</button>
               </div>
-              <div id="auth-error" class="error-text" style="display: none">
+              <div id="auth-error" class="error-text" style="display: none" data-auth-error>
                 Invalid password. Please try again.
               </div>
               <div class="small">
@@ -1237,13 +1252,10 @@
                   <input
                     type="password"
                     id="issuer-admin-password-input"
-                    placeholder="Password"
-                    style="min-width: 180px; border-radius: 999px; padding: 0.35rem 0.7rem; border: 1px solid var(--border-subtle); background: rgba(15, 23, 42, 0.85); color: var(--text-main); font-size: 0.82rem;"
+                    class="access-password-input"
+                    placeholder="Enter admin password"
                   />
-                  <button id="issuer-login-btn" class="secondary" type="button">
-                    🔓
-                    <span>Unlock</span>
-                  </button>
+                  <button id="issuer-login-btn" class="secondary access-unlock-btn" type="button">Unlock</button>
                   <button id="issuer-refresh-btn" type="button" class="secondary">
                     Refresh
                   </button>

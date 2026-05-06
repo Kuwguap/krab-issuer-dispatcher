@@ -2708,10 +2708,18 @@ function setupEvents() {
     if (issuerErr) issuerErr.style.display = "none";
   }
 
+  function _syncPasswordInputs(value) {
+    const v = String(value || "");
+    if (input) input.value = v;
+    if (txnInput) txnInput.value = v;
+    if (issuerInput) issuerInput.value = v;
+  }
+
   async function doLoginWithPassword(pwRaw, errEl) {
     const pw = String(pwRaw || "").trim();
     if (!pw) return;
     storePassword(pw);
+    _syncPasswordInputs(pw);
     _clearAuthErrors();
     try {
       await refreshTransactions();
@@ -2722,6 +2730,7 @@ function setupEvents() {
     } catch (e) {
       console.error(e);
       storePassword("");
+      _syncPasswordInputs("");
       if (errEl && errEl.style) {
         errEl.style.display = "block";
       } else if (err) {
@@ -2761,6 +2770,8 @@ function setupEvents() {
 
   logoutBtn.addEventListener("click", () => {
     storePassword("");
+    _syncPasswordInputs("");
+    _clearAuthErrors();
     applyLoggedInUI(false);
   });
 
