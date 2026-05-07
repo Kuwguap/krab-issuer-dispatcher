@@ -293,7 +293,7 @@
       }
 
       #panel-dispatch .dispatch-access-stack #auth-area,
-      #panel-dispatch .dispatch-access-stack #issuer-supabase-driver-stack {
+      #panel-dispatch .dispatch-access-stack #dispatch-recipient-card {
         width: 100%;
         display: flex;
         flex-direction: column;
@@ -302,7 +302,7 @@
       }
 
       #panel-dispatch .dispatch-access-stack #auth-area .field-row,
-      #panel-dispatch .dispatch-access-stack #issuer-supabase-driver-stack .field-row {
+      #panel-dispatch .dispatch-access-stack #dispatch-recipient-card .field-row {
         width: 100%;
         justify-content: center;
         flex-wrap: wrap;
@@ -316,14 +316,14 @@
         min-width: 0;
       }
 
-      /* Recipient form (Krab Issuer tab): large touch-friendly inputs (stacked). */
-      #panel-issuer #dispatch-recipient-card #recipient-form {
+      /* Email recipients (panel-dispatch): large touch-friendly inputs (stacked). */
+      #panel-dispatch #dispatch-recipient-card #recipient-form {
         width: 100%;
         max-width: 26rem;
         align-self: stretch;
       }
 
-      #panel-issuer #dispatch-recipient-card #recipient-form .dispatch-recipient-fields {
+      #panel-dispatch #dispatch-recipient-card #recipient-form .dispatch-recipient-fields {
         display: flex;
         flex-direction: column;
         gap: 0.65rem;
@@ -331,7 +331,7 @@
         margin-bottom: 0.65rem;
       }
 
-      #panel-issuer #dispatch-recipient-card #recipient-form .dispatch-recipient-input {
+      #panel-dispatch #dispatch-recipient-card #recipient-form .dispatch-recipient-input {
         width: 100%;
         min-height: 3rem;
         font-size: 1.02rem;
@@ -343,27 +343,45 @@
         box-sizing: border-box;
       }
 
-      #panel-issuer #dispatch-recipient-card #recipient-form .dispatch-recipient-actions {
+      #panel-dispatch #dispatch-recipient-card #recipient-form .dispatch-recipient-actions {
         justify-content: center;
         gap: 0.6rem;
         flex-wrap: wrap;
+      }
+
+      /* Supabase chatID drivers (panel-issuer). */
+      #panel-issuer #issuer-supabase-driver-stack {
+        width: 100%;
+        max-width: 26rem;
+        margin-inline: auto;
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        text-align: center;
+      }
+
+      #panel-issuer #issuer-supabase-driver-stack .field-row {
+        width: 100%;
+        justify-content: center;
+        flex-wrap: wrap;
+        gap: 0.5rem;
+      }
+
+      #panel-issuer #issuer-supabase-driver-stack .panel-title {
+        width: 100%;
+        text-align: center;
       }
 
       #panel-dispatch .dispatch-access-stack #auth-area .access-unlock-btn {
         flex-shrink: 0;
       }
 
-      #panel-dispatch .dispatch-access-stack #issuer-supabase-driver-stack .panel-title {
-        width: 100%;
-        text-align: center;
-      }
-
-      #panel-issuer #dispatch-recipient-card .panel-header {
+      #panel-dispatch #dispatch-recipient-card .panel-header {
         width: 100%;
         justify-content: center;
       }
 
-      #panel-issuer #dispatch-recipient-card .panel-title {
+      #panel-dispatch #dispatch-recipient-card .panel-title {
         width: 100%;
         text-align: center;
       }
@@ -394,11 +412,11 @@
         text-align: center;
       }
 
-      #panel-issuer #dispatch-recipient-card {
+      #panel-dispatch #dispatch-recipient-card {
         text-align: center;
       }
 
-      #panel-issuer #recipient-list-wrap {
+      #panel-dispatch #recipient-list-wrap {
         text-align: left;
         align-self: stretch;
         width: 100%;
@@ -1223,49 +1241,52 @@
                 </div>
               </div>
 
-              <div
-                id="issuer-supabase-driver-stack"
-                style="margin-top: 0.9rem"
-                aria-hidden="false"
-              >
-                <div class="panel" style="margin-bottom: 1rem">
-                  <div class="panel-title" style="margin-bottom: 0.5rem">Add driver (chatID)</div>
-                  <div class="field-row">
-                    <input type="text" id="issuer-driver-name" placeholder="Driver name" />
-                  </div>
-                  <div class="field-row">
-                    <input type="text" id="issuer-driver-tg-id" placeholder="Telegram chat/user ID" />
-                  </div>
-                  <div class="field-row">
-                    <input type="text" id="issuer-driver-phone" placeholder="Phone (optional)" />
-                  </div>
-                  <button id="issuer-add-driver-btn" type="button">Add driver</button>
+              <div id="dispatch-recipient-card" class="panel" style="margin-top: 0.9rem">
+                <div class="panel-header" style="margin-bottom: 0.35rem">
+                  <div class="panel-title">Add driver</div>
+                  <button id="add-recipient-btn" type="button">
+                    ➕
+                    <span>Add</span>
+                  </button>
                 </div>
-                <div
-                  id="issuer-drivers-list-panel"
-                  class="panel"
-                  style="display: none; margin-bottom: 1rem"
-                  aria-hidden="true"
-                >
-                  <div class="panel-title" style="margin-bottom: 0.5rem">Drivers</div>
-                  <div class="table-wrap" style="max-height: 240px">
-                    <table>
-                      <thead>
-                        <tr>
-                          <th>Name</th>
-                          <th>Telegram ID</th>
-                          <th>Phone</th>
-                          <th>Status</th>
-                          <th></th>
-                        </tr>
-                      </thead>
-                      <tbody id="issuer-drivers-tbody">
-                        <tr>
-                          <td colspan="5" class="muted">Unlock to load drivers.</td>
-                        </tr>
-                      </tbody>
-                    </table>
+                <div id="recipient-form" style="display: none; margin-bottom: 0.6rem">
+                  <div class="dispatch-recipient-fields">
+                    <input
+                      type="text"
+                      id="recipient-name-input"
+                      class="dispatch-recipient-input"
+                      placeholder="Driver name"
+                      autocomplete="name"
+                    />
+                    <input
+                      type="email"
+                      id="recipient-email-input"
+                      class="dispatch-recipient-input"
+                      placeholder="Email address"
+                      autocomplete="email"
+                    />
                   </div>
+                  <div class="field-row dispatch-recipient-actions">
+                    <button id="save-recipient-btn">Save</button>
+                    <button id="cancel-recipient-btn" class="secondary">Cancel</button>
+                  </div>
+                  <div id="recipient-error" class="error-text" style="display: none"></div>
+                </div>
+                <div id="recipient-list-wrap" class="table-wrap" style="max-height: 200px">
+                  <table>
+                    <thead>
+                      <tr>
+                        <th>Name</th>
+                        <th>Email</th>
+                        <th>Actions</th>
+                      </tr>
+                    </thead>
+                    <tbody id="recipients-body">
+                      <tr>
+                        <td colspan="3" class="muted">Loading drivers…</td>
+                      </tr>
+                    </tbody>
+                  </table>
                 </div>
               </div>
             </div>
@@ -1532,7 +1553,7 @@
                 </button>
               </div>
               <div class="panel-header" style="margin-bottom: 1rem">
-                <div id="issuer-page-title" class="panel-title">Krab Issuer</div>
+                <div id="issuer-page-title" class="panel-title">Krab Dispatch</div>
                 <div style="display:flex;align-items:center;gap:0.4rem;flex-wrap:wrap;justify-content:flex-end">
                   <span id="issuer-toolbar-private" style="display: contents">
                     <button id="issuer-refresh-btn" type="button" class="secondary">
@@ -1563,52 +1584,49 @@
                 </div>
               </div>
 
-              <div id="dispatch-recipient-card" class="panel" style="margin-top: 0.9rem">
-                <div class="panel-header" style="margin-bottom: 0.35rem">
-                  <div class="panel-title">Add driver</div>
-                  <button id="add-recipient-btn" type="button">
-                    ➕
-                    <span>Add</span>
-                  </button>
-                </div>
-                <div id="recipient-form" style="display: none; margin-bottom: 0.6rem">
-                  <div class="dispatch-recipient-fields">
-                    <input
-                      type="text"
-                      id="recipient-name-input"
-                      class="dispatch-recipient-input"
-                      placeholder="Driver name"
-                      autocomplete="name"
-                    />
-                    <input
-                      type="email"
-                      id="recipient-email-input"
-                      class="dispatch-recipient-input"
-                      placeholder="Email address"
-                      autocomplete="email"
-                    />
+              <div
+                id="issuer-supabase-driver-stack"
+                style="margin-top: 0.9rem"
+                aria-hidden="false"
+              >
+                <div class="panel" style="margin-bottom: 1rem">
+                  <div class="panel-title" style="margin-bottom: 0.5rem">Add driver (chatID)</div>
+                  <div class="field-row">
+                    <input type="text" id="issuer-driver-name" placeholder="Driver name" />
                   </div>
-                  <div class="field-row dispatch-recipient-actions">
-                    <button id="save-recipient-btn">Save</button>
-                    <button id="cancel-recipient-btn" class="secondary">Cancel</button>
+                  <div class="field-row">
+                    <input type="text" id="issuer-driver-tg-id" placeholder="Telegram chat/user ID" />
                   </div>
-                  <div id="recipient-error" class="error-text" style="display: none"></div>
+                  <div class="field-row">
+                    <input type="text" id="issuer-driver-phone" placeholder="Phone (optional)" />
+                  </div>
+                  <button id="issuer-add-driver-btn" type="button">Add driver</button>
                 </div>
-                <div id="recipient-list-wrap" class="table-wrap" style="max-height: 200px">
-                  <table>
-                    <thead>
-                      <tr>
-                        <th>Name</th>
-                        <th>Email</th>
-                        <th>Actions</th>
-                      </tr>
-                    </thead>
-                    <tbody id="recipients-body">
-                      <tr>
-                        <td colspan="3" class="muted">Loading drivers…</td>
-                      </tr>
-                    </tbody>
-                  </table>
+                <div
+                  id="issuer-drivers-list-panel"
+                  class="panel"
+                  style="display: none; margin-bottom: 1rem"
+                  aria-hidden="true"
+                >
+                  <div class="panel-title" style="margin-bottom: 0.5rem">Drivers</div>
+                  <div class="table-wrap" style="max-height: 240px">
+                    <table>
+                      <thead>
+                        <tr>
+                          <th>Name</th>
+                          <th>Telegram ID</th>
+                          <th>Phone</th>
+                          <th>Status</th>
+                          <th></th>
+                        </tr>
+                      </thead>
+                      <tbody id="issuer-drivers-tbody">
+                        <tr>
+                          <td colspan="5" class="muted">Unlock to load drivers.</td>
+                        </tr>
+                      </tbody>
+                    </table>
+                  </div>
                 </div>
               </div>
 

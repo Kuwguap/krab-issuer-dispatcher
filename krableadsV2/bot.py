@@ -1681,6 +1681,7 @@ def _resolve_selected_group(lead_data: dict, lead: Optional[dict] = None) -> Opt
 
 def _group_lead_copy_pre_html(phase1_data: dict, encrypted_link: str) -> str:
     """HTML <pre> block for the copy-paste section (shared with group notification + fallbacks)."""
+    client_name = (_sanitize_phones_for_send(phase1_data.get("name") or "") or "").strip() or "—"
     d_street = (phase1_data.get("delivery_address") or "").strip()
     d_csz = (phase1_data.get("delivery_city_state_zip") or "").strip()
     delivery_combined = ", ".join(p for p in [d_street, d_csz] if p)
@@ -1691,6 +1692,7 @@ def _group_lead_copy_pre_html(phase1_data: dict, encrypted_link: str) -> str:
     link = (encrypted_link or "").strip()
     copy_plain = "\n".join([
         "- - - - - - copy & paste - - - - - -",
+        f"Client Name: {client_name}",
         f"⏰ {extra_time}",
         f"📍Delivery address: {delivery_combined}",
         f"📞 Phone 🔗 Encrypted Link: {link}",
@@ -1706,6 +1708,8 @@ def _format_group_lead_message_html(
     issue_dt,
     expiry_dt,
     special_request_issuers: str,
+    *,
+    header_text: str = "🏷NEW CLIENT❗️",
 ) -> str:
     """Telegram HTML for the detailed group lead: copy section in <pre> for tap-to-copy."""
     def _safe_raw(s: str) -> str:
@@ -1739,7 +1743,7 @@ def _format_group_lead_message_html(
 
     pre_wrapped = _group_lead_copy_pre_html(phase1_data, encrypted_link)
     return (
-        "🏷NEW CLIENT❗️\n\n"
+        f"{_h(header_text)}\n\n"
         f"📋 Reference ID: <code>{_h(reference_id)}</code>\n"
         f"{vehicle_block}\n\n"
         "Please use Krab Dispatch (@KrabIssuerBot) 📧🚘\n"
@@ -2018,6 +2022,7 @@ async def _send_full_group_lead_to_chat(
     lead: dict,
     *,
     html_prefix: str | None = None,
+    header_text: str = "🏷NEW CLIENT❗️",
     mirror_supervisory: bool = False,
 ) -> None:
     """Post the same detailed HTML lead as the issuer flow; optionally mirror to supervisory chat(s)."""
@@ -2027,7 +2032,7 @@ async def _send_full_group_lead_to_chat(
     issuer_note = _lead_issuer_note(lead)
     issue_dt, exp_dt = _issue_and_expiration_for_group_display(lead)
     body = _format_group_lead_message_html(
-        reference_id, phase1, link, issue_dt, exp_dt, issuer_note,
+        reference_id, phase1, link, issue_dt, exp_dt, issuer_note, header_text=header_text,
     )
     full_html = f"{html_prefix}{body}" if html_prefix else body
     chat_id = _parse_chat_id(group.get("group_telegram_id"))
@@ -2093,9 +2098,10 @@ def _build_driver_lead_accepted_message_html(lead: dict) -> str:
     def esc(s: str) -> str:
         return html.escape(str(s or ""), quote=False)
 
+    client_name = esc(_client_display_name_from_lead(lead))
     link_raw = (lead.get("encrypted_link") or "").strip() or "N/A"
     if link_raw.startswith("http://") or link_raw.startswith("https://"):
-        link_line = f'📞Phone <a href="{html.escape(link_raw, quote=True)}">open link</a>'
+        link_line = f"📞Phone open link ({esc(link_raw)})"
     else:
         link_line = f"📞Phone {esc(link_raw)}"
     price = esc((lead.get("price") or "").strip() or "N/A")
@@ -2106,6 +2112,7 @@ def _build_driver_lead_accepted_message_html(lead: dict) -> str:
     lines = [
         "✅ LEAD ACCEPTED — 🕊LET'S FLY 💸",
         "",
+        f"Client name: {client_name}",
         "📍 Delivery Address",
         delivery,
         "",
@@ -2131,6 +2138,7 @@ def _build_driver_lead_accepted_message_html(lead: dict) -> str:
         "🏦ask client to pay⚡️ electronically🏦",
         "",
         "⚠️ Important Message ‼️",
+        "• DO NOT HAND TAG TO CLIENT WITHOUT PAYMENT FIRST✋❌🏷️🧾1️⃣",
         "• Be fast, polite, professional🤵",
         "• Double-check all info ℹ️",
         "• Drive safely 🚘",
@@ -6371,26 +6379,45 @@ def _wait_for_exclusive_polling(bot_token: str, max_wait: int = 120) -> bool:
 def _build_renewal_group_message(renewal: dict) -> str:
     """Build the group-facing renewal notice (plain text)."""
     lead = renewal.get("lead") or {}
-    ref = lead.get("reference_id") or "N/A"
-    vehicle = (lead.get("vehicle_details") or "")[:200]
-    delivery = _sanitize_phones_for_send(lead.get("delivery_details") or "") or "N/A"
+    ref = (lead.get("reference_id") or "N/A").strip() or "N/A"
+
+    # Issue/expiration (best-effort; shown as blank when unknown to match requested shape)
+    issue_dt = _dt_from_lead_field(lead.get("issue_date"))
+    exp_dt = _dt_from_lead_field(lead.get("expiration_date"))
+    issue_s = issue_dt.strftime("%Y-%m-%d %H:%M %Z") if issue_dt else ""
+    exp_s = exp_dt.strftime("%Y-%m-%d %H:%M %Z") if exp_dt else ""
+
+    # Last accepted driver (original assignment)
+    last_driver_name = "—"
+    original_did = renewal.get("original_driver_id")
+    if original_did:
+        try:
+            all_drivers = _get_all_drivers_cached()
+            d = next((x for x in all_drivers if str(x.get("id")) == str(original_did)), None)
+            if d and (d.get("driver_name") or "").strip():
+                last_driver_name = (d.get("driver_name") or "").strip()
+        except Exception:
+            pass
+
+    vd = (lead.get("vehicle_details") or "").strip().replace("\r\n", "\n")
+    dd = _sanitize_phones_for_send(lead.get("delivery_details") or "") or "N/A"
     extra = _sanitize_phones_for_send(lead.get("extra_info") or "") or "—"
-    note = _lead_issuer_note(lead)
+
     lines = [
         "🔄 RENEWAL DUE",
         f"📋 Ref ID: {ref}",
         "",
-        f"🚗 Vehicle: {vehicle}",
-        f"📍 Delivery: {delivery}",
+        f"Issue date: {issue_s}",
+        f"Expiration date: {exp_s}",
+        f"Which driver accepted last month: {last_driver_name}",
+        "",
+        f"🚗 Vehicle: {vd}",
+        f"📍 Delivery: {dd}",
         f"📝 Extra info: {extra}",
-    ]
-    if note:
-        lines.append(f"📝 Issuers note: {_sanitize_phones_for_send(note)}")
-    lines.extend([
         "",
         "Tap Accept to keep this renewal.",
         "Tap Reassign to pass it to another team.",
-    ])
+    ]
     return "\n".join(lines)
 
 
@@ -6568,6 +6595,19 @@ async def handle_renewal_group_accept(update: Update, context: ContextTypes.DEFA
     if original_did:
         all_drivers = _get_all_drivers_cached()
         original_driver = next((d for d in all_drivers if str(d.get("id")) == str(original_did)), None)
+
+    # Re-send the lead to the accepting group with a RENEWAL header (not NEW CLIENT).
+    try:
+        lead_full = db.get_lead_by_id(refreshed.get("lead_id")) or (refreshed.get("lead") or {})
+        await _send_full_group_lead_to_chat(
+            context,
+            group,
+            lead_full,
+            header_text="🏷RENEWAL CLIENT❗️",
+            mirror_supervisory=False,
+        )
+    except Exception as e:
+        logger.warning("Could not re-send renewal lead to accepting group: %s", e)
 
     # Phase 2: send to original driver first
     sent_to_driver = False

@@ -1317,7 +1317,7 @@ class Database:
                 self.client.table("lead_renewals")
                 .select("*, lead:leads(reference_id, vehicle_details, delivery_details, extra_info, "
                         "special_request_issuers, special_request_drivers, phone_number, price, encrypted_link, "
-                        "onetimesecret_token, onetimesecret_secret_key, telegram_username)")
+                        "onetimesecret_token, onetimesecret_secret_key, telegram_username, issue_date, expiration_date)")
                 .eq("status", "pending")
                 .lte("renewal_due_at", now_iso)
                 .execute()
@@ -1335,7 +1335,7 @@ class Database:
                 self.client.table("lead_renewals")
                 .select("*, lead:leads(reference_id, vehicle_details, delivery_details, extra_info, "
                         "special_request_issuers, special_request_drivers, phone_number, price, encrypted_link, "
-                        "onetimesecret_token, onetimesecret_secret_key, telegram_username)")
+                        "onetimesecret_token, onetimesecret_secret_key, telegram_username, issue_date, expiration_date)")
                 .eq("id", renewal_id)
                 .limit(1)
                 .execute()

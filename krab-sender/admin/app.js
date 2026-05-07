@@ -84,6 +84,11 @@ function issuerTabActive() {
   return !!(issuerPanel && issuerPanel.classList.contains("tab-panel-active"));
 }
 
+function dispatchTabActive() {
+  const dispatchPanel = document.getElementById("panel-dispatch");
+  return !!(dispatchPanel && dispatchPanel.classList.contains("tab-panel-active"));
+}
+
 function transactionsTabActive() {
   const p = document.getElementById("panel-transactions");
   return !!(p && p.classList.contains("tab-panel-active"));
@@ -95,7 +100,7 @@ function setupAdminTabs() {
   const dispatchPanel = document.getElementById("panel-dispatch");
   const issuerPanel = document.getElementById("panel-issuer");
   if (!strip || !dispatchPanel || !issuerPanel) {
-    return;
+    return () => {};
   }
   const tabs = strip.querySelectorAll(".tab[data-tab]");
 
@@ -116,6 +121,7 @@ function setupAdminTabs() {
       refreshUnifiedTransactions();
     } else if (id === "dispatch") {
       refreshRecipients();
+      refreshIssuerAdmin();
     }
   };
 
@@ -127,6 +133,7 @@ function setupAdminTabs() {
       }
     });
   });
+  return activate;
 }
 
 function resolveHighkageHandleSet() {
@@ -888,12 +895,6 @@ function updateIssuerAuthGate() {
   return false;
 }
 
-function maybeRefreshIssuerTab() {
-  if (issuerTabActive()) {
-    refreshIssuerAdmin();
-  }
-}
-
 function issuerFillAssignSelects(groups, drivers) {
   const sg = document.getElementById("issuer-assign-group");
   const sd = document.getElementById("issuer-assign-driver");
@@ -1386,51 +1387,63 @@ async function refreshIssuerAdmin() {
   if (updateIssuerAuthGate()) {
     return;
   }
-  const gRes = await issuerApiJson("/issuer-admin/groups");
-  if (!hasAdminPassword()) {
-    return;
+  const dtb = document.getElementById("issuer-drivers-tbody");
+  if (dtb) {
+    dtb.innerHTML =
+      '<tr><td colspan="5" class="muted">Loading drivers…</td></tr>';
   }
-  if (!gRes.ok) {
-    setIssuerBanner(
-      gRes.status === 503
-        ? "Configure SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY on the API server."
-        : gRes.error || "Could not load Issuer data."
-    );
-    return;
-  }
-  const groups = Array.isArray(gRes.data) ? gRes.data : [];
-  const [
-    dRes,
-    setRes,
-    aRes,
-    cRes,
-    bRes,
-    stRes,
-    rdRes,
-    subRes,
-    renRes,
-  ] = await Promise.all([
+
+  const [gRes, dRes] = await Promise.all([
+    issuerApiJson("/issuer-admin/groups"),
     issuerApiJson("/issuer-admin/drivers"),
-    issuerApiJson("/issuer-admin/settings"),
-    issuerApiJson("/issuer-admin/assignments"),
-    issuerApiJson("/issuer-admin/contact-sources"),
-    issuerApiJson("/issuer-admin/bot-usage?limit=100"),
-    issuerApiJson("/issuer-admin/stats"),
-    issuerApiJson("/issuer-admin/receipt-debts/summary"),
-    issuerApiJson("/issuer-admin/receipts/submitted?limit=80"),
-    issuerApiJson("/issuer-admin/renewals/upcoming"),
   ]);
   if (!hasAdminPassword()) {
     return;
   }
-  const softErr = [dRes, setRes, aRes, cRes, bRes, stRes, rdRes, subRes, renRes].find(
+  if (gRes.status === 401 || dRes.status === 401) {
+    setIssuerBanner("Session expired. Re-enter password on the Krab Issuer tab.");
+    return;
+  }
+
+  const drivers = dRes.ok && Array.isArray(dRes.data) ? dRes.data : [];
+  if (dRes.ok) {
+    renderIssuerDrivers(drivers);
+  } else if (dtb) {
+    dtb.innerHTML =
+      '<tr><td colspan="5" class="muted">Could not load drivers.</td></tr>';
+  }
+
+  if (!gRes.ok) {
+    setIssuerBanner(
+      gRes.status === 503
+        ? "Configure SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY on the API server."
+        : gRes.error || "Could not load groups."
+    );
+    return;
+  }
+  const groups = Array.isArray(gRes.data) ? gRes.data : [];
+
+  const [setRes, aRes, cRes, bRes, stRes, rdRes, subRes, renRes] =
+    await Promise.all([
+      issuerApiJson("/issuer-admin/settings"),
+      issuerApiJson("/issuer-admin/assignments"),
+      issuerApiJson("/issuer-admin/contact-sources"),
+      issuerApiJson("/issuer-admin/bot-usage?limit=100"),
+      issuerApiJson("/issuer-admin/stats"),
+      issuerApiJson("/issuer-admin/receipt-debts/summary"),
+      issuerApiJson("/issuer-admin/receipts/submitted?limit=80"),
+      issuerApiJson("/issuer-admin/renewals/upcoming"),
+    ]);
+  if (!hasAdminPassword()) {
+    return;
+  }
+  const softErr = [setRes, aRes, cRes, bRes, stRes, rdRes, subRes, renRes].find(
     (x) => !x.ok && x.status !== 503
   );
   if (softErr && softErr.status === 401) {
     setIssuerBanner("Session expired. Re-enter password on the Krab Issuer tab.");
     return;
   }
-  const drivers = dRes.ok && Array.isArray(dRes.data) ? dRes.data : [];
   const settings = setRes.ok && setRes.data ? setRes.data : {};
   const assignments = aRes.ok && Array.isArray(aRes.data) ? aRes.data : [];
   const contacts = cRes.ok && Array.isArray(cRes.data) ? cRes.data : [];
@@ -1450,7 +1463,6 @@ async function refreshIssuerAdmin() {
   renderIssuerContactSources(contacts);
   renderIssuerAssignments(assignments, groups, drivers);
   renderIssuerGroups(groups);
-  renderIssuerDrivers(drivers);
   renderIssuerDebts(debts);
   renderIssuerSubmitted(submitted);
   renderIssuerRenewals(renewals);
@@ -2820,7 +2832,7 @@ function applyLoggedInUI(loggedIn) {
     if (b) b.style.display = loggedIn ? "inline-flex" : "none";
   });
 
-  // Krab Dispatch tab: when locked, show Access + Add driver (chatID); full dashboard after unlock.
+  // panel-dispatch (tab label "Krab Issuer"): Access + email recipients; full dashboard after unlock.
   if (dispatchHeaderWrap) dispatchHeaderWrap.style.display = loggedIn ? "flex" : "none";
   if (dispatchTxPanel) dispatchTxPanel.style.display = loggedIn ? "block" : "none";
 
@@ -2835,7 +2847,7 @@ function applyLoggedInUI(loggedIn) {
   if (issuerAuthArea) issuerAuthArea.style.display = loggedIn ? "none" : "block";
   if (issuerPrivateWrap) issuerPrivateWrap.style.display = loggedIn ? "block" : "none";
   if (issuerToolbarPrivate) issuerToolbarPrivate.style.display = loggedIn ? "contents" : "none";
-  // Krab Dispatch: Add driver (chatID) always visible; Drivers table only after unlock.
+  // panel-issuer (tab label "Krab Dispatch"): chatID add driver always visible; Drivers table after unlock.
   const issuerDriversListPanel = document.getElementById(
     "issuer-drivers-list-panel"
   );
@@ -3546,13 +3558,19 @@ function setupEvents() {
   applyLoggedInUI = (loggedIn) => {
     originalApplyLoggedInUI(loggedIn);
     if (loggedIn) {
+      updateIssuerAuthGate();
       refreshRecipients();
-      maybeRefreshIssuerTab();
+      refreshIssuerAdmin();
       maybeRefreshTxnTab();
     } else {
       updateIssuerAuthGate();
       updateTxnAuthGate();
       updateRecipientConfidentialUI();
+      const idtb = document.getElementById("issuer-drivers-tbody");
+      if (idtb) {
+        idtb.innerHTML =
+          '<tr><td colspan="5" class="muted">Unlock to load drivers.</td></tr>';
+      }
     }
   };
 
@@ -3569,7 +3587,8 @@ function setupEvents() {
 }
 
 window.addEventListener("DOMContentLoaded", async () => {
-  setupAdminTabs();
+  const activateTab = setupAdminTabs();
+  activateTab("transactions");
   checkHealth();
   setupEvents();
   updateTxnAuthGate();
