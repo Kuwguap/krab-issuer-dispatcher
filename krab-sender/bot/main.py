@@ -24,6 +24,7 @@ from telegram.ext import (
     CallbackQueryHandler,
     filters,
 )
+from telegram.ext import Job
 
 from .config import BotConfig
 from .email_client import create_email_provider
@@ -126,6 +127,7 @@ class State(IntEnum):
     WAITING_FOR_CLIENT_DETAILS = auto()
     WAITING_FOR_RECIPIENT = auto()
     WAITING_FOR_CONFIRMATION = auto()
+    WAITING_FOR_INSURANCE = auto()
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -134,10 +136,13 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """
     user = update.effective_user
     keyboard = InlineKeyboardMarkup([
-        [InlineKeyboardButton("📋 View Recent Transactions", callback_data="view_transactions")]
+        [
+            InlineKeyboardButton("📋 View Recent Transactions", callback_data="view_transactions"),
+            InlineKeyboardButton("🛡️INSURANCE🛡️", callback_data="insurance_only"),
+        ]
     ])
     await update.message.reply_text(
-        "🦀 Welcome to Krab Dispatch!\n\n"
+        "🦀 Welcome to Krab Issuer!\n\n"
         "🏷Please upload PDF Document.\n\n"
         f"{_get_bot_motivational()}\n\n"
         "👑🤖🦀.\n\n",
@@ -621,10 +626,44 @@ async def handle_confirmation(update: Update, context: ContextTypes.DEFAULT_TYPE
             context.user_data.pop("selected_recipient_name", None)
             return ConversationHandler.END
 
-        await query.edit_message_text(
-            _format_send_complete_message(recipient_name, _display_reference_for_tx(tx)),
-            parse_mode=None,
+        # Insurance side-flow prompt (does NOT block the tag email; it already sent).
+        insurance_prompt = (
+            "To 📧email 🛡️insurance: type the email & password now\n"
+            "(Otherwise ignore this message)"
         )
+        await query.edit_message_text(insurance_prompt, parse_mode=None)
+
+        # Store pending insurance context for this chat.
+        ref_for_msg = (tx.reference_id or "").strip() or (_display_reference_for_tx(tx) or "").strip()
+        context.user_data["insurance_pending"] = {
+            "recipient_name": recipient_name,
+            "reference_id": ref_for_msg,
+        }
+        context.user_data["insurance_received"] = False
+
+        # Clear document/session context for next transaction right away.
+        context.user_data.pop("pending_document", None)
+        context.user_data.pop("client_details", None)
+        context.user_data.pop("selected_recipient_id", None)
+        context.user_data.pop("selected_recipient_email", None)
+        context.user_data.pop("selected_recipient_name", None)
+
+        # Schedule "no insurance detected" follow-up in 10 minutes.
+        if context.application.job_queue:
+            prev: Job | None = context.user_data.get("insurance_timeout_job")
+            try:
+                if prev:
+                    prev.schedule_removal()
+            except Exception:
+                pass
+            context.user_data["insurance_timeout_job"] = context.application.job_queue.run_once(
+                _insurance_timeout_job,
+                when=10 * 60,
+                chat_id=update.effective_chat.id if update.effective_chat else None,
+                user_id=update.effective_user.id if update.effective_user else None,
+                name=f"insurance_timeout_{update.effective_chat.id if update.effective_chat else 'chat'}",
+            )
+        return State.WAITING_FOR_INSURANCE
     except Exception as e:
         logger.error("Failed to send email: %s", e, exc_info=True)
         if email_sent:
@@ -668,6 +707,121 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     await update.message.reply_text("❌ Operation cancelled. Send a new document to start again.")
     context.user_data.pop("pending_document", None)
     context.user_data.pop("client_details", None)
+    return ConversationHandler.END
+
+
+async def handle_insurance_only_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Inline button: jump straight to insurance email flow."""
+    query = update.callback_query
+    await query.answer()
+    context.user_data["insurance_only_mode"] = True
+    context.user_data["insurance_pending"] = {"recipient_name": None, "reference_id": None}
+    context.user_data["insurance_received"] = False
+    await query.message.reply_text(
+        "To 📧email 🛡️insurance: type the Email & Password",
+        parse_mode=None,
+    )
+    return State.WAITING_FOR_INSURANCE
+
+
+def _parse_insurance_credentials(text: str) -> tuple[str | None, str | None]:
+    raw = (text or "").strip()
+    if not raw:
+        return None, None
+    lines = [ln.strip() for ln in raw.splitlines() if ln.strip()]
+    if len(lines) < 2:
+        return None, None
+    email = lines[0]
+    body = "\n".join(lines[1:])
+    return email, body
+
+
+async def _insurance_timeout_job(ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """After 10 minutes, if user didn't provide insurance, send completion message with prefix."""
+    chat_id = getattr(ctx.job, "chat_id", None)
+    if not chat_id:
+        return
+    ud = ctx.user_data
+    if ud.get("insurance_received"):
+        return
+    pending = ud.get("insurance_pending") or {}
+    recipient_name = pending.get("recipient_name") or "priv"
+    ref = pending.get("reference_id") or None
+    msg = "No insurance detected\n" + _format_send_complete_message(recipient_name, ref)
+    try:
+        await ctx.bot.send_message(chat_id=chat_id, text=msg, parse_mode=None)
+    except Exception:
+        pass
+    try:
+        ud.pop("insurance_pending", None)
+        ud.pop("insurance_only_mode", None)
+        ud.pop("insurance_timeout_job", None)
+    except Exception:
+        pass
+
+
+async def handle_insurance_credentials(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Accept insurance email+password (2+ lines) and forward via email."""
+    pending = context.user_data.get("insurance_pending")
+    if not pending:
+        return ConversationHandler.END
+
+    email_to, insurance_body = _parse_insurance_credentials(update.message.text if update.message else "")
+    if not email_to or not insurance_body:
+        await update.message.reply_text(
+            "To 📧email 🛡️insurance: type the email & password now\n(Example)\nTest@email.com\nTemp#A9",
+            parse_mode=None,
+        )
+        return State.WAITING_FOR_INSURANCE
+
+    application = context.application
+    bot_config: BotConfig = application.bot_data["config"]  # type: ignore[assignment]
+    email_provider = create_email_provider(
+        provider_name=bot_config.email_provider,
+        from_address=bot_config.email_from_address,
+        to_address=bot_config.email_to_address,
+        smtp_host=bot_config.email_smtp_host,
+        smtp_port=bot_config.email_smtp_port,
+        smtp_username=bot_config.email_smtp_username,
+        smtp_password=bot_config.email_smtp_password,
+    )
+
+    ref = pending.get("reference_id")
+    subj = f"INSURANCE LOGIN [{ref}]" if ref else "INSURANCE LOGIN"
+    try:
+        await email_provider.send_plain_email(
+            to_address=email_to,
+            subject=subj,
+            body=insurance_body,
+        )
+        context.user_data["insurance_received"] = True
+        job: Job | None = context.user_data.get("insurance_timeout_job")
+        try:
+            if job:
+                job.schedule_removal()
+        except Exception:
+            pass
+        quote = _get_bot_motivational()
+        await update.message.reply_text(
+            f"🛡️Insurance has been 📧emailed to: {email_to}\n\n"
+            "Success! ✅ Insurance🛡️Emailed 📧\n\n"
+            f"({quote})",
+            parse_mode=None,
+        )
+        # Also send the normal completion message (no "No insurance detected").
+        recipient_name = pending.get("recipient_name") or "priv"
+        await update.message.reply_text(
+            _format_send_complete_message(recipient_name, ref),
+            parse_mode=None,
+        )
+    except Exception as e:
+        logger.error("Failed to send insurance email: %s", e, exc_info=True)
+        await update.message.reply_text("❌ Failed to email insurance. Please try again.", parse_mode=None)
+        return State.WAITING_FOR_INSURANCE
+
+    context.user_data.pop("insurance_pending", None)
+    context.user_data.pop("insurance_only_mode", None)
+    context.user_data.pop("insurance_timeout_job", None)
     return ConversationHandler.END
 
 
@@ -911,7 +1065,10 @@ def build_application(config: BotConfig):
 
     # Conversation for document → client details → recipient selection
     conv_handler = ConversationHandler(
-        entry_points=[MessageHandler(filters.Document.ALL, handle_document)],
+        entry_points=[
+            MessageHandler(filters.Document.ALL, handle_document),
+            CallbackQueryHandler(handle_insurance_only_button, pattern="^insurance_only$"),
+        ],
         states={
             State.WAITING_FOR_CLIENT_DETAILS: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, handle_client_details),
@@ -921,6 +1078,9 @@ def build_application(config: BotConfig):
             ],
             State.WAITING_FOR_CONFIRMATION: [
                 CallbackQueryHandler(handle_confirmation, pattern="^confirm_(yes|no)$"),
+            ],
+            State.WAITING_FOR_INSURANCE: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_insurance_credentials),
             ],
         },
         fallbacks=[CommandHandler("cancel", cancel)],

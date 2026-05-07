@@ -98,6 +98,15 @@ class EmailProvider(Protocol):
     ) -> None:
         ...
 
+    async def send_plain_email(
+        self,
+        *,
+        to_address: str,
+        subject: str,
+        body: str,
+    ) -> None:
+        ...
+
 
 @dataclass
 class StubEmailProvider:
@@ -133,6 +142,21 @@ class StubEmailProvider:
         print("--- Body ---")
         print(body)
         print("=== End Email Stub ===")
+
+    async def send_plain_email(
+        self,
+        *,
+        to_address: str,
+        subject: str,
+        body: str,
+    ) -> None:
+        print("=== Krab Dispatch Plain Email Stub ===")
+        print(f"From: {self.from_address}")
+        print(f"To:   {to_address}")
+        print(f"Subj: {subject}")
+        print("--- Body ---")
+        print(body)
+        print("=== End Plain Email Stub ===")
 
 
 @dataclass
@@ -289,6 +313,71 @@ class SmtpEmailProvider:
                     continue
                 raise
 
+        if last_error:
+            raise last_error
+
+    async def send_plain_email(
+        self,
+        *,
+        to_address: str,
+        subject: str,
+        body: str,
+    ) -> None:
+        """
+        Send a simple text email without attachments.
+        Used for insurance credential forwarding flows.
+        """
+        to_addr = (to_address or "").strip()
+        if not to_addr:
+            raise ValueError("to_address is required")
+        msg = EmailMessage()
+        msg["Subject"] = subject or ""
+        msg["From"] = self.from_address
+        msg["To"] = to_addr
+        msg.set_content(body or "")
+
+        connection_timeout = 20
+        send_timeout = 60
+
+        attempt_plan: list[tuple[int, str]] = []
+        if self.port == 465:
+            attempt_plan.append((465, "ssl"))
+        else:
+            attempt_plan.append((587, "starttls"))
+        if attempt_plan[0] == (587, "starttls"):
+            attempt_plan.append((465, "ssl"))
+        else:
+            attempt_plan.append((587, "starttls"))
+        attempt_plan.append(attempt_plan[0])
+
+        last_error: Exception | None = None
+        for idx, (port, mode) in enumerate(attempt_plan, start=1):
+            try:
+                logger.info(
+                    "Attempting SMTP %s on %s:%d (plain email attempt %d/%d)",
+                    mode,
+                    self.host,
+                    port,
+                    idx,
+                    len(attempt_plan),
+                )
+                if mode == "ssl":
+                    server = smtplib.SMTP_SSL(self.host, port, timeout=connection_timeout)
+                else:
+                    server = smtplib.SMTP(self.host, port, timeout=connection_timeout)
+                    server.ehlo()
+                    server.starttls()
+                    server.ehlo()
+                server.timeout = send_timeout
+                with server:
+                    server.login(self.username, self.password)
+                    server.send_message(msg)
+                    logger.info("✅ Plain email sent successfully to %s", to_addr)
+                    return
+            except Exception as e:
+                last_error = e
+                logger.warning("Plain email send failed (attempt %d): %s", idx, e)
+                continue
         if last_error:
             raise last_error
 
