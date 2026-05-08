@@ -137,7 +137,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user = update.effective_user
     keyboard = InlineKeyboardMarkup([
         [
-            InlineKeyboardButton("📋 View Recent Transactions", callback_data="view_transactions"),
+            InlineKeyboardButton("📋TRANSACTIONS📋", callback_data="view_transactions"),
             InlineKeyboardButton("🛡️INSURANCE🛡️", callback_data="insurance_only"),
         ]
     ])
@@ -628,7 +628,7 @@ async def handle_confirmation(update: Update, context: ContextTypes.DEFAULT_TYPE
 
         # Insurance side-flow prompt (does NOT block the tag email; it already sent).
         insurance_prompt = (
-            "To 📧email 🛡️insurance: type the email & password now\n"
+            "To 📧email 🛡️insurance: type the email now\n"
             "(Otherwise ignore this message)"
         )
         await query.edit_message_text(insurance_prompt, parse_mode=None)
@@ -718,7 +718,7 @@ async def handle_insurance_only_button(update: Update, context: ContextTypes.DEF
     context.user_data["insurance_pending"] = {"recipient_name": None, "reference_id": None}
     context.user_data["insurance_received"] = False
     await query.message.reply_text(
-        "To 📧email 🛡️insurance: type the Email & Password",
+        "To 📧email 🛡️insurance: type the email now\n(Otherwise ignore this message)",
         parse_mode=None,
     )
     return State.WAITING_FOR_INSURANCE
@@ -729,11 +729,8 @@ def _parse_insurance_credentials(text: str) -> tuple[str | None, str | None]:
     if not raw:
         return None, None
     lines = [ln.strip() for ln in raw.splitlines() if ln.strip()]
-    if len(lines) < 2:
-        return None, None
-    email = lines[0]
-    body = "\n".join(lines[1:])
-    return email, body
+    email = lines[0] if lines else ""
+    return (email or None), None
 
 
 async def _insurance_timeout_job(ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -761,15 +758,15 @@ async def _insurance_timeout_job(ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def handle_insurance_credentials(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Accept insurance email+password (2+ lines) and forward via email."""
+    """Accept insurance email (1 line) and forward via email."""
     pending = context.user_data.get("insurance_pending")
     if not pending:
         return ConversationHandler.END
 
-    email_to, insurance_body = _parse_insurance_credentials(update.message.text if update.message else "")
-    if not email_to or not insurance_body:
+    email_to, _ = _parse_insurance_credentials(update.message.text if update.message else "")
+    if not email_to:
         await update.message.reply_text(
-            "To 📧email 🛡️insurance: type the email & password now\n(Example)\nTest@email.com\nTemp#A9",
+            "To 📧email 🛡️insurance: type the email now\n(Example)\nTest@email.com",
             parse_mode=None,
         )
         return State.WAITING_FOR_INSURANCE
@@ -789,6 +786,7 @@ async def handle_insurance_credentials(update: Update, context: ContextTypes.DEF
     ref = pending.get("reference_id")
     subj = f"INSURANCE LOGIN [{ref}]" if ref else "INSURANCE LOGIN"
     try:
+        insurance_body = "Temp#A9"
         await email_provider.send_plain_email(
             to_address=email_to,
             subject=subj,
