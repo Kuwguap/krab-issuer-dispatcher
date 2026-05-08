@@ -1168,22 +1168,22 @@ def _format_phase1_field_lines(state_data: dict) -> str:
     """
     first, last = _name_parts_from_full(state_data.get("name"))
     lines = [
-        f"First name: {first}",
-        f"Last name: {last}",
-        f"Registration address: {state_data.get('address') or '-'}",
-        f"Registration city, state, ZIP: {state_data.get('city_state_zip') or '-'}",
-        f"Delivery address: {state_data.get('delivery_address') or '-'}",
-        f"Delivery city, state, ZIP: {state_data.get('delivery_city_state_zip') or '-'}",
-        f"VIN: {state_data.get('vin') or '-'}",
-        f"Car: {state_data.get('car') or '-'}",
-        f"Color: {state_data.get('color') or '-'}",
-        f"Insurance company: {state_data.get('insurance_company') or '-'}",
-        f"Insurance policy #: {state_data.get('insurance_policy_number') or '-'}",
-        f"Delivery Date/Time & Notes: {state_data.get('extra_info') or '-'}",
-        f"Phone: {state_data.get('pending_phone_number') or '-'}",
-        f"Price: {state_data.get('pending_price') or '-'}",
-        f"Issuer note: {state_data.get('special_request_issuers') or '-'}",
-        f"Driver note: {state_data.get('special_request_drivers') or '-'}",
+        f"👤First name: {first}",
+        f"👤Last name: {last}",
+        f"🏠Registration address: {state_data.get('address') or '-'}",
+        f"🏠Registration city, state, ZIP: {state_data.get('city_state_zip') or '-'}",
+        f"📍Delivery address: {state_data.get('delivery_address') or '-'}",
+        f"📍Delivery city, state, ZIP: {state_data.get('delivery_city_state_zip') or '-'}",
+        f"🔢VIN: {state_data.get('vin') or '-'}",
+        f"🚘Car: {state_data.get('car') or '-'}",
+        f"🎨Color: {state_data.get('color') or '-'}",
+        f"🛡Insurance company: {state_data.get('insurance_company') or '-'}",
+        f"🛡Insurance policy #: {state_data.get('insurance_policy_number') or '-'}",
+        f"🕒Delivery Date/Time & Notes: {state_data.get('extra_info') or '-'}",
+        f"📞Phone: {state_data.get('pending_phone_number') or '-'}",
+        f"💲Price: {state_data.get('pending_price') or '-'}",
+        f"📝Issuer note: {state_data.get('special_request_issuers') or '-'}",
+        f"📝Driver note: {state_data.get('special_request_drivers') or '-'}",
     ]
     return "\n".join(lines)
 
