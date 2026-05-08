@@ -1885,11 +1885,9 @@ def _lead_issue_expiry_supervisory_line(lead: dict) -> str:
 def _lead_issuer_display_from_lead(lead: dict) -> str:
     """Telegram @username of the lead submitter (for supervisory lines)."""
     un = (lead.get("telegram_username") or "").strip()
-    if un and un.lower() != "unknown":
+    # Some older rows stored a numeric Telegram user_id in telegram_username; don't show that as a username.
+    if un and un.lower() != "unknown" and not un.isdigit():
         return un if un.startswith("@") else f"@{un}"
-    uid = str(lead.get("user_id") or "").strip()
-    if uid:
-        return uid
     return "Unknown"
 
 
