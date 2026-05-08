@@ -4143,7 +4143,10 @@ async def handle_driver_selection(update: Update, context: ContextTypes.DEFAULT_
 
     contact_sources = db.get_contact_info_sources()
 
-    if contact_sources:
+    # Only prompt for lead source when configured AND this lead doesn't already have one.
+    lead_fresh = db.get_lead_by_id(lead["id"]) if lead and lead.get("id") else None
+    existing_source = (lead_fresh.get("contact_info_source") or "").strip() if lead_fresh else ""
+    if contact_sources and not existing_source:
         db.set_user_state(
             user_id,
             "select_contact_source",
@@ -5097,7 +5100,10 @@ async def _issuer_open_driver_selection_after_group_accept(
         ).add_done_callback(_bg_task_done)
 
         contact_sources = db.get_contact_info_sources()
-        if contact_sources:
+        # Avoid prompting twice: if source already set on the lead, skip.
+        lead_fresh = db.get_lead_by_id(lead_ref["id"]) if lead_ref and lead_ref.get("id") else None
+        existing_source = (lead_fresh.get("contact_info_source") or "").strip() if lead_fresh else ""
+        if contact_sources and not existing_source:
             db.set_user_state(
                 issuer_uid,
                 "select_contact_source",
