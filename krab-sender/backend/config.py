@@ -29,6 +29,11 @@ class ApiConfig:
         baseline = [
             "https://krab-dispatch.vercel.app",
             "https://krabdispatch.vercel.app",
+            # Embedded /backend admin dashboard hosted alongside the TriState Tag site.
+            "https://tristatetag.com",
+            "https://www.tristatetag.com",
+            "https://tristatetags.com",
+            "https://www.tristatetags.com",
             # Local dev across common ports (uvicorn 8000/8080, Vite 5173, Flask 5000)
             "http://127.0.0.1:8000",
             "http://localhost:8000",
