@@ -4958,8 +4958,8 @@ async def _build_and_send_insurance_card(lead: dict) -> tuple[bool, Optional[str
         address_lines = ["UNKNOWN ADDRESS"]
 
     issuer = ic.CardIssuer(
-        issuer_company_line=Config.INSURANCE_ISSUER_NAME,
-        issuer_phone=Config.INSURANCE_ISSUER_PHONE,
+        carrier_name=Config.INSURANCE_CARRIER_NAME,
+        agency_phone=Config.INSURANCE_ISSUER_PHONE,
         agency_name=Config.INSURANCE_ISSUER_NAME,
         agency_address_lines=[ln.strip() for ln in (Config.INSURANCE_ISSUER_ADDRESS or "").split("|") if ln.strip()],
     )

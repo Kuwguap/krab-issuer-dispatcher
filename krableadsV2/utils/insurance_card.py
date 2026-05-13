@@ -350,16 +350,37 @@ DIVIDER_Y = 518.4
 
 @dataclass
 class CardIssuer:
-    """Issuer block printed on the card (same on every issued FS-20)."""
+    """Issuer block printed on the card (same on every issued FS-20).
 
-    issuer_company_line: str = "TRI STATE COVERAGE INC"
-    issuer_phone: str = "(551) 369-5696"
+    Maps to the two distinct lines on a real NY FS-20:
+      * ``agency_name`` + ``agency_address_lines`` — the agency that issued the
+        card (e.g. "COYNE INSURANCE AGENCY", "146 COLUMBIA TURNPIKE",
+        "RENSSELAER NY 12144").
+      * ``carrier_name`` + ``agency_phone`` — the underwriting carrier line
+        plus the agency's contact number (e.g. "484 NEW SOUTH INS.CO.",
+        "5184772174").
+
+    The older ``issuer_company_line`` / ``issuer_phone`` field names are kept
+    as aliases so existing callers don't break.
+    """
+
+    carrier_name: str = "TRI STATE COVERAGE INC"
+    agency_phone: str = "(551) 369-5696"
     agency_name: str = "TRI STATE COVERAGE INC"
     agency_address_lines: list[str] = field(default_factory=lambda: [
         "1 N CENTRAL RD 6TH FLOOR SUITE 629",
         "FORT LEE NJ 07024",
     ])
     iin: str = AAMVA_IIN_NY
+
+    # Backwards-compat aliases (old field names).
+    @property
+    def issuer_company_line(self) -> str:  # pragma: no cover - shim
+        return self.carrier_name
+
+    @property
+    def issuer_phone(self) -> str:  # pragma: no cover - shim
+        return self.agency_phone
 
 
 @dataclass
@@ -405,22 +426,41 @@ def _render_pdf417_png(text: str, *, columns: int, scale: int) -> bytes:
     return buf.getvalue()
 
 
+def _wrap_text(text: str, max_chars: int) -> list[str]:
+    """Greedy word-wrap; preserves explicit ``\n`` line breaks."""
+    out: list[str] = []
+    for paragraph in (text or "").split("\n"):
+        words = paragraph.split()
+        line = ""
+        for w in words:
+            candidate = (line + " " + w).strip() if line else w
+            if len(candidate) > max_chars and line:
+                out.append(line)
+                line = w
+            else:
+                line = candidate
+        out.append(line)
+    return out
+
+
 def _draw_card(c, *, card_top: float, input_: InsuranceCardInput, card_barcode_png: bytes) -> None:
     """Draw one FS-20 ID card at the given vertical position.
 
-    Coordinate notes: reportlab uses origin at bottom-left.  ``card_top`` is
-    the Y of the card's top edge (PDF coordinate). The card body extends down
-    by ``CARD_H``.
+    Layout matches the official New York State FS-20 Insurance Identification
+    Card: heading band at top, data column on the left (value above label),
+    warning column on the right, and PDF417 barcode bottom-right.
+
+    Reportlab uses origin at bottom-left.  ``card_top`` is the Y of the card's
+    top edge (PDF coordinate). The card body extends down by ``CARD_H``.
     """
     from reportlab.lib.utils import ImageReader
 
     card_bottom = card_top - CARD_H
-    # Card border + corner crop marks
+
+    # ── Frame + corner crop marks ──────────────────────────────────────────
     c.setLineWidth(0.8)
     c.setStrokeColorRGB(0, 0, 0)
     c.rect(CARD_LEFT, card_bottom, CARD_W, CARD_H, stroke=1, fill=0)
-
-    # Corner crop marks (small ticks)
     tick = 6
     for (cx, cy) in (
         (CARD_LEFT, card_bottom),
@@ -431,50 +471,194 @@ def _draw_card(c, *, card_top: float, input_: InsuranceCardInput, card_barcode_p
         c.line(cx - tick, cy, cx + tick, cy)
         c.line(cx, cy - tick, cx, cy + tick)
 
-    # Header band
+    # ── Heading band (centered title + boilerplate preamble) ───────────────
+    title_y = card_top - 14
     c.setFont("Helvetica-Bold", 11)
-    c.drawString(CARD_LEFT + 10, card_top - 18, "NEW YORK STATE FS-20 — INSURANCE IDENTIFICATION CARD")
+    c.drawCentredString(CARD_LEFT + CARD_W / 2, title_y, "NEW YORK STATE INSURANCE IDENTIFICATION CARD")
 
-    c.setFont("Helvetica", 9)
-    c.drawString(CARD_LEFT + 10, card_top - 34, f"Issuer: {input_.issuer.issuer_company_line}")
-    c.drawString(CARD_LEFT + 10, card_top - 46, f"Phone:  {input_.issuer.issuer_phone}")
+    preamble = (
+        "An authorized NEW YORK insurer has issued an Owner's Policy of "
+        "Liability Insurance complying with Article 6 (Motor Vehicle Financial "
+        "Security Act) of the NEW YORK Vehicle and Traffic Law to:"
+    )
+    c.setFont("Helvetica", 7.6)
+    py = title_y - 11
+    for line in _wrap_text(preamble, 95):
+        c.drawCentredString(CARD_LEFT + CARD_W / 2, py, line)
+        py -= 9
 
-    # Two-column layout starting below header
-    label_x = CARD_LEFT + 10
-    value_x = CARD_LEFT + 130
-    y = card_top - 68
+    # Horizontal divider under the heading band
+    divider_y = py - 4
+    c.setLineWidth(0.4)
+    c.line(CARD_LEFT + 6, divider_y, CARD_LEFT + CARD_W - 6, divider_y)
 
-    def _row(label: str, value: str) -> None:
-        nonlocal y
-        c.setFont("Helvetica-Bold", 8.5)
-        c.drawString(label_x, y, label)
-        c.setFont("Helvetica", 9.5)
-        c.drawString(value_x, y, value or "—")
-        # Underline beneath the value for a form-like look
-        c.setLineWidth(0.4)
-        c.line(value_x, y - 2, value_x + 220, y - 2)
-        y -= 16
+    # ── Body geometry: left data column + right warnings column ────────────
+    col_left_x = CARD_LEFT + 12
+    col_left_w = 330
+    col_right_x = CARD_LEFT + CARD_W - 12 - 200
+    col_right_w = 200
+    body_top = divider_y - 6
 
-    insured_display = input_.insured_fs20_name or input_.insured_name_upper
-    addr_display = ", ".join([line for line in input_.insured_address_lines if line])[:80]
-    vehicle_display = f"{input_.vehicle_year_full} {input_.vehicle_make_short}".strip()
+    # Helper: draw a labelled field "VALUE" then "label" below it.
+    def field(value: str, label: str, *, y: float, value_font: str = "Helvetica-Bold",
+              value_size: float = 10.0, label_size: float = 6.6,
+              underline: bool = False, x: Optional[float] = None,
+              width: Optional[float] = None) -> float:
+        fx = x if x is not None else col_left_x
+        fw = width if width is not None else col_left_w
+        c.setFont(value_font, value_size)
+        c.drawString(fx, y, str(value or " "))
+        if underline:
+            c.setLineWidth(0.3)
+            c.line(fx, y - 2, fx + fw, y - 2)
+        c.setFont("Helvetica", label_size)
+        c.drawString(fx, y - label_size - 2, label)
+        return y - (value_size + label_size + 6)
 
-    _row("POLICY NUMBER", input_.policy_number)
-    _row("EFFECTIVE", input_.effective_mm_dd_yyyy)
-    _row("EXPIRATION", input_.expiration_mm_dd_yyyy)
-    _row("INSURED", insured_display.upper())
-    _row("ADDRESS", addr_display.upper())
-    _row("VIN", normalize_vin(input_.vin) or input_.vin)
-    _row("VEHICLE", vehicle_display.upper())
+    # Build display strings
+    name_line = (input_.insured_fs20_name or input_.insured_name_upper).upper()
+    addr_lines = [str(ln).upper().strip() for ln in input_.insured_address_lines if str(ln).strip()]
+    if len(addr_lines) < 2:
+        addr_lines = addr_lines + [""] * (2 - len(addr_lines))
+    addr_lines = addr_lines[:2]
 
-    # Agency info bottom-left
-    c.setFont("Helvetica-Oblique", 7.5)
-    agency_y = card_bottom + 12
-    for line in reversed([input_.issuer.agency_name, *input_.issuer.agency_address_lines]):
-        c.drawString(CARD_LEFT + 10, agency_y, line)
-        agency_y += 9
+    vin_clean = normalize_vin(input_.vin) or (input_.vin or "")
+    year_str = str(input_.vehicle_year_full or "").strip()
+    make_str = str(input_.vehicle_make_short or "").strip().upper()
+    eff = input_.effective_mm_dd_yyyy
+    exp = input_.expiration_mm_dd_yyyy
+    policy = input_.policy_number
 
-    # Card PDF417 barcode (right side)
+    # ── Left column: insured name + address ────────────────────────────────
+    y = body_top - 4
+    c.setFont("Helvetica-Bold", 10.0)
+    c.drawString(col_left_x, y, name_line)
+    y -= 11
+    c.setFont("Helvetica", 9.0)
+    c.drawString(col_left_x, y, addr_lines[0])
+    y -= 10
+    c.drawString(col_left_x, y, addr_lines[1])
+    y -= 12
+
+    c.setFont("Helvetica-Bold", 7.4)
+    c.drawString(col_left_x, y, "Applicable with respect to the following Motor Vehicle:")
+    y -= 12
+
+    # VIN row
+    y = field(vin_clean, "Vehicle Identification Number", y=y, underline=True)
+
+    # Year / Make row (side-by-side)
+    year_x = col_left_x
+    make_x = col_left_x + 90
+    year_w = 70
+    make_w = col_left_w - 90
+    c.setFont("Helvetica-Bold", 10.0)
+    c.drawString(year_x, y, year_str)
+    c.drawString(make_x, y, make_str)
+    c.setLineWidth(0.3)
+    c.line(year_x, y - 2, year_x + year_w, y - 2)
+    c.line(make_x, y - 2, make_x + make_w, y - 2)
+    c.setFont("Helvetica", 6.6)
+    c.drawString(year_x, y - 9, "Year")
+    c.drawString(make_x, y - 9, "Make")
+    y -= 22
+
+    # Effective / Expiration row (side-by-side) with "12:01 a.m." sublabels
+    eff_x = col_left_x
+    exp_x = col_left_x + 120
+    col_w = 105
+    c.setFont("Helvetica-Bold", 10.0)
+    c.drawString(eff_x, y, eff)
+    c.drawString(exp_x, y, exp)
+    c.setLineWidth(0.3)
+    c.line(eff_x, y - 2, eff_x + col_w, y - 2)
+    c.line(exp_x, y - 2, exp_x + col_w, y - 2)
+    c.setFont("Helvetica", 6.6)
+    c.drawString(eff_x, y - 9, "Effective Date")
+    c.drawString(exp_x, y - 9, "Expiration Date")
+    c.drawString(eff_x + 64, y - 9, "12:01 a.m.")
+    c.drawString(exp_x + 64, y - 9, "12:01 a.m.")
+    y -= 22
+
+    # Policy number + parenthetical note
+    c.setFont("Helvetica-Bold", 10.0)
+    c.drawString(col_left_x, y, policy)
+    c.setLineWidth(0.3)
+    c.line(col_left_x, y - 2, col_left_x + col_left_w, y - 2)
+    c.setFont("Helvetica", 6.6)
+    c.drawString(col_left_x, y - 9, "Policy Number")
+    c.setFont("Helvetica-Oblique", 6.2)
+    c.drawString(col_left_x + 75, y - 9,
+                 "(Not acceptable to obtain registration after 45 days from effective date.)")
+    y -= 22
+
+    # Agency name + address (issuer)
+    c.setFont("Helvetica-Bold", 9.0)
+    c.drawString(col_left_x, y, str(input_.issuer.agency_name or "").upper())
+    y -= 10
+    c.setFont("Helvetica", 8.6)
+    for line in (input_.issuer.agency_address_lines or [])[:2]:
+        c.drawString(col_left_x, y, str(line or "").upper())
+        y -= 10
+    c.setFont("Helvetica", 6.6)
+    c.drawString(col_left_x, y, "Name & Address of Issuer")
+    y -= 12
+
+    # Underwriting carrier + agency phone
+    c.setFont("Helvetica-Bold", 9.0)
+    c.drawString(col_left_x, y, str(input_.issuer.carrier_name or "").upper())
+    y -= 10
+    c.setFont("Helvetica", 8.6)
+    c.drawString(col_left_x, y, str(input_.issuer.agency_phone or ""))
+    y -= 10
+
+    # ── Right column: standard FS-20 warnings ──────────────────────────────
+    warn_y = body_top - 4
+    c.setFont("Helvetica-Bold", 7.6)
+    for line in _wrap_text("THIS ID CARD MUST BE CARRIED IN THE INSURED VEHICLE FOR PRODUCTION UPON DEMAND", 36):
+        c.drawString(col_right_x, warn_y, line)
+        warn_y -= 9
+    warn_y -= 4
+
+    c.setFont("Helvetica-Bold", 6.8)
+    c.drawString(col_right_x, warn_y, "WARNING:")
+    c.setFont("Helvetica", 6.8)
+    warn_text = (
+        " Any person who issues or produces an ID card knowing that an Owner's "
+        "Policy of insurance is not in effect may be committing a misdemeanor. "
+        "In addition, a person who presents an ID card if insurance is not in "
+        "effect may be committing a misdemeanor."
+    )
+    # First line continues after "WARNING:"; subsequent lines start at left edge
+    first_indent = c.stringWidth("WARNING:", "Helvetica-Bold", 6.8)
+    lines = _wrap_text(warn_text.strip(), 40)
+    if lines:
+        c.drawString(col_right_x + first_indent + 2, warn_y, lines[0])
+        warn_y -= 8
+        for ln in lines[1:]:
+            c.drawString(col_right_x, warn_y, ln)
+            warn_y -= 8
+    warn_y -= 4
+
+    c.setFont("Helvetica", 6.8)
+    for line in _wrap_text("The name of the registrant and the name of the insured must coincide.", 40):
+        c.drawString(col_right_x, warn_y, line)
+        warn_y -= 8
+    warn_y -= 4
+
+    c.setFont("Helvetica-Bold", 6.8)
+    c.drawString(col_right_x, warn_y, "REPLACEMENT VEHICLE NOTATION:")
+    warn_y -= 8
+    c.setFont("Helvetica", 6.8)
+    for line in _wrap_text(
+        "DMV WILL ONLY PROCESS A VEHICLE CHANGE (RE-REGISTRATION) USING THE "
+        "REPLACED VEHICLE'S CURRENT REGISTRATION.",
+        40,
+    ):
+        c.drawString(col_right_x, warn_y, line)
+        warn_y -= 8
+
+    # ── Card PDF417 barcode (bottom-right of card) ─────────────────────────
     if card_barcode_png:
         img = ImageReader(io.BytesIO(card_barcode_png))
         bx = CARD_LEFT + CARD_W - BARCODE_W - BARCODE_X
@@ -512,34 +696,46 @@ def build_ny_insurance_id_card_pdf(input_: InsuranceCardInput) -> bytes:
     _draw_card(c, card_top=CARD_TOP_1, input_=input_, card_barcode_png=card_barcode_png)
     _draw_card(c, card_top=CARD_TOP_2, input_=input_, card_barcode_png=card_barcode_png)
 
-    # Divider between cards/FAX
-    c.setLineWidth(0.6)
-    c.setStrokeColorRGB(0, 0, 0)
-    c.line(0, DIVIDER_Y, PAGE_W, DIVIDER_Y)
-    c.setFont("Helvetica", 8)
-    c.drawString(CARD_LEFT + 6, DIVIDER_Y - 12, "Cut along the line — keep both copies in vehicle.")
+    # ── Bottom strip: FAX barcode + FAX INSTRUCTIONS + FS-20 badge ─────────
+    from reportlab.lib.utils import ImageReader
 
-    # FAX label + barcode + instructions at bottom
     if fax_barcode_png:
-        from reportlab.lib.utils import ImageReader
         img = ImageReader(io.BytesIO(fax_barcode_png))
         c.drawImage(img, FAX_BARCODE_X, FAX_BARCODE_Y,
                     width=FAX_BARCODE_W, height=FAX_BARCODE_H,
                     preserveAspectRatio=False, mask='auto')
 
-    c.setFont("Helvetica-Bold", 9)
-    c.drawString(FAX_BARCODE_X + FAX_BARCODE_W + 16, FAX_BARCODE_Y + FAX_BARCODE_H - 12,
-                 "DMV FAX SCAN")
-    c.setFont("Helvetica", 8)
-    inst_y = FAX_BARCODE_Y + FAX_BARCODE_H - 28
+    # Label beneath the FAX barcode
+    c.setFont("Helvetica-Bold", 8.5)
+    c.drawString(FAX_BARCODE_X + 4, FAX_BARCODE_Y - 12, "FAX: Scanable Bar Code")
+
+    # FAX INSTRUCTIONS column to the right of the barcode
+    inst_x = FAX_BARCODE_X + FAX_BARCODE_W + 16
+    inst_top = FAX_BARCODE_Y + FAX_BARCODE_H - 6
+    c.setFont("Helvetica-Bold", 9.0)
+    c.drawString(inst_x, inst_top, "FAX INSTRUCTIONS:")
+    c.setFont("Helvetica", 7.6)
+    iy = inst_top - 12
     for line in (
-        "Scan this barcode to upload",
-        "policy data to the DMV via fax.",
-        "Encoded with AAMVA Annex D",
-        f"(NY IIN {input_.issuer.iin}).",
+        "1. The entire page must be faxed.",
+        "2. If submitted to DMV, either the entire page or the second",
+        "   ID card and large scanable bar code will be retained.",
+        "3. A faxed ID card must be replaced with a scanable",
+        "   ID card within 14 days of the effective date.",
+        "4. DMV will not accept a faxed ID card without a",
+        "   scanable barcode.",
     ):
-        c.drawString(FAX_BARCODE_X + FAX_BARCODE_W + 16, inst_y, line)
-        inst_y -= 10
+        c.drawString(inst_x, iy, line)
+        iy -= 10
+
+    # "FS-20" badge in the bottom-right corner
+    badge_x = PAGE_W - 60
+    badge_y = FAX_BARCODE_Y + 4
+    c.setStrokeColorRGB(0, 0, 0)
+    c.setLineWidth(0.8)
+    c.rect(badge_x, badge_y, 50, 22, stroke=1, fill=0)
+    c.setFont("Helvetica-Bold", 13)
+    c.drawCentredString(badge_x + 25, badge_y + 7, "FS-20")
 
     c.showPage()
     c.save()

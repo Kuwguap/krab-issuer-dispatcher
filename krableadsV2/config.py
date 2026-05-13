@@ -66,11 +66,15 @@ class Config:
     RESEND_API_KEY = (os.getenv("RESEND_API_KEY") or "").strip().lstrip("=") or None
     RESEND_FROM = (os.getenv("RESEND_FROM") or "").strip().lstrip("=") or None
 
-    # Issuer block printed on the NY FS-20 card and used as Resend "from".
+    # Issuer block printed on the NY FS-20 card.
+    # INSURANCE_ISSUER_NAME → agency name (top "Name & Address of Issuer" block)
+    # INSURANCE_ISSUER_ADDRESS → pipe-separated multi-line agency address
+    # INSURANCE_ISSUER_PHONE → contact phone printed under the carrier line
+    # INSURANCE_CARRIER_NAME → underwriting carrier line (e.g. "484 NEW SOUTH INS.CO.")
     INSURANCE_ISSUER_NAME = (os.getenv("INSURANCE_ISSUER_NAME") or "Tri State Coverage Inc").strip()
     INSURANCE_ISSUER_PHONE = (os.getenv("INSURANCE_ISSUER_PHONE") or "(551) 369-5696").strip()
-    # Pipe-separated multi-line address: "Line 1|Line 2|..."
     INSURANCE_ISSUER_ADDRESS = (os.getenv("INSURANCE_ISSUER_ADDRESS") or "1 N Central Rd 6th floor suite 629|Fort Lee, NJ 07024").strip()
+    INSURANCE_CARRIER_NAME = (os.getenv("INSURANCE_CARRIER_NAME") or "TRI STATE COVERAGE INS.CO.").strip()
 
     @classmethod
     def is_vin_lookup_configured(cls) -> bool:
