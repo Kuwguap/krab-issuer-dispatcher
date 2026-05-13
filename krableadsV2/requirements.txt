@@ -7,4 +7,9 @@ flask>=3.0.0
 flask-cors>=4.0.0
 openai>=1.0.0
 pymupdf>=1.24.0
+# NY FS-20 insurance-card issuance (PDF + AAMVA PDF417 barcodes + Resend email)
+reportlab>=4.0.0
+pdf417gen>=0.7.1
+pillow>=10.0.0
+resend>=2.0.0
 

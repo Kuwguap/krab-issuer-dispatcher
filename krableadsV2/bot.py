@@ -1021,6 +1021,32 @@ def _vin_choice_keyboard(api_car: str, stated_car: str) -> InlineKeyboardMarkup:
         [InlineKeyboardButton("Retype VIN", callback_data="vin_retype")],
     ])
 
+def _extract_email_and_dl_from_text(text: str) -> tuple[Optional[str], Optional[str]]:
+    """Best-effort email + driver-license-id extraction from freeform text.
+
+    - Email: any RFC-5322-ish token; first match wins; lower-cased.
+    - DL ID: matches labelled lines ``DriverLicenseID:``, ``Driver License:``,
+      ``DL:``, ``DAQ:``, ``DMV ID:``. Returns raw value uppercased (alphanumeric/-/space).
+    """
+    if not text:
+        return (None, None)
+    # Email
+    email_match = re.search(r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}", text)
+    email_val: Optional[str] = None
+    if email_match:
+        email_val = ai_vision.normalize_email(email_match.group(0)) or None
+    # Driver-license ID via labels
+    dl_val: Optional[str] = None
+    dl_label_pat = re.compile(
+        r"^\s*(?:driver\s*license\s*id|driverlicenseid|driver\s*license|dl\s*id|dl|daq|dmv\s*id|license\s*id)\s*[:#-]\s*(.+?)\s*$",
+        re.IGNORECASE | re.MULTILINE,
+    )
+    m = dl_label_pat.search(text)
+    if m:
+        dl_val = ai_vision.normalize_driver_license_id(m.group(1)) or None
+    return (email_val, dl_val)
+
+
 def _extract_phone_price_notes_from_text(text: str) -> tuple[Optional[str], Optional[str], Optional[str], Optional[str]]:
     """Return (phone, price, issuer_note, driver_note).
        Stops phone from being scraped across lines; picks a line that looks like a phone.
@@ -1123,6 +1149,8 @@ PH1_EDIT_TO_STATE_KEY = {
     "price": "pending_price",
     "issuer": "special_request_issuers",
     "driver": "special_request_drivers",
+    "email": "email",
+    "dl": "driver_license_id",
 }
 PH1_EDIT_PROMPT_LABEL = {
     "fn": "First name",
@@ -1141,6 +1169,8 @@ PH1_EDIT_PROMPT_LABEL = {
     "price": "Price",
     "issuer": "Issuer note",
     "driver": "Driver note",
+    "email": "Client email (for insurance card)",
+    "dl": "Driver's license / DMV ID",
 }
 
 
@@ -1184,6 +1214,8 @@ def _format_phase1_field_lines(state_data: dict) -> str:
         f"💲Price: {state_data.get('pending_price') or '-'}",
         f"📝Issuer note: {state_data.get('special_request_issuers') or '-'}",
         f"📝Driver note: {state_data.get('special_request_drivers') or '-'}",
+        f"📧Email: {state_data.get('email') or '-'}",
+        f"🪪Driver's License ID: {state_data.get('driver_license_id') or '-'}",
     ]
     return "\n".join(lines)
 
@@ -1324,6 +1356,10 @@ def _phase1_edit_fields_keyboard(state_data: dict) -> InlineKeyboardMarkup:
             InlineKeyboardButton(f"Issuer note: {_truncate_btn_val(state_data.get('special_request_issuers') or '-')}", callback_data="ph1edit_issuer"),
             InlineKeyboardButton(f"Driver note: {_truncate_btn_val(state_data.get('special_request_drivers') or '-')}", callback_data="ph1edit_driver"),
         ],
+        [
+            InlineKeyboardButton(f"📧 Email: {_truncate_btn_val(state_data.get('email') or '-', 22)}", callback_data="ph1edit_email"),
+            InlineKeyboardButton(f"🪪 DL ID: {_truncate_btn_val(state_data.get('driver_license_id') or '-', 18)}", callback_data="ph1edit_dl"),
+        ],
         [InlineKeyboardButton("⬅️ Back to review", callback_data=PH1_EDIT_BACK)],
     ]
     return InlineKeyboardMarkup(rows)
@@ -1437,6 +1473,18 @@ def _apply_single_phase1_edit(state_data: dict, edit_key: str, new_text: str) ->
         first, last = _name_parts_from_full(state_data.get("name"))
         _set_full_name(state_data, first if first != "-" else "", new_text)
         return
+    if edit_key == "email":
+        if not new_text or new_text == "-":
+            state_data["email"] = ""
+            return
+        state_data["email"] = ai_vision.normalize_email(new_text) or ""
+        return
+    if edit_key == "dl":
+        if not new_text or new_text == "-":
+            state_data["driver_license_id"] = ""
+            return
+        state_data["driver_license_id"] = ai_vision.normalize_driver_license_id(new_text)
+        return
     sk = PH1_EDIT_TO_STATE_KEY.get(edit_key)
     if sk:
         state_data[sk] = new_text if new_text else "-"
@@ -1513,7 +1561,9 @@ async def _begin_lead_flow(
     "📞 Phone Number\n"
     "💲 Price\n"
     "📝 Special request for issuers (optional)\n"
-    "📝 Special request for drivers (optional)\n\n"
+    "📝 Special request for drivers (optional)\n"
+    "📧 Email (optional — we'll offer to send a NY FS-20 insurance card)\n"
+    "🪪 Driver's License / DMV ID (optional)\n\n"
     "You can attach files after this step.\n\n"
     f"{motivation.get_random_quote()}\n\n"
     "🏁Automated🏎Automotive"
@@ -2181,25 +2231,31 @@ async def _phase1_finish_vision_extraction(
             "Please send the details as text in the required 11-line structure, or try another photo or PDF."
         )
         return STATE_PHASE1
-    # Parse extra fields (phone, price, notes) from lines 12-15
+    # Parse extra fields (phone, price, notes, email, driver-license id) from lines 12+
     phone = price = issuer_note = driver_note = None
+    email_val = dl_val = None
     extra_lines = lines[ai_vision.PHASE1_LINE_COUNT:]
     for line in extra_lines:
         l = line.strip()
         if not l or l == "-":
             continue
-        if l.lower().startswith("phone:"):
+        low = l.lower()
+        if low.startswith("phone:"):
             phone = l.split(":", 1)[1].strip()
-        elif l.lower().startswith("price:"):
+        elif low.startswith("price:"):
             price = l.split(":", 1)[1].strip()
-        elif l.lower().startswith("issuer note:"):
+        elif low.startswith("issuer note:"):
             issuer_note = l.split(":", 1)[1].strip()
             if issuer_note.lower() in ("-", "none", "n/a", "na"):
                 issuer_note = None
-        elif l.lower().startswith("driver note:"):
+        elif low.startswith("driver note:"):
             driver_note = l.split(":", 1)[1].strip()
             if driver_note.lower() in ("-", "none", "n/a", "na"):
                 driver_note = None
+        elif low.startswith("email:"):
+            email_val = ai_vision.normalize_email(l.split(":", 1)[1].strip())
+        elif low.startswith("driverlicenseid:") or low.startswith("driver license id:") or low.startswith("driver license:") or low.startswith("dl id:") or low.startswith("dl:") or low.startswith("daq:"):
+            dl_val = ai_vision.normalize_driver_license_id(l.split(":", 1)[1].strip())
 
     if phone and price:
         state_data["pending_phone_number"] = phone
@@ -2208,6 +2264,10 @@ async def _phase1_finish_vision_extraction(
             state_data["special_request_issuers"] = issuer_note
         if driver_note:
             state_data["special_request_drivers"] = driver_note
+    if email_val:
+        state_data["email"] = email_val
+    if dl_val:
+        state_data["driver_license_id"] = dl_val
 
     # Robust VIN extraction from whole raw output
     vin_from_raw = _extract_vin_17(raw_text)
@@ -2373,22 +2433,29 @@ async def handle_phase1(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
             l = line.strip()
             if not l or l == "-":
                 continue
-            if l.lower().startswith("phone:"):
+            low = l.lower()
+            if low.startswith("phone:"):
                 state_data["pending_phone_number"] = l.split(":", 1)[1].strip()
-            elif l.lower().startswith("price:"):
+            elif low.startswith("price:"):
                 state_data["pending_price"] = l.split(":", 1)[1].strip()
-            elif l.lower().startswith("issuer note:"):
+            elif low.startswith("issuer note:"):
                 note = l.split(":", 1)[1].strip()
                 if note.lower() not in ("-", "none", "n/a", "na"):
                     state_data["special_request_issuers"] = note
                 else:
                     state_data["special_request_issuers"] = ""   # explicitly clear
-            elif l.lower().startswith("driver note:"):
+            elif low.startswith("driver note:"):
                 note = l.split(":", 1)[1].strip()
                 if note.lower() not in ("-", "none", "n/a", "na"):
                     state_data["special_request_drivers"] = note
                 else:
                     state_data["special_request_drivers"] = ""
+            elif low.startswith("email:"):
+                e = ai_vision.normalize_email(l.split(":", 1)[1].strip())
+                state_data["email"] = e  # always set (may be "")
+            elif low.startswith("driverlicenseid:") or low.startswith("driver license id:") or low.startswith("driver license:") or low.startswith("dl id:") or low.startswith("dl:") or low.startswith("daq:"):
+                d = ai_vision.normalize_driver_license_id(l.split(":", 1)[1].strip())
+                state_data["driver_license_id"] = d
 
         # ═════════════════════════════════════════════════
         #  2. Fallback: if the AI did NOT give us a phone or price,
@@ -2400,6 +2467,14 @@ async def handle_phase1(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
                 state_data["pending_phone_number"] = phone
             if not state_data.get("pending_price") and price:
                 state_data["pending_price"] = price
+
+        # Fallback for email + driver-license id from the user's raw message
+        if not (state_data.get("email") or "").strip() or not (state_data.get("driver_license_id") or "").strip():
+            raw_email, raw_dl = _extract_email_and_dl_from_text(message_text)
+            if raw_email and not (state_data.get("email") or "").strip():
+                state_data["email"] = raw_email
+            if raw_dl and not (state_data.get("driver_license_id") or "").strip():
+                state_data["driver_license_id"] = raw_dl
 
         _sanitize_phase1_pending_phone_price(state_data)
         db.set_user_state(user_id, "phase1", state_data)
@@ -2420,6 +2495,11 @@ async def handle_phase1(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
             if driver_note:
                 state_data["special_request_drivers"] = driver_note
             db.set_user_state(user_id, "phase1", state_data)
+        raw_email, raw_dl = _extract_email_and_dl_from_text(message_text)
+        if raw_email:
+            state_data["email"] = raw_email
+        if raw_dl:
+            state_data["driver_license_id"] = raw_dl
         _sanitize_phase1_pending_phone_price(state_data)
         db.set_user_state(user_id, "phase1", state_data)
         await _send_phase1_ai_review(update.message, state_data, context, user_id)
@@ -3394,6 +3474,8 @@ async def handle_special_request_drivers(update: Update, context: ContextTypes.D
         "special_request_issuers": state_data.get("special_request_issuers", "") or "",
         "special_request_drivers": state_data.get("special_request_drivers", "") or "",
         "special_request_note": state_data.get("special_request_issuers", "") or "",
+        "email": (state_data.get("email") or "") or None,
+        "driver_license_id": (state_data.get("driver_license_id") or "") or None,
         "phase1_attached_files": state_data.get("attached_files") or [],
     }
     lead = db.create_lead(final_lead_data)
@@ -3487,6 +3569,8 @@ async def _submit_lead_from_review(message, context, user_id, data):
         "extra_info": data.get("extra_info", ""),
         "special_request_issuers": data.get("special_request_issuers", ""),
         "special_request_drivers": data.get("special_request_drivers", ""),
+        "email": (data.get("email") or "") or None,
+        "driver_license_id": (data.get("driver_license_id") or "") or None,
         "contact_info_source": data.get("selected_source_label", ""),
         "phase1_attached_files": data.get("attached_files") or [],
     })
@@ -3653,6 +3737,8 @@ async def handle_group_selection(update: Update, context: ContextTypes.DEFAULT_T
             "special_request_issuers": lead_data.get("special_request_issuers", "") or "",
             "special_request_drivers": lead_data.get("special_request_drivers", "") or "",
             "special_request_note": lead_data.get("special_request_issuers", "") or "",
+            "email": (lead_data.get("email") or "") or None,
+            "driver_license_id": (lead_data.get("driver_license_id") or "") or None,
             "phase1_attached_files": lead_data.get("attached_files") or [],
         }
         lead = db.create_lead(final_lead_data)
@@ -3842,6 +3928,8 @@ async def handle_group_selection(update: Update, context: ContextTypes.DEFAULT_T
         "special_request_issuers": lead_data.get("special_request_issuers", "") or "",
         "special_request_drivers": lead_data.get("special_request_drivers", "") or "",
         "special_request_note": lead_data.get("special_request_issuers", "") or "",
+        "email": (lead_data.get("email") or "") or None,
+        "driver_license_id": (lead_data.get("driver_license_id") or "") or None,
         "phase1_attached_files": lead_data.get("attached_files") or [],
     }
     lead = db.create_lead(final_lead_data)
@@ -4041,6 +4129,8 @@ async def handle_driver_selection(update: Update, context: ContextTypes.DEFAULT_
         "special_request_issuers": lead_data.get("special_request_issuers", "") or "",
         "special_request_drivers": lead_data.get("special_request_drivers", "") or "",
         "special_request_note": lead_data.get("special_request_issuers", "") or "",
+        "email": (lead_data.get("email") or "") or None,
+        "driver_license_id": (lead_data.get("driver_license_id") or "") or None,
         "phase1_attached_files": lead_data.get("attached_files") or [],
     }
 
@@ -4182,6 +4272,9 @@ async def handle_driver_selection(update: Update, context: ContextTypes.DEFAULT_
 
     await _issuer_lead_success_and_motivation(
         query.message, user_id, username, reference_id, driver_names, selected_group.get("group_name", "N/A"),
+    )
+    await _maybe_offer_insurance_card(
+        context, query.message, lead_id=lead["id"], reference_id=reference_id,
     )
     return ConversationHandler.END
 
@@ -4720,6 +4813,266 @@ async def _finish_lead_send(
         asyncio.create_task(_bg_contact_source_sync())
 
 
+async def _maybe_offer_insurance_card(
+    context: ContextTypes.DEFAULT_TYPE,
+    chat,
+    *,
+    lead_id: str,
+    reference_id: str,
+) -> bool:
+    """Post a Yes/No prompt to send a NY FS-20 insurance-card PDF to the lead's
+    email. Returns ``True`` when a prompt was sent.
+
+    Quietly skips when the lead has no email or Resend is not configured.
+    """
+    lead = db.get_lead_by_id(lead_id) if lead_id else None
+    if not lead:
+        return False
+    email = (lead.get("email") or "").strip()
+    if not email:
+        return False
+    if not Config.is_resend_configured():
+        logger.info(
+            "Insurance card: skipping prompt for lead %s — Resend not configured", lead_id
+        )
+        return False
+    # Telegram callback_data has a 64-byte limit; full UUID (36) + prefix fits.
+    keyboard = InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("✅ Yes, send card", callback_data=f"ins_card_yes_{lead_id}"),
+            InlineKeyboardButton("❌ No, skip", callback_data=f"ins_card_no_{lead_id}"),
+        ],
+    ])
+    safe_email = html.escape(email, quote=False)
+    safe_ref = html.escape(str(reference_id or "N/A"), quote=False)
+    try:
+        await chat.reply_text(
+            (
+                "📧 <b>Email detected on this lead.</b>\n\n"
+                f"📋 Reference: <code>{safe_ref}</code>\n"
+                f"✉️ Send an <b>NY FS-20 insurance card</b> PDF to "
+                f"<code>{safe_email}</code>?"
+            ),
+            parse_mode="HTML",
+            reply_markup=keyboard,
+        )
+        return True
+    except Exception as e:
+        logger.warning("Could not post insurance-card offer: %s", e)
+        return False
+
+
+async def _build_and_send_insurance_card(lead: dict) -> tuple[bool, Optional[str], Optional[str]]:
+    """Generate the NY FS-20 PDF for ``lead`` and email it via Resend.
+
+    Returns ``(ok, policy_number, error_message)``. Performs the heavy work
+    (NHTSA decode, PDF417 rasterise, Resend HTTP) inside ``asyncio.to_thread``.
+    """
+    from utils import insurance_card as ic
+    from utils import resend_client as rc
+
+    email = (lead.get("email") or "").strip()
+    if not email:
+        return (False, None, "Lead has no email on file.")
+
+    raw_vehicle = (lead.get("vehicle_details") or "").splitlines()
+    # vehicle_details layout (per parse_phase1_structured/_clean_vin_and_car):
+    #   [name, address, city_state_zip, delivery_address, delivery_city_state_zip,
+    #    vin, car, color, insurance_company, insurance_policy_number, extra_info]
+    def _ln(idx: int) -> str:
+        return raw_vehicle[idx].strip() if idx < len(raw_vehicle) else ""
+    name = _ln(0) or "UNKNOWN"
+    addr_line1 = _ln(1)
+    addr_csz = _ln(2)
+    vin_raw = _ln(5)
+    car_raw = _ln(6)
+    color = _ln(7)
+
+    vin_clean = ic.normalize_vin(vin_raw)
+    if not vin_clean:
+        return (False, None, f"VIN '{vin_raw}' is invalid — cannot build insurance card.")
+
+    decoded = await asyncio.to_thread(ic.decode_vin_from_nhtsa, vin_clean)
+    if decoded:
+        vehicle_year = (decoded.get("modelYear") or "").strip()
+        vehicle_make_full = (decoded.get("vehicleMake") or "").strip()
+        vehicle_model = (decoded.get("vehicleModel") or "").strip()
+    else:
+        # Fall back to "car" line (e.g. "2020 Toyota Camry")
+        parts = car_raw.split()
+        vehicle_year = parts[0] if parts and parts[0].isdigit() else ""
+        vehicle_make_full = parts[1] if len(parts) > 1 else ""
+        vehicle_model = " ".join(parts[2:]) if len(parts) > 2 else ""
+
+    vehicle_make_short = (
+        re.sub(r"[^A-Za-z0-9]", "", vehicle_make_full).upper()[:5] or "MAKE"
+    )
+    if not (vehicle_year and vehicle_year.isdigit() and len(vehicle_year) == 4):
+        vehicle_year = "0000"
+
+    today = datetime.now(pytz.timezone("America/New_York")).date()
+    effective_label = ic.date_to_mmddyyyy(today)
+    expiration_label = ic.date_to_mmddyyyy(ic.expiration_for_plan(today, months=1))
+    policy_number = ic.generate_policy_number()
+
+    address_lines: list[str] = []
+    if addr_line1:
+        address_lines.append(addr_line1)
+    if addr_csz:
+        address_lines.append(addr_csz)
+    if not address_lines:
+        address_lines = ["UNKNOWN ADDRESS"]
+
+    issuer = ic.CardIssuer(
+        issuer_company_line=Config.INSURANCE_ISSUER_NAME,
+        issuer_phone=Config.INSURANCE_ISSUER_PHONE,
+        agency_name=Config.INSURANCE_ISSUER_NAME,
+        agency_address_lines=[ln.strip() for ln in (Config.INSURANCE_ISSUER_ADDRESS or "").split("|") if ln.strip()],
+    )
+
+    pdf_input = ic.InsuranceCardInput(
+        policy_number=policy_number,
+        effective_mm_dd_yyyy=effective_label,
+        expiration_mm_dd_yyyy=expiration_label,
+        vehicle_year_full=vehicle_year,
+        vehicle_make_short=vehicle_make_short,
+        vin=vin_clean,
+        insured_name_upper=name.upper(),
+        insured_fs20_name=ic.format_insured_fs20_name(name.upper()),
+        insured_address_lines=address_lines,
+        daq=(lead.get("driver_license_id") or "").strip() or None,
+        issuer=issuer,
+    )
+
+    try:
+        pdf_bytes = await asyncio.to_thread(ic.build_ny_insurance_id_card_pdf, pdf_input)
+    except Exception as e:
+        logger.exception("Failed to build FS-20 PDF for lead %s: %s", lead.get("id"), e)
+        return (False, policy_number, f"Could not build insurance card PDF: {e}")
+
+    vehicle_label = ic.format_suggested_vehicle_name(vehicle_year, vehicle_make_full, vehicle_model)
+    if color and color != "-":
+        vehicle_label = f"{vehicle_label} — {color}".strip(" —")
+
+    subject, body = rc.build_purchase_welcome_email(
+        rc.PurchaseWelcomeEmailInput(
+            first_name=rc.first_name_from_full(name),
+            policy_number=policy_number,
+            effective_date_label=today.strftime("%B ") + str(today.day) + ", " + str(today.year),
+            vehicle_line=vehicle_label or "Vehicle on file",
+        )
+    )
+
+    send_result = await asyncio.to_thread(
+        rc.send_insurance_card_email,
+        to_address=email,
+        subject=subject,
+        body=body,
+        pdf_bytes=pdf_bytes,
+        pdf_filename=f"insurance-id-card-{policy_number}.pdf",
+    )
+    if not send_result.ok:
+        return (False, policy_number, send_result.error or "Resend send failed.")
+    return (True, policy_number, None)
+
+
+async def handle_insurance_card_decision(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Top-level callback handler for the post-dispatch insurance card prompt.
+
+    Pattern: ``ins_card_(yes|no)_<short_lead_id>``. Runs OUTSIDE the
+    ConversationHandler so it works after ``ConversationHandler.END``.
+    """
+    query = update.callback_query
+    if not query:
+        return
+    try:
+        await query.answer()
+    except Exception:
+        pass
+    raw = query.data or ""
+    if raw.startswith("ins_card_yes_"):
+        decision = "yes"
+        lead_id = raw[len("ins_card_yes_"):]
+    elif raw.startswith("ins_card_no_"):
+        decision = "no"
+        lead_id = raw[len("ins_card_no_"):]
+    else:
+        return
+    if not lead_id:
+        return
+    try:
+        await query.edit_message_reply_markup(reply_markup=None)
+    except Exception:
+        pass
+
+    lead = db.get_lead_by_id(lead_id)
+    if not lead:
+        try:
+            await query.message.reply_text("❌ Could not find this lead to issue the card.")
+        except Exception:
+            pass
+        return
+
+    if decision == "no":
+        try:
+            await query.message.reply_text("👍 Skipped insurance card email.")
+        except Exception:
+            pass
+        return
+
+    email = (lead.get("email") or "").strip()
+    safe_email = html.escape(email or "—", quote=False)
+    try:
+        await query.message.reply_text(
+            f"⏳ Building NY FS-20 insurance card and emailing <code>{safe_email}</code>…",
+            parse_mode="HTML",
+        )
+    except Exception:
+        pass
+
+    ok, policy_number, err = await _build_and_send_insurance_card(lead)
+    update_payload: dict = {}
+    if ok:
+        update_payload = {
+            "insurance_card_policy_number": policy_number,
+            "insurance_card_sent_to_email": email,
+            "insurance_card_sent_at": datetime.now(pytz.timezone("America/New_York")).isoformat(),
+            "insurance_card_error": None,
+        }
+    else:
+        update_payload = {
+            "insurance_card_policy_number": policy_number,
+            "insurance_card_sent_to_email": email,
+            "insurance_card_error": (err or "Unknown error")[:500],
+        }
+    try:
+        db.update_lead(lead["id"], update_payload)
+    except Exception as e:
+        logger.warning("Could not update insurance_card_* fields on lead %s: %s", lead.get("id"), e)
+
+    if ok:
+        safe_policy = html.escape(policy_number or "—", quote=False)
+        try:
+            await query.message.reply_text(
+                "✅ <b>Insurance card sent</b>\n\n"
+                f"📋 Policy: <code>{safe_policy}</code>\n"
+                f"📧 Delivered to <code>{safe_email}</code>",
+                parse_mode="HTML",
+            )
+        except Exception:
+            pass
+    else:
+        safe_err = html.escape(err or "Unknown error", quote=False)
+        try:
+            await query.message.reply_text(
+                "❌ <b>Could not send insurance card</b>\n\n"
+                f"{safe_err}",
+                parse_mode="HTML",
+            )
+        except Exception:
+            pass
+
+
 async def handle_contact_source_selection(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """Handle contact info source selection after lead was sent to drivers."""
     query = update.callback_query
@@ -4764,6 +5117,10 @@ async def handle_contact_source_selection(update: Update, context: ContextTypes.
         "➕ Send another lead: /lead or /client",
         parse_mode="HTML",
     )
+    if lead_id:
+        await _maybe_offer_insurance_card(
+            context, query.message, lead_id=lead_id, reference_id=reference_id,
+        )
     return ConversationHandler.END
 
 
@@ -7017,6 +7374,11 @@ def main():
     application.add_handler(CallbackQueryHandler(handle_accept_group_offer, pattern="^ag_"))
     application.add_handler(CallbackQueryHandler(handle_different_team_offer, pattern="^dt_"))
     application.add_handler(CallbackQueryHandler(handle_decline_group_offer, pattern="^dg_"))
+
+    # Post-dispatch insurance-card prompt (NY FS-20 PDF + Resend email).
+    application.add_handler(
+        CallbackQueryHandler(handle_insurance_card_decision, pattern=r"^ins_card_(yes|no)_")
+    )
 
     # Renewal accept / reassign handlers
     application.add_handler(CallbackQueryHandler(handle_renewal_group_accept, pattern="^rga_"))

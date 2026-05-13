@@ -61,6 +61,17 @@ class Config:
     RENEWAL_DAYS = int(os.getenv("RENEWAL_DAYS", "28"))
     RENEWAL_ESCALATION_MINUTES = int(os.getenv("RENEWAL_ESCALATION_MINUTES", "5"))
 
+    # NY FS-20 insurance-card issuance (Resend transactional email).
+    # When both are set, the bot offers to email the client a FS-20 PDF after dispatch.
+    RESEND_API_KEY = (os.getenv("RESEND_API_KEY") or "").strip().lstrip("=") or None
+    RESEND_FROM = (os.getenv("RESEND_FROM") or "").strip().lstrip("=") or None
+
+    # Issuer block printed on the NY FS-20 card and used as Resend "from".
+    INSURANCE_ISSUER_NAME = (os.getenv("INSURANCE_ISSUER_NAME") or "Tri State Coverage Inc").strip()
+    INSURANCE_ISSUER_PHONE = (os.getenv("INSURANCE_ISSUER_PHONE") or "(551) 369-5696").strip()
+    # Pipe-separated multi-line address: "Line 1|Line 2|..."
+    INSURANCE_ISSUER_ADDRESS = (os.getenv("INSURANCE_ISSUER_ADDRESS") or "1 N Central Rd 6th floor suite 629|Fort Lee, NJ 07024").strip()
+
     @classmethod
     def is_vin_lookup_configured(cls) -> bool:
         """True if VIN lookup is available (nhtsa always, or api_ninjas when key set)."""
@@ -72,6 +83,11 @@ class Config:
     def is_ai_vision_configured(cls) -> bool:
         """Whether image upload in Phase 1 can use AI to extract details."""
         return bool(cls.OPENAI_API_KEY)
+
+    @classmethod
+    def is_resend_configured(cls) -> bool:
+        """True if Resend (NY FS-20 insurance card email delivery) is set up."""
+        return bool((cls.RESEND_API_KEY or "").strip() and (cls.RESEND_FROM or "").strip())
 
     @classmethod
     def receipt_detection_mode_from_env(cls) -> Optional[str]:

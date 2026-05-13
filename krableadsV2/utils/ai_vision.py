@@ -89,16 +89,18 @@ class AIVisionQuotaError(Exception):
     pass
 
 # Expected output: exactly 11 lines in this order (used by parse_phase1_structured)
-STRUCTURE_PROMPT = """You are extracting vehicle/registration and delivery details, plus the client's phone number and price, from an image or PDF page (screenshot, scan, or form).
+STRUCTURE_PROMPT = """You are extracting vehicle/registration and delivery details, plus the client's phone number, price, optional email and driver's-license ID, from an image or PDF page (screenshot, scan, or form).
 
 STRICT RULES:
-- Output ONLY a plain text block with exactly 15 lines. One line per field—nothing else on that line.
+- Output ONLY a plain text block with exactly 17 lines. One line per field—nothing else on that line.
 - Lines 1-11 must contain ONLY the vehicle/delivery values. No phone numbers, no URLs, no extra text.
 - Line 6 (VIN): exactly 17 alphanumeric characters (no spaces, no truncation, no extra digits). Or "-" if missing. Nothing else on that line.
 - Line 7 (Car): only year, make, and model—e.g. "2020 Nissan Altima". Nothing else.
 - Line 8 (Color): ONLY the vehicle color. DMV/registration forms often show exactly THREE letters (e.g. GRY=gray, BLK=black, WHT=white, SIL=silver). Copy those three letters exactly in UPPERCASE—never drop a letter (wrong: GY; correct: GRY). Full words like Silver or Black are fine. If not stated, use "-". Never put city names (Brick, Jersey), addresses, or insurance names in color.
 - If a value is missing or unreadable, put a single dash "-" for that line.
-- Lines 12-15 must contain the phone number, price, and any special notes, each on its own line with the exact labels shown below. If a value is not visible, put a single dash "-".
+- Lines 12-17 must contain the phone number, price, special notes, email, and driver-license ID, each on its own line with the exact labels shown below. If a value is not visible, put a single dash "-".
+- Line 16 (Email): a single email address only (e.g. john@example.com). Never invent an address. If none is visible, output "Email: -".
+- Line 17 (DriverLicenseID): the customer's driver's-license / DMV ID exactly as printed (digits and/or letters). Never invent it. If none is visible, output "DriverLicenseID: -". Do NOT put the insurance policy number here.
 
 Order and labels (one value per line, no extra text):
 1) Full Name
@@ -116,6 +118,8 @@ Order and labels (one value per line, no extra text):
 13) Price: <price>  (e.g. Price: $250)
 14) Issuer note: <note or ->  (e.g. Issuer note: Please double-check VIN)
 15) Driver note: <note or ->  (e.g. Driver note: Call before arrival)
+16) Email: <email address or ->  (e.g. Email: john.doe@example.com)
+17) DriverLicenseID: <driver license / DMV id or ->  (e.g. DriverLicenseID: 123456789)
 
 - For City, State, ZIP: use the standard two‑letter state abbreviation (e.g., "NY" not "New York"). Format as "City, ST 12345" (no extra comma before ZIP). Correct obvious misspellings only if you are certain (e.g., "Laurelton" not "Laurenton"). If you see a separate ZIP code line, merge it into the City line.
 - For addresses: capitalise as appropriate, but do not invent missing parts.
@@ -136,22 +140,26 @@ Phone: +1234567890
 Price: $150
 Issuer note: -
 Driver note: Ring the bell
+Email: john.doe@example.com
+DriverLicenseID: 123456789
 
-Output nothing else—no explanation, no markdown, no line numbers. Only these 15 lines."""
+Output nothing else—no explanation, no markdown, no line numbers. Only these 17 lines."""
 
 # For freeform text: user can send any format; we ask the model to identify and rearrange into 11 lines
-TEXT_STRUCTURE_PROMPT = """The user sent the following message. It may be in any format: paragraph, bullet list, different order, labels like "Name: John", etc. It also includes a phone number, a price (maybe with a $ sign), and possibly two notes (one for the tag issuer, one for the driver).
+TEXT_STRUCTURE_PROMPT = """The user sent the following message. It may be in any format: paragraph, bullet list, different order, labels like "Name: John", etc. It also includes a phone number, a price (maybe with a $ sign), and possibly two notes (one for the tag issuer, one for the driver), an email, and a driver-license / DMV ID.
 
 STRICT RULES:
-- Output ONLY a plain text block with exactly 15 lines. One line per field—nothing else on that line.
+- Output ONLY a plain text block with exactly 17 lines. One line per field—nothing else on that line.
 - Lines 1-11 must contain ONLY the vehicle/delivery values. No phone numbers, no URLs, no extra text.
 - Line 6 (VIN): exactly 17 alphanumeric characters (no spaces, no truncation, no extra digits). Or "-" if missing.
 - Line 7 (Car): only year, make, and model—e.g. "2020 Nissan Altima". Nothing else.
 - Line 8 (Color): ONLY the vehicle color. Three-letter DMV codes (GRY, BLK, etc.) are fine. If missing, use "-". Never put city names, addresses, or insurance names in color.
 - If something is missing, put a single dash "-" for that line.
-- Lines 12-15 must contain the phone number, price, and any notes, each with the labels exactly as shown below. If a value is not present, put a single dash "-".
+- Lines 12-17 must contain the phone number, price, notes, email, and driver-license ID, each with the labels exactly as shown below. If a value is not present, put a single dash "-".
+- Line 16 (Email): a single email address only (e.g. john@example.com). Never invent one. If none, output "Email: -".
+- Line 17 (DriverLicenseID): the customer's driver-license / DMV ID exactly as written. Never invent it. If none, output "DriverLicenseID: -". Do NOT put the insurance policy number here.
 
-Order (one value per line, with labels for lines 12-15):
+Order (one value per line, with labels for lines 12-17):
 1) Full Name
 2) Registration Address (street only)
 3) Registration City, State, ZIP
@@ -167,11 +175,13 @@ Order (one value per line, with labels for lines 12-15):
 13) Price: <price>  (e.g. Price: $250)
 14) Issuer note: <note or ->  (e.g. Issuer note: Please double-check VIN)
 15) Driver note: <note or ->  (e.g. Driver note: Call before arrival)
+16) Email: <email address or ->  (e.g. Email: john.doe@example.com)
+17) DriverLicenseID: <driver license / DMV id or ->  (e.g. DriverLicenseID: 123456789)
 
 - For City, State, ZIP: use the standard two‑letter state abbreviation (e.g., "NY" not "New York"). Format as "City, ST 12345". Correct obvious misspellings only if you are certain.
 - For addresses: capitalise appropriately, but do not invent missing parts.
 
-Output nothing else—no explanation, no markdown, no line numbers. Only these 15 lines.
+Output nothing else—no explanation, no markdown, no line numbers. Only these 17 lines.
 
 User message:
 """
@@ -339,6 +349,34 @@ def normalize_phase1_color(val: str) -> str:
 def _has_value(val: str) -> bool:
     """True if field has a non-empty value (not blank or single dash)."""
     return bool(val and str(val).strip() and str(val).strip() != "-")
+
+
+# RFC 5322-lite: good enough to detect "looks like an email".
+EMAIL_PATTERN = re.compile(r"^[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}$")
+
+
+def normalize_email(val: str) -> str:
+    """Return a clean lowercase email if val looks valid, else ''."""
+    s = (val or "").strip().rstrip(",.;:").strip("<>\"' ")
+    if not s or s == "-" or s.lower() in ("none", "n/a", "na", "unknown"):
+        return ""
+    s = s.lower()
+    if EMAIL_PATTERN.match(s):
+        return s
+    return ""
+
+
+def normalize_driver_license_id(val: str) -> str:
+    """Driver-license / AAMVA DAQ id: keep alphanumeric, dashes, spaces; trim and uppercase.
+    Returns '' when blank/dash/placeholder.
+    """
+    s = (val or "").strip()
+    if not s or s == "-" or s.lower() in ("none", "n/a", "na", "unknown", "tbd", "pending"):
+        return ""
+    # Drop anything that's clearly not part of an ID (e.g. labels left over)
+    cleaned = re.sub(r"[^A-Za-z0-9\-\s]", "", s).strip()
+    cleaned = re.sub(r"\s+", " ", cleaned)
+    return cleaned.upper()[:80]
 
 
 def validate_phase1_extraction(normalized_text: str, state_data: dict) -> tuple[bool, list[str]]:

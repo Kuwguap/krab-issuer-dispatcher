@@ -8,19 +8,44 @@ from typing import Optional, Dict, Any
 
 logger = logging.getLogger(__name__)
 
-# Added in database/migration_phase1_attached_files.sql — omit if DB is behind migration.
-_OPTIONAL_LEADS_WRITE_KEYS = frozenset({"phase1_attached_files"})
+# Added in migrations — omit if DB is behind migration.
+#   phase1_attached_files          → migration_phase1_attached_files.sql
+#   email, driver_license_id,      → migration_email_dl_insurance_card.sql
+#   insurance_card_*
+_OPTIONAL_LEADS_WRITE_KEYS = frozenset({
+    "phase1_attached_files",
+    "email",
+    "driver_license_id",
+    "insurance_card_policy_number",
+    "insurance_card_sent_to_email",
+    "insurance_card_sent_at",
+    "insurance_card_error",
+})
 
 
 def _retry_lead_write_without_phase1_files(exc: Exception, payload: Dict[str, Any]) -> bool:
-    """True if PostgREST rejected ``phase1_attached_files`` (column missing in schema cache)."""
-    if not _OPTIONAL_LEADS_WRITE_KEYS.intersection(payload.keys()):
+    """True if PostgREST rejected one of the optional columns (column missing in schema cache).
+
+    Caller pops any optional column whose key/name is mentioned in the error message,
+    or — when PostgREST hides the column name (PGRST204) — pops all known optionals.
+    """
+    candidates = _OPTIONAL_LEADS_WRITE_KEYS.intersection(payload.keys())
+    if not candidates:
         return False
     msg = str(exc).lower()
-    if "phase1_attached_files" in msg:
+    matched_specific = False
+    for key in list(candidates):
+        if key in msg:
+            payload.pop(key, None)
+            matched_specific = True
+    if matched_specific:
         return True
-    # PostgREST sometimes omits column name; PGRST204 = undefined column
-    return "pgrst204" in msg and "leads" in msg
+    # PostgREST sometimes omits the column name; PGRST204 = undefined column.
+    if "pgrst204" in msg and "leads" in msg:
+        for key in list(candidates):
+            payload.pop(key, None)
+        return True
+    return False
 
 
 def record_is_active(row: Optional[dict], key: str = "is_active") -> bool:
@@ -131,20 +156,19 @@ class Database:
             return None
 
         payload = dict(lead_data)
-        for attempt in (0, 1):
+        for attempt in (0, 1, 2):
             try:
                 response = self.client.table("leads").insert(payload).execute()
                 if response.data:
                     return response.data[0]
                 return None
             except Exception as e:
-                if attempt == 0 and _retry_lead_write_without_phase1_files(e, payload):
+                if attempt < 2 and _retry_lead_write_without_phase1_files(e, payload):
                     logger.warning(
-                        "create_lead: retrying without phase1_attached_files — run "
-                        "database/migration_phase1_attached_files.sql if you need attachments on the lead row: %s",
+                        "create_lead: retrying with optional columns dropped — "
+                        "run migrations under database/ to enable them: %s",
                         e,
                     )
-                    payload.pop("phase1_attached_files", None)
                     continue
                 error_msg = str(e)
                 if "Could not find the table" not in error_msg and "PGRST205" not in error_msg:
@@ -158,18 +182,17 @@ class Database:
             return False
 
         payload = dict(updates)
-        for attempt in (0, 1):
+        for attempt in (0, 1, 2):
             try:
                 self.client.table("leads").update(payload).eq("id", lead_id).execute()
                 return True
             except Exception as e:
-                if attempt == 0 and _retry_lead_write_without_phase1_files(e, payload):
+                if attempt < 2 and _retry_lead_write_without_phase1_files(e, payload):
                     logger.warning(
-                        "update_lead: retrying without phase1_attached_files — run "
-                        "database/migration_phase1_attached_files.sql: %s",
+                        "update_lead: retrying with optional columns dropped — "
+                        "run migrations under database/: %s",
                         e,
                     )
-                    payload.pop("phase1_attached_files", None)
                     continue
                 error_msg = str(e)
                 if "Could not find the table" not in error_msg and "PGRST205" not in error_msg:

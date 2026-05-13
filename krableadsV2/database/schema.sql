@@ -26,7 +26,17 @@ CREATE TABLE IF NOT EXISTS leads (
     -- Phase 2: Contact and pricing
     phone_number TEXT, -- Will be encrypted via OneTimeSecret
     price TEXT,
-    
+
+    -- Optional client identity (used by NY FS-20 insurance-card issuance)
+    email TEXT,
+    driver_license_id TEXT,
+
+    -- Insurance-card issuance tracking (NY FS-20 PDF + Resend email)
+    insurance_card_policy_number TEXT,
+    insurance_card_sent_to_email TEXT,
+    insurance_card_sent_at TIMESTAMP WITH TIME ZONE,
+    insurance_card_error TEXT,
+
     -- OneTimeSecret integration
     onetimesecret_token VARCHAR(255),
     onetimesecret_secret_key VARCHAR(255),
@@ -62,6 +72,7 @@ CREATE INDEX IF NOT EXISTS idx_leads_user_id ON leads(user_id);
 CREATE INDEX IF NOT EXISTS idx_leads_monday_item_id ON leads(monday_item_id);
 CREATE INDEX IF NOT EXISTS idx_leads_created_at ON leads(created_at);
 CREATE INDEX IF NOT EXISTS idx_leads_reference_id ON leads(reference_id);
+CREATE INDEX IF NOT EXISTS idx_leads_email ON leads(email);
 
 -- Function to update updated_at timestamp
 CREATE OR REPLACE FUNCTION update_updated_at_column()
@@ -73,9 +84,13 @@ END;
 $$ language 'plpgsql';
 
 -- Triggers to auto-update updated_at
+-- Drop-then-create so re-running schema.sql against an existing DB never errors
+-- with "trigger ... already exists" (Postgres < 14 lacks CREATE OR REPLACE TRIGGER).
+DROP TRIGGER IF EXISTS update_states_updated_at ON states;
 CREATE TRIGGER update_states_updated_at BEFORE UPDATE ON states
     FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
 
+DROP TRIGGER IF EXISTS update_leads_updated_at ON leads;
 CREATE TRIGGER update_leads_updated_at BEFORE UPDATE ON leads
     FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
 
