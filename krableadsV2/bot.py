@@ -4839,17 +4839,36 @@ async def _maybe_offer_insurance_card(
     """
     lead = db.get_lead_by_id(lead_id) if lead_id else None
     if not lead:
+        logger.warning(
+            "Insurance card: lead %s not found; cannot offer card", lead_id
+        )
         return False
     email = (lead.get("email") or "").strip()
     if not email:
+        logger.info(
+            "Insurance card: lead %s has no email; skipping offer", lead_id
+        )
         return False
     # Don't re-offer if a card was already sent for this lead.
     if (lead.get("insurance_card_sent_at") or "").strip():
         return False
     if not Config.is_resend_configured():
-        logger.info(
-            "Insurance card: skipping prompt for lead %s — Resend not configured", lead_id
+        logger.warning(
+            "Insurance card: lead %s has email %s but RESEND_API_KEY/RESEND_FROM "
+            "are not configured — prompt skipped",
+            lead_id,
+            email,
         )
+        try:
+            await chat.reply_text(
+                "ℹ️ Email detected on this lead but insurance-card sending is not "
+                "configured.\n\nSet <code>RESEND_API_KEY</code> and "
+                "<code>RESEND_FROM</code> in the bot's environment to enable the "
+                "NY FS-20 PDF email flow.",
+                parse_mode="HTML",
+            )
+        except Exception:
+            pass
         return False
     # Telegram callback_data has a 64-byte limit; full UUID (36) + prefix fits.
     keyboard = InlineKeyboardMarkup([
