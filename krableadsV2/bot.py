@@ -3507,6 +3507,9 @@ async def handle_special_request_drivers(update: Update, context: ContextTypes.D
         "**right after** they accept.",
         parse_mode="HTML",
     )
+    await _maybe_offer_insurance_card(
+        context, update.message, lead_id=str(lead["id"]), reference_id=str(reference_id),
+    )
     return ConversationHandler.END
 
 async def _submit_lead_from_review(message, context, user_id, data):
@@ -3697,6 +3700,9 @@ async def _submit_lead_from_review(message, context, user_id, data):
         f"Use /lead to add another.",
         parse_mode="Markdown",
     )
+    await _maybe_offer_insurance_card(
+        context, message, lead_id=str(lead["id"]), reference_id=str(ref_id),
+    )
     return ConversationHandler.END
 
 async def handle_group_selection(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -3849,6 +3855,9 @@ async def handle_group_selection(update: Update, context: ContextTypes.DEFAULT_T
                 "📣 Approval requests sent. Wait for a team to **Accept**, then choose drivers here.",
                 parse_mode="Markdown",
             )
+        await _maybe_offer_insurance_card(
+            context, query.message, lead_id=str(lead["id"]), reference_id=str(reference_id),
+        )
         return ConversationHandler.END
 
     group_id = query.data.replace("select_group_", "")
@@ -3959,6 +3968,9 @@ async def handle_group_selection(update: Update, context: ContextTypes.DEFAULT_T
         "**Wait for the team to tap Accept** in their chat. You will get a prompt here to choose drivers "
         "**right after** they accept.",
         parse_mode="HTML",
+    )
+    await _maybe_offer_insurance_card(
+        context, query.message, lead_id=str(lead["id"]), reference_id=str(reference_id),
     )
     return ConversationHandler.END
 
@@ -4830,6 +4842,9 @@ async def _maybe_offer_insurance_card(
         return False
     email = (lead.get("email") or "").strip()
     if not email:
+        return False
+    # Don't re-offer if a card was already sent for this lead.
+    if (lead.get("insurance_card_sent_at") or "").strip():
         return False
     if not Config.is_resend_configured():
         logger.info(
