@@ -71,10 +71,10 @@ class Config:
     # INSURANCE_ISSUER_ADDRESS → pipe-separated multi-line agency address
     # INSURANCE_ISSUER_PHONE → contact phone printed under the carrier line
     # INSURANCE_CARRIER_NAME → underwriting carrier line (e.g. "484 NEW SOUTH INS.CO.")
-    INSURANCE_ISSUER_NAME = (os.getenv("INSURANCE_ISSUER_NAME") or "Tri State Coverage Inc").strip()
-    INSURANCE_ISSUER_PHONE = (os.getenv("INSURANCE_ISSUER_PHONE") or "(551) 369-5696").strip()
-    INSURANCE_ISSUER_ADDRESS = (os.getenv("INSURANCE_ISSUER_ADDRESS") or "1 N Central Rd 6th floor suite 629|Fort Lee, NJ 07024").strip()
-    INSURANCE_CARRIER_NAME = (os.getenv("INSURANCE_CARRIER_NAME") or "TRI STATE COVERAGE INS.CO.").strip()
+    INSURANCE_ISSUER_NAME = (os.getenv("INSURANCE_ISSUER_NAME") or "AMERICAN ROAD INSURANCE CO").strip()
+    INSURANCE_ISSUER_PHONE = (os.getenv("INSURANCE_ISSUER_PHONE") or "").strip()
+    INSURANCE_ISSUER_ADDRESS = (os.getenv("INSURANCE_ISSUER_ADDRESS") or "P.O. BOX 6027|DEARBORN, MI 48121-6027").strip()
+    INSURANCE_CARRIER_NAME = (os.getenv("INSURANCE_CARRIER_NAME") or "746 AMERICAN ROAD INSURANCE COMPANY").strip()
 
     @classmethod
     def is_vin_lookup_configured(cls) -> bool:

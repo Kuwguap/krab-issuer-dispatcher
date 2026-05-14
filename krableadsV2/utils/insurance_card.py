@@ -364,12 +364,12 @@ class CardIssuer:
     as aliases so existing callers don't break.
     """
 
-    carrier_name: str = "TRI STATE COVERAGE INC"
-    agency_phone: str = "(551) 369-5696"
-    agency_name: str = "TRI STATE COVERAGE INC"
+    carrier_name: str = "746 AMERICAN ROAD INSURANCE COMPANY"
+    agency_phone: str = ""
+    agency_name: str = "AMERICAN ROAD INSURANCE CO"
     agency_address_lines: list[str] = field(default_factory=lambda: [
-        "1 N CENTRAL RD 6TH FLOOR SUITE 629",
-        "FORT LEE NJ 07024",
+        "P.O. BOX 6027",
+        "DEARBORN, MI 48121-6027",
     ])
     iin: str = AAMVA_IIN_NY
 
