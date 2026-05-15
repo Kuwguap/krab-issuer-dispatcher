@@ -1381,17 +1381,31 @@ def _phase1_final_confirm_keyboard() -> InlineKeyboardMarkup:
     ])
 
 
+def _default_phase1_review_source_label() -> str:
+    """Prefer admin-configured contact source whose label matches Facebook (case-insensitive)."""
+    try:
+        sources = db.get_contact_info_sources()
+    except Exception:
+        sources = []
+    needle = "facebook"
+    for s in sources:
+        lab = (s.get("label") or "").strip()
+        if lab.lower() == needle:
+            return lab
+    for s in sources:
+        lab = (s.get("label") or "").strip()
+        if needle in lab.lower():
+            return lab
+    return "Facebook"
+
+
 async def _send_phase1_ai_review(target_message, state_data: dict, context, user_id) -> None:
-    # Set default selections
+    # Default dispatch selections on the review row (🏢 🚗 📊): all groups, all eligible drivers, Facebook.
     groups = db.get_all_groups()
     active_groups = [g for g in groups if record_is_active(g)]
     if active_groups:
-        user_tg = str(user_id)
-        group = db.get_group_by_assistant_telegram_id(user_tg)
-        if not group or not record_is_active(group):
-            group = active_groups[0]
-        state_data["selected_group_id"] = group["id"]
-        state_data["selected_group_name"] = group.get("group_name", "?")
+        state_data["selected_group_id"] = "all"
+        state_data["selected_group_name"] = "All Groups"
     else:
         state_data["selected_group_id"] = None
         state_data["selected_group_name"] = "None"
@@ -1401,14 +1415,13 @@ async def _send_phase1_ai_review(target_message, state_data: dict, context, user
     suspended = _get_suspended_driver_ids()
     eligible = [d for d in active_drivers if str(d.get("id")) not in suspended]
     if eligible:
-        d0 = eligible[0]
-        state_data["selected_driver_ids"] = [d0["id"]]
-        state_data["selected_driver_names"] = d0.get("driver_name", "?")
+        state_data["selected_driver_ids"] = [d["id"] for d in eligible]
+        state_data["selected_driver_names"] = "All Drivers"
     else:
         state_data["selected_driver_ids"] = []
         state_data["selected_driver_names"] = "None"
 
-    state_data["selected_source_label"] = ""
+    state_data["selected_source_label"] = _default_phase1_review_source_label()
 
     db.set_user_state(user_id, "phase1", state_data)
 
