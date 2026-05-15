@@ -381,6 +381,182 @@ def extract_structured_from_pdf(pdf_bytes: bytes) -> Optional[str]:
     return extract_structured_from_image(png, mime_type="image/png")
 
 
+# Vision prompt used to locate phone numbers for redaction.
+# Returns coordinates as percentages of image dimensions so we can apply boxes
+# without needing to know the image size on the model side.
+PHONE_REDACTION_PROMPT = (
+    "You are a privacy filter. Look at the image and find every region that "
+    "contains a complete phone number — US or international, in any format. "
+    "Examples include `+1 (732) 534-2659`, `732-534-2659`, `732.534.2659`, "
+    "`+44 7712 345 678`, `(732) 534 2659`. Be generous: include the entire run "
+    "of digits, separators, parentheses, country code, and surrounding labels "
+    "such as 'Phone:' or 'Tel:'.\n\n"
+    "Respond with ONLY a JSON object of the form:\n"
+    "{\"boxes\": [{\"x1\": <float 0-100>, \"y1\": <float 0-100>, "
+    "\"x2\": <float 0-100>, \"y2\": <float 0-100>}, ...]}\n\n"
+    "Coordinates are percentages (0-100) of image width and height. "
+    "Add ~1-2% padding around each phone-number region. "
+    "If there are no phone numbers, return {\"boxes\": []}. "
+    "Do not include any other keys, prose, code fences, or commentary."
+)
+
+
+@dataclass
+class _PhoneRedactionResponse:
+    boxes: list[tuple[float, float, float, float]]
+    api_ok: bool  # True iff the model call completed and we parsed valid JSON
+
+
+def _phone_redaction_boxes(
+    image_bytes: bytes, mime_type: str = "image/jpeg"
+) -> _PhoneRedactionResponse:
+    """Ask OpenAI Vision for bounding boxes (as percentages) of visible phone numbers.
+
+    Distinguishes "no phone numbers in image" (api_ok=True, boxes=[]) from
+    "API/parse failed" (api_ok=False) so the caller can choose between
+    forwarding the original and refusing to upload it.
+    """
+    from config import Config
+
+    empty_ok = _PhoneRedactionResponse([], True)
+    empty_fail = _PhoneRedactionResponse([], False)
+
+    if not image_bytes:
+        return empty_ok
+    api_key = (getattr(Config, "OPENAI_API_KEY", "") or "").strip()
+    if not api_key:
+        return empty_fail
+
+    mt = (mime_type or "image/jpeg").strip()
+    if not mt.startswith("image/"):
+        mt = "image/jpeg"
+    b64 = base64.standard_b64encode(image_bytes).decode("ascii")
+    data_url = f"data:{mt};base64,{b64}"
+
+    try:
+        from openai import OpenAI
+
+        client = OpenAI(api_key=api_key, max_retries=0)
+        model = getattr(Config, "OPENAI_VISION_MODEL", None) or "gpt-4o"
+        response = client.chat.completions.create(
+            model=model,
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": PHONE_REDACTION_PROMPT},
+                        {"type": "image_url", "image_url": {"url": data_url}},
+                    ],
+                }
+            ],
+            max_tokens=500,
+        )
+        raw = (response.choices[0].message.content or "").strip()
+    except Exception as e:
+        logger.warning("phone redaction API call failed: %s", e)
+        return empty_fail
+
+    data = _parse_json_from_model(raw)
+    if not isinstance(data, dict):
+        return empty_fail
+    raw_boxes = data.get("boxes")
+    if not isinstance(raw_boxes, list):
+        return empty_fail
+
+    out: list[tuple[float, float, float, float]] = []
+    for entry in raw_boxes:
+        try:
+            x1 = float(entry.get("x1"))
+            y1 = float(entry.get("y1"))
+            x2 = float(entry.get("x2"))
+            y2 = float(entry.get("y2"))
+        except (TypeError, ValueError, AttributeError):
+            continue
+        # Clamp + normalize ordering so x1<x2, y1<y2.
+        x1c, x2c = max(0.0, min(100.0, min(x1, x2))), max(0.0, min(100.0, max(x1, x2)))
+        y1c, y2c = max(0.0, min(100.0, min(y1, y2))), max(0.0, min(100.0, max(y1, y2)))
+        # Pad a bit so the bar fully covers digits ascenders/descenders.
+        pad = 1.0
+        x1c = max(0.0, x1c - pad)
+        y1c = max(0.0, y1c - pad)
+        x2c = min(100.0, x2c + pad)
+        y2c = min(100.0, y2c + pad)
+        if x2c - x1c < 0.5 or y2c - y1c < 0.5:
+            continue
+        out.append((x1c, y1c, x2c, y2c))
+    return _PhoneRedactionResponse(out, True)
+
+
+@dataclass
+class PhoneRedactionResult:
+    """Outcome of a single image redaction attempt.
+
+    Attributes:
+        image_bytes: Bytes to send (always set; equals input if api failed).
+        api_ok: True if the AI call completed; False on quota/parse/network failures.
+        redacted: True if at least one black rectangle was drawn.
+    """
+
+    image_bytes: bytes
+    api_ok: bool
+    redacted: bool
+
+
+def redact_phones_in_image_bytes(
+    image_bytes: bytes,
+    mime_type: str = "image/jpeg",
+) -> PhoneRedactionResult:
+    """Paint solid black rectangles over phone numbers detected by OpenAI Vision.
+
+    Falls back gracefully when Pillow is unavailable — the original bytes are
+    returned with ``api_ok=False`` so the caller can decide whether to upload.
+    """
+    if not image_bytes:
+        return PhoneRedactionResult(image_bytes or b"", False, False)
+    try:
+        from PIL import Image, ImageDraw
+    except Exception as e:
+        logger.warning("Pillow not available; cannot redact image: %s", e)
+        return PhoneRedactionResult(image_bytes, False, False)
+
+    resp = _phone_redaction_boxes(image_bytes, mime_type=mime_type)
+    if not resp.api_ok:
+        return PhoneRedactionResult(image_bytes, False, False)
+    if not resp.boxes:
+        return PhoneRedactionResult(image_bytes, True, False)
+
+    import io as _io
+
+    try:
+        img = Image.open(_io.BytesIO(image_bytes))
+        img.load()
+        if img.mode not in ("RGB", "RGBA"):
+            img = img.convert("RGB")
+        draw = ImageDraw.Draw(img)
+        w, h = img.size
+        for x1p, y1p, x2p, y2p in resp.boxes:
+            x1 = int(round(x1p / 100.0 * w))
+            y1 = int(round(y1p / 100.0 * h))
+            x2 = int(round(x2p / 100.0 * w))
+            y2 = int(round(y2p / 100.0 * h))
+            if x2 <= x1 or y2 <= y1:
+                continue
+            draw.rectangle([x1, y1, x2, y2], fill=(0, 0, 0))
+        out = _io.BytesIO()
+        save_format = "PNG"
+        save_kwargs: dict[str, Any] = {}
+        if (mime_type or "").lower() in ("image/jpeg", "image/jpg"):
+            save_format = "JPEG"
+            save_kwargs["quality"] = 92
+            if img.mode == "RGBA":
+                img = img.convert("RGB")
+        img.save(out, format=save_format, **save_kwargs)
+        return PhoneRedactionResult(out.getvalue(), True, True)
+    except Exception as e:
+        logger.warning("redact_phones_in_image_bytes failed: %s", e)
+        return PhoneRedactionResult(image_bytes, False, False)
+
+
 # OCR/models sometimes drop one letter from standard 3-letter DMV color codes → repair before storage.
 _TWO_LETTER_DMV_TO_THREE = {
     "gy": "GRY",   # gray

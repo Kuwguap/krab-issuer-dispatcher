@@ -14,7 +14,7 @@ import time
 from datetime import datetime, time as dt_time, timedelta
 import pytz
 from typing import Optional
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, InputFile
 from telegram.error import BadRequest, Conflict, RetryAfter
 from telegram.ext import (
     Application,
@@ -403,6 +403,96 @@ def _build_group_keyboard(groups: list, include_all: bool = True) -> InlineKeybo
     if include_all and groups:
         buttons.append([InlineKeyboardButton("📢 Send to All Groups", callback_data="select_group_all")])
     return InlineKeyboardMarkup(buttons)
+
+
+async def _finalize_phase1_media_for_dispatch(
+    context: ContextTypes.DEFAULT_TYPE,
+    issuer_chat_id: int | str | None,
+) -> list[dict]:
+    """Redact phone numbers in any Phase 1 vision media, upload the censored
+    copies back to the issuer's own chat, and return file_id descriptors usable
+    by ``_forward_phase1_attached_files_to_targets`` after a group accepts.
+
+    Idempotent: if media was already finalized for this lead the cached list is
+    returned. Sending happens to the issuer's own chat so the issuer sees the
+    exact censored copy that will reach the team — and so we get a stable
+    ``file_id`` that survives bot restarts (Telegram caches it server-side).
+    """
+    if not context.user_data:
+        return []
+    cached = context.user_data.get("phase1_attached_files")
+    if cached and isinstance(cached, list):
+        return cached
+    pending: list[dict] = list(context.user_data.get("phase1_pending_media") or [])
+    if not pending or not issuer_chat_id:
+        return []
+
+    try:
+        await context.bot.send_message(
+            chat_id=issuer_chat_id,
+            text="🔒 Censoring phone numbers in the images you sent — these are the copies your team will see.",
+        )
+    except Exception:
+        pass
+
+    attached: list[dict] = []
+    skipped_unsafe = 0
+    for item in pending:
+        try:
+            img_bytes = item.get("bytes") or b""
+            mime = (item.get("mime") or "image/jpeg").lower()
+            if not img_bytes:
+                continue
+            try:
+                result = await asyncio.to_thread(
+                    ai_vision.redact_phones_in_image_bytes, img_bytes, mime
+                )
+            except Exception as e:
+                logger.warning("Phone redaction call failed: %s", e)
+                skipped_unsafe += 1
+                continue
+
+            # If the AI call itself failed we cannot prove the image is safe to
+            # forward — drop it rather than leak the issuer's phone number.
+            if not result.api_ok:
+                skipped_unsafe += 1
+                continue
+
+            caption = (
+                "🔒 Censored copy (phone numbers hidden)"
+                if result.redacted
+                else "✅ No phone numbers detected — original will be forwarded"
+            )
+            filename = "censored.jpg" if mime in ("image/jpeg", "image/jpg") else "censored.png"
+            input_file = InputFile(io.BytesIO(result.image_bytes), filename=filename)
+            sent = await context.bot.send_photo(
+                chat_id=issuer_chat_id,
+                photo=input_file,
+                caption=caption,
+            )
+            if sent and sent.photo:
+                attached.append({"type": "photo", "file_id": sent.photo[-1].file_id})
+        except Exception as e:
+            logger.warning("Could not upload censored copy for dispatch: %s", e)
+
+    if skipped_unsafe:
+        try:
+            await context.bot.send_message(
+                chat_id=issuer_chat_id,
+                text=(
+                    f"⚠️ {skipped_unsafe} image(s) couldn't be auto-censored "
+                    "right now and were **not** forwarded so your phone number "
+                    "stays hidden. The lead itself was still sent."
+                ),
+                parse_mode="Markdown",
+            )
+        except Exception:
+            pass
+
+    if attached:
+        context.user_data["phase1_attached_files"] = attached
+    context.user_data.pop("phase1_pending_media", None)
+    return attached
 
 
 async def _forward_phase1_attached_files_to_targets(
@@ -1608,6 +1698,7 @@ async def _begin_lead_flow(
     if context.user_data:
         context.user_data.pop("phase1_attached_files", None)
         context.user_data.pop("phase1_vision_batch", None)
+        context.user_data.pop("phase1_pending_media", None)
         context.user_data.pop("phase1_pending_edit_key", None)
         context.user_data.pop("phase1_recent_edits", None)
         for _k in ("receipt_lead_id", "receipt_reference_id", "receipt_monday_item_id"):
@@ -1631,7 +1722,7 @@ async def _begin_lead_flow(
     "📝 Special request for drivers (optional)\n"
     "📧Email (required for insurance)\n"
     "🪪Driver license (required for insurance)\n\n"
-    "You can attach files after this step.\n\n"
+    "📎 Any photos or PDFs you send for lead extraction are auto-forwarded to the accepting team — phone numbers are blurred first to keep your number private.\n\n"
         "Commands: **/help** — how to use the bot · **/cancel** — restart from the top (like **/start**).\n\n"
     f"{motivation.get_random_quote()}\n\n"
     "🏁Automated🏎Automotive"
@@ -1672,6 +1763,7 @@ def _clear_lead_conversation_user_data(context: ContextTypes.DEFAULT_TYPE) -> No
     for key in (
         "phase1_pending_edit_key",
         "phase1_vision_batch",
+        "phase1_pending_media",
         "phase1_attached_files",
         "phase1_recent_edits",
         "review_message_id",
@@ -2440,14 +2532,24 @@ async def handle_phase1_vision_batch_callback(update: Update, context: ContextTy
         return STATE_PHASE1
 
     parts: list[tuple[bytes, str]] = []
+    pending_media: list[dict] = []
     for item in batch:
         if item.get("kind") == "image":
-            parts.append((item["bytes"], item.get("mime") or "image/jpeg"))
+            img_bytes = item["bytes"]
+            img_mime = item.get("mime") or "image/jpeg"
+            parts.append((img_bytes, img_mime))
+            pending_media.append({"kind": "image", "bytes": img_bytes, "mime": img_mime})
         elif item.get("kind") == "pdf":
             png = await asyncio.to_thread(ai_vision.pdf_first_page_to_png_bytes, item["bytes"])
             if png:
                 parts.append((png, "image/png"))
+                pending_media.append({"kind": "image", "bytes": png, "mime": "image/png"})
 
+    # Stash a copy for forwarding-after-accept: we hold the raw bytes only until
+    # the lead is submitted, when they're redacted and uploaded to obtain stable
+    # Telegram file_ids stored on the lead row.
+    if pending_media:
+        context.user_data["phase1_pending_media"] = pending_media
     context.user_data["phase1_vision_batch"] = []
 
     if not parts:
@@ -2814,32 +2916,41 @@ async def _delete_pending_file_prompts(context: ContextTypes.DEFAULT_TYPE, chat_
         await _safe_delete_chat_message(context, chat_id, mid)
 
 
-async def _ask_add_files(message, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Ask user if they want to add files; returns STATE_ADD_FILES."""
-    context.user_data["phase1_attached_files"] = []
-    keyboard = InlineKeyboardMarkup([
-        [InlineKeyboardButton("Yes", callback_data="add_files_yes")],
-        [InlineKeyboardButton("No", callback_data="add_files_no")],
-    ])
-    sent = await message.reply_text("Do you want to add files?", reply_markup=keyboard)
-    if sent is not None:
-        context.user_data["add_files_prompt_msg_id"] = sent.message_id
-    return STATE_ADD_FILES
+async def _prompt_issuer_special_request(message, context: ContextTypes.DEFAULT_TYPE, user_id: int) -> int:
+    """Bridge into the special-request flow once phone + price are known.
+
+    Mirrors how ``handle_phase2`` enters STATE_SPECIAL_REQUEST_ISSUERS, but is
+    callable from review-accept / VIN-choice paths where Phase 2 was skipped
+    because the AI extraction already filled in pending_phone/price.
+    """
+    state = db.get_user_state(user_id)
+    if not state or not state.get("data"):
+        await message.reply_text("❌ Phase 1 data not found. Please start over with /start")
+        return ConversationHandler.END
+    state_data = state["data"].copy()
+    db.set_user_state(user_id, "special_request_issuers", state_data)
+    await message.reply_text(PHASE2_ISSUERS_PROMPT)
+    return STATE_SPECIAL_REQUEST_ISSUERS
 
 
 async def _ensure_phone_price_before_files(message, context: ContextTypes.DEFAULT_TYPE, user_id: int) -> int:
-    """Require client phone + price before the add-files step (same gate as other mandatory fields)."""
+    """Gate the lead on phone + price before the issuer/driver-note flow.
+
+    Phase 1 used to ask the user to attach files here. Files are now reused
+    from the photos/PDFs that were uploaded for AI parsing, so we go straight
+    into the special-request notes path instead.
+    """
     state = db.get_user_state(user_id)
     if not state or not state.get("data"):
         await message.reply_text("❌ Phase 1 data not found. Please start over with /start")
         return ConversationHandler.END
     state_data = state["data"].copy()
     if _phase1_has_phone_and_price(state_data):
-        return await _ask_add_files(message, context)
-    context.user_data["phase2_before_files"] = True
+        return await _prompt_issuer_special_request(message, context, user_id)
+    context.user_data.pop("phase2_before_files", None)
     db.set_user_state(user_id, "phase1", state_data)
     await message.reply_text(
-        "📞💲 **Phone number and price are required before you can attach files.**\n\n" + PHASE2_INTRO_MESSAGE,
+        "📞💲 **Phone number and price are required to continue.**\n\n" + PHASE2_INTRO_MESSAGE,
         parse_mode="Markdown",
     )
     return STATE_PHASE2
@@ -3504,10 +3615,7 @@ async def handle_phase2(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
     state_data = phase1_data.copy()
     state_data["pending_phone_number"] = phone_number
     state_data["pending_price"] = price
-    if context.user_data.pop("phase2_before_files", None):
-        db.set_user_state(user_id, "phase1", state_data)
-        await msg.reply_text(PHASE2_SUCCESS_BEFORE_FILES_MESSAGE)
-        return await _ask_add_files(msg, context)
+    context.user_data.pop("phase2_before_files", None)
     db.set_user_state(user_id, "special_request_issuers", state_data)
     await msg.reply_text(PHASE2_ISSUERS_PROMPT)
     return STATE_SPECIAL_REQUEST_ISSUERS
@@ -3647,6 +3755,11 @@ async def handle_special_request_drivers(update: Update, context: ContextTypes.D
     phase1_data.get("insurance_policy_number", "-"),
     phase1_data.get("extra_info", "-"),
 ])
+    attached_for_dispatch = await _finalize_phase1_media_for_dispatch(
+        context, update.effective_chat.id if update.effective_chat else None
+    )
+    if not attached_for_dispatch:
+        attached_for_dispatch = state_data.get("attached_files") or []
     final_lead_data = {
         "user_id": user_id,
         "telegram_username": username,
@@ -3665,7 +3778,7 @@ async def handle_special_request_drivers(update: Update, context: ContextTypes.D
         "special_request_note": state_data.get("special_request_issuers", "") or "",
         "email": (state_data.get("email") or "") or None,
         "driver_license_id": (state_data.get("driver_license_id") or "") or None,
-        "phase1_attached_files": state_data.get("attached_files") or [],
+        "phase1_attached_files": attached_for_dispatch,
     }
     lead = db.create_lead(final_lead_data)
     if not lead:
@@ -3687,6 +3800,8 @@ async def handle_special_request_drivers(update: Update, context: ContextTypes.D
         await_mode="pick_drivers",
         pick_payload=continue_data,
     )
+    context.user_data.pop("phase1_pending_media", None)
+    context.user_data.pop("phase1_attached_files", None)
     ref_h = html.escape(str(reference_id), quote=False)
     await update.message.reply_text(
         "✅ Lead saved.\n\n"
@@ -3749,6 +3864,11 @@ async def _submit_lead_from_review(message, context, user_id, data):
         data.get("extra_info", "-"),
     ])
 
+    attached_for_dispatch = await _finalize_phase1_media_for_dispatch(
+        context, getattr(message, "chat_id", None)
+    )
+    if not attached_for_dispatch:
+        attached_for_dispatch = data.get("attached_files") or []
     lead = db.create_lead({
         "user_id": user_id, "telegram_username": username,
         "vehicle_details": vd,
@@ -3764,7 +3884,7 @@ async def _submit_lead_from_review(message, context, user_id, data):
         "email": (data.get("email") or "") or None,
         "driver_license_id": (data.get("driver_license_id") or "") or None,
         "contact_info_source": data.get("selected_source_label", ""),
-        "phase1_attached_files": data.get("attached_files") or [],
+        "phase1_attached_files": attached_for_dispatch,
     })
     if not lead:
         await message.reply_text("❌ Could not save lead.")
@@ -3880,6 +4000,7 @@ async def _submit_lead_from_review(message, context, user_id, data):
         selected_driver_ids=[str(d.get("id")) for d in drivers_list if d.get("id")],
     )
     context.user_data.pop("phase1_attached_files", None)
+    context.user_data.pop("phase1_pending_media", None)
     context.user_data.pop("review_message_id", None)
     success_label = "broadcast sent" if is_all_groups else "sent"
     await message.reply_text(
@@ -7534,18 +7655,6 @@ def main():
                 CallbackQueryHandler(handle_phase1_ai_review_callback, pattern="^edit_cancel$"),
             ],
             STATE_MISSING_FIELD: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_missing_field)],
-            STATE_ADD_FILES: [
-                CallbackQueryHandler(handle_add_files_callback, pattern="^(add_files_yes|add_files_no)$"),
-                MessageHandler(
-                    (filters.TEXT & ~filters.COMMAND) | filters.PHOTO | filters.Document.ALL,
-                    handle_add_files_stray_message,
-                ),
-            ],
-            STATE_WAITING_FILE: [
-                MessageHandler(filters.PHOTO | filters.Document.ALL, handle_file_upload),
-                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_waiting_file_text),
-                CallbackQueryHandler(handle_another_file_callback, pattern="^(another_file_yes|another_file_no)$"),
-            ],
             STATE_PHASE2: [
                 MessageHandler(
                     (
