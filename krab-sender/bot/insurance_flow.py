@@ -153,16 +153,29 @@ async def build_and_send_insurance_card(
     name = _ln(0) or "UNKNOWN"
     addr_line1 = _ln(1)
     addr_csz = _ln(2)
-    vin_raw = _ln(5)
-    car_raw = _ln(6)
-    color = _ln(7)
 
-    vin_clean = ic.normalize_vin(vin_raw)
+    vin_blob = "\n".join(
+        s
+        for s in (
+            (lead.get("vehicle_details") or "").strip(),
+            (lead.get("delivery_details") or "").strip(),
+            (lead.get("extra_info") or "").strip(),
+        )
+        if s
+    )
+    vin_clean = ic.extract_vin_from_text(vin_blob) or ic.normalize_vin(_ln(5))
     if not vin_clean:
         return InsuranceCardResult(
-            False, None, None,
-            f"VIN '{vin_raw}' on the lead is invalid — cannot build insurance card.",
+            False,
+            None,
+            None,
+            "No valid 17-character VIN found on this lead (searched vehicle details, "
+            "delivery details, and notes). Update the lead with the correct VIN and try again.",
         )
+
+    car_raw, color = ic.infer_car_and_color_from_vehicle_lines(
+        raw_vehicle, vin_clean=vin_clean
+    )
 
     decoded = await asyncio.to_thread(ic.decode_vin_from_nhtsa, vin_clean)
     if decoded:

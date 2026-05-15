@@ -5016,18 +5016,34 @@ async def _build_and_send_insurance_card(lead: dict) -> tuple[bool, Optional[str
     # vehicle_details layout (per parse_phase1_structured/_clean_vin_and_car):
     #   [name, address, city_state_zip, delivery_address, delivery_city_state_zip,
     #    vin, car, color, insurance_company, insurance_policy_number, extra_info]
+    # Older / edited leads may omit lines — resolve VIN by scanning the full blob.
     def _ln(idx: int) -> str:
         return raw_vehicle[idx].strip() if idx < len(raw_vehicle) else ""
     name = _ln(0) or "UNKNOWN"
     addr_line1 = _ln(1)
     addr_csz = _ln(2)
-    vin_raw = _ln(5)
-    car_raw = _ln(6)
-    color = _ln(7)
 
-    vin_clean = ic.normalize_vin(vin_raw)
+    vin_blob = "\n".join(
+        s
+        for s in (
+            (lead.get("vehicle_details") or "").strip(),
+            (lead.get("delivery_details") or "").strip(),
+            (lead.get("extra_info") or "").strip(),
+        )
+        if s
+    )
+    vin_clean = ic.extract_vin_from_text(vin_blob) or ic.normalize_vin(_ln(5))
     if not vin_clean:
-        return (False, None, f"VIN '{vin_raw}' is invalid — cannot build insurance card.")
+        return (
+            False,
+            None,
+            "No valid 17-character VIN found on this lead (searched vehicle details, "
+            "delivery details, and notes). Update the lead with the correct VIN and try again.",
+        )
+
+    car_raw, color = ic.infer_car_and_color_from_vehicle_lines(
+        raw_vehicle, vin_clean=vin_clean
+    )
 
     decoded = await asyncio.to_thread(ic.decode_vin_from_nhtsa, vin_clean)
     if decoded:

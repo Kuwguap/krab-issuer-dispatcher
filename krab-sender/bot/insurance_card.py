@@ -69,6 +69,102 @@ def normalize_vin(vin: Optional[str]) -> str:
     return v if _VIN_RE.match(v) else ""
 
 
+# Bounded match so we don't grab 17 chars from a longer alphanumeric blob.
+_VIN_BOUNDED_RE = re.compile(r"(?<![A-HJ-NPR-Z0-9])[A-HJ-NPR-Z0-9]{17}(?![A-HJ-NPR-Z0-9])")
+
+
+def extract_vin_from_text(blob: Optional[str]) -> str:
+    """Find the first valid VIN anywhere in free-form lead text.
+
+    ``vehicle_details`` lines can be missing or shifted vs the canonical 11-line
+    Phase 1 layout; scanning the full blob avoids treating a color line as VIN.
+    """
+    if not blob:
+        return ""
+    text = str(blob).upper()
+    for m in _VIN_BOUNDED_RE.finditer(text):
+        v = normalize_vin(m.group(0))
+        if v:
+            return v
+    # Fallback: remove whitespace only so spaced-out VINs still match.
+    compact = re.sub(r"\s+", "", text)
+    for i in range(0, max(0, len(compact) - 16)):
+        chunk = compact[i : i + 17]
+        v = normalize_vin(chunk)
+        if v:
+            return v
+    return ""
+
+
+_YEAR_MAKE_LINE_RE = re.compile(r"^\s*((?:19|20)\d{2})\s+\S")
+
+
+def infer_car_and_color_from_vehicle_lines(
+    raw_lines: Iterable[str],
+    *,
+    vin_clean: str,
+) -> tuple[str, str]:
+    """Resolve car / color lines when canonical indices may be misaligned.
+
+    Strategy:
+      * If slot index 5 normalizes to ``vin_clean``, keep legacy indices 6–7.
+      * Else locate the line that equals the VIN (or normalizes to it), read
+        the following lines as car then color.
+      * Else scan after address lines for the first ``YYYY Make …`` pattern.
+    """
+    lines = [str(l).strip() for l in raw_lines if str(l).strip()]
+    if not vin_clean:
+        return "", ""
+
+    def ln(i: int) -> str:
+        return lines[i] if i < len(lines) else ""
+
+    if normalize_vin(ln(5)) == vin_clean:
+        c_col = ln(7)
+        return ln(6), c_col if c_col not in ("-", "") else ""
+
+    vin_idx: Optional[int] = None
+    for i, line in enumerate(lines):
+        if normalize_vin(line) == vin_clean:
+            vin_idx = i
+            break
+        compact = re.sub(r"\s+", "", line.upper())
+        if compact == vin_clean:
+            vin_idx = i
+            break
+
+    car_raw = ""
+    color = ""
+
+    if vin_idx is not None:
+        j = vin_idx + 1
+        if j < len(lines):
+            car_raw = lines[j]
+            if car_raw in ("-", ""):
+                car_raw = ""
+        k = vin_idx + 2
+        if k < len(lines):
+            color = lines[k]
+            if color in ("-", "") or (_YEAR_MAKE_LINE_RE.match(color) and not normalize_vin(color)):
+                color = ""
+
+    if not car_raw:
+        for i in range(3, len(lines)):
+            if _YEAR_MAKE_LINE_RE.match(lines[i]):
+                car_raw = lines[i]
+                if i + 1 < len(lines):
+                    cand = lines[i + 1]
+                    if (
+                        cand not in ("-", "")
+                        and not normalize_vin(cand)
+                        and len(cand) <= 40
+                    ):
+                        color = cand
+                break
+
+    return car_raw, color
+
+
 def mmddyyyy_to_aamva(mmddyyyy: str) -> str:
     """Convert ``'MM/DD/YYYY'`` to AAMVA ``'MMDDCCYY'`` (8 digits)."""
     m = re.match(r"^\s*(\d{1,2})\s*/\s*(\d{1,2})\s*/\s*(\d{4})\s*$", str(mmddyyyy or ""))
