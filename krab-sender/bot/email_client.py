@@ -6,6 +6,7 @@ In later phases this can be swapped for SendGrid, Mailgun, SES, etc.
 """
 
 import logging
+import re
 import time
 from dataclasses import dataclass
 from datetime import datetime
@@ -22,70 +23,88 @@ logger = logging.getLogger(__name__)
 NY_TZ = ZoneInfo("America/New_York")
 
 
-# Single fixed opening line for outbound emails (matches product messaging).
-MOTIVATIONAL_MESSAGES = [
-    "Small tasks handled on time become big wins over time.",
-]
+# ─── Client-facing policy-issued email ───────────────────────────────────────
+# Replicated from krableadsV2/utils/resend_client.py::build_purchase_welcome_email
+# so both the Krab Issuer (insurance card generator) and Krab Sender bots
+# deliver the exact same body/subject to the client.
+
+# Matches "2021 Honda Civic", "2013 Ford F-150", etc. inside free-form text.
+_VEHICLE_YEAR_RE = re.compile(
+    r"\b((?:19|20)\d{2})\s+([A-Za-z][A-Za-z0-9\-]*(?:\s+[A-Za-z0-9\-]+){0,4})"
+)
 
 
-def _format_timestamp_ny_display(ts: datetime) -> str:
+def _first_name_from_full(full: Optional[str]) -> str:
+    parts = [p for p in (full or "").strip().split() if p]
+    return parts[0] if parts else "there"
+
+
+def _format_effective_date_ny(ts: datetime) -> str:
+    """Format a UTC datetime as 'May 8, 2026' in America/New_York."""
+    d = ts.astimezone(NY_TZ)
+    return f"{d.strftime('%B')} {d.day}, {d.year}"
+
+
+def _extract_vehicle_line(client_details: Optional[str]) -> str:
+    """Best-effort 'YYYY Make Model' extraction from free-form client details."""
+    text = (client_details or "").strip()
+    if not text:
+        return "—"
+    m = _VEHICLE_YEAR_RE.search(text)
+    if not m:
+        return "—"
+    year = m.group(1)
+    rest = re.split(r"[\n,;|]", m.group(2))[0].strip()
+    rest = re.sub(r"\s+", " ", rest)
+    line = f"{year} {rest}".strip()
+    return line or "—"
+
+
+def _build_email_subject(tx: Transaction) -> str:
+    policy_number = (tx.reference_id or "").strip() or "—"
+    return f"Your policy is active — {policy_number}"
+
+
+def _build_email_body(tx: Transaction, *, mention_attached_card: bool = True) -> str:
+    """Build the policy-issued email body.
+
+    Byte-for-byte match (modulo the optional attachment note) with
+    ``krableadsV2/utils/resend_client.py::build_purchase_welcome_email`` so both
+    bots send the same message to the client.
     """
-    Format a UTC datetime for email body (America/New_York):
-    '⏰ March 17, 2026 — 5:05 PM'
-    """
-    ts_ny = ts.astimezone(NY_TZ)
-    month = ts_ny.strftime("%B")
-    day = ts_ny.day
-    year = ts_ny.year
-    hour_24 = ts_ny.hour
-    minute = ts_ny.minute
+    first_name = _first_name_from_full(tx.recipient_name)
+    policy_number = (tx.reference_id or "").strip() or "—"
+    effective_date_label = _format_effective_date_ny(tx.timestamp)
+    vehicle_line = _extract_vehicle_line(tx.client_details)
 
-    ampm = "PM" if hour_24 >= 12 else "AM"
-    hour_12 = hour_24 % 12
-    if hour_12 == 0:
-        hour_12 = 12
-
-    time_part = f"{hour_12}:{minute:02d} {ampm}"
-    return f"⏰ {month} {day}, {year} — {time_part}"
-
-
-def _build_email_body(tx: Transaction) -> str:
-    """Build the full email body from the standard template."""
-    motivational = _get_motivational_message()
-    timestamp_line = _format_timestamp_ny_display(tx.timestamp)
-    ref = (tx.reference_id or "").strip()
-    ref_block = f"📋 Reference: {ref}\n\n" if ref else ""
-    return (
-        f'"{motivational}"\n\n'
-        f"{ref_block}"
-        f"{timestamp_line}\n\n"
-        "📞 Call the client NOW⚡️- 15 minute timer ⏱️\n"
-        "🚘 Deliver the tag FAST⚡️- 1 hour timer ⏱️\n"
-        "🧾 Upload the receipt IMMEDIATELY⚡️- 1 minute timer ⏱️\n\n"
-        "🚨Client must pay dealership directly🚨\n"
-        "💳 We Must collect all electronic payments: 💲\n"
-        "CashApp: $TriStateTags\n"
-        "Venmo: @TriStateTags\n"
-        "Zelle: OrganizeDataOnline@gmail.com\n"
-        "PayPal: privatedealership@gmail.com\n\n"
-        f"{tx.client_details}\n\n"
-        "🤖 Krab Issuer (Telegram):\n"
-        "https://t.me/krableadsbot\n\n"
-        "💳 Payment Portal:\n"
-        "www.TriStateTags.com/Payments (http://www.tristatetags.com/Payments)\n\n"
-        "🌐 Website:\n"
-        "www.TriStateTags.com (http://www.tristatetags.com/)\n\n"
-        "🤖 AI Assistant:\n"
-        "551-369-5696\n\n"
-        "👤 Owner Cellphone:\n"
-        "551-301-3737\n"
+    attachment_note = (
+        "\nYour proof of insurance (PDF) is attached to this email.\n\n"
+        if mention_attached_card
+        else "\n"
     )
-
-
-def _get_motivational_message() -> str:
-    # Simple rotation based on current minute to avoid importing random
-    idx = datetime.now(NY_TZ).minute % len(MOTIVATIONAL_MESSAGES)
-    return MOTIVATIONAL_MESSAGES[idx]
+    return (
+        f"Hi {first_name},\n\n"
+        "Thank you for choosing Tri State Coverage for your auto insurance needs.\n\n"
+        "Your policy is now active and coverage has been successfully issued.\n"
+        f"{attachment_note}"
+        "Here's a quick summary of your policy:\n"
+        f"• Policy Number: {policy_number}\n"
+        f"• Effective Date: {effective_date_label}\n"
+        f"• Vehicle Insured: {vehicle_line}\n\n"
+        "What's Next?\n"
+        "• Review your coverage online\n"
+        "• Download proof of insurance\n"
+        "• Set up automatic payments\n"
+        "• Access your policy anytime through your online dashboard\n\n"
+        "Log into your TRISTATECOVERAGE account anytime to manage your policy online.\n\n"
+        "Thank you again for choosing Tri State Coverage.\n\n"
+        "Sincerely,\n"
+        "The Tri State Coverage Team\n\n"
+        "Www.TriStateCoverage.com (http://www.tristatecoverage.com/)\n"
+        "Tri State Coverage Inc\n"
+        "1 N Central Rd 6th floor suite 629\n"
+        "Fort Lee, NJ 07024\n"
+    )
 
 
 class EmailProvider(Protocol):
@@ -129,9 +148,8 @@ class StubEmailProvider:
         attachment_filename: Optional[str],
         recipient_email: Optional[str] = None,
     ) -> None:
-        ref = (tx.reference_id or "").strip()
-        subject = f"NEW CLIENT [{ref}]" if ref else "NEW CLIENT"
-        body = _build_email_body(tx)
+        subject = _build_email_subject(tx)
+        body = _build_email_body(tx, mention_attached_card=attachment_bytes is not None)
         to_addr = recipient_email or self.to_address
 
         # For now we just log to stdout. Replace this with real email API calls later.
@@ -191,9 +209,8 @@ class SmtpEmailProvider:
         attachment_filename: Optional[str],
         recipient_email: Optional[str] = None,
     ) -> None:
-        ref = (tx.reference_id or "").strip()
-        subject = f"NEW CLIENT [{ref}]" if ref else "NEW CLIENT"
-        body = _build_email_body(tx)
+        subject = _build_email_subject(tx)
+        body = _build_email_body(tx, mention_attached_card=attachment_bytes is not None)
         to_addr = recipient_email or self.to_address
 
         logger.info(f"Preparing email - Body length: {len(body)}, Client details length: {len(tx.client_details)}")
