@@ -201,16 +201,64 @@ _EMPTY_INLINE_KB = InlineKeyboardMarkup([])
 # Driver inline: add lead; after receipt success also offer owed-receipt flow
 _DRIVER_ADD_LEAD_BTN = InlineKeyboardButton("➕ Add new lead", callback_data="driver_add_lead")
 _DRIVER_ADD_RECEIPT_BTN = InlineKeyboardButton("🧾 Add new receipt", callback_data="driver_add_receipt")
+_DRIVER_HELP_BTN = InlineKeyboardButton("❓ Help", callback_data="bot_help")
+
+
+def _help_guide_text() -> str:
+    """Plain-text user guide (shown by /help and the ❓ Help button)."""
+    return (
+        "📖 How to use this bot\n\n"
+        "Commands\n"
+        "• /start — Open the bot (drivers see shortcuts; others begin lead entry).\n"
+        "• /lead or /client — Submit a new lead.\n"
+        "• /receipts — Drivers: upload receipts (also try /receipt).\n"
+        "• /cancel — Stop current flow and restart from the top (same as /start).\n"
+        "• /help — Show this guide.\n\n"
+        "Submitting a lead\n"
+        "1) Tap ➕ Add new lead or send /lead.\n"
+        "2) Send client info as text and/or send photos or PDFs.\n"
+        "3) If you send several files, add them all, then tap "
+        "✅ Done — extract lead.\n"
+        "4) Review the summary, edit with the buttons if needed, then submit.\n"
+        "5) Choose group, driver, and contact source to dispatch.\n\n"
+        "Insurance\n"
+        "• Email and driver license are required for the NY FS-20 insurance "
+        "card option after dispatch.\n\n"
+        "Drivers\n"
+        "• Use /receipts or 🧾 Add new receipt to upload proof for a reference ID.\n\n"
+        "Tips\n"
+        "• Enter a valid 17-character VIN when possible.\n"
+        "• If stuck: /cancel restarts everything from the top.\n"
+        "• Anytime: /help for this guide.\n\n"
+        "🏁Automated🏎Automotive"
+    )
+
+
+async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Reply with usage guide (/help). Registered outside ConversationHandler so it works in any state."""
+    msg = update.effective_message
+    if msg:
+        await msg.reply_text(_help_guide_text())
+
+
+async def handle_help_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Inline ❓ Help — same text as /help."""
+    query = update.callback_query
+    if not query:
+        return
+    await _safe_answer_callback_query(query)
+    if query.message:
+        await query.message.reply_text(_help_guide_text())
 
 
 def _driver_add_lead_keyboard_only() -> InlineKeyboardMarkup:
     """Default driver follow-up keyboard (single action — not receipt on every message)."""
-    return InlineKeyboardMarkup([[_DRIVER_ADD_LEAD_BTN]])
+    return InlineKeyboardMarkup([[_DRIVER_ADD_LEAD_BTN], [_DRIVER_HELP_BTN]])
 
 
 def _driver_keyboard_lead_and_receipt() -> InlineKeyboardMarkup:
     """After receipt submitted: add another lead or open owed-receipts upload flow."""
-    return InlineKeyboardMarkup([[_DRIVER_ADD_LEAD_BTN, _DRIVER_ADD_RECEIPT_BTN]])
+    return InlineKeyboardMarkup([[_DRIVER_ADD_LEAD_BTN, _DRIVER_ADD_RECEIPT_BTN], [_DRIVER_HELP_BTN]])
 
 
 def _keyboard_lead_accept_decline(lead_id: str) -> InlineKeyboardMarkup:
@@ -1583,8 +1631,8 @@ async def _begin_lead_flow(
     "📝 Special request for drivers (optional)\n"
     "📧Email (required for insurance)\n"
     "🪪Driver license (required for insurance)\n\n"
-    "You can send **several photos or PDFs** in Phase 1, then tap **Done — extract lead**.\n"
     "You can attach files after this step.\n\n"
+        "Commands: **/help** — how to use the bot · **/cancel** — restart from the top (like **/start**).\n\n"
     f"{motivation.get_random_quote()}\n\n"
     "🏁Automated🏎Automotive"
 )
@@ -1617,9 +1665,38 @@ async def handle_driver_add_lead_callback(update: Update, context: ContextTypes.
     return STATE_PHASE1
 
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Start the conversation and initialize state."""
-    if not update.message:
+def _clear_lead_conversation_user_data(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Drop ConversationHandler scratch keys so /cancel leaves no stale UI/state."""
+    if not context.user_data:
+        return
+    for key in (
+        "phase1_pending_edit_key",
+        "phase1_vision_batch",
+        "phase1_attached_files",
+        "phase1_recent_edits",
+        "review_message_id",
+        "review_chat_id",
+        "vin_choice_api_car",
+        "vin_choice_stated_car",
+        "vin_conflict_msg_id",
+        "missing_fields",
+        "missing_field_state_data",
+        "add_files_prompt_msg_id",
+        "phase2_before_files",
+        "send_file_prompt_msg_id",
+        "another_file_prompt_msg_id",
+        "edit_prompt_msg_id",
+        "receipt_lead_id",
+        "receipt_reference_id",
+        "receipt_monday_item_id",
+    ):
+        context.user_data.pop(key, None)
+
+
+async def _restart_bot_from_top(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Driver hub (/start-style) or Phase 1 welcome — shared by /start and /cancel restart."""
+    msg = update.effective_message
+    if not msg:
         return ConversationHandler.END
     user = update.effective_user
     user_id = user.id
@@ -1642,15 +1719,24 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
             )
         lines.append("\nTo add a lead, type /lead or /client.")
         lines.append("\nTo view all receipts type /receipts.")
+        lines.append("\nTap ❓ Help below or type /help for a full guide.")
         lines.append(f"\n{motivation.get_random_quote()}")
         lines.append("\n🏁Automated🏎Automotive")
-        await update.message.reply_text(
+        await msg.reply_text(
             "\n".join(lines),
             reply_markup=_driver_add_lead_keyboard_only(),
         )
         return ConversationHandler.END
 
-    return await begin_lead_command(update, context)
+    await _begin_lead_flow(context, user_id, username, msg)
+    return STATE_PHASE1
+
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Start the conversation and initialize state."""
+    if not update.message:
+        return ConversationHandler.END
+    return await _restart_bot_from_top(update, context)
 
 
 def _normalize_ai_phase1_text(text: str) -> str:
@@ -2889,7 +2975,7 @@ async def handle_file_upload(update: Update, context: ContextTypes.DEFAULT_TYPE)
             context.user_data["another_file_prompt_msg_id"] = sent.message_id
     except Exception as e:
         logger.error("handle_file_upload reply failed: %s", e, exc_info=True)
-        await msg.reply_text("File saved. Tap Yes/No on the previous keyboard if you still see it, or send /cancel and /start.")
+        await msg.reply_text("File saved. Tap Yes/No on the previous keyboard if you still see it, or send /cancel to restart from the top.")
     return STATE_WAITING_FILE
 
 
@@ -5277,15 +5363,28 @@ async def handle_contact_source_selection(update: Update, context: ContextTypes.
     return ConversationHandler.END
 
 
-async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Cancel the conversation."""
+async def cancel_from_lead_conversation(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Lead flow /cancel: wipe in-memory + DB flow state and restart like /start."""
+    msg = update.effective_message
+    if not msg:
+        return ConversationHandler.END
     user_id = update.effective_user.id
-    if context.user_data:
-        context.user_data.pop("phase1_pending_edit_key", None)
-        context.user_data.pop("phase1_vision_batch", None)
+    _clear_lead_conversation_user_data(context)
     db.clear_user_state(user_id)
-    
-    await update.message.reply_text("❌ Operation cancelled. Use /start to begin again.")
+    await msg.reply_text("❌ Cancelled — restarting from the top.")
+    return await _restart_bot_from_top(update, context)
+
+
+async def cancel_from_receipt_conversation(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Receipt-upload /cancel: full restart; always end receipt ConversationHandler."""
+    msg = update.effective_message
+    if not msg:
+        return ConversationHandler.END
+    user_id = update.effective_user.id
+    _clear_lead_conversation_user_data(context)
+    db.clear_user_state(user_id)
+    await msg.reply_text("❌ Cancelled — restarting from the top.")
+    await _restart_bot_from_top(update, context)
     return ConversationHandler.END
 
 
@@ -6403,7 +6502,7 @@ async def handle_reference_id_input(update: Update, context: ContextTypes.DEFAUL
     msg = update.effective_message
     if not msg or not (getattr(msg, "text", None) or "").strip():
         if msg:
-            await msg.reply_text("Please send the reference ID as text, or type /cancel.")
+            await msg.reply_text("Please send the reference ID as text, or type /cancel to restart from the top.")
         return STATE_WAITING_REFERENCE_ID
     reference_id = msg.text.strip().upper()
     
@@ -6413,7 +6512,7 @@ async def handle_reference_id_input(update: Update, context: ContextTypes.DEFAUL
     if not lead:
         await msg.reply_text(
             "❌ Reference ID not found. Please check and try again.\n"
-            "Or type /cancel to cancel."
+            "Or type /cancel to restart from the top."
         )
         return STATE_WAITING_REFERENCE_ID
 
@@ -7475,7 +7574,7 @@ def main():
             STATE_SELECT_CONTACT_SOURCE: [CallbackQueryHandler(handle_contact_source_selection, pattern="^contact_source_")],
         },
         fallbacks=[
-            CommandHandler("cancel", cancel),
+            CommandHandler("cancel", cancel_from_lead_conversation),
             CommandHandler("start", start),
             CommandHandler(["lead", "client"], begin_lead_command),
             CallbackQueryHandler(handle_driver_add_lead_callback, pattern="^driver_add_lead$"),
@@ -7511,7 +7610,7 @@ def main():
             ],
         },
         fallbacks=[
-            CommandHandler("cancel", cancel),
+            CommandHandler("cancel", cancel_from_receipt_conversation),
             CommandHandler("start", start),
             CommandHandler(["receipt", "receipts", "recipts"], handle_driver_receipts_menu_command),
             CallbackQueryHandler(handle_driver_add_receipt_callback, pattern="^driver_add_receipt$"),
@@ -7520,7 +7619,11 @@ def main():
 
     application.add_handler(receipt_handler)
     application.add_handler(conv_handler)
-    
+
+    # /help + inline ❓ Help — outside ConversationHandler so they work during any flow.
+    application.add_handler(CommandHandler("help", cmd_help))
+    application.add_handler(CallbackQueryHandler(handle_help_callback, pattern=r"^bot_help$"))
+
     # Add accept/decline handlers for driver assignments
     application.add_handler(CallbackQueryHandler(handle_accept_lead, pattern="^accept_lead_"))
     application.add_handler(CallbackQueryHandler(handle_decline_lead, pattern="^decline_lead_"))
