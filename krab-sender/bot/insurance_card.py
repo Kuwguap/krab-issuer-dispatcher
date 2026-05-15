@@ -1,18 +1,17 @@
 """NY FS-20 insurance ID card PDF generator with AAMVA Annex D PDF417 barcodes.
 
-Port of the TypeScript blueprint (`buildNyInsuranceIdCardPdf` + `pdf-lib` +
-`bwip-js`) into Python using ``reportlab`` (PDF) and ``pdf417gen`` (PDF417).
+Mirror of ``krableadsV2/utils/insurance_card.py`` so the Krab Dispatch (sender)
+bot produces *byte-identical* insurance cards as the Krab Issuer bot.
+
+Keep these two files in sync. If you change one, update the other.
 
 Public surface:
   * ``build_aamva_ny_insurance_pdf417_payload(...)`` — AAMVA byte stream encoder.
   * ``build_ny_insurance_id_card_pdf(...)`` — returns PDF bytes (US Letter portrait).
   * ``normalize_vin``, ``decode_vin_from_nhtsa`` — VIN helpers (reuses
-    ``utils.vin_lookup``).
+    sibling ``vin_lookup``).
   * ``normalize_aamva_daq`` — customer/document id formatter (blank → '000000000').
   * ``generate_policy_number`` — ``ATP1234567-00`` style id.
-
-The code is intentionally faithful to the blueprint constants so scanners that
-read AAMVA Annex D streams (NY IIN 636001) accept the output without changes.
 """
 from __future__ import annotations
 
@@ -357,11 +356,11 @@ def decode_vin_from_nhtsa(vin: str) -> Optional[dict]:
     """Return ``{'vin','suggestedVehicleName','modelYear','vehicleMake','vehicleModel'}``
     or ``None`` if the API is unreachable.
 
-    Wraps ``utils.vin_lookup.vin_lookup_nhtsa`` (already used by the bot for VIN
-    verification) and shapes the result to the blueprint's contract.
+    Wraps the sibling ``vin_lookup`` module (NHTSA vPIC) and shapes the result
+    to the blueprint's contract.
     """
     try:
-        from utils.vin_lookup import vin_lookup_nhtsa
+        from .vin_lookup import vin_lookup_nhtsa
     except Exception:  # pragma: no cover - circular safety
         return None
     v = normalize_vin(vin)

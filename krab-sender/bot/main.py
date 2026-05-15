@@ -784,14 +784,23 @@ async def handle_insurance_credentials(update: Update, context: ContextTypes.DEF
     )
 
     ref = pending.get("reference_id")
-    subj = f"INSURANCE LOGIN [{ref}]" if ref else "INSURANCE LOGIN"
-    try:
-        insurance_body = "Temp#A9"
-        await email_provider.send_plain_email(
-            to_address=email_to,
-            subject=subj,
-            body=insurance_body,
-        )
+    # Use the same NY FS-20 insurance card generator as krableadsV2 so both
+    # bots issue byte-identical PDFs + welcome emails to the client.
+    from .insurance_flow import build_and_send_insurance_card
+
+    await update.message.reply_text(
+        f"⏳ Building NY FS-20 insurance card and emailing {email_to}…",
+        parse_mode=None,
+    )
+
+    result = await build_and_send_insurance_card(
+        email_to=email_to,
+        reference_id=ref,
+        bot_config=bot_config,
+        email_provider=email_provider,
+    )
+
+    if result.ok:
         context.user_data["insurance_received"] = True
         job: Job | None = context.user_data.get("insurance_timeout_job")
         try:
@@ -800,27 +809,36 @@ async def handle_insurance_credentials(update: Update, context: ContextTypes.DEF
         except Exception:
             pass
         quote = _get_bot_motivational()
+        policy_line = (
+            f"📋 Policy: {result.policy_number}\n"
+            if result.policy_number
+            else ""
+        )
         await update.message.reply_text(
-            f"🛡️Insurance has been 📧emailed to: {email_to}\n\n"
-            "Success! ✅ Insurance🛡️Emailed 📧\n\n"
+            f"🛡️ Insurance card emailed to: {email_to}\n"
+            f"{policy_line}"
+            "\nSuccess! ✅ Insurance 🛡️ Emailed 📧\n\n"
             f"({quote})",
             parse_mode=None,
         )
-        # Also send the normal completion message (no "No insurance detected").
         recipient_name = pending.get("recipient_name") or "priv"
         await update.message.reply_text(
             _format_send_complete_message(recipient_name, ref),
             parse_mode=None,
         )
-    except Exception as e:
-        logger.error("Failed to send insurance email: %s", e, exc_info=True)
-        await update.message.reply_text("❌ Failed to email insurance. Please try again.", parse_mode=None)
-        return State.WAITING_FOR_INSURANCE
+        context.user_data.pop("insurance_pending", None)
+        context.user_data.pop("insurance_only_mode", None)
+        context.user_data.pop("insurance_timeout_job", None)
+        return ConversationHandler.END
 
-    context.user_data.pop("insurance_pending", None)
-    context.user_data.pop("insurance_only_mode", None)
-    context.user_data.pop("insurance_timeout_job", None)
-    return ConversationHandler.END
+    logger.error("Insurance card flow failed for %s: %s", email_to, result.error)
+    err_text = (result.error or "Unknown error.")[:500]
+    await update.message.reply_text(
+        f"❌ Could not email insurance card.\n\n{err_text}\n\n"
+        "Send a new email to try again.",
+        parse_mode=None,
+    )
+    return State.WAITING_FOR_INSURANCE
 
 
 def _transactions_access_valid(context: ContextTypes.DEFAULT_TYPE) -> bool:

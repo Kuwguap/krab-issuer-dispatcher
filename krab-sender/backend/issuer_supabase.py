@@ -399,6 +399,48 @@ def resolve_reference_from_filename(
     return None, None
 
 
+def fetch_lead_row_by_reference(
+    base_url: str,
+    service_key: str,
+    reference_id: str,
+) -> Optional[dict[str, Any]]:
+    """
+    Return the full Krab Issuer lead row matching ``reference_id``.
+
+    Used by the Krab Dispatch bot's insurance flow to pull the same data the
+    Issuer bot uses (vehicle_details, email, driver_license_id, ...) so the
+    generated NY FS-20 card matches across bots.
+    """
+    ref = (reference_id or "").strip()
+    base = (base_url or "").strip().rstrip("/")
+    key = (service_key or "").strip()
+    if not ref or not base or not key:
+        return None
+    params = {
+        "select": "*",
+        "reference_id": f"eq.{ref}",
+        "limit": "1",
+    }
+    try:
+        with httpx.Client(timeout=20.0) as client:
+            r = client.get(f"{base}/rest/v1/leads", params=params, headers=_headers(key))
+        if r.status_code >= 400:
+            logger.warning(
+                "fetch_lead_row_by_reference HTTP %s: %s",
+                r.status_code,
+                (r.text or "")[:300],
+            )
+            return None
+        data = r.json()
+        if isinstance(data, list) and data:
+            row = data[0]
+            if isinstance(row, dict):
+                return row
+    except Exception as e:
+        logger.warning("fetch_lead_row_by_reference: %s", e)
+    return None
+
+
 def get_lead_id_by_reference(base_url: str, service_key: str, reference_id: str) -> Optional[str]:
     ref = (reference_id or "").strip()
     base = (base_url or "").strip().rstrip("/")
