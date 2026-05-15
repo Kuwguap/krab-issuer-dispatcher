@@ -145,6 +145,13 @@ DriverLicenseID: 123456789
 
 Output nothing else—no explanation, no markdown, no line numbers. Only these 17 lines."""
 
+MULTI_STRUCTURE_PROMPT = STRUCTURE_PROMPT.replace(
+    "from an image or PDF page (screenshot, scan, or form).",
+    "from multiple images (screenshots, scans, document photos, or rendered PDF pages). "
+    "Merge information from ALL images into one result. If a field appears in more than one image, "
+    "prefer the clearest and most complete value and resolve minor conflicts sensibly.",
+)
+
 # For freeform text: user can send any format; we ask the model to identify and rearrange into 11 lines
 TEXT_STRUCTURE_PROMPT = """The user sent the following message. It may be in any format: paragraph, bullet list, different order, labels like "Name: John", etc. It also includes a phone number, a price (maybe with a $ sign), and possibly two notes (one for the tag issuer, one for the driver), an email, and a driver-license / DMV ID.
 
@@ -273,6 +280,63 @@ def extract_structured_from_image(image_bytes: bytes, mime_type: str = "image/jp
             logger.warning("AI vision quota exceeded: %s", e)
             raise AIVisionQuotaError("API quota exceeded") from e
         logger.exception("AI vision extraction failed: %s", e)
+        return None
+
+
+def extract_structured_from_media_parts(parts: list[tuple[bytes, str]]) -> Optional[str]:
+    """
+    Run Phase 1 vision extraction over one or more images (PNG/JPEG bytes + MIME).
+
+    PDFs should be converted to PNG (e.g. ``pdf_first_page_to_png_bytes``) before calling.
+    Multiple parts are sent in a single multimodal request so the model can merge fields.
+    """
+    if not parts:
+        return None
+    cleaned = [(b, m) for b, m in parts if b and (m or "").strip()]
+    if not cleaned:
+        return None
+    if len(cleaned) == 1:
+        return extract_structured_from_image(cleaned[0][0], mime_type=cleaned[0][1] or "image/jpeg")
+
+    from config import Config
+
+    api_key = Config.OPENAI_API_KEY
+    if not api_key or not api_key.strip():
+        logger.warning("OPENAI_API_KEY not set; cannot process images.")
+        return None
+
+    max_parts = 12
+    trimmed = cleaned[:max_parts]
+
+    content: list[dict[str, Any]] = [{"type": "text", "text": MULTI_STRUCTURE_PROMPT}]
+    for image_bytes, mime_type in trimmed:
+        mt = (mime_type or "image/jpeg").strip()
+        if not mt.startswith("image/"):
+            mt = "image/jpeg"
+        b64 = base64.standard_b64encode(image_bytes).decode("ascii")
+        data_url = f"data:{mt};base64,{b64}"
+        content.append({"type": "image_url", "image_url": {"url": data_url}})
+
+    try:
+        from openai import OpenAI
+
+        client = OpenAI(api_key=api_key.strip(), max_retries=0)
+        model = getattr(Config, "OPENAI_VISION_MODEL", None) or "gpt-4o"
+        response = client.chat.completions.create(
+            model=model,
+            messages=[{"role": "user", "content": content}],
+            max_tokens=1024,
+        )
+        text = (response.choices[0].message.content or "").strip()
+        return text if text else None
+    except AIVisionQuotaError:
+        raise
+    except Exception as e:
+        err_msg = str(e).lower()
+        if "429" in err_msg or "insufficient_quota" in err_msg or "quota" in err_msg or "rate limit" in err_msg:
+            logger.warning("AI vision quota exceeded (multi-image): %s", e)
+            raise AIVisionQuotaError("API quota exceeded") from e
+        logger.exception("AI vision multi-image extraction failed: %s", e)
         return None
 
 

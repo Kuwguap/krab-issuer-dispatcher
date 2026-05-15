@@ -64,6 +64,11 @@ STATE_SPECIAL_REQUEST_ISSUERS = 19  # After phone + price: note for group / issu
 STATE_SPECIAL_REQUEST_DRIVERS = 20  # Then: note only for drivers (before encrypt)
 STATE_EDIT_FIELD_PROMPT = 29   # waiting for text input for editing a field
 
+# Phase 1: accumulate multiple photos/PDFs before one vision extraction
+PHASE1_VISION_DONE_CB = "phase1_vision_done"
+PHASE1_VISION_CLEAR_CB = "phase1_vision_clear"
+PHASE1_VISION_MAX_FILES = 12
+
 # Supabase ``states.state`` value: issuer posted group approval and must wait for Accept before driver pick / dispatch
 USER_STATE_AWAIT_GROUP_ACCEPT = "await_group_accept"
 
@@ -1169,8 +1174,8 @@ PH1_EDIT_PROMPT_LABEL = {
     "price": "Price",
     "issuer": "Issuer note",
     "driver": "Driver note",
-    "email": "Client email (for insurance card)",
-    "dl": "Driver's license / DMV ID",
+    "email": "Email (required for insurance)",
+    "dl": "Driver license (required for insurance)",
 }
 
 
@@ -1214,8 +1219,8 @@ def _format_phase1_field_lines(state_data: dict) -> str:
         f"💲Price: {state_data.get('pending_price') or '-'}",
         f"📝Issuer note: {state_data.get('special_request_issuers') or '-'}",
         f"📝Driver note: {state_data.get('special_request_drivers') or '-'}",
-        f"📧Email: {state_data.get('email') or '-'}",
-        f"🪪Driver's License ID: {state_data.get('driver_license_id') or '-'}",
+        f"📧Email (required for insurance): {state_data.get('email') or '-'}",
+        f"🪪Driver license (required for insurance): {state_data.get('driver_license_id') or '-'}",
     ]
     return "\n".join(lines)
 
@@ -1358,7 +1363,7 @@ def _phase1_edit_fields_keyboard(state_data: dict) -> InlineKeyboardMarkup:
         ],
         [
             InlineKeyboardButton(f"📧 Email: {_truncate_btn_val(state_data.get('email') or '-', 22)}", callback_data="ph1edit_email"),
-            InlineKeyboardButton(f"🪪 DL ID: {_truncate_btn_val(state_data.get('driver_license_id') or '-', 18)}", callback_data="ph1edit_dl"),
+            InlineKeyboardButton(f"🪪 DL: {_truncate_btn_val(state_data.get('driver_license_id') or '-', 18)}", callback_data="ph1edit_dl"),
         ],
         [InlineKeyboardButton("⬅️ Back to review", callback_data=PH1_EDIT_BACK)],
     ]
@@ -1554,6 +1559,7 @@ async def _begin_lead_flow(
     db.clear_user_state(user_id)
     if context.user_data:
         context.user_data.pop("phase1_attached_files", None)
+        context.user_data.pop("phase1_vision_batch", None)
         context.user_data.pop("phase1_pending_edit_key", None)
         context.user_data.pop("phase1_recent_edits", None)
         for _k in ("receipt_lead_id", "receipt_reference_id", "receipt_monday_item_id"):
@@ -1575,8 +1581,9 @@ async def _begin_lead_flow(
     "💲 Price\n"
     "📝 Special request for issuers (optional)\n"
     "📝 Special request for drivers (optional)\n"
-    "📧 Email (optional — we'll offer to send a NY FS-20 insurance card)\n"
-    "🪪 Driver's License / DMV ID (optional)\n\n"
+    "📧Email (required for insurance)\n"
+    "🪪Driver license (required for insurance)\n\n"
+    "You can send **several photos or PDFs** in Phase 1, then tap **Done — extract lead**.\n"
     "You can attach files after this step.\n\n"
     f"{motivation.get_random_quote()}\n\n"
     "🏁Automated🏎Automotive"
@@ -2219,8 +2226,11 @@ async def _phase1_finish_vision_extraction(
     source_label: str = "image",
 ) -> int:
     """Normalize AI vision output, validate, then AI review — shared by photo and PDF."""
+    msg = update.effective_message
+    if not msg:
+        return STATE_PHASE1
     if not raw_text or not raw_text.strip():
-        await update.message.reply_text(
+        await msg.reply_text(
             f"❌ Could not extract details from the {source_label}. "
             "Please send the details as text in the required structure."
         )
@@ -2238,7 +2248,7 @@ async def _phase1_finish_vision_extraction(
             f"VIN: {state_data.get('vin') or '-'}\n"
             f"Delivery: {state_data.get('delivery_address') or '-'} / {state_data.get('delivery_city_state_zip') or '-'}"
         )
-        await update.message.reply_text(
+        await msg.reply_text(
             "⚠️ Extraction didn’t pass validation:\n\n• " + err_blurb + "\n\n"
             "Extracted preview:\n" + preview + "\n\n"
             "Please send the details as text in the required 11-line structure, or try another photo or PDF."
@@ -2303,23 +2313,99 @@ async def _phase1_finish_vision_extraction(
     ])
 
     db.set_user_state(user_id, "phase1", state_data)
-    await _send_phase1_ai_review(update.message, state_data, context, user_id)
+    await _send_phase1_ai_review(msg, state_data, context, user_id)
     return STATE_AI_REVIEW
 
 
-async def handle_phase1_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Handle Phase 1 image upload: OCR + AI extract structured fields, then same flow as text."""
-    user_id = update.effective_user.id
+def _phase1_vision_batch_reply_markup() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("✅ Done — extract lead", callback_data=PHASE1_VISION_DONE_CB)],
+        [InlineKeyboardButton("🗑 Clear all", callback_data=PHASE1_VISION_CLEAR_CB)],
+    ])
+
+
+async def handle_phase1_vision_batch_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Accumulated Phase 1 photos/PDFs: extract merged lead or clear batch."""
+    query = update.callback_query
+    await _safe_answer_callback_query(query)
+    user_id = query.from_user.id
+    msg = query.message
+    if not msg:
+        return STATE_PHASE1
+    data = query.data or ""
+
+    if data == PHASE1_VISION_CLEAR_CB:
+        context.user_data["phase1_vision_batch"] = []
+        await msg.reply_text("🗑 Cleared. Send photos or PDFs to build a new batch.")
+        return STATE_PHASE1
+
+    if data != PHASE1_VISION_DONE_CB:
+        return STATE_PHASE1
+
     if not Config.is_ai_vision_configured():
-        await update.message.reply_text(
+        await msg.reply_text(
             "❌ Image extraction is not configured. Please send the details as text in the required structure."
         )
         return STATE_PHASE1
-    await update.message.reply_text("⏳ Processing image…")
-    if not update.message.photo:
-        await update.message.reply_text("❌ No image received. Please send a screenshot or try sending as text.")
+
+    batch = context.user_data.get("phase1_vision_batch") or []
+    if not batch:
+        await msg.reply_text("Nothing to extract yet. Send at least one photo or PDF.")
         return STATE_PHASE1
-    photo = update.message.photo[-1]
+
+    parts: list[tuple[bytes, str]] = []
+    for item in batch:
+        if item.get("kind") == "image":
+            parts.append((item["bytes"], item.get("mime") or "image/jpeg"))
+        elif item.get("kind") == "pdf":
+            png = await asyncio.to_thread(ai_vision.pdf_first_page_to_png_bytes, item["bytes"])
+            if png:
+                parts.append((png, "image/png"))
+
+    context.user_data["phase1_vision_batch"] = []
+
+    if not parts:
+        await msg.reply_text(
+            "❌ Could not read images from those files (PDF render may have failed). "
+            "Try screenshots or type the details."
+        )
+        return STATE_PHASE1
+
+    await msg.reply_text(f"⏳ Processing **{len(parts)}** image(s)…", parse_mode="Markdown")
+    try:
+        raw_text = await asyncio.to_thread(ai_vision.extract_structured_from_media_parts, parts)
+    except ai_vision.AIVisionQuotaError:
+        await msg.reply_text(
+            "❌ Extraction is temporarily unavailable (API quota exceeded). "
+            "Please send the details as text in the required structure."
+        )
+        return STATE_PHASE1
+
+    label = "files" if len(parts) > 1 else "photo"
+    return await _phase1_finish_vision_extraction(update, context, user_id, raw_text, source_label=label)
+
+
+async def handle_phase1_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Phase 1: queue screenshot(s); user taps Done to run vision on all queued images/PDFs."""
+    msg = update.message
+    if not msg or not msg.photo:
+        return STATE_PHASE1
+    if not Config.is_ai_vision_configured():
+        await msg.reply_text(
+            "❌ Image extraction is not configured. Please send the details as text in the required structure."
+        )
+        return STATE_PHASE1
+
+    batch = context.user_data.setdefault("phase1_vision_batch", [])
+    if len(batch) >= PHASE1_VISION_MAX_FILES:
+        await msg.reply_text(
+            f"❌ Maximum {PHASE1_VISION_MAX_FILES} files in one batch. Tap **Done — extract lead** or Clear.",
+            parse_mode="Markdown",
+            reply_markup=_phase1_vision_batch_reply_markup(),
+        )
+        return STATE_PHASE1
+
+    photo = msg.photo[-1]
     file = await context.bot.get_file(photo.file_id)
     bio = io.BytesIO()
     await file.download_to_memory(out=bio)
@@ -2327,70 +2413,70 @@ async def handle_phase1_photo(update: Update, context: ContextTypes.DEFAULT_TYPE
     mime = "image/jpeg"
     if file.file_path and file.file_path.lower().endswith(".png"):
         mime = "image/png"
-    try:
-        raw_text = await asyncio.to_thread(
-            lambda: ai_vision.extract_structured_from_image(image_bytes, mime_type=mime)
-        )
-    except ai_vision.AIVisionQuotaError:
-        await update.message.reply_text(
-            "❌ Image extraction is temporarily unavailable (API quota exceeded). "
-            "Please send the details as text in the required structure."
-        )
-        return STATE_PHASE1
-    return await _phase1_finish_vision_extraction(update, context, user_id, raw_text, source_label="photo")
+    batch.append({"kind": "image", "bytes": image_bytes, "mime": mime})
+    n = len(batch)
+    await msg.reply_text(
+        f"📎 Added image **{n}** / {PHASE1_VISION_MAX_FILES}. "
+        "Send another photo or PDF, or tap **Done — extract lead**.",
+        parse_mode="Markdown",
+        reply_markup=_phase1_vision_batch_reply_markup(),
+    )
+    return STATE_PHASE1
 
 
 async def handle_phase1_document(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Phase 1 PDF: render first page and run the same AI extraction + review as photos."""
-    user_id = update.effective_user.id
+    """Phase 1: queue PDF (first page per file); merged extraction when user taps Done."""
+    msg = update.message
+    if not msg:
+        return STATE_PHASE1
     if not Config.is_ai_vision_configured():
-        await update.message.reply_text(
+        await msg.reply_text(
             "❌ Document extraction is not configured. Please send the details as text in the required structure."
         )
         return STATE_PHASE1
-    msg = update.message
-    doc = msg.document if msg else None
+    doc = msg.document
     if not doc:
-        await update.message.reply_text("❌ No document received.")
+        await msg.reply_text("❌ No document received.")
         return STATE_PHASE1
     mime = (doc.mime_type or "").lower()
     fname = (doc.file_name or "").lower()
     pdf_mimes = ("application/pdf", "application/x-pdf")
     if mime not in pdf_mimes and not fname.endswith(".pdf"):
-        await update.message.reply_text(
-            "📄 In Phase 1, send **text**, a **photo/screenshot**, or a **PDF** with vehicle and delivery details.\n\n"
+        await msg.reply_text(
+            "📄 In Phase 1, send **text**, **photo(s)/screenshot(s)**, or **PDF(s)** with vehicle and delivery details.\n\n"
             "Other file types are not supported for auto-extraction — use a PDF or type the details.",
             parse_mode="Markdown",
         )
         return STATE_PHASE1
     sz = doc.file_size
     if sz is not None and sz > 20 * 1024 * 1024:
-        await update.message.reply_text(
+        await msg.reply_text(
             "❌ This PDF is too large (max ~20 MB). Please send a smaller file or a screenshot."
         )
         return STATE_PHASE1
-    await update.message.reply_text("⏳ Processing PDF…")
+
+    batch = context.user_data.setdefault("phase1_vision_batch", [])
+    if len(batch) >= PHASE1_VISION_MAX_FILES:
+        await msg.reply_text(
+            f"❌ Maximum {PHASE1_VISION_MAX_FILES} files in one batch. Tap **Done — extract lead** or Clear.",
+            parse_mode="Markdown",
+            reply_markup=_phase1_vision_batch_reply_markup(),
+        )
+        return STATE_PHASE1
+
     file = await context.bot.get_file(doc.file_id)
     bio = io.BytesIO()
     await file.download_to_memory(out=bio)
     pdf_bytes = bio.getvalue()
-    try:
-        raw_text = await asyncio.to_thread(
-            lambda: ai_vision.extract_structured_from_pdf(pdf_bytes)
-        )
-    except ai_vision.AIVisionQuotaError:
-        await update.message.reply_text(
-            "❌ Extraction is temporarily unavailable (API quota exceeded). "
-            "Please send the details as text in the required structure."
-        )
-        return STATE_PHASE1
-    if not raw_text:
-        await update.message.reply_text(
-            "❌ Could not read this PDF (empty, invalid, or install failed). "
-            "Try another PDF, send a photo/screenshot, or type the details."
-        )
-        return STATE_PHASE1
-    return await _phase1_finish_vision_extraction(update, context, user_id, raw_text, source_label="photo")
+    batch.append({"kind": "pdf", "bytes": pdf_bytes})
+    n = len(batch)
+    await msg.reply_text(
+        f"📎 Added PDF **{n}** / {PHASE1_VISION_MAX_FILES} (first page will be used per PDF). "
+        "Send another file or tap **Done — extract lead**.",
+        parse_mode="Markdown",
+        reply_markup=_phase1_vision_batch_reply_markup(),
+    )
+    return STATE_PHASE1
 
 
 async def handle_phase1(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -2399,9 +2485,13 @@ async def handle_phase1(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
     message_text = (update.message.text or "").strip()
     if not message_text:
         await update.message.reply_text(
-            "Please send the client/vehicle and delivery details (text, screenshot, or PDF)."
+            "Please send the client/vehicle and delivery details as **text**, or send **photo(s)/PDF(s)** "
+            "and tap **Done — extract lead** when finished.",
+            parse_mode="Markdown",
         )
         return STATE_PHASE1
+
+    context.user_data.pop("phase1_vision_batch", None)
 
     if Config.is_ai_vision_configured():
         await update.message.reply_text("⏳ Processing…")
@@ -5176,6 +5266,7 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     user_id = update.effective_user.id
     if context.user_data:
         context.user_data.pop("phase1_pending_edit_key", None)
+        context.user_data.pop("phase1_vision_batch", None)
     db.clear_user_state(user_id)
     
     await update.message.reply_text("❌ Operation cancelled. Use /start to begin again.")
@@ -7302,6 +7393,7 @@ def main():
         ],
         states={
             STATE_PHASE1: [
+                CallbackQueryHandler(handle_phase1_vision_batch_callback, pattern=r"^phase1_vision_(done|clear)$"),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, handle_phase1),
                 MessageHandler(filters.PHOTO, handle_phase1_photo),
                 MessageHandler(filters.Document.ALL, handle_phase1_document),
