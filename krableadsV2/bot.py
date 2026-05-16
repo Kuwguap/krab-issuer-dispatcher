@@ -2523,7 +2523,7 @@ def _phase1_batch_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
         [
             InlineKeyboardButton("❌ Cancel", callback_data=PHASE1_VISION_CANCEL_CB),
-            InlineKeyboardButton("➕ Photo", callback_data=PHASE1_VISION_PHOTO_CB),
+            InlineKeyboardButton("📸➕Photo", callback_data=PHASE1_VISION_PHOTO_CB),
             InlineKeyboardButton("✅ Done", callback_data=PHASE1_VISION_DONE_CB),
         ],
     ])
@@ -2553,26 +2553,23 @@ async def _refresh_phase1_batch_status_message(
     chat_id: int,
     batch: list,
 ) -> None:
-    """Single status line + Cancel / Photo / Done — edited as more files arrive."""
-    text = _phase1_batch_count_text(batch)
-    markup = _phase1_batch_keyboard()
-    mid = context.user_data.get("phase1_batch_status_msg_id") if context.user_data else None
-    if mid:
-        try:
-            await context.bot.edit_message_text(
-                chat_id=chat_id,
-                message_id=mid,
-                text=text,
-                reply_markup=markup,
-            )
-            return
-        except Exception:
-            if context.user_data:
-                context.user_data.pop("phase1_batch_status_msg_id", None)
+    """Drop the prior status message and post a fresh count at the bottom of the chat.
+
+    Deleting + resending (rather than editing) keeps the count visible right after
+    the user's latest upload, so it never looks like stale text scrolled away from
+    the new photo.
+    """
+    if context.user_data:
+        old_mid = context.user_data.pop("phase1_batch_status_msg_id", None)
+        if old_mid:
+            try:
+                await context.bot.delete_message(chat_id=chat_id, message_id=old_mid)
+            except Exception:
+                pass
     sent = await context.bot.send_message(
         chat_id=chat_id,
-        text=text,
-        reply_markup=markup,
+        text=_phase1_batch_count_text(batch),
+        reply_markup=_phase1_batch_keyboard(),
     )
     if context.user_data:
         context.user_data["phase1_batch_status_msg_id"] = sent.message_id
