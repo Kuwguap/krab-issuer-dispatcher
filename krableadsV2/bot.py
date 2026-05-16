@@ -64,9 +64,11 @@ STATE_SPECIAL_REQUEST_ISSUERS = 19  # After phone + price: note for group / issu
 STATE_SPECIAL_REQUEST_DRIVERS = 20  # Then: note only for drivers (before encrypt)
 STATE_EDIT_FIELD_PROMPT = 29   # waiting for text input for editing a field
 
-# Phase 1: accumulate multiple photos/PDFs, then auto-extract after a short pause
+# Phase 1: accumulate photos/PDFs; user taps Done to run vision extraction
 PHASE1_VISION_MAX_FILES = 12
-PHASE1_VISION_AUTO_EXTRACT_DELAY_S = 2.0
+PHASE1_VISION_CANCEL_CB = "phase1_vision_cancel"
+PHASE1_VISION_PHOTO_CB = "phase1_vision_photo"
+PHASE1_VISION_DONE_CB = "phase1_vision_done"
 
 # Supabase ``states.state`` value: issuer posted group approval and must wait for Accept before driver pick / dispatch
 USER_STATE_AWAIT_GROUP_ACCEPT = "await_group_accept"
@@ -216,7 +218,7 @@ def _help_guide_text() -> str:
         "Submitting a lead\n"
         "1) Tap ➕ Add new lead or send /lead.\n"
         "2) Send client info as text and/or one or more photos or PDFs.\n"
-        "3) The bot reads everything you send and builds the lead automatically.\n"
+        "3) When sending files, tap **Done** to parse them (phone numbers are hidden before forwarding).\n"
         "4) Review the summary, edit with the buttons if needed, then submit.\n"
         "5) Choose group, driver, and contact source to dispatch.\n\n"
         "Insurance\n"
@@ -422,6 +424,24 @@ async def _finalize_phase1_media_for_dispatch(
     if cached and isinstance(cached, list):
         return cached
     pending: list[dict] = list(context.user_data.get("phase1_pending_media") or [])
+    # Fallback: rebuild from an in-memory batch if extraction ran but pending was not stashed.
+    if not pending:
+        batch = context.user_data.get("phase1_vision_batch") or []
+        for item in batch:
+            if item.get("kind") == "image":
+                pending.append(
+                    {
+                        "kind": "image",
+                        "bytes": item.get("bytes") or b"",
+                        "mime": item.get("mime") or "image/jpeg",
+                    }
+                )
+            elif item.get("kind") == "pdf":
+                png = await asyncio.to_thread(
+                    ai_vision.pdf_first_page_to_png_bytes, item.get("bytes") or b""
+                )
+                if png:
+                    pending.append({"kind": "image", "bytes": png, "mime": "image/png"})
     if not pending or not issuer_chat_id:
         return []
 
@@ -1696,7 +1716,6 @@ async def _begin_lead_flow(
     if context.user_data:
         context.user_data.pop("phase1_attached_files", None)
         context.user_data.pop("phase1_vision_batch", None)
-        context.user_data.pop("phase1_vision_gen", None)
         context.user_data.pop("phase1_pending_media", None)
         context.user_data.pop("phase1_pending_edit_key", None)
         context.user_data.pop("phase1_recent_edits", None)
@@ -1760,9 +1779,9 @@ def _clear_lead_conversation_user_data(context: ContextTypes.DEFAULT_TYPE) -> No
     for key in (
         "phase1_pending_edit_key",
         "phase1_vision_batch",
-        "phase1_vision_gen",
         "phase1_vision_reply_chat_id",
         "phase1_vision_extracting",
+        "phase1_batch_status_msg_id",
         "phase1_pending_media",
         "phase1_attached_files",
         "phase1_recent_edits",
@@ -2494,28 +2513,107 @@ async def _phase1_finish_vision_extraction(
     return STATE_AI_REVIEW
 
 
-def _bump_phase1_vision_generation(context: ContextTypes.DEFAULT_TYPE, chat_id: int) -> int:
-    """Increment generation so only the latest debounced extract runs; return new gen."""
-    if not context.user_data:
-        return 0
-    generation = int(context.user_data.get("phase1_vision_gen") or 0) + 1
-    context.user_data["phase1_vision_gen"] = generation
-    context.user_data["phase1_vision_reply_chat_id"] = chat_id
-    return generation
+def _phase1_batch_count_text(batch: list) -> str:
+    """User-facing count while queueing photos/PDFs for AI parsing."""
+    n = len(batch)
+    return f"Received {n} photo(s)."
 
 
-async def _wait_and_run_phase1_vision_extract(
+def _phase1_batch_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("❌ Cancel", callback_data=PHASE1_VISION_CANCEL_CB),
+            InlineKeyboardButton("📷 Photo", callback_data=PHASE1_VISION_PHOTO_CB),
+            InlineKeyboardButton("✅ Done", callback_data=PHASE1_VISION_DONE_CB),
+        ],
+    ])
+
+
+async def _clear_phase1_vision_upload_state(
     context: ContextTypes.DEFAULT_TYPE,
-    user_id: int,
-    generation: int,
-    *,
-    delay_s: float | None = None,
-) -> int | None:
-    """Sleep briefly so album/burst uploads finish, then extract if still the latest batch."""
-    wait = PHASE1_VISION_AUTO_EXTRACT_DELAY_S if delay_s is None else delay_s
-    await asyncio.sleep(wait)
-    if not context.user_data or context.user_data.get("phase1_vision_gen") != generation:
-        return None
+    chat_id: int | None = None,
+) -> None:
+    """Drop queued files and remove the batch status message."""
+    if not context.user_data:
+        return
+    status_mid = context.user_data.pop("phase1_batch_status_msg_id", None)
+    if chat_id and status_mid:
+        try:
+            await context.bot.delete_message(chat_id=chat_id, message_id=status_mid)
+        except Exception:
+            pass
+    context.user_data.pop("phase1_vision_batch", None)
+    context.user_data.pop("phase1_vision_reply_chat_id", None)
+    context.user_data.pop("phase1_vision_extracting", None)
+    context.user_data.pop("phase1_pending_media", None)
+
+
+async def _refresh_phase1_batch_status_message(
+    context: ContextTypes.DEFAULT_TYPE,
+    chat_id: int,
+    batch: list,
+) -> None:
+    """Single status line + Cancel / Photo / Done — edited as more files arrive."""
+    text = _phase1_batch_count_text(batch)
+    markup = _phase1_batch_keyboard()
+    mid = context.user_data.get("phase1_batch_status_msg_id") if context.user_data else None
+    if mid:
+        try:
+            await context.bot.edit_message_text(
+                chat_id=chat_id,
+                message_id=mid,
+                text=text,
+                reply_markup=markup,
+            )
+            return
+        except Exception:
+            if context.user_data:
+                context.user_data.pop("phase1_batch_status_msg_id", None)
+    sent = await context.bot.send_message(
+        chat_id=chat_id,
+        text=text,
+        reply_markup=markup,
+    )
+    if context.user_data:
+        context.user_data["phase1_batch_status_msg_id"] = sent.message_id
+
+
+async def handle_phase1_vision_batch_callback(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> int:
+    """Cancel upload batch, prompt for more photos, or run AI extraction (Done)."""
+    query = update.callback_query
+    await _safe_answer_callback_query(query)
+    user_id = query.from_user.id
+    msg = query.message
+    if not msg or not context.user_data:
+        return STATE_PHASE1
+    chat_id = msg.chat_id
+    data = query.data or ""
+
+    if data == PHASE1_VISION_CANCEL_CB:
+        await _clear_phase1_vision_upload_state(context, chat_id)
+        db.clear_user_state(user_id)
+        await msg.reply_text("❌ Cancelled — restarting from the top.")
+        return await _restart_bot_from_top(update, context)
+
+    if data == PHASE1_VISION_PHOTO_CB:
+        await query.answer("Send another photo or PDF below.", show_alert=False)
+        return STATE_PHASE1
+
+    if data != PHASE1_VISION_DONE_CB:
+        return STATE_PHASE1
+
+    batch = context.user_data.get("phase1_vision_batch") or []
+    if not batch:
+        await query.answer("Send at least one photo or PDF first.", show_alert=True)
+        return STATE_PHASE1
+
+    context.user_data["phase1_vision_reply_chat_id"] = chat_id
+    try:
+        await query.edit_message_reply_markup(reply_markup=None)
+    except Exception:
+        pass
     return await _execute_phase1_vision_batch_extraction(context, user_id)
 
 
@@ -2596,10 +2694,11 @@ async def _execute_phase1_vision_batch_extraction(
     finally:
         if context.user_data:
             context.user_data.pop("phase1_vision_extracting", None)
+            context.user_data.pop("phase1_batch_status_msg_id", None)
 
 
 async def handle_phase1_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Phase 1: queue screenshot(s); auto-extract after user stops sending."""
+    """Phase 1: queue screenshot(s); user taps Done to run vision on the batch."""
     msg = update.message
     if not msg or not msg.photo:
         return STATE_PHASE1
@@ -2623,19 +2722,13 @@ async def handle_phase1_photo(update: Update, context: ContextTypes.DEFAULT_TYPE
     if file.file_path and file.file_path.lower().endswith(".png"):
         mime = "image/png"
     batch.append({"kind": "image", "bytes": image_bytes, "mime": mime})
-
-    user_id = update.effective_user.id
-    gen = _bump_phase1_vision_generation(context, msg.chat_id)
-    if len(batch) >= PHASE1_VISION_MAX_FILES:
-        return await _execute_phase1_vision_batch_extraction(context, user_id)
-    next_state = await _wait_and_run_phase1_vision_extract(context, user_id, gen)
-    if next_state is not None:
-        return next_state
-    return None
+    context.user_data["phase1_vision_reply_chat_id"] = msg.chat_id
+    await _refresh_phase1_batch_status_message(context, msg.chat_id, batch)
+    return STATE_PHASE1
 
 
 async def handle_phase1_document(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Phase 1: queue PDF (first page per file); auto-extract after user stops sending."""
+    """Phase 1: queue PDF (first page per file); user taps Done to extract."""
     msg = update.message
     if not msg:
         return STATE_PHASE1
@@ -2675,15 +2768,9 @@ async def handle_phase1_document(update: Update, context: ContextTypes.DEFAULT_T
     await file.download_to_memory(out=bio)
     pdf_bytes = bio.getvalue()
     batch.append({"kind": "pdf", "bytes": pdf_bytes})
-
-    user_id = update.effective_user.id
-    gen = _bump_phase1_vision_generation(context, msg.chat_id)
-    if len(batch) >= PHASE1_VISION_MAX_FILES:
-        return await _execute_phase1_vision_batch_extraction(context, user_id)
-    next_state = await _wait_and_run_phase1_vision_extract(context, user_id, gen)
-    if next_state is not None:
-        return next_state
-    return None
+    context.user_data["phase1_vision_reply_chat_id"] = msg.chat_id
+    await _refresh_phase1_batch_status_message(context, msg.chat_id, batch)
+    return STATE_PHASE1
 
 
 async def handle_phase1(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -2692,13 +2779,15 @@ async def handle_phase1(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
     message_text = (update.message.text or "").strip()
     if not message_text:
         await update.message.reply_text(
-            "Please send the client/vehicle and delivery details as **text**, or send **photo(s)/PDF(s)**.",
+            "Please send the client/vehicle and delivery details as **text**, or send **photo(s)/PDF(s)** "
+            "and tap **Done** when finished.",
             parse_mode="Markdown",
         )
         return STATE_PHASE1
 
-    context.user_data.pop("phase1_vision_batch", None)
-    context.user_data.pop("phase1_vision_gen", None)
+    await _clear_phase1_vision_upload_state(
+        context, update.effective_chat.id if update.effective_chat else None
+    )
 
     if Config.is_ai_vision_configured():
         await update.message.reply_text("⏳ Processing…")
@@ -5509,6 +5598,7 @@ async def cancel_from_lead_conversation(update: Update, context: ContextTypes.DE
     if not msg:
         return ConversationHandler.END
     user_id = update.effective_user.id
+    await _clear_phase1_vision_upload_state(context, msg.chat_id)
     _clear_lead_conversation_user_data(context)
     db.clear_user_state(user_id)
     await msg.reply_text("❌ Cancelled — restarting from the top.")
@@ -7648,6 +7738,10 @@ def main():
         ],
         states={
             STATE_PHASE1: [
+                CallbackQueryHandler(
+                    handle_phase1_vision_batch_callback,
+                    pattern=r"^phase1_vision_(cancel|photo|done)$",
+                ),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, handle_phase1),
                 MessageHandler(filters.PHOTO, handle_phase1_photo),
                 MessageHandler(filters.Document.ALL, handle_phase1_document),
