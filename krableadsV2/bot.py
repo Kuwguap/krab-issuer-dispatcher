@@ -2523,7 +2523,7 @@ def _phase1_batch_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
         [
             InlineKeyboardButton("❌ Cancel", callback_data=PHASE1_VISION_CANCEL_CB),
-            InlineKeyboardButton("📷 Photo", callback_data=PHASE1_VISION_PHOTO_CB),
+            InlineKeyboardButton("➕ Photo", callback_data=PHASE1_VISION_PHOTO_CB),
             InlineKeyboardButton("✅ Done", callback_data=PHASE1_VISION_DONE_CB),
         ],
     ])
@@ -2598,6 +2598,14 @@ async def handle_phase1_vision_batch_callback(
         return await _restart_bot_from_top(update, context)
 
     if data == PHASE1_VISION_PHOTO_CB:
+        # Remove the stale "Received N photo(s)" message so the next upload
+        # produces a fresh count covering ALL queued photos (not just the new ones).
+        status_mid = context.user_data.pop("phase1_batch_status_msg_id", None)
+        if status_mid:
+            try:
+                await context.bot.delete_message(chat_id=chat_id, message_id=status_mid)
+            except Exception:
+                pass
         await query.answer("Send another photo or PDF below.", show_alert=False)
         return STATE_PHASE1
 
