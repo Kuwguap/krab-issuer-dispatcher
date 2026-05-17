@@ -7352,9 +7352,10 @@ async def handle_receipt_image(update: Update, context: ContextTypes.DEFAULT_TYP
         ref_show = html.escape(str(reference_id or "N/A"), quote=False)
         dq = html.escape(driver_motivation.get_random_driver_quote(), quote=False)
         driver_confirm_html = (
-            "✅ <b>Receipt submitted successfully</b>\n\n"
-            f"Reference ID: <code>{ref_show}</code>\n"
-            "Your receipt is on file.\n\n"
+            "✅ <b>Receipt received successfully!</b>\n"
+            "📂 Your Receipt🧾 is on file.\n"
+            "🚗💨 Thank you &amp; 💪Great job — keep up the excellent work!\n\n"
+            f"Reference ID: <code>{ref_show}</code>\n\n"
             f"💪 <i>{dq}</i>"
         )
         try:
@@ -7395,8 +7396,53 @@ async def handle_receipt_image(update: Update, context: ContextTypes.DEFAULT_TYP
             pending_after = db.get_driver_pending_receipts(dr_check["id"])
             if len(pending_after) < SUSPENSION_THRESHOLD:
                 await update.message.reply_text(
-                    "✅ **Suspension lifted!**\n\n"
-                    "You have cleared enough receipts. You can now receive new leads again.",
+                    "✅ **Suspension lifted!**\n"
+                    "You’re back in action 👊💥\n"
+                    "🚗 You will now receive new leads again\n"
+                    "🔔 Turn on your notifications 🛜 to grab them fast!\n\n"
+                    "—Important Message❗️\n"
+                    "Please keep $100 available 24/7 in your bank 🏦 account "
+                    "to upload receipts on time🧾 instantly upon delivery‼️\n\n"
+                    "🏦 Keep $100 available at all times for instant receipt uploads 🧾⚡\n"
+                    "💵 Keep $100 available in your account 🏦 for immediate receipt uploads 🧾\n"
+                    "⚠️ Maintain a $100 balance 🏦 so receipts can be uploaded instantly 🧾\n"
+                    "🚗 Keep $100 ready in your account 🏦 for fast receipt uploads 🧾⚡️\n\n"
+                    "🚗 **Critical Reminders for Reactivated Drivers**\n\n"
+                    "📲 **Stay Ready**\n"
+                    "🔔 Turn on Telegram notifications.\n"
+                    "📱 Keep your phone charged and internet on.\n"
+                    "⚡ Respond quickly to new leads.\n\n"
+                    "🧾 **Receipt Rules**\n"
+                    "🧾 Upload receipts immediately after every delivery.\n"
+                    "⚠️ 3 missing receipts = automatic suspension.\n"
+                    "📸 Make sure receipt photos are clear and readable.\n\n"
+                    "💰 **Financial Readiness**\n"
+                    "🏦 Keep at least $100 available for instant receipt uploads.\n"
+                    "💵 Do not spend receipt funds before submitting them.\n\n"
+                    "🖨️ **Equipment Checklist**\n"
+                    "🖨️ Keep your printer working and stocked with paper.\n"
+                    "🚗 Keep your vehicle fueled and ready.\n"
+                    "🔋 Carry a charger and backup battery.\n\n"
+                    "📍 **Delivery Best Practices**\n"
+                    "📍 Confirm the client’s address before leaving.\n"
+                    "📞 Call or message the client if needed.\n"
+                    "🤝 Be professional and courteous.\n\n"
+                    "⏰ **Availability**\n"
+                    "🟢 Stay online during your working hours.\n"
+                    "❌ If unavailable, notify dispatch immediately.\n\n"
+                    "📈 **Performance Matters**\n"
+                    "🚀 Fast responses and timely receipts help you receive more leads.\n"
+                    "⭐ Reliable drivers are prioritized for future dispatches.\n\n"
+                    "🛡️ **Security**\n"
+                    "🔒 Keep client information confidential.\n"
+                    "📄 Double-check documents before delivery.\n\n"
+                    "_________________\n"
+                    "🚗 Stay online, keep notifications on, upload receipts immediately, "
+                    "maintain $100 in your account, and remember: 3 missing receipts = "
+                    "automatic suspension. 🚀🧾⚠️\n\n"
+                    "✅ **Suspension lifted!**\n"
+                    "You’re back in action 👊💥\n"
+                    "🚗 You will now receive new leads again",
                     parse_mode="Markdown",
                     reply_markup=_driver_keyboard_lead_and_receipt(),
                 )
