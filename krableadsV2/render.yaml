@@ -10,11 +10,13 @@ previews:
 
 services:
   # ── 1. Admin Dashboard (Flask web) ────────────────────────────────────
+  #     Same Docker image as the bot so tesseract is available everywhere.
   - type: web
     name: krab-issuer-admin
-    runtime: python
-    buildCommand: pip install -r requirements.txt
-    startCommand: python admin_dashboard.py
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    dockerContext: .
+    dockerCommand: python admin_dashboard.py
     envVars:
       - key: SUPABASE_URL
         sync: false
@@ -22,13 +24,16 @@ services:
         sync: false
 
   # ── 2. Krab Issuer bot (single worker) ─────────────────────────────────
+  #     Docker so the tesseract binary used for phone-number redaction in
+  #     image uploads is always present.
   - type: worker
     name: krab-issuer-bot
-    runtime: python
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    dockerContext: .
+    dockerCommand: python bot.py
     numInstances: 1
     maxShutdownDelaySeconds: 60
-    buildCommand: pip install -r requirements.txt
-    startCommand: python bot.py
     envVars:
       - key: TELEGRAM_BOT_TOKEN
         sync: false

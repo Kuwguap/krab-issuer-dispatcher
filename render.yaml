@@ -110,14 +110,17 @@ services:
   # 3) Krab Issuer admin dashboard (Flask)
   #    Optional — the unified dashboard at krab-dispatch-api:/admin covers this
   #    via the Issuer tab. Keep if you want the legacy Flask UI too.
+  #    Uses the same Docker image as the bot so the tesseract binary is
+  #    available for any image-processing endpoints.
   # --------------------------------------------------------------------------
   - type: web
     name: krab-issuer-admin
-    runtime: python
+    runtime: docker
     rootDir: krableadsV2
+    dockerfilePath: ./Dockerfile
+    dockerContext: .
+    dockerCommand: python admin_dashboard.py
     plan: starter
-    buildCommand: pip install --upgrade pip && pip install -r requirements.txt
-    startCommand: python admin_dashboard.py
     envVars:
       - key: SUPABASE_URL
         sync: false
@@ -129,16 +132,19 @@ services:
 
   # --------------------------------------------------------------------------
   # 4) Krab Issuer Telegram bot (background worker)
+  #    Docker runtime so we can ship tesseract-ocr (used for pixel-precise
+  #    phone-number redaction in user-uploaded images).
   # --------------------------------------------------------------------------
   - type: worker
     name: krab-issuer-bot
-    runtime: python
+    runtime: docker
     rootDir: krableadsV2
+    dockerfilePath: ./Dockerfile
+    dockerContext: .
+    dockerCommand: python bot.py
     plan: starter
     numInstances: 1
     maxShutdownDelaySeconds: 60
-    buildCommand: pip install --upgrade pip && pip install -r requirements.txt
-    startCommand: python bot.py
     envVars:
       - key: TELEGRAM_BOT_TOKEN
         sync: false
