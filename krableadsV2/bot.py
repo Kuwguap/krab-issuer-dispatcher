@@ -1782,6 +1782,7 @@ def _clear_lead_conversation_user_data(context: ContextTypes.DEFAULT_TYPE) -> No
         "phase1_vision_reply_chat_id",
         "phase1_vision_extracting",
         "phase1_batch_status_msg_id",
+        "phase1_send_another_msg_id",
         "phase1_pending_media",
         "phase1_attached_files",
         "phase1_recent_edits",
@@ -2529,19 +2530,30 @@ def _phase1_batch_keyboard() -> InlineKeyboardMarkup:
     ])
 
 
+async def _delete_phase1_transient_prompts(
+    context: ContextTypes.DEFAULT_TYPE,
+    chat_id: int | None,
+) -> None:
+    """Remove the live 'Received N photo(s)' status and any 'Send another photo' nudge."""
+    if not context.user_data or not chat_id:
+        return
+    for key in ("phase1_batch_status_msg_id", "phase1_send_another_msg_id"):
+        mid = context.user_data.pop(key, None)
+        if mid:
+            try:
+                await context.bot.delete_message(chat_id=chat_id, message_id=mid)
+            except Exception:
+                pass
+
+
 async def _clear_phase1_vision_upload_state(
     context: ContextTypes.DEFAULT_TYPE,
     chat_id: int | None = None,
 ) -> None:
-    """Drop queued files and remove the batch status message."""
+    """Drop queued files and remove any phase1 prompt messages."""
     if not context.user_data:
         return
-    status_mid = context.user_data.pop("phase1_batch_status_msg_id", None)
-    if chat_id and status_mid:
-        try:
-            await context.bot.delete_message(chat_id=chat_id, message_id=status_mid)
-        except Exception:
-            pass
+    await _delete_phase1_transient_prompts(context, chat_id)
     context.user_data.pop("phase1_vision_batch", None)
     context.user_data.pop("phase1_vision_reply_chat_id", None)
     context.user_data.pop("phase1_vision_extracting", None)
@@ -2553,19 +2565,13 @@ async def _refresh_phase1_batch_status_message(
     chat_id: int,
     batch: list,
 ) -> None:
-    """Drop the prior status message and post a fresh count at the bottom of the chat.
+    """Drop the prior status / 'send another photo' messages and post a fresh count.
 
-    Deleting + resending (rather than editing) keeps the count visible right after
-    the user's latest upload, so it never looks like stale text scrolled away from
-    the new photo.
+    Deleting + resending (rather than editing) keeps the count visible right
+    after the user's latest upload, so it never looks like stale text scrolled
+    away from the new photo.
     """
-    if context.user_data:
-        old_mid = context.user_data.pop("phase1_batch_status_msg_id", None)
-        if old_mid:
-            try:
-                await context.bot.delete_message(chat_id=chat_id, message_id=old_mid)
-            except Exception:
-                pass
+    await _delete_phase1_transient_prompts(context, chat_id)
     sent = await context.bot.send_message(
         chat_id=chat_id,
         text=_phase1_batch_count_text(batch),
@@ -2595,15 +2601,15 @@ async def handle_phase1_vision_batch_callback(
         return await _restart_bot_from_top(update, context)
 
     if data == PHASE1_VISION_PHOTO_CB:
-        # Remove the stale "Received N photo(s)" message so the next upload
-        # produces a fresh count covering ALL queued photos (not just the new ones).
-        status_mid = context.user_data.pop("phase1_batch_status_msg_id", None)
-        if status_mid:
-            try:
-                await context.bot.delete_message(chat_id=chat_id, message_id=status_mid)
-            except Exception:
-                pass
-        await query.answer("Send another photo or PDF below.", show_alert=False)
+        # Drop the "Received N photo(s)" message that hosted the buttons, then
+        # nudge the user. The nudge itself is cleared when the next upload
+        # posts a fresh cumulative count.
+        await _delete_phase1_transient_prompts(context, chat_id)
+        sent = await context.bot.send_message(
+            chat_id=chat_id,
+            text="📸 Send another Photo",
+        )
+        context.user_data["phase1_send_another_msg_id"] = sent.message_id
         return STATE_PHASE1
 
     if data != PHASE1_VISION_DONE_CB:
