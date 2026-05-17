@@ -511,11 +511,109 @@ def _phone_variants(phone: str) -> list[str]:
 
 @dataclass
 class _PhoneRedactionResponse:
-    """AI-derived rectangles, in pixel coordinates of the **original** image."""
+    """Rectangles, in pixel coordinates of the **original** image.
+
+    Produced by OCR (pytesseract) when available, otherwise by the AI fallback.
+    """
 
     # Each entry: (x1, y1, x2, y2) in pixels of the source image.
     boxes: list[tuple[int, int, int, int]]
-    api_ok: bool  # True iff the model call completed and we parsed valid JSON
+    api_ok: bool  # True iff at least one detection method completed successfully
+
+
+# Match common phone-number shapes inside an OCR text run.
+# 10-digit US (with or without country code, separators tolerant), or +1...
+_OCR_PHONE_RE = re.compile(
+    r"(?:\+?\d{1,3}[\s\-.()]*)?"     # optional country code
+    r"\(?\d{3}\)?[\s\-.]?"            # area code
+    r"\d{3}[\s\-.]?\d{4}"             # 3-4
+)
+
+
+def _ocr_phone_boxes(image_bytes: bytes) -> Optional[list[tuple[int, int, int, int]]]:
+    """Locate phone-number bounding boxes via Tesseract OCR.
+
+    Returns ``None`` when OCR isn't available (binary or library missing) so
+    the caller can fall back to AI-based detection. Returns ``[]`` when OCR
+    ran but found no phone numbers.
+
+    Why this exists: AI vision models hallucinate pixel coordinates badly.
+    Tesseract gives **exact** word boxes, so we can draw a tight rectangle
+    on the actual phone digits.
+    """
+    if not image_bytes:
+        return None
+    try:
+        import pytesseract  # type: ignore
+        from PIL import Image  # noqa: F401
+    except Exception as e:
+        logger.info("OCR phone detection unavailable: %s", e)
+        return None
+    import io as _io
+
+    try:
+        img = Image.open(_io.BytesIO(image_bytes))
+        img.load()
+        if img.mode not in ("RGB",):
+            img = img.convert("RGB")
+        data = pytesseract.image_to_data(img, output_type=pytesseract.Output.DICT)
+    except pytesseract.TesseractNotFoundError:
+        logger.info("OCR phone detection unavailable: tesseract binary missing")
+        return None
+    except Exception as e:
+        logger.warning("OCR phone detection failed: %s", e)
+        return None
+
+    n = len(data.get("text") or [])
+    if not n:
+        return []
+
+    # Group consecutive words on the same line, then run the phone regex over
+    # the joined text. Track each word's pixel rect so we can union them.
+    rects: list[tuple[int, int, int, int]] = []
+    by_line: dict[tuple, list[int]] = {}
+    for i in range(n):
+        txt = (data["text"][i] or "").strip()
+        if not txt:
+            continue
+        key = (
+            int(data.get("block_num", [0]*n)[i] or 0),
+            int(data.get("par_num", [0]*n)[i] or 0),
+            int(data.get("line_num", [0]*n)[i] or 0),
+        )
+        by_line.setdefault(key, []).append(i)
+
+    for indices in by_line.values():
+        if not indices:
+            continue
+        indices.sort(key=lambda i: int(data["left"][i]))
+        words = [(data["text"][i] or "").strip() for i in indices]
+        joined = " ".join(words)
+        for m in _OCR_PHONE_RE.finditer(joined):
+            phone_text = m.group(0)
+            if not _phone_text_looks_real(phone_text):
+                continue
+            # Map regex match span back to which words it covers.
+            cursor = 0
+            covered: list[int] = []
+            for idx, w in zip(indices, words):
+                word_start = cursor
+                word_end = cursor + len(w)
+                cursor = word_end + 1  # +1 for the joining space
+                if word_end <= m.start():
+                    continue
+                if word_start >= m.end():
+                    break
+                covered.append(idx)
+            if not covered:
+                continue
+            xs1 = min(int(data["left"][i]) for i in covered)
+            ys1 = min(int(data["top"][i]) for i in covered)
+            xs2 = max(int(data["left"][i]) + int(data["width"][i]) for i in covered)
+            ys2 = max(int(data["top"][i]) + int(data["height"][i]) for i in covered)
+            if xs2 > xs1 and ys2 > ys1:
+                rects.append((xs1, ys1, xs2, ys2))
+    return rects
 
 
 def _normalize_image_for_redaction(image_bytes: bytes) -> tuple[bytes, str, int, int, float]:
@@ -608,6 +706,16 @@ def _phone_redaction_boxes(
 
     if not image_bytes:
         return empty_ok
+
+    # Prefer real OCR (tesseract) for pixel-precise phone boxes. The AI is
+    # only used as a fallback when OCR isn't available, because vision LLMs
+    # are unreliable at exact pixel coordinates.
+    ocr_rects = _ocr_phone_boxes(image_bytes)
+    if ocr_rects is not None:
+        if ocr_rects:
+            logger.info("OCR found %d phone box(es)", len(ocr_rects))
+        return _PhoneRedactionResponse(ocr_rects, True)
+
     api_key = (getattr(Config, "OPENAI_API_KEY", "") or "").strip()
     if not api_key:
         return empty_fail
