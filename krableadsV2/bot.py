@@ -567,6 +567,15 @@ async def _forward_phase1_attached_files_to_targets(
     _group_cid = _parse_chat_id(group_chat_id) if group_chat_id is not None else None
     if not _group_cid:
         return
+    # If censored inline payloads exist, do not also send legacy raw ``file_id``
+    # photos for the same lead. That old/new mix is what causes a first
+    # uncensored image followed by a censored copy.
+    has_inline_photo_payload = any(
+        isinstance(f, dict)
+        and (f.get("type") or "").lower() == "photo"
+        and bool(f.get("data_b64"))
+        for f in attached_files
+    )
     for f in attached_files:
         if not isinstance(f, dict):
             continue
@@ -592,6 +601,9 @@ async def _forward_phase1_attached_files_to_targets(
                 continue
             fid = f.get("file_id")
             if not fid:
+                continue
+            if has_inline_photo_payload and ftype == "photo":
+                # Prefer censored inline bytes; skip raw historical photo file_id.
                 continue
             if ftype == "photo":
                 await context.bot.send_photo(chat_id=_group_cid, photo=fid)
@@ -4134,18 +4146,24 @@ async def _finalize_lead_after_notes(
     context.user_data.pop("phase1_pending_media", None)
     context.user_data.pop("phase1_attached_files", None)
     ref_h = html.escape(str(reference_id), quote=False)
+    drivers_count = len([d for d in drivers_list if d and d.get("id")])
+    source_label = html.escape((state_data.get("selected_source_label") or "—"), quote=False)
     if is_all_groups:
         await message.reply_text(
             "✅ Lead saved.\n\n"
             f"📋 Reference ID: <code>{ref_h}</code>\n"
-            f"📣 Approval sent to <b>{len(active_groups)}</b> group(s).",
+            f"📣 Approval sent to <b>{len(active_groups)}</b> group(s)\n"
+            f"🚗 Sent to <b>{drivers_count}</b> driver(s) after team accepts\n"
+            f"📊 Lead source: <b>{source_label}</b>",
             parse_mode="HTML",
         )
     else:
         await message.reply_text(
             "✅ Lead saved.\n\n"
             f"📋 Reference ID: <code>{ref_h}</code>\n"
-            f"Approval sent to <b>{html.escape(selected_group.get('group_name') or 'group', quote=False)}</b>.",
+            f"Approval sent to <b>{html.escape(selected_group.get('group_name') or 'group', quote=False)}</b>\n"
+            f"🚗 Sent to <b>{drivers_count}</b> driver(s) after team accepts\n"
+            f"📊 Lead source: <b>{source_label}</b>",
             parse_mode="HTML",
         )
     await _maybe_offer_insurance_card(
@@ -4886,46 +4904,15 @@ async def handle_driver_selection(update: Update, context: ContextTypes.DEFAULT_
         )
     ).add_done_callback(_bg_task_done)
 
-    contact_sources = db.get_contact_info_sources()
-
-    # Only prompt for lead source when configured AND this lead doesn't already have one.
+    # Source is already chosen in the main lead flow; do not ask again here.
     lead_fresh = db.get_lead_by_id(lead["id"]) if lead and lead.get("id") else None
     existing_source = (lead_fresh.get("contact_info_source") or "").strip() if lead_fresh else ""
-    if contact_sources and not existing_source:
-        db.set_user_state(
-            user_id,
-            "select_contact_source",
-            {
-                "lead_id": lead["id"],
-                "reference_id": reference_id,
-                "driver_names": driver_names,
-                "group_name": selected_group.get("group_name", "N/A"),
-                "username": username,
-            },
-        )
-        buttons = [
-            [InlineKeyboardButton(s.get("label", str(s["id"])), callback_data=f"contact_source_{s['id']}")]
-            for s in contact_sources
-        ]
-        await query.message.reply_text(
-            "📊 **Where did this lead come from?**\n\n"
-            "Tap a **lead source** below.\n"
-            f"⏱️ You have **{CONTACT_SOURCE_TIMEOUT_SEC // 60} minutes** — if you don't, we save the lead without a source.",
-            parse_mode="Markdown",
-            reply_markup=InlineKeyboardMarkup(buttons),
-        )
-        if context.application.job_queue:
-            context.application.job_queue.run_once(
-                _contact_source_timeout_job,
-                when=CONTACT_SOURCE_TIMEOUT_SEC,
-                data={
-                    "user_id": user_id,
-                    "lead_id": lead["id"],
-                    "reference_id": reference_id,
-                },
-                name=f"contact_source_timeout_{user_id}_{lead['id']}",
-            )
-        return STATE_SELECT_CONTACT_SOURCE
+    preselected_source = (lead_data.get("selected_source_label") or "").strip()
+    if not existing_source and preselected_source:
+        try:
+            db.update_lead(lead["id"], {"contact_info_source": preselected_source})
+        except Exception as e:
+            logger.warning("Could not persist preselected contact source on lead %s: %s", lead.get("id"), e)
 
     await _issuer_lead_success_and_motivation(
         query.message, user_id, username, reference_id, driver_names, selected_group.get("group_name", "N/A"),
@@ -6164,52 +6151,20 @@ async def _issuer_open_driver_selection_after_group_accept(
             )
         ).add_done_callback(_bg_task_done)
 
-        contact_sources = db.get_contact_info_sources()
-        # Avoid prompting twice: if source already set on the lead, skip.
+        # Source is already chosen in the main lead flow; do not prompt here.
         lead_fresh = db.get_lead_by_id(lead_ref["id"]) if lead_ref and lead_ref.get("id") else None
         existing_source = (lead_fresh.get("contact_info_source") or "").strip() if lead_fresh else ""
-        if contact_sources and not existing_source:
-            db.set_user_state(
-                issuer_uid,
-                "select_contact_source",
-                {
-                    "lead_id": lead_ref["id"],
-                    "reference_id": reference_id,
-                    "driver_names": driver_names,
-                    "group_name": winner_group.get("group_name", "N/A"),
-                    "username": username,
-                },
-            )
-            buttons = [
-                [InlineKeyboardButton(s.get("label", str(s["id"])), callback_data=f"contact_source_{s['id']}")]
-                for s in contact_sources
-            ]
+        preselected_source = (lead_data.get("selected_source_label") or "").strip()
+        if not existing_source and preselected_source:
             try:
-                await context.bot.send_message(
-                    chat_id=issuer_uid,
-                    text=(
-                        "📊 **Where did this lead come from?**\n\n"
-                        "Tap a **lead source** below.\n"
-                        f"⏱️ You have **{CONTACT_SOURCE_TIMEOUT_SEC // 60} minutes** — if you don't, we save the lead without a source."
-                    ),
-                    parse_mode="Markdown",
-                    reply_markup=InlineKeyboardMarkup(buttons),
-                )
+                db.update_lead(lead_ref["id"], {"contact_info_source": preselected_source})
             except Exception as e:
-                logger.warning("contact source prompt after delayed dispatch: %s", e)
-            if context.application.job_queue:
-                context.application.job_queue.run_once(
-                    _contact_source_timeout_job,
-                    when=CONTACT_SOURCE_TIMEOUT_SEC,
-                    data={
-                        "user_id": issuer_uid,
-                        "lead_id": lead_ref["id"],
-                        "reference_id": reference_id,
-                    },
-                    name=f"contact_source_timeout_{issuer_uid}_{lead_ref['id']}",
+                logger.warning(
+                    "Could not persist preselected contact source on delayed dispatch lead %s: %s",
+                    lead_ref.get("id"),
+                    e,
                 )
-        else:
-            db.clear_user_state(issuer_uid)
+        db.clear_user_state(issuer_uid)
         return
 
     pick_payload = inner.get("pick_payload")

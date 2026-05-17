@@ -680,7 +680,7 @@ def redact_phones_in_image_bytes(
     mime_type: str = "image/jpeg",
     known_phone: Optional[str] = None,
 ) -> PhoneRedactionResult:
-    """Cover phone numbers detected by OpenAI Vision with heavy blur + solid bar.
+    """Cover phone numbers detected by OpenAI Vision with solid black bars only.
 
     Pass ``known_phone`` (the lead's extracted phone number, any format) to
     anchor the detector on a specific target — that lowers both false
@@ -689,7 +689,7 @@ def redact_phones_in_image_bytes(
     if not image_bytes:
         return PhoneRedactionResult(image_bytes or b"", False, False)
     try:
-        from PIL import Image, ImageDraw, ImageFilter
+        from PIL import Image, ImageDraw
     except Exception as e:
         logger.warning("Pillow not available; cannot redact image: %s", e)
         return PhoneRedactionResult(image_bytes, False, False)
@@ -710,10 +710,6 @@ def redact_phones_in_image_bytes(
         if img.mode not in ("RGB", "RGBA"):
             img = img.convert("RGB")
         w, h = img.size
-        # Blur kernel scales with the image so it stays visually heavy at any
-        # resolution. ~5% of the shorter side flattens phone-number glyphs even
-        # at high DPI scans.
-        blur_radius = max(14.0, min(w, h) * 0.05)
         draw = ImageDraw.Draw(img)
         for x1p, y1p, x2p, y2p in resp.boxes:
             x1 = max(0, int(round(x1p / 100.0 * w)))
@@ -724,34 +720,15 @@ def redact_phones_in_image_bytes(
                 continue
             box_w = x2 - x1
             box_h = y2 - y1
-            # Far more generous pixel-space margins than before — the
-            # text-content sanity check upstream already filters out boxes
-            # that aren't really phone numbers, so we can afford to over-
-            # paint without leaking false positives. Tall thin boxes get
-            # extra vertical margin so we cover ascenders / descenders /
-            # nearby separators that the model often crops.
-            margin_x = max(6, int(round(box_w * 0.25)))
-            margin_y = max(8, int(round(box_h * 0.50)))
-            # Black-bar bounds: the *full* padded region. This is what
-            # actually hides the digits — earlier code only painted the
-            # tight box, which is why minor drift left readable edges.
+            # Tight black bars over number glyphs only (as requested), with
+            # tiny padding to catch separator edges.
+            margin_x = max(1, int(round(box_w * 0.03)))
+            margin_y = max(1, int(round(box_h * 0.08)))
             bx1 = max(0, x1 - margin_x)
             by1 = max(0, y1 - margin_y)
             bx2 = min(w, x2 + margin_x)
             by2 = min(h, y2 + margin_y)
-            # Blur a slightly wider region so the seam where blur meets
-            # original pixels is itself blurred.
-            blur_margin_x = max(margin_x + 4, int(round(box_w * 0.35)))
-            blur_margin_y = max(margin_y + 4, int(round(box_h * 0.70)))
-            rx1 = max(0, x1 - blur_margin_x)
-            ry1 = max(0, y1 - blur_margin_y)
-            rx2 = min(w, x2 + blur_margin_x)
-            ry2 = min(h, y2 + blur_margin_y)
-            region = img.crop((rx1, ry1, rx2, ry2))
-            region = region.filter(ImageFilter.GaussianBlur(radius=blur_radius))
-            img.paste(region, (rx1, ry1))
-            # Solid black bar on the padded region guarantees the digits
-            # themselves are invisible, even if the AI undersized the box.
+            # Solid black bar only; no blur halo.
             draw.rectangle([bx1, by1, bx2, by2], fill=(0, 0, 0))
         out = _io.BytesIO()
         save_format = "PNG"
