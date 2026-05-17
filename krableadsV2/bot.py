@@ -5210,13 +5210,12 @@ def _cancel_contact_source_timeout_job(application, user_id: int, lead_id) -> No
 
 
 async def _contact_source_timeout_job(context: ContextTypes.DEFAULT_TYPE) -> None:
-    """3 minutes without tapping a lead source: clear state; lead stays without source."""
+    """3 minutes without tapping a lead source: clear state silently."""
     job = context.job
     if not job or not job.data:
         return
     user_id = job.data.get("user_id")
     expected_lead_id = job.data.get("lead_id")
-    reference_id = job.data.get("reference_id", "N/A")
     if user_id is None or expected_lead_id is None:
         return
     st = db.get_user_state(user_id)
@@ -5226,20 +5225,6 @@ async def _contact_source_timeout_job(context: ContextTypes.DEFAULT_TYPE) -> Non
     if str(data.get("lead_id")) != str(expected_lead_id):
         return
     db.clear_user_state(user_id)
-    ref_esc = _telegram_md1_escape(str(reference_id))
-    try:
-        await context.bot.send_message(
-            chat_id=user_id,
-            text=(
-                "⏱️ **Lead source not selected in time**\n\n"
-                "Your lead was already sent to drivers **without** a lead source.\n\n"
-                f"📋 Reference: `{ref_esc}`\n\n"
-                "Start a new lead anytime with /lead or /client."
-            ),
-            parse_mode="Markdown",
-        )
-    except Exception as e:
-        logger.warning("Could not send contact source timeout message to %s: %s", user_id, e)
 
     # One 📬 supervisory (Source: —) if a driver already accepted and source still empty
     try:
