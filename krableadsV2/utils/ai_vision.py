@@ -385,6 +385,7 @@ def extract_structured_from_pdf(pdf_bytes: bytes) -> Optional[str]:
 # cleanly when we paint over the original image. Larger render = more accurate digit
 # localisation, especially for small print in screenshots / scans.
 PHONE_REDACTION_RENDER_WIDTH = 1600
+PHONE_REDACTION_MODEL_FALLBACK = "gpt-5"
 
 
 def _build_phone_redaction_prompt(target_phones: list[str]) -> str:
@@ -584,7 +585,13 @@ def _phone_redaction_boxes(
         from openai import OpenAI
 
         client = OpenAI(api_key=api_key, max_retries=0)
-        model = getattr(Config, "OPENAI_VISION_MODEL", None) or "gpt-4o"
+        # Redaction is explicitly pinned to GPT-5 unless the deploy sets a
+        # dedicated override for this subsystem.
+        model = (
+            getattr(Config, "OPENAI_PHONE_REDACTION_MODEL", None)
+            or getattr(Config, "OPENAI_REDACTION_MODEL", None)
+            or PHONE_REDACTION_MODEL_FALLBACK
+        )
         response = client.chat.completions.create(
             model=model,
             messages=[
@@ -628,10 +635,10 @@ def _phone_redaction_boxes(
         # Drop boxes the model itself flagged as non-phone.
         if entry.get("is_phone") is False:
             continue
-        # Strict text sanity-check: kills the worst false positives where the
-        # model returns a giant box around an address or ZIP and labels it a phone.
+        # Sanity-check text only when model actually returned text. Some valid
+        # responses omit `text`; dropping those caused missed redactions.
         text_val = entry.get("text") or entry.get("phone") or ""
-        if not _phone_text_looks_real(text_val):
+        if text_val and not _phone_text_looks_real(text_val):
             continue
         # Clamp + normalize ordering so x1<x2, y1<y2.
         x1c, x2c = max(0.0, min(100.0, min(x1, x2))), max(0.0, min(100.0, max(x1, x2)))
@@ -657,6 +664,53 @@ def _phone_redaction_boxes(
         x2c = min(100.0, x2c + pad_x)
         y2c = min(100.0, y2c + pad_y)
         out.append((x1c, y1c, x2c, y2c))
+
+    # Safety retry: when GPT finds no boxes on the generic pass but we already
+    # know the lead's phone, run a targeted locate pass for that exact number.
+    if not out and target_phones:
+        targeted_prompt = (
+            "Locate ONLY these phone numbers in the image and return boxes:\n"
+            + "\n".join(f"- {p}" for p in target_phones)
+            + "\n\nReturn ONLY JSON in this shape:\n"
+            + '{"boxes":[{"x1":<0-100>,"y1":<0-100>,"x2":<0-100>,"y2":<0-100>}]}\n'
+            + "If not visible, return {\"boxes\":[]}."
+        )
+        try:
+            retry = client.chat.completions.create(
+                model=model,
+                messages=[
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": targeted_prompt},
+                            {"type": "image_url", "image_url": {"url": data_url, "detail": "high"}},
+                        ],
+                    }
+                ],
+                max_tokens=300,
+                temperature=0.0,
+            )
+            raw_retry = (retry.choices[0].message.content or "").strip()
+            data_retry = _parse_json_from_model(raw_retry) or {}
+            boxes_retry = data_retry.get("boxes") if isinstance(data_retry, dict) else []
+            if isinstance(boxes_retry, list):
+                for entry in boxes_retry:
+                    if not isinstance(entry, dict):
+                        continue
+                    try:
+                        x1 = float(entry.get("x1"))
+                        y1 = float(entry.get("y1"))
+                        x2 = float(entry.get("x2"))
+                        y2 = float(entry.get("y2"))
+                    except (TypeError, ValueError, AttributeError):
+                        continue
+                    x1c, x2c = max(0.0, min(100.0, min(x1, x2))), max(0.0, min(100.0, max(x1, x2)))
+                    y1c, y2c = max(0.0, min(100.0, min(y1, y2))), max(0.0, min(100.0, max(y1, y2)))
+                    if x2c - x1c < 0.5 or y2c - y1c < 0.5:
+                        continue
+                    out.append((x1c, y1c, x2c, y2c))
+        except Exception as e:
+            logger.warning("phone redaction targeted retry failed: %s", e)
     return _PhoneRedactionResponse(out, True)
 
 
