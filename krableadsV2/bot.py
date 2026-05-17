@@ -1637,6 +1637,49 @@ def _resolve_contact_source_label(data: dict | None) -> str:
     return label or _default_phase1_review_source_label()
 
 
+def _resolve_dispatch_driver_ids(
+    data: dict | None,
+    *,
+    group_id: str | None = None,
+    is_all_groups: bool = False,
+) -> list[str]:
+    """Resolve driver IDs for deferred dispatch after group accept.
+
+    Priority:
+    1) Explicit selected_driver_ids from review/selection state.
+    2) Fallback pool (group-linked for single-group, global for broadcast).
+    Filters to active, non-suspended, and parseable Telegram IDs.
+    """
+    payload = data or {}
+    all_rows = _get_all_drivers_cached() or []
+    id_set = {str(x).strip() for x in (payload.get("selected_driver_ids") or []) if str(x).strip()}
+    selected = [d for d in all_rows if str(d.get("id")) in id_set]
+
+    if not selected:
+        if is_all_groups:
+            pool = all_rows
+        else:
+            try:
+                linked = db.get_group_driver_rows_for_group(group_id) if group_id else []
+            except Exception:
+                linked = []
+            pool = linked or all_rows
+        selected = list(pool or [])
+
+    suspended = _get_suspended_driver_ids()
+    out_ids: list[str] = []
+    for d in selected:
+        if not d or not record_is_active(d):
+            continue
+        did = str(d.get("id") or "").strip()
+        if not did or did in suspended:
+            continue
+        if _parse_chat_id(d.get("driver_telegram_id")) is None:
+            continue
+        out_ids.append(did)
+    return out_ids
+
+
 async def _send_phase1_ai_review(target_message, state_data: dict, context, user_id) -> None:
     # Default dispatch selections on the review row (🏢 🚗 📊): all groups, all eligible drivers, Facebook.
     groups = db.get_all_groups()
@@ -4161,7 +4204,7 @@ async def _finalize_lead_after_notes(
             "✅ Lead saved.\n\n"
             f"📋 Reference ID: <code>{ref_h}</code>\n"
             f"📣 Approval sent to <b>{len(active_groups)}</b> group(s)\n"
-            f"🚗 Sent to <b>{drivers_count}</b> driver(s) after team accepts\n"
+            f"🚗 Approval sent to <b>{drivers_count}</b> driver(s)\n"
             f"📊 Lead source: <b>{source_label}</b>",
             parse_mode="HTML",
         )
@@ -4170,7 +4213,7 @@ async def _finalize_lead_after_notes(
             "✅ Lead saved.\n\n"
             f"📋 Reference ID: <code>{ref_h}</code>\n"
             f"Approval sent to <b>{html.escape(selected_group.get('group_name') or 'group', quote=False)}</b>\n"
-            f"🚗 Sent to <b>{drivers_count}</b> driver(s) after team accepts\n"
+            f"🚗 Approval sent to <b>{drivers_count}</b> driver(s)\n"
             f"📊 Lead source: <b>{source_label}</b>",
             parse_mode="HTML",
         )
@@ -4505,8 +4548,12 @@ async def handle_group_selection(update: Update, context: ContextTypes.DEFAULT_T
         _store_issuer_await_group_accept(
             user_id,
             lead_id=str(lead["id"]),
-            await_mode="pick_drivers",
-            pick_payload=continue_data,
+            await_mode="dispatch_pending",
+            selected_driver_ids=_resolve_dispatch_driver_ids(
+                lead_data,
+                group_id=primary_group.get("id"),
+                is_all_groups=True,
+            ),
         )
         try:
             summary = ""
@@ -4562,8 +4609,12 @@ async def handle_group_selection(update: Update, context: ContextTypes.DEFAULT_T
         _store_issuer_await_group_accept(
             user_id,
             lead_id=str(rid),
-            await_mode="pick_drivers",
-            pick_payload=continue_data,
+            await_mode="dispatch_pending",
+            selected_driver_ids=_resolve_dispatch_driver_ids(
+                continue_data,
+                group_id=group_id,
+                is_all_groups=False,
+            ),
         )
         reference_id = lead.get("reference_id", "N/A")
         ref_h = html.escape(str(reference_id), quote=False)
@@ -4632,8 +4683,12 @@ async def handle_group_selection(update: Update, context: ContextTypes.DEFAULT_T
     _store_issuer_await_group_accept(
         user_id,
         lead_id=str(lead["id"]),
-        await_mode="pick_drivers",
-        pick_payload=continue_data,
+        await_mode="dispatch_pending",
+        selected_driver_ids=_resolve_dispatch_driver_ids(
+            lead_data,
+            group_id=group_id,
+            is_all_groups=False,
+        ),
     )
     ref_h = html.escape(str(reference_id), quote=False)
     await query.message.reply_text(
@@ -6041,6 +6096,16 @@ async def _issuer_open_driver_selection_after_group_accept(
         id_set = {str(x).strip() for x in raw_ids if str(x).strip()}
         all_drivers = _get_all_drivers_cached()
         selected_drivers = [d for d in all_drivers if str(d.get("id")) in id_set]
+        if not selected_drivers:
+            # Safety fallback: if stored IDs are stale/missing, resolve from
+            # current group-linked/global pool so accepted leads still reach drivers.
+            fallback_ids = _resolve_dispatch_driver_ids(
+                {"selected_driver_ids": []},
+                group_id=str((winner_group or {}).get("id") or ""),
+                is_all_groups=bool(db.get_group_lead_offers(str(lead_id))),
+            )
+            id_set = {str(x).strip() for x in fallback_ids if str(x).strip()}
+            selected_drivers = [d for d in all_drivers if str(d.get("id")) in id_set]
         if not selected_drivers:
             try:
                 ref_h = html.escape(str(lead_ref.get("reference_id") or "N/A"), quote=False)
