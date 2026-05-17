@@ -3978,9 +3978,9 @@ async def _finalize_lead_after_notes(
         await message.reply_text("❌ Error: No active groups configured. Please contact admin.")
         return ConversationHandler.END
 
+    preferred_group_id = str(state_data.get("selected_group_id") or "").strip()
     assistants_choose_group = (db.get_setting("assistants_choose_group") or "").lower() in ("true", "1", "yes")
-
-    if assistants_choose_group:
+    if assistants_choose_group and not preferred_group_id:
         db.set_user_state(user_id, "select_group", state_data)
         group_keyboard = _build_group_keyboard(active_groups, include_all=True)
         await message.reply_text(
@@ -3990,18 +3990,30 @@ async def _finalize_lead_after_notes(
         )
         return STATE_SELECT_GROUP
 
-    user_telegram_id = str(user_id)
-    assistant_group = db.get_group_by_assistant_telegram_id(user_telegram_id)
-    if assistant_group and record_is_active(assistant_group):
-        selected_group = assistant_group
-        group_id = selected_group["id"]
-        logger.info(f"User is assistant for group '{selected_group.get('group_name')}'; using that group for lead")
-    else:
-        selected_group = active_groups[0]
-        group_id = selected_group["id"]
+    is_all_groups = preferred_group_id == "all"
+    selected_group = None
+    if not is_all_groups and preferred_group_id:
+        picked = db.get_group_by_id(preferred_group_id)
+        if picked and record_is_active(picked):
+            selected_group = picked
+
+    if not selected_group:
+        user_telegram_id = str(user_id)
+        assistant_group = db.get_group_by_assistant_telegram_id(user_telegram_id)
+        if assistant_group and record_is_active(assistant_group):
+            selected_group = assistant_group
+            logger.info(
+                "User is assistant for group '%s'; using that group for lead",
+                selected_group.get("group_name"),
+            )
+        else:
+            selected_group = active_groups[0]
+    group_id = selected_group["id"]
     logger.info(
-        f"Using group '{selected_group.get('group_name')}' (id={group_id}, "
-        f"group_telegram_id={selected_group.get('group_telegram_id')}) for lead"
+        "Finalize flow routing lead via group '%s' (id=%s, is_all_groups=%s)",
+        selected_group.get("group_name"),
+        group_id,
+        is_all_groups,
     )
 
     phase1_data = {k: v for k, v in state_data.items() if k not in _PHASE1_STATE_EXCLUDE}
@@ -4052,30 +4064,90 @@ async def _finalize_lead_after_notes(
 
     reference_id = lead.get("reference_id", "N/A")
 
-    await _post_single_group_approval(context, lead, selected_group)
+    # Honor selected drivers from review defaults/edits (all active by default).
+    drivers_list: list = []
+    try:
+        raw_driver_ids = state_data.get("selected_driver_ids") or []
+        driver_id_set = {str(x).strip() for x in raw_driver_ids if str(x).strip()}
+        all_drivers_now = _get_all_drivers_cached() or []
+        drivers_list = [d for d in all_drivers_now if str(d.get("id")) in driver_id_set]
+    except Exception as e:
+        logger.warning("finalize_lead_after_notes: resolving selected drivers failed: %s", e)
+        drivers_list = []
+    if not drivers_list:
+        try:
+            suspended = _get_suspended_driver_ids()
+        except Exception:
+            suspended = set()
+        if is_all_groups:
+            fallback_pool = _get_all_drivers_cached() or []
+        else:
+            try:
+                linked = db.get_group_driver_rows_for_group(group_id)
+            except Exception:
+                linked = []
+            fallback_pool = linked or _get_all_drivers_cached() or []
+        drivers_list = [
+            d for d in fallback_pool
+            if d and record_is_active(d) and str(d.get("id")) not in suspended
+        ]
 
-    continue_data = state_data.copy()
-    continue_data["lead_id"] = lead["id"]
-    continue_data["group_id"] = group_id
-    continue_data["selected_group"] = selected_group
-    continue_data["follow_after_broadcast"] = True
+    if is_all_groups:
+        group_offer_message = (
+            "🏷 NEW CLIENT\n"
+            f"📋 Ref ID: `{reference_id}`\n\n"
+            "✅ Double-check the tag for mistakes\n"
+            "📲 Send tag with Krab Dispatch (@KrabIssuerBot)\n"
+            "📋 Copy/paste client phone, address, and delivery time"
+        )
+        short_lead = _short_uuid(lead["id"])
+        for g in active_groups:
+            gid = g.get("id")
+            chat_id = _parse_chat_id(g.get("group_telegram_id"))
+            if not gid or not chat_id:
+                continue
+            short_gid = _short_uuid(gid)
+            offer_kb = InlineKeyboardMarkup([[
+                InlineKeyboardButton("✅ Accept", callback_data=f"ag_{short_lead}{short_gid}"),
+                InlineKeyboardButton("🔄 Different Team", callback_data=f"dg_{short_lead}{short_gid}"),
+            ]])
+            db.create_group_lead_offer(lead["id"], gid, group_chat_id=str(chat_id), group_message_id=None)
+            try:
+                msg = await context.bot.send_message(
+                    chat_id=chat_id,
+                    text=group_offer_message,
+                    parse_mode="Markdown",
+                    reply_markup=offer_kb,
+                )
+                db.update_group_lead_offer_message(lead["id"], gid, str(chat_id), msg.message_id)
+            except Exception:
+                pass
+    else:
+        await _post_single_group_approval(context, lead, selected_group)
+
     _store_issuer_await_group_accept(
         user_id,
         lead_id=str(lead["id"]),
-        await_mode="pick_drivers",
-        pick_payload=continue_data,
+        await_mode="dispatch_pending",
+        selected_driver_ids=[str(d.get("id")) for d in drivers_list if d.get("id")],
     )
     context.user_data.pop("phase1_pending_media", None)
     context.user_data.pop("phase1_attached_files", None)
     ref_h = html.escape(str(reference_id), quote=False)
-    await message.reply_text(
-        "✅ Lead saved.\n\n"
-        f"📋 Reference ID: <code>{ref_h}</code>\n"
-        f"Approval sent to <b>{html.escape(selected_group.get('group_name') or 'group', quote=False)}</b>.\n\n"
-        "**Wait for the team to tap Accept** in their group chat. You will get a prompt here to choose drivers "
-        "**right after** they accept.",
-        parse_mode="HTML",
-    )
+    if is_all_groups:
+        await message.reply_text(
+            "✅ Lead saved.\n\n"
+            f"📋 Reference ID: <code>{ref_h}</code>\n"
+            f"📣 Approval sent to <b>{len(active_groups)}</b> group(s).",
+            parse_mode="HTML",
+        )
+    else:
+        await message.reply_text(
+            "✅ Lead saved.\n\n"
+            f"📋 Reference ID: <code>{ref_h}</code>\n"
+            f"Approval sent to <b>{html.escape(selected_group.get('group_name') or 'group', quote=False)}</b>.",
+            parse_mode="HTML",
+        )
     await _maybe_offer_insurance_card(
         context, message, lead_id=str(lead["id"]), reference_id=str(reference_id),
     )
@@ -4272,7 +4344,7 @@ async def _submit_lead_from_review(message, context, user_id, data):
     success_label = "broadcast sent" if is_all_groups else "sent"
     await message.reply_text(
         f"✅ **Lead created & {success_label}!**\n📋 Reference: `{ref_id}`\n\n"
-        "**Teams must tap Accept** in their group chat before drivers are notified.\n\n"
+        "Approval was posted to the selected team chat.\n\n"
         f"In **Krab Dispatch**, name the tag PDF **similar to this client’s name** (first line of details) so it auto‑links to reference `{ref_id}`.\n\n"
         f"Use /lead to add another.",
         parse_mode="Markdown",
@@ -4420,16 +4492,14 @@ async def handle_group_selection(update: Update, context: ContextTypes.DEFAULT_T
             body = (
                 "📣 **Approval requests sent**\n\n"
                 f"📋 Reference ID: <code>{ref_h}</code>\n"
-                f"Sent to {sent_count} group(s).\n\n"
-                "**Wait for a team to tap Accept** in their chat. You will get a prompt here to choose drivers "
-                "right after a team accepts."
+                f"Sent to {sent_count} group(s)."
                 f"{html.escape(summary, quote=False)}"
             )
             await query.message.reply_text(body, parse_mode="HTML")
         except Exception as e:
             logger.error("Broadcast: could not reply to issuer: %s", e)
             await query.message.reply_text(
-                "📣 Approval requests sent. Wait for a team to **Accept**, then choose drivers here.",
+                "📣 Approval requests sent.",
                 parse_mode="Markdown",
             )
         await _maybe_offer_insurance_card(
@@ -4473,8 +4543,7 @@ async def handle_group_selection(update: Update, context: ContextTypes.DEFAULT_T
         await query.message.reply_text(
             "✅ Group updated.\n\n"
             f"📋 Reference ID: <code>{ref_h}</code>\n"
-            f"Approval sent to <b>{html.escape(selected_group.get('group_name') or 'group', quote=False)}</b>.\n\n"
-            "**Wait for the team to tap Accept** — you will then be prompted here to choose drivers.",
+            f"Approval sent to <b>{html.escape(selected_group.get('group_name') or 'group', quote=False)}</b>.",
             parse_mode="HTML",
         )
         return ConversationHandler.END
@@ -4542,8 +4611,7 @@ async def handle_group_selection(update: Update, context: ContextTypes.DEFAULT_T
     await query.message.reply_text(
         f"✅ Group selected: <b>{html.escape(selected_group.get('group_name', 'N/A'), quote=False)}</b>\n\n"
         f"📋 Reference ID: <code>{ref_h}</code>\n"
-        "**Wait for the team to tap Accept** in their chat. You will get a prompt here to choose drivers "
-        "**right after** they accept.",
+        "Approval sent.",
         parse_mode="HTML",
     )
     await _maybe_offer_insurance_card(
