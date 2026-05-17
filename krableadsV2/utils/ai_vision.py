@@ -387,66 +387,56 @@ def extract_structured_from_pdf(pdf_bytes: bytes) -> Optional[str]:
 PHONE_REDACTION_RENDER_WIDTH = 1600
 
 
-def _build_phone_redaction_prompt(target_phones: list[str]) -> str:
+def _build_phone_redaction_prompt(
+    target_phones: list[str],
+    img_w: int,
+    img_h: int,
+) -> str:
     """Compose the AI prompt; if we already extracted the lead phone, anchor on it.
 
-    The model is dramatically better at locating *specific* text it has been
-    told to look for than at applying a generic phone-shaped pattern, which is
-    the main source of false positives we've been hitting.
+    The AI is asked for **center coordinates + the exact phone text + the
+    digit height in pixels** for every phone it sees. Python then computes a
+    tight rectangle around the centre point using the digit count and digit
+    height (rather than trusting the AI to draw a correctly-sized box, which
+    is the main source of oversized / mis-located rectangles).
     """
+    base = (
+        "You are a privacy filter that locates phone numbers in an image.\n\n"
+        f"The image is exactly {img_w} pixels wide and {img_h} pixels tall. "
+        "Use absolute pixel coordinates with the image origin (0,0) at the "
+        "TOP-LEFT corner. Positive X = right. Positive Y = down.\n\n"
+        "For EACH phone number visible in the image, return:\n"
+        "  - text:        the exact characters of the phone (digits + any "
+        "separators / spaces / parentheses / + sign)\n"
+        "  - cx:          horizontal center of the phone number text, in pixels\n"
+        "  - cy:          vertical center of the phone number text, in pixels\n"
+        "  - char_height: vertical height of a single digit glyph, in pixels\n\n"
+        "Strict rules:\n"
+        "- Treat as a phone number ONLY clearly-formatted phones: 10-digit "
+        "US, +1 international, +44, etc. with at least 7 visible digits.\n"
+        "- ZIP codes (5 digits), VIN (17 alphanumeric), policy numbers, "
+        "license/plate numbers, account numbers, prices, dates, times and "
+        "addresses are NOT phone numbers — do NOT return them.\n"
+        "- (cx, cy) must point at the exact center of the phone-number "
+        "text, NOT the center of a label or the row.\n"
+        "- char_height should be the height of one digit, in pixels — not "
+        "the height of the whole row.\n"
+        "- If a phone wraps onto a second line, return TWO entries.\n\n"
+        "Return ONLY a single JSON object of this exact shape "
+        "(no prose, no code fences):\n"
+        '{"phones": [{"text": <string>, "cx": <int>, "cy": <int>, '
+        '"char_height": <int>}, ...]}\n'
+        'If no phone numbers are visible, return {"phones": []}.\n'
+    )
     if target_phones:
         targets_block = "\n".join(f"- {p}" for p in target_phones)
-        return (
-            "You are a privacy filter. Find the bounding boxes of ALL phone "
-            "numbers visible in the image. The lead's phone number is one of "
-            "these formats — locate it FIRST, then look for any other "
-            "phone numbers in the image:\n"
-            f"{targets_block}\n\n"
-            "Also redact any other clearly-formatted phone numbers (10-digit "
-            "US, +1 international, +44, etc.) but DO NOT redact text that is "
-            "not a phone number (e.g. ZIP codes, VINs, policy numbers, "
-            "license plate numbers, prices, dates, addresses).\n\n"
-            "Return ONLY a JSON object of this exact shape:\n"
-            '{"boxes": [{"x1": <float 0-100>, "y1": <float 0-100>, '
-            '"x2": <float 0-100>, "y2": <float 0-100>, "text": <string of '
-            'what is inside the box>, "is_phone": true}, ...]}\n\n'
-            "Rules:\n"
-            "- Percentages of image width (x) and height (y), 0–100.\n"
-            "- Each box must tightly enclose ONLY the phone-number digits and "
-            "any embedded separators / spaces / parentheses / + sign.\n"
-            "- A box must NEVER be wider than 60% of the image or taller than "
-            "20% of the image — phone numbers are short text.\n"
-            "- 'text' MUST contain ONLY the visible characters of that phone "
-            "number — at least 7 digits. If text has fewer than 7 digits, "
-            "DO NOT include the box at all.\n"
-            "- If a phone wraps across two visible lines, return TWO boxes.\n"
-            "- ZIP codes (5 digits), policy/VIN/license numbers, account "
-            "numbers, dollar amounts, dates, and times are NOT phone numbers "
-            "— do not include them.\n"
-            'If no phone numbers are visible, return {"boxes": []}. '
-            "Never include code fences, prose, or extra keys."
+        base += (
+            "\nThe lead's phone number is one of these spellings — locate "
+            "it FIRST and include it in `phones`. Then add any other "
+            "phone numbers visible in the image:\n"
+            f"{targets_block}\n"
         )
-    return (
-        "You are a privacy filter. Find the bounding boxes of all clearly-"
-        "formatted phone numbers visible in the image (10-digit US, +1 "
-        "international, +44, etc.). DO NOT redact ZIP codes, VINs, policy "
-        "numbers, license plate numbers, prices, dates, or addresses.\n\n"
-        "Return ONLY a JSON object of this exact shape:\n"
-        '{"boxes": [{"x1": <float 0-100>, "y1": <float 0-100>, '
-        '"x2": <float 0-100>, "y2": <float 0-100>, "text": <string of what '
-        'is inside the box>, "is_phone": true}, ...]}\n\n'
-        "Rules:\n"
-        "- Percentages of image width (x) and height (y), 0–100.\n"
-        "- Each box must tightly enclose ONLY the phone-number digits and "
-        "any embedded separators / spaces / parentheses / + sign.\n"
-        "- A box must NEVER be wider than 60% of the image or taller than "
-        "20% of the image.\n"
-        "- 'text' MUST contain ONLY the visible characters of that phone "
-        "number — at least 7 digits. Skip boxes whose text has fewer "
-        "than 7 digits.\n"
-        'If no phone numbers are visible, return {"boxes": []}. '
-        "Never include code fences, prose, or extra keys."
-    )
+    return base
 
 
 _PHONE_DIGIT_RE = re.compile(r"\d")
@@ -521,16 +511,25 @@ def _phone_variants(phone: str) -> list[str]:
 
 @dataclass
 class _PhoneRedactionResponse:
-    boxes: list[tuple[float, float, float, float]]
+    """AI-derived rectangles, in pixel coordinates of the **original** image."""
+
+    # Each entry: (x1, y1, x2, y2) in pixels of the source image.
+    boxes: list[tuple[int, int, int, int]]
     api_ok: bool  # True iff the model call completed and we parsed valid JSON
 
 
-def _normalize_image_for_redaction(image_bytes: bytes) -> tuple[bytes, str]:
-    """Down-scale to ``PHONE_REDACTION_RENDER_WIDTH`` and emit as JPEG."""
+def _normalize_image_for_redaction(image_bytes: bytes) -> tuple[bytes, str, int, int, float]:
+    """Down-scale to ``PHONE_REDACTION_RENDER_WIDTH`` and emit as JPEG.
+
+    Returns ``(bytes, mime, width, height, scale_from_orig)`` so the caller
+    can convert pixel coordinates from the AI's coordinate space back to the
+    original image. ``scale_from_orig`` is ``norm_width / original_width``.
+    """
     try:
         from PIL import Image
     except Exception:
-        return image_bytes, "image/jpeg"
+        # Without Pillow we can't measure; return as-is and let caller skip rescaling.
+        return image_bytes, "image/jpeg", 0, 0, 1.0
     import io as _io
 
     try:
@@ -538,17 +537,57 @@ def _normalize_image_for_redaction(image_bytes: bytes) -> tuple[bytes, str]:
         img.load()
         if img.mode not in ("RGB",):
             img = img.convert("RGB")
-        w, h = img.size
-        if w > PHONE_REDACTION_RENDER_WIDTH:
-            scale = PHONE_REDACTION_RENDER_WIDTH / float(w)
-            new_h = max(1, int(round(h * scale)))
+        orig_w, orig_h = img.size
+        scale = 1.0
+        if orig_w > PHONE_REDACTION_RENDER_WIDTH:
+            scale = PHONE_REDACTION_RENDER_WIDTH / float(orig_w)
+            new_h = max(1, int(round(orig_h * scale)))
             img = img.resize((PHONE_REDACTION_RENDER_WIDTH, new_h), Image.LANCZOS)
+        out_w, out_h = img.size
         out = _io.BytesIO()
         img.save(out, format="JPEG", quality=92)
-        return out.getvalue(), "image/jpeg"
+        return out.getvalue(), "image/jpeg", out_w, out_h, scale
     except Exception as e:
         logger.warning("normalize image for redaction failed: %s", e)
-        return image_bytes, "image/jpeg"
+        return image_bytes, "image/jpeg", 0, 0, 1.0
+
+
+def _box_from_center_and_text(
+    cx: float,
+    cy: float,
+    text: str,
+    char_height: float,
+    img_w: int,
+    img_h: int,
+) -> Optional[tuple[int, int, int, int]]:
+    """Compute a tight rectangle around phone text from center + glyph height.
+
+    This is the key fix for "oversized at wrong location":
+    - Width is derived analytically from the text length and digit height
+      (digit width ≈ 0.6 * digit height for proportional fonts, 0.55 for
+      common DMV/form fonts), not from a fuzzy AI bounding box.
+    - Height clamps to a sane phone-number row height.
+    """
+    if char_height <= 0 or not text:
+        return None
+    n_chars = max(7, len([c for c in text if not c.isspace()]))
+    # Use a slightly conservative width factor so the bar always covers the
+    # last digit when the AI underestimates char_height a bit.
+    digit_w = char_height * 0.62
+    half_w = (n_chars * digit_w) * 0.55  # *0.55 ≈ half + small padding
+    half_h = char_height * 0.75
+    x1 = int(round(cx - half_w))
+    y1 = int(round(cy - half_h))
+    x2 = int(round(cx + half_w))
+    y2 = int(round(cy + half_h))
+    # Clamp into the image
+    x1 = max(0, min(img_w - 1, x1))
+    y1 = max(0, min(img_h - 1, y1))
+    x2 = max(0, min(img_w, x2))
+    y2 = max(0, min(img_h, y2))
+    if x2 <= x1 or y2 <= y1:
+        return None
+    return (x1, y1, x2, y2)
 
 
 def _phone_redaction_boxes(
@@ -556,11 +595,11 @@ def _phone_redaction_boxes(
     mime_type: str = "image/jpeg",
     known_phone: Optional[str] = None,
 ) -> _PhoneRedactionResponse:
-    """Ask OpenAI Vision for bounding boxes of visible phone numbers.
+    """Ask OpenAI Vision for phone-number locations and return pixel boxes.
 
-    When ``known_phone`` is supplied the prompt is anchored on that exact
-    number, which dramatically reduces both false positives ("This is a ZIP /
-    policy number / address") and false negatives ("there is no phone here").
+    The AI returns center + text + digit height; Python computes the actual
+    rectangle. Coordinates returned by this function are in **pixels of the
+    original input image**.
     """
     from config import Config
 
@@ -573,12 +612,14 @@ def _phone_redaction_boxes(
     if not api_key:
         return empty_fail
 
-    norm_bytes, norm_mime = _normalize_image_for_redaction(image_bytes)
+    norm_bytes, norm_mime, norm_w, norm_h, norm_scale = _normalize_image_for_redaction(image_bytes)
+    if not norm_w or not norm_h:
+        return empty_fail
     b64 = base64.standard_b64encode(norm_bytes).decode("ascii")
     data_url = f"data:{norm_mime};base64,{b64}"
 
     target_phones = _phone_variants(known_phone or "")
-    prompt = _build_phone_redaction_prompt(target_phones)
+    prompt = _build_phone_redaction_prompt(target_phones, norm_w, norm_h)
 
     try:
         from openai import OpenAI
@@ -610,53 +651,79 @@ def _phone_redaction_boxes(
     data = _parse_json_from_model(raw)
     if not isinstance(data, dict):
         return empty_fail
-    raw_boxes = data.get("boxes")
-    if not isinstance(raw_boxes, list):
+    raw_phones = data.get("phones")
+    if not isinstance(raw_phones, list):
+        # Backward compat: old "boxes" key still tolerated as a no-op signal.
+        if isinstance(data.get("boxes"), list) and not data.get("boxes"):
+            return empty_ok
         return empty_fail
 
-    out: list[tuple[float, float, float, float]] = []
-    for entry in raw_boxes:
+    # Scale back from normalized image space (what the AI saw) to original pixels.
+    if norm_scale <= 0:
+        norm_scale = 1.0
+    inv_scale = 1.0 / norm_scale
+
+    try:
+        from PIL import Image as _Image
+        import io as _io2
+        with _Image.open(_io2.BytesIO(image_bytes)) as _src:
+            orig_w, orig_h = _src.size
+    except Exception:
+        orig_w = int(round(norm_w * inv_scale))
+        orig_h = int(round(norm_h * inv_scale))
+
+    out: list[tuple[int, int, int, int]] = []
+    for entry in raw_phones:
         if not isinstance(entry, dict):
             continue
-        try:
-            x1 = float(entry.get("x1"))
-            y1 = float(entry.get("y1"))
-            x2 = float(entry.get("x2"))
-            y2 = float(entry.get("y2"))
-        except (TypeError, ValueError, AttributeError):
-            continue
-        # Drop boxes the model itself flagged as non-phone.
-        if entry.get("is_phone") is False:
-            continue
-        # Strict text sanity-check: kills the worst false positives where the
-        # model returns a giant box around an address or ZIP and labels it a phone.
-        text_val = entry.get("text") or entry.get("phone") or ""
+        text_val = str(entry.get("text") or "").strip()
         if not _phone_text_looks_real(text_val):
             continue
-        # Clamp + normalize ordering so x1<x2, y1<y2.
-        x1c, x2c = max(0.0, min(100.0, min(x1, x2))), max(0.0, min(100.0, max(x1, x2)))
-        y1c, y2c = max(0.0, min(100.0, min(y1, y2))), max(0.0, min(100.0, max(y1, y2)))
-        width = x2c - x1c
-        height = y2c - y1c
-        if width < 0.5 or height < 0.5:
+        try:
+            cx_norm = float(entry.get("cx"))
+            cy_norm = float(entry.get("cy"))
+            ch_norm = float(entry.get("char_height"))
+        except (TypeError, ValueError, AttributeError):
             continue
-        # Reject obviously oversized boxes — phone numbers are short text.
-        if width > 70.0 or height > 25.0:
-            logger.info("dropping oversized phone box %.1fx%.1f (text=%r)", width, height, text_val)
+        if ch_norm <= 1:
             continue
-        # Reject boxes that cover most of the image (clear hallucinations).
-        if width * height > 1500.0:  # > 15% of total area
-            logger.info("dropping huge-area phone box (text=%r)", text_val)
+        # Sanity: digit height should be a small fraction of image height —
+        # a phone number isn't half the image tall.
+        if ch_norm > norm_h * 0.25:
+            logger.info(
+                "dropping phone w/ implausible char_height %.1f (img_h=%d, text=%r)",
+                ch_norm,
+                norm_h,
+                text_val,
+            )
             continue
-        # Aggressive padding so blur covers all digit edges, but only on the
-        # vetted small boxes — won't make false positives any worse.
-        pad_x = 2.0
-        pad_y = 3.0
-        x1c = max(0.0, x1c - pad_x)
-        y1c = max(0.0, y1c - pad_y)
-        x2c = min(100.0, x2c + pad_x)
-        y2c = min(100.0, y2c + pad_y)
-        out.append((x1c, y1c, x2c, y2c))
+        # Sanity: center must sit inside the normalized image.
+        if not (0 <= cx_norm <= norm_w and 0 <= cy_norm <= norm_h):
+            continue
+        # Map back to original-image pixels.
+        cx = cx_norm * inv_scale
+        cy = cy_norm * inv_scale
+        ch = ch_norm * inv_scale
+        rect = _box_from_center_and_text(cx, cy, text_val, ch, orig_w, orig_h)
+        if not rect:
+            continue
+        rx1, ry1, rx2, ry2 = rect
+        rw = rx2 - rx1
+        rh = ry2 - ry1
+        # Final guard: rectangle must be small compared to the image (phones
+        # are short rows of text). >55% width or >18% height is almost
+        # certainly wrong.
+        if rw > orig_w * 0.55 or rh > orig_h * 0.18:
+            logger.info(
+                "dropping oversized computed phone rect %dx%d (img=%dx%d, text=%r)",
+                rw,
+                rh,
+                orig_w,
+                orig_h,
+                text_val,
+            )
+            continue
+        out.append((rx1, ry1, rx2, ry2))
 
     return _PhoneRedactionResponse(out, True)
 
@@ -712,24 +779,25 @@ def redact_phones_in_image_bytes(
             img = img.convert("RGB")
         w, h = img.size
         draw = ImageDraw.Draw(img)
-        for x1p, y1p, x2p, y2p in resp.boxes:
-            x1 = max(0, int(round(x1p / 100.0 * w)))
-            y1 = max(0, int(round(y1p / 100.0 * h)))
-            x2 = min(w, int(round(x2p / 100.0 * w)))
-            y2 = min(h, int(round(y2p / 100.0 * h)))
+        # ``resp.boxes`` are already tight pixel rectangles computed from the
+        # AI's center + text + char_height. Just paint solid black bars.
+        for x1, y1, x2, y2 in resp.boxes:
+            x1 = max(0, min(w, int(x1)))
+            y1 = max(0, min(h, int(y1)))
+            x2 = max(0, min(w, int(x2)))
+            y2 = max(0, min(h, int(y2)))
             if x2 <= x1 or y2 <= y1:
                 continue
+            # Tiny safety pad: 2% of the rect on each side to catch sub-pixel
+            # drift in the AI's center estimate.
             box_w = x2 - x1
             box_h = y2 - y1
-            # Tight black bars over number glyphs only (as requested), with
-            # tiny padding to catch separator edges.
-            margin_x = max(1, int(round(box_w * 0.03)))
-            margin_y = max(1, int(round(box_h * 0.08)))
-            bx1 = max(0, x1 - margin_x)
-            by1 = max(0, y1 - margin_y)
-            bx2 = min(w, x2 + margin_x)
-            by2 = min(h, y2 + margin_y)
-            # Solid black bar only; no blur halo.
+            pad_x = max(1, int(round(box_w * 0.02)))
+            pad_y = max(1, int(round(box_h * 0.05)))
+            bx1 = max(0, x1 - pad_x)
+            by1 = max(0, y1 - pad_y)
+            bx2 = min(w, x2 + pad_x)
+            by2 = min(h, y2 + pad_y)
             draw.rectangle([bx1, by1, bx2, by2], fill=(0, 0, 0))
         out = _io.BytesIO()
         save_format = "PNG"
