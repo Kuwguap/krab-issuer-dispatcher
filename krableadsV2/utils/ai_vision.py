@@ -799,6 +799,46 @@ def redact_phones_in_image_bytes(
         return PhoneRedactionResult(image_bytes, False, False)
 
 
+def force_privacy_blur_image_bytes(
+    image_bytes: bytes,
+    mime_type: str = "image/jpeg",
+) -> bytes:
+    """Fail-safe privacy fallback: blur the whole image heavily.
+
+    Used only when phone redaction API fails so we can still forward a safe
+    copy instead of dropping the media entirely.
+    """
+    if not image_bytes:
+        return b""
+    try:
+        from PIL import Image, ImageFilter
+    except Exception:
+        return image_bytes
+    import io as _io
+
+    try:
+        img = Image.open(_io.BytesIO(image_bytes))
+        img.load()
+        if img.mode not in ("RGB", "RGBA"):
+            img = img.convert("RGB")
+        w, h = img.size
+        blur_radius = max(16.0, min(w, h) * 0.06)
+        img = img.filter(ImageFilter.GaussianBlur(radius=blur_radius))
+        out = _io.BytesIO()
+        save_format = "PNG"
+        save_kwargs: dict[str, Any] = {}
+        if (mime_type or "").lower() in ("image/jpeg", "image/jpg"):
+            save_format = "JPEG"
+            save_kwargs["quality"] = 90
+            if img.mode == "RGBA":
+                img = img.convert("RGB")
+        img.save(out, format=save_format, **save_kwargs)
+        return out.getvalue()
+    except Exception as e:
+        logger.warning("force_privacy_blur_image_bytes failed: %s", e)
+        return image_bytes
+
+
 # OCR/models sometimes drop one letter from standard 3-letter DMV color codes → repair before storage.
 _TWO_LETTER_DMV_TO_THREE = {
     "gy": "GRY",   # gray
