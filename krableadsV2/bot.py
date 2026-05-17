@@ -2132,21 +2132,23 @@ def _format_group_lead_message_html(
     vin_raw = (phase1_data.get("vin") or "").strip() or "-"
     car_raw = (phase1_data.get("car") or "").strip() or "-"
     name_line = _h(_safe_raw(phase1_data.get("name")))
+    # Labelled lines so every field stays visible even when partially filled,
+    # and the policy / insurance company etc. can't be mistaken for each other.
     tail_lines = [
-        _h(_safe_raw(phase1_data.get("address"))),
-        _h(_safe_raw(phase1_data.get("city_state_zip"))),
-        _h(vin_raw),
-        _h(car_raw),
-        _h(_safe_raw(phase1_data.get("color"))),
-        _h(_safe_raw(phase1_data.get("insurance_company"))),
-        _h(_safe_raw(phase1_data.get("insurance_policy_number"))),
-        _h(_safe_raw(phase1_data.get("extra_info"))),
+        f"🏠 Address: {_h(_safe_raw(phase1_data.get('address')))}",
+        f"🏙 City/ST/ZIP: {_h(_safe_raw(phase1_data.get('city_state_zip')))}",
+        f"🔢 VIN: {_h(vin_raw)}",
+        f"🚘 Car: {_h(car_raw)}",
+        f"🎨 Color: {_h(_safe_raw(phase1_data.get('color')))}",
+        f"🛡 Insurance: {_h(_safe_raw(phase1_data.get('insurance_company')))}",
+        f"📄 Policy #: {_h(_safe_raw(phase1_data.get('insurance_policy_number')))}",
+        f"🕒 Extra: {_h(_safe_raw(phase1_data.get('extra_info')))}",
     ]
     note_i = (special_request_issuers or "").strip()
     if note_i:
-        tail_lines.append(_h("📝 " + _safe_raw(note_i)))
+        tail_lines.append(f"📝 Issuer note: {_h(_safe_raw(note_i))}")
     else:
-        tail_lines.append(_h("📝 No"))
+        tail_lines.append("📝 Issuer note: —")
     vehicle_block = f"🚗 Vehicle: {name_line}\n" + "\n".join(tail_lines)
 
     issue_s = issue_dt.strftime("%Y-%m-%d %H:%M:%S %Z") if issue_dt else "N/A"
@@ -6564,8 +6566,12 @@ async def handle_accept_group_offer(update: Update, context: ContextTypes.DEFAUL
         accepted_group = db.get_group_by_id(win_gid) if win_gid else None
         gname = accepted_group.get("group_name") if accepted_group else "another group"
         ref_show = lead.get("reference_id", "N/A")
-        issuer_handle = (lead.get("telegram_username") or "").strip() or "Unknown"
-        issuer_esc = _telegram_md1_escape(issuer_handle)
+        # "Accepted by" line should show the team member who actually tapped
+        # the button (not the lead creator).
+        acceptor_handle = (query.from_user.username or "").strip() or (
+            query.from_user.full_name or "Unknown"
+        )
+        acceptor_esc = _telegram_md1_escape(acceptor_handle)
         for o in db.get_group_lead_offers(lead_id):
             ocid = _parse_chat_id(o.get("group_chat_id"))
             mid = o.get("group_message_id")
@@ -6579,7 +6585,7 @@ async def handle_accept_group_offer(update: Update, context: ContextTypes.DEFAUL
                         message_id=int(mid),
                         text=(
                             f"✅ **Accepted by {gname}**\n"
-                            f"Issuer: @{issuer_esc}\n"
+                            f"Issuer: @{acceptor_esc}\n"
                             f"Reference ID: `{ref_show}`"
                         ),
                         parse_mode="Markdown",
@@ -6592,7 +6598,7 @@ async def handle_accept_group_offer(update: Update, context: ContextTypes.DEFAUL
                         text=(
                             f"❌ **Taken by another group**\n\n"
                             f"Accepted by: **{gname}**\n"
-                            f"Issuer: @{issuer_esc}\n"
+                            f"Issuer: @{acceptor_esc}\n"
                             f"Reference ID: `{ref_show}`"
                         ),
                         parse_mode="Markdown",
@@ -6625,8 +6631,11 @@ async def handle_accept_group_offer(update: Update, context: ContextTypes.DEFAUL
 
     reference_id = lead.get("reference_id", "N/A")
     winner_name = (winner_group.get("group_name") or "Group").strip() or "Group"
-    issuer_handle = (lead.get("telegram_username") or "").strip() or "Unknown"
-    issuer_esc = _telegram_md1_escape(issuer_handle)
+    # "Accepted by" line shows the team member who actually tapped Accept.
+    acceptor_handle = (query.from_user.username or "").strip() or (
+        query.from_user.full_name or "Unknown"
+    )
+    acceptor_esc = _telegram_md1_escape(acceptor_handle)
 
     # Update all group offer messages to reflect taken/accepted
     offers = db.get_group_lead_offers(lead_id)
@@ -6643,7 +6652,7 @@ async def handle_accept_group_offer(update: Update, context: ContextTypes.DEFAUL
                     message_id=int(mid),
                     text=(
                         f"✅ **Accepted by {winner_name}**\n"
-                        f"Issuer: @{issuer_esc}\n"
+                        f"Issuer: @{acceptor_esc}\n"
                         f"Reference ID: `{reference_id}`"
                     ),
                     parse_mode="Markdown",
@@ -6656,7 +6665,7 @@ async def handle_accept_group_offer(update: Update, context: ContextTypes.DEFAUL
                     text=(
                         f"❌ **Taken by another group**\n\n"
                         f"Accepted by: **{winner_name}**\n"
-                        f"Issuer: @{issuer_esc}\n"
+                        f"Issuer: @{acceptor_esc}\n"
                         f"Reference ID: `{reference_id}`"
                     ),
                     parse_mode="Markdown",

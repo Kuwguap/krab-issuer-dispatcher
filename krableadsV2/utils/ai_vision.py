@@ -99,6 +99,7 @@ STRICT RULES:
 - Line 8 (Color): ONLY the vehicle color. DMV/registration forms often show exactly THREE letters (e.g. GRY=gray, BLK=black, WHT=white, SIL=silver). Copy those three letters exactly in UPPERCASE—never drop a letter (wrong: GY; correct: GRY). Full words like Silver or Black are fine. If not stated, use "-". Never put city names (Brick, Jersey), addresses, or insurance names in color.
 - If a value is missing or unreadable, put a single dash "-" for that line.
 - Lines 12-17 must contain the phone number, price, special notes, email, and driver-license ID, each on its own line with the exact labels shown below. If a value is not visible, put a single dash "-".
+- Line 12 (Phone): ONLY use a number that is EXPLICITLY labelled as a phone number in the source — e.g. "Phone", "Phone:", "Phone #", "Client phone", "Client #", "Client phone #", "Tel", "Tel.", "Cell", "Mobile", "Contact". The label may be on the same line OR on the line immediately above the number. NEVER copy the **insurance policy number**, **VIN**, **license / DMV ID**, **plate**, **account**, **reference id**, **ZIP code**, or any unlabelled digit run into the Phone field. If no clearly-labelled phone is visible, output "Phone: -".
 - Line 16 (Email): a single email address only (e.g. john@example.com). Never invent an address. If none is visible, output "Email: -".
 - Line 17 (DriverLicenseID): the customer's driver's-license / DMV ID exactly as printed (digits and/or letters). Never invent it. If none is visible, output "DriverLicenseID: -". Do NOT put the insurance policy number here.
 
@@ -163,6 +164,7 @@ STRICT RULES:
 - Line 8 (Color): ONLY the vehicle color. Three-letter DMV codes (GRY, BLK, etc.) are fine. If missing, use "-". Never put city names, addresses, or insurance names in color.
 - If something is missing, put a single dash "-" for that line.
 - Lines 12-17 must contain the phone number, price, notes, email, and driver-license ID, each with the labels exactly as shown below. If a value is not present, put a single dash "-".
+- Line 12 (Phone): ONLY use a number that the user EXPLICITLY calls a phone — e.g. "Phone", "Phone #", "Client phone", "Client #", "Tel", "Cell", "Mobile", "Contact". Never copy the insurance policy number, VIN, license / DMV ID, plate, account, reference id, or ZIP into the Phone field. If no clearly-labelled phone is given, output "Phone: -".
 - Line 16 (Email): a single email address only (e.g. john@example.com). Never invent one. If none, output "Email: -".
 - Line 17 (DriverLicenseID): the customer's driver-license / DMV ID exactly as written. Never invent it. If none, output "DriverLicenseID: -". Do NOT put the insurance policy number here.
 
@@ -521,13 +523,50 @@ class _PhoneRedactionResponse:
     api_ok: bool  # True iff at least one detection method completed successfully
 
 
-# Match common phone-number shapes inside an OCR text run.
-# 10-digit US (with or without country code, separators tolerant), or +1...
+# Match phone-number shapes inside an OCR text run. Require either
+# parentheses around the area code, an explicit ``+`` country code, or a
+# separator (dash / dot / space) between the area-code and exchange. This
+# stops bare 10-digit account / policy numbers (e.g. ``2025693380``) from
+# matching when they're written as one run of digits.
 _OCR_PHONE_RE = re.compile(
-    r"(?:\+?\d{1,3}[\s\-.()]*)?"     # optional country code
-    r"\(?\d{3}\)?[\s\-.]?"            # area code
-    r"\d{3}[\s\-.]?\d{4}"             # 3-4
+    r"(?:"
+    r"\+\d{1,3}[\s\-.()]*"               # +1 / +44 etc.
+    r"(?:\(?\d{3}\)?[\s\-.]?)?"           # optional area code
+    r"\d{3}[\s\-.]?\d{4}"                 # exchange + 4
+    r"|"
+    r"\(\d{3}\)[\s\-.]?\d{3}[\s\-.]?\d{4}"  # (732) 534-2659  / (732)534-2659
+    r"|"
+    r"\d{3}[\-.][\d]{3}[\-.]\d{4}"         # 732-534-2659 / 732.534.2659
+    r"|"
+    r"\d{3}\s\d{3}\s\d{4}"                  # 732 534 2659
+    r")"
 )
+
+# Phone-context labels (lowercase, word boundaries) — if a line contains
+# any of these we trust that the digit run on it is a phone number.
+_PHONE_CONTEXT_TERMS = (
+    "phone", "phone#", "phone #", "phn", "tel", "tel.",
+    "cell", "mobile", "client phone", "client #", "client phone #",
+    "contact", "call", "office",
+)
+
+# Negative-context labels — when a line contains any of these we REFUSE
+# to redact digits on it, because they're almost certainly something
+# else (policy / account / VIN / etc.).
+_PHONE_NEGATIVE_TERMS = (
+    "policy", "policy number", "policy #", "policy#",
+    "vin", "license", "lic #", "lic#", "dl #", "dl#",
+    "plate", "tag #", "tag#",
+    "account", "acct", "acct #", "acct#",
+    "zip", "postal",
+    "ssn", "tax id", "ein",
+    "reference", "ref #", "ref#",
+    "order", "invoice", "receipt #", "receipt#",
+)
+
+
+def _line_has_term(line_lower: str, terms: tuple[str, ...]) -> bool:
+    return any(t in line_lower for t in terms)
 
 
 def _ocr_phone_boxes(image_bytes: bytes) -> Optional[list[tuple[int, int, int, int]]]:
@@ -583,15 +622,41 @@ def _ocr_phone_boxes(image_bytes: bytes) -> Optional[list[tuple[int, int, int, i
         )
         by_line.setdefault(key, []).append(i)
 
-    for indices in by_line.values():
+    # Sort lines top-to-bottom so we can peek at the previous line's text
+    # (some forms put the label "Client phone #" on its own line above the
+    # number). We use median y of words on a line as the sort key.
+    sorted_lines: list[tuple[int, tuple, list[int]]] = []
+    for key, indices in by_line.items():
         if not indices:
             continue
+        ys = [int(data["top"][i]) for i in indices]
+        sorted_lines.append((sum(ys) // len(ys), key, indices))
+    sorted_lines.sort(key=lambda t: t[0])
+    prev_line_lower = ""
+    for _y, _key, indices in sorted_lines:
         indices.sort(key=lambda i: int(data["left"][i]))
         words = [(data["text"][i] or "").strip() for i in indices]
         joined = " ".join(words)
+        line_lower = joined.lower()
+        # Skip lines that clearly contain non-phone identifiers — even if
+        # the digit run *looks* like a phone, redacting it would be wrong.
+        if _line_has_term(line_lower, _PHONE_NEGATIVE_TERMS):
+            prev_line_lower = line_lower
+            continue
+        has_phone_context = _line_has_term(line_lower, _PHONE_CONTEXT_TERMS) or _line_has_term(
+            prev_line_lower, _PHONE_CONTEXT_TERMS
+        )
         for m in _OCR_PHONE_RE.finditer(joined):
             phone_text = m.group(0)
             if not _phone_text_looks_real(phone_text):
+                continue
+            # If we don't have an explicit phone label nearby, the digit
+            # run must contain a phone-shaped separator to be trusted.
+            # ``_OCR_PHONE_RE`` already enforces that, but a bare run like
+            # "732 534 2659" can still appear in addresses. Require either
+            # context OR strong separators (parentheses or '+' country code).
+            strong_separators = ("(" in phone_text or "+" in phone_text or "-" in phone_text or "." in phone_text)
+            if not has_phone_context and not strong_separators:
                 continue
             # Map regex match span back to which words it covers.
             cursor = 0
@@ -613,6 +678,7 @@ def _ocr_phone_boxes(image_bytes: bytes) -> Optional[list[tuple[int, int, int, i
             ys2 = max(int(data["top"][i]) + int(data["height"][i]) for i in covered)
             if xs2 > xs1 and ys2 > ys1:
                 rects.append((xs1, ys1, xs2, ys2))
+        prev_line_lower = line_lower
     return rects
 
 
