@@ -471,7 +471,6 @@ async def _finalize_phase1_media_for_dispatch(
 
     attached: list[dict] = []
     skipped_unsafe = 0
-    fallback_blurred = 0
     skipped_too_big = 0
     for item in pending:
         try:
@@ -491,28 +490,11 @@ async def _finalize_phase1_media_for_dispatch(
                 skipped_unsafe += 1
                 continue
 
-            # If AI redaction fails, use a strict privacy fallback (full-image
-            # heavy blur) so we can still forward a safe copy.
+            # If the AI call itself failed we cannot prove the image is safe to
+            # forward — drop it rather than leak the issuer's phone number.
             if not result.api_ok:
-                try:
-                    blurred = await asyncio.to_thread(
-                        ai_vision.force_privacy_blur_image_bytes,
-                        img_bytes,
-                        mime,
-                    )
-                except Exception as e:
-                    logger.warning("Privacy fallback blur failed: %s", e)
-                    skipped_unsafe += 1
-                    continue
-                if not blurred:
-                    skipped_unsafe += 1
-                    continue
-                result = ai_vision.PhoneRedactionResult(
-                    image_bytes=blurred,
-                    api_ok=True,
-                    redacted=True,
-                )
-                fallback_blurred += 1
+                skipped_unsafe += 1
+                continue
 
             censored_bytes = result.image_bytes or b""
             if not censored_bytes:
@@ -533,12 +515,8 @@ async def _finalize_phase1_media_for_dispatch(
         except Exception as e:
             logger.warning("Could not stage censored copy for dispatch: %s", e)
 
-    if (skipped_unsafe or skipped_too_big or fallback_blurred) and issuer_chat_id:
+    if (skipped_unsafe or skipped_too_big) and issuer_chat_id:
         warn_parts: list[str] = []
-        if fallback_blurred:
-            warn_parts.append(
-                f"{fallback_blurred} image(s) used privacy fallback blur"
-            )
         if skipped_unsafe:
             warn_parts.append(
                 f"{skipped_unsafe} image(s) couldn't be auto-censored right now"
@@ -553,12 +531,8 @@ async def _finalize_phase1_media_for_dispatch(
                 text=(
                     "⚠️ "
                     + " and ".join(warn_parts)
-                    + (
-                        " — safe blurred copies were forwarded."
-                        if fallback_blurred and not (skipped_unsafe or skipped_too_big)
-                        else " — unsafe/oversized files were not forwarded so your phone number stays hidden. "
-                        "The lead itself was still sent."
-                    )
+                    + " — unsafe/oversized files were not forwarded so your phone number stays hidden. "
+                    "The lead itself was still sent."
                 ),
                 parse_mode="Markdown",
             )
