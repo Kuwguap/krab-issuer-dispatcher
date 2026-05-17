@@ -419,20 +419,28 @@ def _build_group_keyboard(groups: list, include_all: bool = True) -> InlineKeybo
     return InlineKeyboardMarkup(buttons)
 
 
+# Per-image cap so we don't bloat the lead row's JSONB with huge base64 blobs.
+# 5 MB raw == ~6.7 MB base64; Telegram bot uploads themselves cap at 10 MB
+# for photos. Anything larger gets skipped (the lead itself still dispatches).
+_PHASE1_MEDIA_MAX_BYTES = 5 * 1024 * 1024
+
+
 async def _finalize_phase1_media_for_dispatch(
     context: ContextTypes.DEFAULT_TYPE,
     issuer_chat_id: int | str | None,
     known_phone: str | None = None,
 ) -> list[dict]:
-    """Redact phone numbers in any Phase 1 vision media, capture a stable
-    ``file_id`` via a silent upload (immediately deleted from the issuer's
-    chat), and return descriptors usable by
-    ``_forward_phase1_attached_files_to_targets`` after a group accepts.
+    """Redact phone numbers in any Phase 1 vision media and return descriptors
+    that ``_forward_phase1_attached_files_to_targets`` can send to the
+    accepting group **without** the issuer ever seeing a copy of the
+    censored image.
 
-    Idempotent: if media was already finalized for this lead the cached list
-    is returned. ``known_phone`` (when supplied) anchors the AI detector on
-    the exact phone we extracted from the lead, sharply reducing false
-    positives compared to a generic phone-shape pattern.
+    Censored bytes are base64-encoded inline on each entry so the data
+    survives DB persistence on the lead row and the forward step can rebuild
+    a fresh upload with no intermediate Telegram messages. ``known_phone``
+    (when supplied) anchors the AI detector on the exact phone we extracted
+    from the lead, sharply reducing false positives compared to a generic
+    phone-shape pattern.
     """
     if not context.user_data:
         return []
@@ -458,11 +466,12 @@ async def _finalize_phase1_media_for_dispatch(
                 )
                 if png:
                     pending.append({"kind": "image", "bytes": png, "mime": "image/png"})
-    if not pending or not issuer_chat_id:
+    if not pending:
         return []
 
     attached: list[dict] = []
     skipped_unsafe = 0
+    skipped_too_big = 0
     for item in pending:
         try:
             img_bytes = item.get("bytes") or b""
@@ -487,37 +496,43 @@ async def _finalize_phase1_media_for_dispatch(
                 skipped_unsafe += 1
                 continue
 
-            filename = "censored.jpg" if mime in ("image/jpeg", "image/jpg") else "censored.png"
-            input_file = InputFile(io.BytesIO(result.image_bytes), filename=filename)
-            # Upload to grab a stable file_id, then immediately delete the
-            # message so the issuer never sees the censored copy in their chat.
-            # Telegram retains the file server-side and the cached file_id
-            # stays valid for later forwarding to the accepting team.
-            sent = await context.bot.send_photo(
-                chat_id=issuer_chat_id,
-                photo=input_file,
-                disable_notification=True,
-            )
-            if sent is not None:
-                try:
-                    await context.bot.delete_message(
-                        chat_id=issuer_chat_id, message_id=sent.message_id
-                    )
-                except Exception:
-                    pass
-            if sent and sent.photo:
-                attached.append({"type": "photo", "file_id": sent.photo[-1].file_id})
-        except Exception as e:
-            logger.warning("Could not upload censored copy for dispatch: %s", e)
+            censored_bytes = result.image_bytes or b""
+            if not censored_bytes:
+                continue
+            if len(censored_bytes) > _PHASE1_MEDIA_MAX_BYTES:
+                skipped_too_big += 1
+                continue
 
-    if skipped_unsafe:
+            ext = "jpg" if mime in ("image/jpeg", "image/jpg") else "png"
+            attached.append(
+                {
+                    "type": "photo",
+                    "mime": "image/jpeg" if ext == "jpg" else "image/png",
+                    "filename": f"censored.{ext}",
+                    "data_b64": base64.b64encode(censored_bytes).decode("ascii"),
+                }
+            )
+        except Exception as e:
+            logger.warning("Could not stage censored copy for dispatch: %s", e)
+
+    if (skipped_unsafe or skipped_too_big) and issuer_chat_id:
+        warn_parts: list[str] = []
+        if skipped_unsafe:
+            warn_parts.append(
+                f"{skipped_unsafe} image(s) couldn't be auto-censored right now"
+            )
+        if skipped_too_big:
+            warn_parts.append(
+                f"{skipped_too_big} image(s) were too large to forward safely"
+            )
         try:
             await context.bot.send_message(
                 chat_id=issuer_chat_id,
                 text=(
-                    f"⚠️ {skipped_unsafe} image(s) couldn't be auto-censored "
-                    "right now and were **not** forwarded so your phone number "
-                    "stays hidden. The lead itself was still sent."
+                    "⚠️ "
+                    + " and ".join(warn_parts)
+                    + " — they were **not** forwarded so your phone number stays hidden. "
+                    "The lead itself was still sent."
                 ),
                 parse_mode="Markdown",
             )
@@ -537,7 +552,15 @@ async def _forward_phase1_attached_files_to_targets(
 ) -> None:
     """Forward Phase 1 files to the **accepting** group chat only.
 
-    Invoked from ``handle_accept_group_offer`` after Accept — not during approval broadcast or driver pick.
+    Invoked from ``handle_accept_group_offer`` after Accept — not during
+    approval broadcast or driver pick. Two payload shapes are supported:
+
+    - ``{"type": "photo|document", "file_id": ...}`` — legacy Telegram
+      file-id reference (pre-redaction code path).
+    - ``{"type": "photo|document", "data_b64": ..., "filename": ...,
+      "mime": ...}`` — inline base64 of the censored bytes, produced by
+      ``_finalize_phase1_media_for_dispatch``. We rebuild a fresh upload
+      so the issuer never sees the censored copy.
     """
     if not attached_files:
         return
@@ -545,15 +568,33 @@ async def _forward_phase1_attached_files_to_targets(
     if not _group_cid:
         return
     for f in attached_files:
-        ftype = (f.get("type") or "").lower()
-        fid = f.get("file_id")
-        if not fid:
+        if not isinstance(f, dict):
             continue
+        ftype = (f.get("type") or "").lower()
+        data_b64 = f.get("data_b64")
         try:
+            if data_b64:
+                try:
+                    blob = base64.b64decode(data_b64)
+                except Exception as e:
+                    logger.warning("Could not decode censored file payload: %s", e)
+                    continue
+                if not blob:
+                    continue
+                filename = f.get("filename") or (
+                    "censored.jpg" if ftype == "photo" else "censored.bin"
+                )
+                upload = InputFile(io.BytesIO(blob), filename=filename)
+                if ftype == "photo":
+                    await context.bot.send_photo(chat_id=_group_cid, photo=upload)
+                else:
+                    await context.bot.send_document(chat_id=_group_cid, document=upload)
+                continue
+            fid = f.get("file_id")
+            if not fid:
+                continue
             if ftype == "photo":
                 await context.bot.send_photo(chat_id=_group_cid, photo=fid)
-            elif ftype == "document":
-                await context.bot.send_document(chat_id=_group_cid, document=fid)
             else:
                 await context.bot.send_document(chat_id=_group_cid, document=fid)
         except Exception as e:
