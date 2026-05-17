@@ -2141,7 +2141,7 @@ def _format_group_lead_message_html(
         f"🚘 Car: {_h(car_raw)}",
         f"🎨 Color: {_h(_safe_raw(phase1_data.get('color')))}",
         f"🛡 Insurance: {_h(_safe_raw(phase1_data.get('insurance_company')))}",
-        f"📄 Policy #: {_h(_safe_raw(phase1_data.get('insurance_policy_number')))}",
+        f"📄 Policy #: {_h((phase1_data.get('insurance_policy_number') or '').strip() or '-')}",
         f"🕒 Extra: {_h(_safe_raw(phase1_data.get('extra_info')))}",
     ]
     note_i = (special_request_issuers or "").strip()
@@ -4950,7 +4950,7 @@ async def handle_driver_selection(update: Update, context: ContextTypes.DEFAULT_
         car_only,
         _safe(phase1_data.get("color")),
         _safe(phase1_data.get("insurance_company")),
-        _safe(phase1_data.get("insurance_policy_number")),
+        (phase1_data.get("insurance_policy_number") or "").strip() or "-",
         _safe(phase1_data.get("extra_info")),
     ]
     if issuer_note_disp:
@@ -6191,7 +6191,7 @@ async def _issuer_open_driver_selection_after_group_accept(
             car_only,
             _safe(phase1_data.get("color")),
             _safe(phase1_data.get("insurance_company")),
-            _safe(phase1_data.get("insurance_policy_number")),
+            (phase1_data.get("insurance_policy_number") or "").strip() or "-",
             _safe(phase1_data.get("extra_info")),
         ]
         issuer_note_disp = (lead_data.get("special_request_issuers") or "").strip()
@@ -6597,8 +6597,6 @@ async def handle_accept_group_offer(update: Update, context: ContextTypes.DEFAUL
                         message_id=int(mid),
                         text=(
                             f"❌ **Taken by another group**\n\n"
-                            f"Accepted by: **{gname}**\n"
-                            f"Issuer: @{acceptor_esc}\n"
                             f"Reference ID: `{ref_show}`"
                         ),
                         parse_mode="Markdown",
@@ -6664,8 +6662,6 @@ async def handle_accept_group_offer(update: Update, context: ContextTypes.DEFAUL
                     message_id=int(mid),
                     text=(
                         f"❌ **Taken by another group**\n\n"
-                        f"Accepted by: **{winner_name}**\n"
-                        f"Issuer: @{acceptor_esc}\n"
                         f"Reference ID: `{reference_id}`"
                     ),
                     parse_mode="Markdown",
