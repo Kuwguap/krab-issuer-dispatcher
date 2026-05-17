@@ -2478,8 +2478,12 @@ async def _phase1_finish_vision_extraction(
             dl_val = ai_vision.normalize_driver_license_id(l.split(":", 1)[1].strip())
 
     if phone and price:
-        state_data["pending_phone_number"] = phone
-        state_data["pending_price"] = price
+        norm_phone = _normalize_ai_phone(phone)
+        norm_price = _normalize_ai_price(price)
+        if norm_phone:
+            state_data["pending_phone_number"] = norm_phone
+        if norm_price:
+            state_data["pending_price"] = norm_price
         if issuer_note:
             state_data["special_request_issuers"] = issuer_note
         if driver_note:
@@ -2975,6 +2979,46 @@ async def handle_edit_field_text(update, context):
 _PHONE_PRICE_PLACEHOLDERS = frozenset(
     ("-", "—", "–", "n/a", "na", "none", "null", "?", "unknown", "tbd", "pending")
 )
+
+
+def _normalize_ai_phone(raw) -> str:
+    """Coerce a vision-extracted phone into the +1XXXXXXXXXX shape Phase 2 produces.
+
+    Returns ``""`` when the string clearly isn't a phone number; otherwise the
+    same canonical form ``_is_valid_pending_phone`` accepts so the AI output
+    flows through without re-prompting the user.
+    """
+    p = (raw or "").strip()
+    if not p or p.lower() in _PHONE_PRICE_PLACEHOLDERS:
+        return ""
+    digits = re.sub(r"\D", "", p)
+    if len(digits) == 11 and digits.startswith("1"):
+        digits = digits[1:]
+    if len(digits) not in (9, 10) or not digits.isdigit():
+        return ""
+    return "+1" + digits
+
+
+def _normalize_ai_price(raw) -> str:
+    """Coerce a vision-extracted price into the ``$N`` shape Phase 2 expects.
+
+    Strips currency words and stray punctuation, keeps digits + decimal,
+    re-adds a leading ``$`` if the AI omitted it.
+    """
+    p = (raw or "").strip()
+    if not p or p.lower() in _PHONE_PRICE_PLACEHOLDERS:
+        return ""
+    p = p.replace("USD", "").replace("usd", "").replace("Usd", "").strip()
+    has_digit = bool(re.search(r"\d", p))
+    if not has_digit:
+        return ""
+    # Keep $ + digits + decimal/comma; drop everything else.
+    cleaned = re.sub(r"[^0-9.$,]", "", p).strip()
+    if not cleaned:
+        return ""
+    if "$" not in cleaned:
+        cleaned = "$" + cleaned.lstrip("$")
+    return cleaned
 
 
 def _is_valid_pending_phone(raw) -> bool:
