@@ -6564,6 +6564,8 @@ async def handle_accept_group_offer(update: Update, context: ContextTypes.DEFAUL
         accepted_group = db.get_group_by_id(win_gid) if win_gid else None
         gname = accepted_group.get("group_name") if accepted_group else "another group"
         ref_show = lead.get("reference_id", "N/A")
+        issuer_handle = (lead.get("telegram_username") or "").strip() or "Unknown"
+        issuer_esc = _telegram_md1_escape(issuer_handle)
         for o in db.get_group_lead_offers(lead_id):
             ocid = _parse_chat_id(o.get("group_chat_id"))
             mid = o.get("group_message_id")
@@ -6575,7 +6577,11 @@ async def handle_accept_group_offer(update: Update, context: ContextTypes.DEFAUL
                     await context.bot.edit_message_text(
                         chat_id=ocid,
                         message_id=int(mid),
-                        text=f"✅ **Accepted by {gname}**\n\nReference ID: `{ref_show}`",
+                        text=(
+                            f"✅ **Accepted by {gname}**\n"
+                            f"Issuer: @{issuer_esc}\n"
+                            f"Reference ID: `{ref_show}`"
+                        ),
                         parse_mode="Markdown",
                         reply_markup=_EMPTY_INLINE_KB,
                     )
@@ -6585,7 +6591,9 @@ async def handle_accept_group_offer(update: Update, context: ContextTypes.DEFAUL
                         message_id=int(mid),
                         text=(
                             f"❌ **Taken by another group**\n\n"
-                            f"Accepted by: **{gname}**\nReference ID: `{ref_show}`"
+                            f"Accepted by: **{gname}**\n"
+                            f"Issuer: @{issuer_esc}\n"
+                            f"Reference ID: `{ref_show}`"
                         ),
                         parse_mode="Markdown",
                         reply_markup=_EMPTY_INLINE_KB,
@@ -6617,6 +6625,8 @@ async def handle_accept_group_offer(update: Update, context: ContextTypes.DEFAUL
 
     reference_id = lead.get("reference_id", "N/A")
     winner_name = (winner_group.get("group_name") or "Group").strip() or "Group"
+    issuer_handle = (lead.get("telegram_username") or "").strip() or "Unknown"
+    issuer_esc = _telegram_md1_escape(issuer_handle)
 
     # Update all group offer messages to reflect taken/accepted
     offers = db.get_group_lead_offers(lead_id)
@@ -6631,7 +6641,11 @@ async def handle_accept_group_offer(update: Update, context: ContextTypes.DEFAUL
                 await context.bot.edit_message_text(
                     chat_id=ocid,
                     message_id=int(mid),
-                    text=f"✅ **Accepted by {winner_name}**\n\nReference ID: `{reference_id}`",
+                    text=(
+                        f"✅ **Accepted by {winner_name}**\n"
+                        f"Issuer: @{issuer_esc}\n"
+                        f"Reference ID: `{reference_id}`"
+                    ),
                     parse_mode="Markdown",
                     reply_markup=_EMPTY_INLINE_KB,
                 )
@@ -6639,7 +6653,12 @@ async def handle_accept_group_offer(update: Update, context: ContextTypes.DEFAUL
                 await context.bot.edit_message_text(
                     chat_id=ocid,
                     message_id=int(mid),
-                    text=f"❌ **Taken by another group**\n\nAccepted by: **{winner_name}**\nReference ID: `{reference_id}`",
+                    text=(
+                        f"❌ **Taken by another group**\n\n"
+                        f"Accepted by: **{winner_name}**\n"
+                        f"Issuer: @{issuer_esc}\n"
+                        f"Reference ID: `{reference_id}`"
+                    ),
                     parse_mode="Markdown",
                     reply_markup=_EMPTY_INLINE_KB,
                 )
