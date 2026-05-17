@@ -459,14 +459,6 @@ async def _finalize_phase1_media_for_dispatch(
     if not pending or not issuer_chat_id:
         return []
 
-    try:
-        await context.bot.send_message(
-            chat_id=issuer_chat_id,
-            text="🔒 Censoring phone numbers in the images you sent — these are the copies your team will see.",
-        )
-    except Exception:
-        pass
-
     attached: list[dict] = []
     skipped_unsafe = 0
     for item in pending:
@@ -490,17 +482,11 @@ async def _finalize_phase1_media_for_dispatch(
                 skipped_unsafe += 1
                 continue
 
-            caption = (
-                "🔒 Censored copy (phone numbers hidden)"
-                if result.redacted
-                else "✅ No phone numbers detected — original will be forwarded"
-            )
             filename = "censored.jpg" if mime in ("image/jpeg", "image/jpg") else "censored.png"
             input_file = InputFile(io.BytesIO(result.image_bytes), filename=filename)
             sent = await context.bot.send_photo(
                 chat_id=issuer_chat_id,
                 photo=input_file,
-                caption=caption,
             )
             if sent and sent.photo:
                 attached.append({"type": "photo", "file_id": sent.photo[-1].file_id})
@@ -3043,18 +3029,44 @@ async def _delete_pending_file_prompts(context: ContextTypes.DEFAULT_TYPE, chat_
         await _safe_delete_chat_message(context, chat_id, mid)
 
 
+def _has_special_request(value) -> bool:
+    """Treat any non-blank, non-placeholder string as a real note from the AI extract."""
+    if value is None:
+        return False
+    s = str(value).strip()
+    return bool(s) and s.lower() not in ("-", "—", "–", "none", "n/a", "na")
+
+
 async def _prompt_issuer_special_request(message, context: ContextTypes.DEFAULT_TYPE, user_id: int) -> int:
     """Bridge into the special-request flow once phone + price are known.
 
     Mirrors how ``handle_phase2`` enters STATE_SPECIAL_REQUEST_ISSUERS, but is
     callable from review-accept / VIN-choice paths where Phase 2 was skipped
     because the AI extraction already filled in pending_phone/price.
+    Skips the prompts when AI has already extracted issuer/driver notes.
     """
     state = db.get_user_state(user_id)
     if not state or not state.get("data"):
         await message.reply_text("❌ Phase 1 data not found. Please start over with /start")
         return ConversationHandler.END
     state_data = state["data"].copy()
+
+    has_issuer = _has_special_request(state_data.get("special_request_issuers"))
+    has_driver = _has_special_request(state_data.get("special_request_drivers"))
+
+    if has_issuer and has_driver:
+        # AI already filled both notes — go straight to dispatch.
+        db.set_user_state(user_id, "special_request_drivers", state_data)
+        return await _finalize_lead_after_notes(message, context, user_id, state_data)
+
+    if has_issuer:
+        # Only driver note still missing.
+        db.set_user_state(user_id, "special_request_drivers", state_data)
+        await message.reply_text(
+            "📝 Would you like to say any Special Requests to the delivery drivers? (optional)"
+        )
+        return STATE_SPECIAL_REQUEST_DRIVERS
+
     db.set_user_state(user_id, "special_request_issuers", state_data)
     await message.reply_text(PHASE2_ISSUERS_PROMPT)
     return STATE_SPECIAL_REQUEST_ISSUERS
@@ -3769,6 +3781,9 @@ async def handle_special_request_issuers(update: Update, context: ContextTypes.D
     skip_tokens = frozenset(("-", "—", "–", "none", "n/a", "na"))
     issuers_note = "" if not raw or raw.lower() in skip_tokens else raw
     state_data["special_request_issuers"] = issuers_note
+    if _has_special_request(state_data.get("special_request_drivers")):
+        db.set_user_state(user_id, "special_request_drivers", state_data)
+        return await _finalize_lead_after_notes(update.message, context, user_id, state_data)
     db.set_user_state(user_id, "special_request_drivers", state_data)
     await update.message.reply_text(
         "📝 Would you like to say any Special Requests to the delivery drivers? (optional)"
@@ -3779,7 +3794,6 @@ async def handle_special_request_issuers(update: Update, context: ContextTypes.D
 async def handle_special_request_drivers(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """After issuer + driver notes: encrypt phone and continue to group/driver selection."""
     user_id = update.effective_user.id
-    username = update.effective_user.username or "Unknown"
     state = db.get_user_state(user_id)
     if not state or not state.get("data"):
         await update.message.reply_text("❌ Error: Phase 1 data not found. Please start over with /start")
@@ -3793,14 +3807,43 @@ async def handle_special_request_drivers(update: Update, context: ContextTypes.D
             parse_mode="Markdown",
         )
         return STATE_PHASE2
-    phone_number = state_data.pop("pending_phone_number", None)
-    price = state_data.pop("pending_price", None)
 
     raw_d = (update.message.text or "").strip()
     skip_tokens = frozenset(("-", "—", "–", "none", "n/a", "na"))
     drivers_note = "" if not raw_d or raw_d.lower() in skip_tokens else raw_d
     state_data["special_request_drivers"] = drivers_note
+    return await _finalize_lead_after_notes(update.message, context, user_id, state_data)
+
+
+async def _finalize_lead_after_notes(
+    message,
+    context: ContextTypes.DEFAULT_TYPE,
+    user_id: int,
+    state_data: dict,
+) -> int:
+    """Encrypt phone, persist lead, post group approval, and continue dispatch.
+
+    Reusable so notes flows can skip prompts when the AI already extracted them.
+    """
+    msg_user = getattr(message, "from_user", None) if message else None
+    username = (
+        (state_data.get("username") if state_data.get("username") not in (None, "", "Unknown") else None)
+        or (msg_user.username if msg_user and msg_user.username else None)
+        or "Unknown"
+    )
+
+    if not _phase1_has_phone_and_price(state_data):
+        db.set_user_state(user_id, "phase1", state_data)
+        await message.reply_text(
+            "📞💲 **Phone number and price are required.**\n\n" + PHASE2_INTRO_MESSAGE,
+            parse_mode="Markdown",
+        )
+        return STATE_PHASE2
+
+    phone_number = state_data.pop("pending_phone_number", None)
+    price = state_data.pop("pending_price", None)
     issuers_note = (state_data.get("special_request_issuers") or "").strip()
+    drivers_note = (state_data.get("special_request_drivers") or "").strip()
 
     encrypted_data = await asyncio.to_thread(ots.encrypt_phone, phone_number)
     if not encrypted_data:
@@ -3809,7 +3852,7 @@ async def handle_special_request_drivers(update: Update, context: ContextTypes.D
         db.set_user_state(user_id, "special_request_drivers", state_data)
         reason = (getattr(ots, "last_error", "") or "").strip()
         if reason:
-            await update.message.reply_text(
+            await message.reply_text(
                 "❌ Error encrypting phone number.\n\n"
                 f"Reason: {reason}\n\n"
                 "If this keeps happening, the `clientsphonenumber` service is usually missing env vars "
@@ -3819,7 +3862,7 @@ async def handle_special_request_drivers(update: Update, context: ContextTypes.D
                 parse_mode="Markdown",
             )
         else:
-            await update.message.reply_text(
+            await message.reply_text(
                 "❌ Error encrypting phone number. Please try again.\n\n"
                 "Send your reply again (or **-** for none).",
                 parse_mode="Markdown",
@@ -3839,7 +3882,7 @@ async def handle_special_request_drivers(update: Update, context: ContextTypes.D
     groups = db.get_all_groups()
     active_groups = [g for g in groups if record_is_active(g)]
     if not active_groups:
-        await update.message.reply_text("❌ Error: No active groups configured. Please contact admin.")
+        await message.reply_text("❌ Error: No active groups configured. Please contact admin.")
         return ConversationHandler.END
 
     assistants_choose_group = (db.get_setting("assistants_choose_group") or "").lower() in ("true", "1", "yes")
@@ -3847,14 +3890,14 @@ async def handle_special_request_drivers(update: Update, context: ContextTypes.D
     if assistants_choose_group:
         db.set_user_state(user_id, "select_group", state_data)
         group_keyboard = _build_group_keyboard(active_groups, include_all=True)
-        await update.message.reply_text(
+        await message.reply_text(
             "✅ Ready.\n\n**Select which group to send this lead to:**",
             parse_mode="Markdown",
             reply_markup=group_keyboard,
         )
         return STATE_SELECT_GROUP
 
-    user_telegram_id = str(update.effective_user.id)
+    user_telegram_id = str(user_id)
     assistant_group = db.get_group_by_assistant_telegram_id(user_telegram_id)
     if assistant_group and record_is_active(assistant_group):
         selected_group = assistant_group
@@ -3883,7 +3926,7 @@ async def handle_special_request_drivers(update: Update, context: ContextTypes.D
     phase1_data.get("extra_info", "-"),
 ])
     attached_for_dispatch = await _finalize_phase1_media_for_dispatch(
-        context, update.effective_chat.id if update.effective_chat else None
+        context, getattr(message, "chat_id", None)
     )
     if not attached_for_dispatch:
         attached_for_dispatch = state_data.get("attached_files") or []
@@ -3909,7 +3952,7 @@ async def handle_special_request_drivers(update: Update, context: ContextTypes.D
     }
     lead = db.create_lead(final_lead_data)
     if not lead:
-        await update.message.reply_text("❌ Error saving lead to database.")
+        await message.reply_text("❌ Error saving lead to database.")
         return ConversationHandler.END
 
     reference_id = lead.get("reference_id", "N/A")
@@ -3930,7 +3973,7 @@ async def handle_special_request_drivers(update: Update, context: ContextTypes.D
     context.user_data.pop("phase1_pending_media", None)
     context.user_data.pop("phase1_attached_files", None)
     ref_h = html.escape(str(reference_id), quote=False)
-    await update.message.reply_text(
+    await message.reply_text(
         "✅ Lead saved.\n\n"
         f"📋 Reference ID: <code>{ref_h}</code>\n"
         f"Approval sent to <b>{html.escape(selected_group.get('group_name') or 'group', quote=False)}</b>.\n\n"
@@ -3939,7 +3982,7 @@ async def handle_special_request_drivers(update: Update, context: ContextTypes.D
         parse_mode="HTML",
     )
     await _maybe_offer_insurance_card(
-        context, update.message, lead_id=str(lead["id"]), reference_id=str(reference_id),
+        context, message, lead_id=str(lead["id"]), reference_id=str(reference_id),
     )
     return ConversationHandler.END
 

@@ -381,30 +381,70 @@ def extract_structured_from_pdf(pdf_bytes: bytes) -> Optional[str]:
     return extract_structured_from_image(png, mime_type="image/png")
 
 
-# Vision prompt used to locate phone numbers for redaction.
-# Returns coordinates as percentages of image dimensions so we can apply boxes
-# without needing to know the image size on the model side.
+# Vision prompt used to locate phone numbers for redaction. The model sees a
+# normalized 1024-px-wide rendering so percentages map cleanly back to pixels.
 PHONE_REDACTION_PROMPT = (
-    "You are a privacy filter. Look at the image and find every region that "
-    "contains a complete phone number — US or international, in any format. "
-    "Examples include `+1 (732) 534-2659`, `732-534-2659`, `732.534.2659`, "
-    "`+44 7712 345 678`, `(732) 534 2659`. Be generous: include the entire run "
-    "of digits, separators, parentheses, country code, and surrounding labels "
-    "such as 'Phone:' or 'Tel:'.\n\n"
-    "Respond with ONLY a JSON object of the form:\n"
-    "{\"boxes\": [{\"x1\": <float 0-100>, \"y1\": <float 0-100>, "
-    "\"x2\": <float 0-100>, \"y2\": <float 0-100>}, ...]}\n\n"
-    "Coordinates are percentages (0-100) of image width and height. "
-    "Add ~1-2% padding around each phone-number region. "
-    "If there are no phone numbers, return {\"boxes\": []}. "
-    "Do not include any other keys, prose, code fences, or commentary."
+    "You are a privacy filter. Find EVERY phone number visible in the image — "
+    "US or international — and return tight bounding boxes that cover the "
+    "ENTIRE phone-number text plus any leading label such as 'Phone:', 'Tel:', "
+    "'Cell:', 'Mobile:'.\n\n"
+    "What counts as a phone number:\n"
+    "- 10-digit US numbers with any separators: `(732) 534-2659`, "
+    "`732-534-2659`, `732.534.2659`, `732 534 2659`, `7325342659`\n"
+    "- With country code: `+1 (732) 534-2659`, `+1 732 534 2659`, `+17325342659`\n"
+    "- International forms: `+44 7712 345 678`, `+49 30 1234567`, etc.\n"
+    "- Numbers split with spaces across boxes — still cover them as one row.\n\n"
+    "Respond with ONLY a JSON object of this exact shape:\n"
+    '{"boxes": [{"x1": <float 0-100>, "y1": <float 0-100>, '
+    '"x2": <float 0-100>, "y2": <float 0-100>, "phone": <string>}, ...]}\n\n'
+    "Rules for coordinates:\n"
+    "- Percentages of image width (x) and height (y), 0–100.\n"
+    "- The box must FULLY enclose every digit, separator and label character.\n"
+    "- Add ~3% horizontal padding and ~5% vertical padding on each side.\n"
+    "- If a single phone number wraps across two visible lines, return TWO boxes.\n"
+    "- Cover even partially visible phone numbers.\n"
+    'If there are no phone numbers, return {"boxes": []}. '
+    "Never include code fences, prose, or extra keys."
 )
+
+
+PHONE_REDACTION_RENDER_WIDTH = 1024
 
 
 @dataclass
 class _PhoneRedactionResponse:
     boxes: list[tuple[float, float, float, float]]
     api_ok: bool  # True iff the model call completed and we parsed valid JSON
+
+
+def _normalize_image_for_redaction(image_bytes: bytes) -> tuple[bytes, str]:
+    """Down-scale to ``PHONE_REDACTION_RENDER_WIDTH`` and emit as JPEG.
+
+    The model sees a stable coordinate space, so percentage boxes round-trip
+    cleanly when we paint over the original image.
+    """
+    try:
+        from PIL import Image
+    except Exception:
+        return image_bytes, "image/jpeg"
+    import io as _io
+
+    try:
+        img = Image.open(_io.BytesIO(image_bytes))
+        img.load()
+        if img.mode not in ("RGB",):
+            img = img.convert("RGB")
+        w, h = img.size
+        if w > PHONE_REDACTION_RENDER_WIDTH:
+            scale = PHONE_REDACTION_RENDER_WIDTH / float(w)
+            new_h = max(1, int(round(h * scale)))
+            img = img.resize((PHONE_REDACTION_RENDER_WIDTH, new_h), Image.LANCZOS)
+        out = _io.BytesIO()
+        img.save(out, format="JPEG", quality=88)
+        return out.getvalue(), "image/jpeg"
+    except Exception as e:
+        logger.warning("normalize image for redaction failed: %s", e)
+        return image_bytes, "image/jpeg"
 
 
 def _phone_redaction_boxes(
@@ -427,11 +467,9 @@ def _phone_redaction_boxes(
     if not api_key:
         return empty_fail
 
-    mt = (mime_type or "image/jpeg").strip()
-    if not mt.startswith("image/"):
-        mt = "image/jpeg"
-    b64 = base64.standard_b64encode(image_bytes).decode("ascii")
-    data_url = f"data:{mt};base64,{b64}"
+    norm_bytes, norm_mime = _normalize_image_for_redaction(image_bytes)
+    b64 = base64.standard_b64encode(norm_bytes).decode("ascii")
+    data_url = f"data:{norm_mime};base64,{b64}"
 
     try:
         from openai import OpenAI
@@ -449,7 +487,7 @@ def _phone_redaction_boxes(
                     ],
                 }
             ],
-            max_tokens=500,
+            max_tokens=600,
         )
         raw = (response.choices[0].message.content or "").strip()
     except Exception as e:
@@ -475,12 +513,14 @@ def _phone_redaction_boxes(
         # Clamp + normalize ordering so x1<x2, y1<y2.
         x1c, x2c = max(0.0, min(100.0, min(x1, x2))), max(0.0, min(100.0, max(x1, x2)))
         y1c, y2c = max(0.0, min(100.0, min(y1, y2))), max(0.0, min(100.0, max(y1, y2)))
-        # Pad a bit so the bar fully covers digits ascenders/descenders.
-        pad = 1.0
-        x1c = max(0.0, x1c - pad)
-        y1c = max(0.0, y1c - pad)
-        x2c = min(100.0, x2c + pad)
-        y2c = min(100.0, y2c + pad)
+        # Aggressive padding — the model consistently under-shoots, and the
+        # whole point of this pass is to guarantee phone numbers are unreadable.
+        pad_x = 3.0
+        pad_y = 5.0
+        x1c = max(0.0, x1c - pad_x)
+        y1c = max(0.0, y1c - pad_y)
+        x2c = min(100.0, x2c + pad_x)
+        y2c = min(100.0, y2c + pad_y)
         if x2c - x1c < 0.5 or y2c - y1c < 0.5:
             continue
         out.append((x1c, y1c, x2c, y2c))
@@ -506,15 +546,20 @@ def redact_phones_in_image_bytes(
     image_bytes: bytes,
     mime_type: str = "image/jpeg",
 ) -> PhoneRedactionResult:
-    """Paint solid black rectangles over phone numbers detected by OpenAI Vision.
+    """Cover phone numbers detected by OpenAI Vision with heavy blur + solid bar.
 
-    Falls back gracefully when Pillow is unavailable — the original bytes are
-    returned with ``api_ok=False`` so the caller can decide whether to upload.
+    Two-layer redaction so minor box drift still obscures the digits:
+
+    1. Strong Gaussian blur over the bounding region (kills sub-pixel digit shape).
+    2. Solid black rectangle slightly inside that region (visual confirmation +
+       guarantee even if blur is partly outside the digit row).
+
+    Falls back gracefully when Pillow is unavailable.
     """
     if not image_bytes:
         return PhoneRedactionResult(image_bytes or b"", False, False)
     try:
-        from PIL import Image, ImageDraw
+        from PIL import Image, ImageDraw, ImageFilter
     except Exception as e:
         logger.warning("Pillow not available; cannot redact image: %s", e)
         return PhoneRedactionResult(image_bytes, False, False)
@@ -532,15 +577,30 @@ def redact_phones_in_image_bytes(
         img.load()
         if img.mode not in ("RGB", "RGBA"):
             img = img.convert("RGB")
-        draw = ImageDraw.Draw(img)
         w, h = img.size
+        # Blur kernel scales with the image so it stays visually heavy at any
+        # resolution. ~3.5% of the shorter side is enough to flatten any 12-pt
+        # phone-number glyph.
+        blur_radius = max(8.0, min(w, h) * 0.035)
+        draw = ImageDraw.Draw(img)
         for x1p, y1p, x2p, y2p in resp.boxes:
-            x1 = int(round(x1p / 100.0 * w))
-            y1 = int(round(y1p / 100.0 * h))
-            x2 = int(round(x2p / 100.0 * w))
-            y2 = int(round(y2p / 100.0 * h))
+            x1 = max(0, int(round(x1p / 100.0 * w)))
+            y1 = max(0, int(round(y1p / 100.0 * h)))
+            x2 = min(w, int(round(x2p / 100.0 * w)))
+            y2 = min(h, int(round(y2p / 100.0 * h)))
             if x2 <= x1 or y2 <= y1:
                 continue
+            # Expand for extra safety margin in pixel space.
+            margin_x = int(round((x2 - x1) * 0.08))
+            margin_y = int(round((y2 - y1) * 0.20))
+            bx1 = max(0, x1 - margin_x)
+            by1 = max(0, y1 - margin_y)
+            bx2 = min(w, x2 + margin_x)
+            by2 = min(h, y2 + margin_y)
+            region = img.crop((bx1, by1, bx2, by2))
+            region = region.filter(ImageFilter.GaussianBlur(radius=blur_radius))
+            img.paste(region, (bx1, by1))
+            # Solid black bar on the inner area covers the actual text region.
             draw.rectangle([x1, y1, x2, y2], fill=(0, 0, 0))
         out = _io.BytesIO()
         save_format = "PNG"
