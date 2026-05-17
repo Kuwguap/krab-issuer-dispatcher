@@ -381,34 +381,142 @@ def extract_structured_from_pdf(pdf_bytes: bytes) -> Optional[str]:
     return extract_structured_from_image(png, mime_type="image/png")
 
 
-# Vision prompt used to locate phone numbers for redaction. The model sees a
-# normalized 1024-px-wide rendering so percentages map cleanly back to pixels.
-PHONE_REDACTION_PROMPT = (
-    "You are a privacy filter. Find EVERY phone number visible in the image — "
-    "US or international — and return tight bounding boxes that cover the "
-    "ENTIRE phone-number text plus any leading label such as 'Phone:', 'Tel:', "
-    "'Cell:', 'Mobile:'.\n\n"
-    "What counts as a phone number:\n"
-    "- 10-digit US numbers with any separators: `(732) 534-2659`, "
-    "`732-534-2659`, `732.534.2659`, `732 534 2659`, `7325342659`\n"
-    "- With country code: `+1 (732) 534-2659`, `+1 732 534 2659`, `+17325342659`\n"
-    "- International forms: `+44 7712 345 678`, `+49 30 1234567`, etc.\n"
-    "- Numbers split with spaces across boxes — still cover them as one row.\n\n"
-    "Respond with ONLY a JSON object of this exact shape:\n"
-    '{"boxes": [{"x1": <float 0-100>, "y1": <float 0-100>, '
-    '"x2": <float 0-100>, "y2": <float 0-100>, "phone": <string>}, ...]}\n\n'
-    "Rules for coordinates:\n"
-    "- Percentages of image width (x) and height (y), 0–100.\n"
-    "- The box must FULLY enclose every digit, separator and label character.\n"
-    "- Add ~3% horizontal padding and ~5% vertical padding on each side.\n"
-    "- If a single phone number wraps across two visible lines, return TWO boxes.\n"
-    "- Cover even partially visible phone numbers.\n"
-    'If there are no phone numbers, return {"boxes": []}. '
-    "Never include code fences, prose, or extra keys."
-)
+# The model sees a normalized large-format rendering so percentage boxes round-trip
+# cleanly when we paint over the original image. Larger render = more accurate digit
+# localisation, especially for small print in screenshots / scans.
+PHONE_REDACTION_RENDER_WIDTH = 1600
 
 
-PHONE_REDACTION_RENDER_WIDTH = 1024
+def _build_phone_redaction_prompt(target_phones: list[str]) -> str:
+    """Compose the AI prompt; if we already extracted the lead phone, anchor on it.
+
+    The model is dramatically better at locating *specific* text it has been
+    told to look for than at applying a generic phone-shaped pattern, which is
+    the main source of false positives we've been hitting.
+    """
+    if target_phones:
+        targets_block = "\n".join(f"- {p}" for p in target_phones)
+        return (
+            "You are a privacy filter. Find the bounding boxes of ALL phone "
+            "numbers visible in the image. The lead's phone number is one of "
+            "these formats — locate it FIRST, then look for any other "
+            "phone numbers in the image:\n"
+            f"{targets_block}\n\n"
+            "Also redact any other clearly-formatted phone numbers (10-digit "
+            "US, +1 international, +44, etc.) but DO NOT redact text that is "
+            "not a phone number (e.g. ZIP codes, VINs, policy numbers, "
+            "license plate numbers, prices, dates, addresses).\n\n"
+            "Return ONLY a JSON object of this exact shape:\n"
+            '{"boxes": [{"x1": <float 0-100>, "y1": <float 0-100>, '
+            '"x2": <float 0-100>, "y2": <float 0-100>, "text": <string of '
+            'what is inside the box>, "is_phone": true}, ...]}\n\n'
+            "Rules:\n"
+            "- Percentages of image width (x) and height (y), 0–100.\n"
+            "- Each box must tightly enclose ONLY the phone-number digits and "
+            "any embedded separators / spaces / parentheses / + sign.\n"
+            "- A box must NEVER be wider than 60% of the image or taller than "
+            "20% of the image — phone numbers are short text.\n"
+            "- 'text' MUST contain ONLY the visible characters of that phone "
+            "number — at least 7 digits. If text has fewer than 7 digits, "
+            "DO NOT include the box at all.\n"
+            "- If a phone wraps across two visible lines, return TWO boxes.\n"
+            "- ZIP codes (5 digits), policy/VIN/license numbers, account "
+            "numbers, dollar amounts, dates, and times are NOT phone numbers "
+            "— do not include them.\n"
+            'If no phone numbers are visible, return {"boxes": []}. '
+            "Never include code fences, prose, or extra keys."
+        )
+    return (
+        "You are a privacy filter. Find the bounding boxes of all clearly-"
+        "formatted phone numbers visible in the image (10-digit US, +1 "
+        "international, +44, etc.). DO NOT redact ZIP codes, VINs, policy "
+        "numbers, license plate numbers, prices, dates, or addresses.\n\n"
+        "Return ONLY a JSON object of this exact shape:\n"
+        '{"boxes": [{"x1": <float 0-100>, "y1": <float 0-100>, '
+        '"x2": <float 0-100>, "y2": <float 0-100>, "text": <string of what '
+        'is inside the box>, "is_phone": true}, ...]}\n\n'
+        "Rules:\n"
+        "- Percentages of image width (x) and height (y), 0–100.\n"
+        "- Each box must tightly enclose ONLY the phone-number digits and "
+        "any embedded separators / spaces / parentheses / + sign.\n"
+        "- A box must NEVER be wider than 60% of the image or taller than "
+        "20% of the image.\n"
+        "- 'text' MUST contain ONLY the visible characters of that phone "
+        "number — at least 7 digits. Skip boxes whose text has fewer "
+        "than 7 digits.\n"
+        'If no phone numbers are visible, return {"boxes": []}. '
+        "Never include code fences, prose, or extra keys."
+    )
+
+
+_PHONE_DIGIT_RE = re.compile(r"\d")
+
+
+def _phone_text_looks_real(text: str) -> bool:
+    """Sanity-check the model's claim that a returned box covers a phone number.
+
+    Filters out boxes whose ``text`` is obviously not a phone (e.g. just a
+    label, an empty string, an address line) — the #1 source of false
+    positives.
+    """
+    if not text:
+        return False
+    s = str(text).strip()
+    if not s:
+        return False
+    digits = "".join(_PHONE_DIGIT_RE.findall(s))
+    # Real phones have 7+ digits; ZIPs/policy/VIN should be filtered separately
+    # but a 5-digit number alone is almost always a ZIP.
+    if len(digits) < 7:
+        return False
+    if len(digits) > 16:
+        return False
+    # Reject obviously non-phone patterns like long alphanumeric VIN strings.
+    if re.fullmatch(r"[A-Za-z0-9]{17}", s.replace(" ", "")):
+        return False
+    return True
+
+
+def _phone_variants(phone: str) -> list[str]:
+    """Yield common visible spellings of a single E.164-ish phone number.
+
+    Used to anchor the AI prompt on the exact value extracted from the lead so
+    the model doesn't have to guess what "the" phone number looks like.
+    """
+    if not phone:
+        return []
+    digits = "".join(c for c in str(phone) if c.isdigit())
+    if not digits:
+        return []
+    # Always preserve full international form first; many forms have +1 prefix.
+    seen: list[str] = []
+
+    def _add(v: str) -> None:
+        v = v.strip()
+        if v and v not in seen:
+            seen.append(v)
+
+    if len(digits) == 11 and digits.startswith("1"):
+        d10 = digits[1:]
+        _add(f"+1 {d10[0:3]} {d10[3:6]} {d10[6:10]}")
+        _add(f"+1 ({d10[0:3]}) {d10[3:6]}-{d10[6:10]}")
+        _add(f"+1{d10}")
+        _add(f"1-{d10[0:3]}-{d10[3:6]}-{d10[6:10]}")
+        _add(f"({d10[0:3]}) {d10[3:6]}-{d10[6:10]}")
+        _add(f"{d10[0:3]}-{d10[3:6]}-{d10[6:10]}")
+        _add(f"{d10[0:3]}.{d10[3:6]}.{d10[6:10]}")
+        _add(f"{d10[0:3]} {d10[3:6]} {d10[6:10]}")
+        _add(d10)
+    elif len(digits) == 10:
+        _add(f"({digits[0:3]}) {digits[3:6]}-{digits[6:10]}")
+        _add(f"{digits[0:3]}-{digits[3:6]}-{digits[6:10]}")
+        _add(f"{digits[0:3]}.{digits[3:6]}.{digits[6:10]}")
+        _add(f"{digits[0:3]} {digits[3:6]} {digits[6:10]}")
+        _add(digits)
+    else:
+        _add(str(phone))
+        _add(digits)
+    return seen
 
 
 @dataclass
@@ -418,11 +526,7 @@ class _PhoneRedactionResponse:
 
 
 def _normalize_image_for_redaction(image_bytes: bytes) -> tuple[bytes, str]:
-    """Down-scale to ``PHONE_REDACTION_RENDER_WIDTH`` and emit as JPEG.
-
-    The model sees a stable coordinate space, so percentage boxes round-trip
-    cleanly when we paint over the original image.
-    """
+    """Down-scale to ``PHONE_REDACTION_RENDER_WIDTH`` and emit as JPEG."""
     try:
         from PIL import Image
     except Exception:
@@ -440,7 +544,7 @@ def _normalize_image_for_redaction(image_bytes: bytes) -> tuple[bytes, str]:
             new_h = max(1, int(round(h * scale)))
             img = img.resize((PHONE_REDACTION_RENDER_WIDTH, new_h), Image.LANCZOS)
         out = _io.BytesIO()
-        img.save(out, format="JPEG", quality=88)
+        img.save(out, format="JPEG", quality=92)
         return out.getvalue(), "image/jpeg"
     except Exception as e:
         logger.warning("normalize image for redaction failed: %s", e)
@@ -448,13 +552,15 @@ def _normalize_image_for_redaction(image_bytes: bytes) -> tuple[bytes, str]:
 
 
 def _phone_redaction_boxes(
-    image_bytes: bytes, mime_type: str = "image/jpeg"
+    image_bytes: bytes,
+    mime_type: str = "image/jpeg",
+    known_phone: Optional[str] = None,
 ) -> _PhoneRedactionResponse:
-    """Ask OpenAI Vision for bounding boxes (as percentages) of visible phone numbers.
+    """Ask OpenAI Vision for bounding boxes of visible phone numbers.
 
-    Distinguishes "no phone numbers in image" (api_ok=True, boxes=[]) from
-    "API/parse failed" (api_ok=False) so the caller can choose between
-    forwarding the original and refusing to upload it.
+    When ``known_phone`` is supplied the prompt is anchored on that exact
+    number, which dramatically reduces both false positives ("This is a ZIP /
+    policy number / address") and false negatives ("there is no phone here").
     """
     from config import Config
 
@@ -471,6 +577,9 @@ def _phone_redaction_boxes(
     b64 = base64.standard_b64encode(norm_bytes).decode("ascii")
     data_url = f"data:{norm_mime};base64,{b64}"
 
+    target_phones = _phone_variants(known_phone or "")
+    prompt = _build_phone_redaction_prompt(target_phones)
+
     try:
         from openai import OpenAI
 
@@ -482,12 +591,16 @@ def _phone_redaction_boxes(
                 {
                     "role": "user",
                     "content": [
-                        {"type": "text", "text": PHONE_REDACTION_PROMPT},
-                        {"type": "image_url", "image_url": {"url": data_url}},
+                        {"type": "text", "text": prompt},
+                        {
+                            "type": "image_url",
+                            "image_url": {"url": data_url, "detail": "high"},
+                        },
                     ],
                 }
             ],
             max_tokens=600,
+            temperature=0.0,
         )
         raw = (response.choices[0].message.content or "").strip()
     except Exception as e:
@@ -503,6 +616,8 @@ def _phone_redaction_boxes(
 
     out: list[tuple[float, float, float, float]] = []
     for entry in raw_boxes:
+        if not isinstance(entry, dict):
+            continue
         try:
             x1 = float(entry.get("x1"))
             y1 = float(entry.get("y1"))
@@ -510,19 +625,37 @@ def _phone_redaction_boxes(
             y2 = float(entry.get("y2"))
         except (TypeError, ValueError, AttributeError):
             continue
+        # Drop boxes the model itself flagged as non-phone.
+        if entry.get("is_phone") is False:
+            continue
+        # Strict text sanity-check: kills the worst false positives where the
+        # model returns a giant box around an address or ZIP and labels it a phone.
+        text_val = entry.get("text") or entry.get("phone") or ""
+        if not _phone_text_looks_real(text_val):
+            continue
         # Clamp + normalize ordering so x1<x2, y1<y2.
         x1c, x2c = max(0.0, min(100.0, min(x1, x2))), max(0.0, min(100.0, max(x1, x2)))
         y1c, y2c = max(0.0, min(100.0, min(y1, y2))), max(0.0, min(100.0, max(y1, y2)))
-        # Aggressive padding — the model consistently under-shoots, and the
-        # whole point of this pass is to guarantee phone numbers are unreadable.
-        pad_x = 3.0
-        pad_y = 5.0
+        width = x2c - x1c
+        height = y2c - y1c
+        if width < 0.5 or height < 0.5:
+            continue
+        # Reject obviously oversized boxes — phone numbers are short text.
+        if width > 70.0 or height > 25.0:
+            logger.info("dropping oversized phone box %.1fx%.1f (text=%r)", width, height, text_val)
+            continue
+        # Reject boxes that cover most of the image (clear hallucinations).
+        if width * height > 1500.0:  # > 15% of total area
+            logger.info("dropping huge-area phone box (text=%r)", text_val)
+            continue
+        # Aggressive padding so blur covers all digit edges, but only on the
+        # vetted small boxes — won't make false positives any worse.
+        pad_x = 2.0
+        pad_y = 3.0
         x1c = max(0.0, x1c - pad_x)
         y1c = max(0.0, y1c - pad_y)
         x2c = min(100.0, x2c + pad_x)
         y2c = min(100.0, y2c + pad_y)
-        if x2c - x1c < 0.5 or y2c - y1c < 0.5:
-            continue
         out.append((x1c, y1c, x2c, y2c))
     return _PhoneRedactionResponse(out, True)
 
@@ -545,16 +678,13 @@ class PhoneRedactionResult:
 def redact_phones_in_image_bytes(
     image_bytes: bytes,
     mime_type: str = "image/jpeg",
+    known_phone: Optional[str] = None,
 ) -> PhoneRedactionResult:
     """Cover phone numbers detected by OpenAI Vision with heavy blur + solid bar.
 
-    Two-layer redaction so minor box drift still obscures the digits:
-
-    1. Strong Gaussian blur over the bounding region (kills sub-pixel digit shape).
-    2. Solid black rectangle slightly inside that region (visual confirmation +
-       guarantee even if blur is partly outside the digit row).
-
-    Falls back gracefully when Pillow is unavailable.
+    Pass ``known_phone`` (the lead's extracted phone number, any format) to
+    anchor the detector on a specific target — that lowers both false
+    positives and missed redactions versus a generic "find any phone" prompt.
     """
     if not image_bytes:
         return PhoneRedactionResult(image_bytes or b"", False, False)
@@ -564,7 +694,9 @@ def redact_phones_in_image_bytes(
         logger.warning("Pillow not available; cannot redact image: %s", e)
         return PhoneRedactionResult(image_bytes, False, False)
 
-    resp = _phone_redaction_boxes(image_bytes, mime_type=mime_type)
+    resp = _phone_redaction_boxes(
+        image_bytes, mime_type=mime_type, known_phone=known_phone
+    )
     if not resp.api_ok:
         return PhoneRedactionResult(image_bytes, False, False)
     if not resp.boxes:
@@ -579,9 +711,9 @@ def redact_phones_in_image_bytes(
             img = img.convert("RGB")
         w, h = img.size
         # Blur kernel scales with the image so it stays visually heavy at any
-        # resolution. ~3.5% of the shorter side is enough to flatten any 12-pt
-        # phone-number glyph.
-        blur_radius = max(8.0, min(w, h) * 0.035)
+        # resolution. ~4% of the shorter side is enough to flatten any phone-
+        # number glyph.
+        blur_radius = max(10.0, min(w, h) * 0.04)
         draw = ImageDraw.Draw(img)
         for x1p, y1p, x2p, y2p in resp.boxes:
             x1 = max(0, int(round(x1p / 100.0 * w)))
@@ -590,9 +722,9 @@ def redact_phones_in_image_bytes(
             y2 = min(h, int(round(y2p / 100.0 * h)))
             if x2 <= x1 or y2 <= y1:
                 continue
-            # Expand for extra safety margin in pixel space.
-            margin_x = int(round((x2 - x1) * 0.08))
-            margin_y = int(round((y2 - y1) * 0.20))
+            # Small pixel-space margin so even sub-pixel box drift is covered.
+            margin_x = max(2, int(round((x2 - x1) * 0.06)))
+            margin_y = max(2, int(round((y2 - y1) * 0.15)))
             bx1 = max(0, x1 - margin_x)
             by1 = max(0, y1 - margin_y)
             bx2 = min(w, x2 + margin_x)
@@ -600,7 +732,8 @@ def redact_phones_in_image_bytes(
             region = img.crop((bx1, by1, bx2, by2))
             region = region.filter(ImageFilter.GaussianBlur(radius=blur_radius))
             img.paste(region, (bx1, by1))
-            # Solid black bar on the inner area covers the actual text region.
+            # Solid black bar on the inner area covers the actual digits even
+            # if blur strength was insufficient for the digit size.
             draw.rectangle([x1, y1, x2, y2], fill=(0, 0, 0))
         out = _io.BytesIO()
         save_format = "PNG"

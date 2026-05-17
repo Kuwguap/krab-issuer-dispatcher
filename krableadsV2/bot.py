@@ -422,15 +422,17 @@ def _build_group_keyboard(groups: list, include_all: bool = True) -> InlineKeybo
 async def _finalize_phase1_media_for_dispatch(
     context: ContextTypes.DEFAULT_TYPE,
     issuer_chat_id: int | str | None,
+    known_phone: str | None = None,
 ) -> list[dict]:
-    """Redact phone numbers in any Phase 1 vision media, upload the censored
-    copies back to the issuer's own chat, and return file_id descriptors usable
-    by ``_forward_phase1_attached_files_to_targets`` after a group accepts.
+    """Redact phone numbers in any Phase 1 vision media, capture a stable
+    ``file_id`` via a silent upload (immediately deleted from the issuer's
+    chat), and return descriptors usable by
+    ``_forward_phase1_attached_files_to_targets`` after a group accepts.
 
-    Idempotent: if media was already finalized for this lead the cached list is
-    returned. Sending happens to the issuer's own chat so the issuer sees the
-    exact censored copy that will reach the team — and so we get a stable
-    ``file_id`` that survives bot restarts (Telegram caches it server-side).
+    Idempotent: if media was already finalized for this lead the cached list
+    is returned. ``known_phone`` (when supplied) anchors the AI detector on
+    the exact phone we extracted from the lead, sharply reducing false
+    positives compared to a generic phone-shape pattern.
     """
     if not context.user_data:
         return []
@@ -469,7 +471,10 @@ async def _finalize_phase1_media_for_dispatch(
                 continue
             try:
                 result = await asyncio.to_thread(
-                    ai_vision.redact_phones_in_image_bytes, img_bytes, mime
+                    ai_vision.redact_phones_in_image_bytes,
+                    img_bytes,
+                    mime,
+                    known_phone,
                 )
             except Exception as e:
                 logger.warning("Phone redaction call failed: %s", e)
@@ -484,10 +489,22 @@ async def _finalize_phase1_media_for_dispatch(
 
             filename = "censored.jpg" if mime in ("image/jpeg", "image/jpg") else "censored.png"
             input_file = InputFile(io.BytesIO(result.image_bytes), filename=filename)
+            # Upload to grab a stable file_id, then immediately delete the
+            # message so the issuer never sees the censored copy in their chat.
+            # Telegram retains the file server-side and the cached file_id
+            # stays valid for later forwarding to the accepting team.
             sent = await context.bot.send_photo(
                 chat_id=issuer_chat_id,
                 photo=input_file,
+                disable_notification=True,
             )
+            if sent is not None:
+                try:
+                    await context.bot.delete_message(
+                        chat_id=issuer_chat_id, message_id=sent.message_id
+                    )
+                except Exception:
+                    pass
             if sent and sent.photo:
                 attached.append({"type": "photo", "file_id": sent.photo[-1].file_id})
         except Exception as e:
@@ -3088,38 +3105,22 @@ def _has_special_request(value) -> bool:
 
 
 async def _prompt_issuer_special_request(message, context: ContextTypes.DEFAULT_TYPE, user_id: int) -> int:
-    """Bridge into the special-request flow once phone + price are known.
-
-    Mirrors how ``handle_phase2`` enters STATE_SPECIAL_REQUEST_ISSUERS, but is
-    callable from review-accept / VIN-choice paths where Phase 2 was skipped
-    because the AI extraction already filled in pending_phone/price.
-    Skips the prompts when AI has already extracted issuer/driver notes.
+    """Notes are optional and already editable from the AI review screen; never
+    re-prompt the user for them once phone + price are known. Whatever the AI
+    extracted (or didn't) flows straight through to dispatch.
     """
     state = db.get_user_state(user_id)
     if not state or not state.get("data"):
         await message.reply_text("❌ Phase 1 data not found. Please start over with /start")
         return ConversationHandler.END
     state_data = state["data"].copy()
-
-    has_issuer = _has_special_request(state_data.get("special_request_issuers"))
-    has_driver = _has_special_request(state_data.get("special_request_drivers"))
-
-    if has_issuer and has_driver:
-        # AI already filled both notes — go straight to dispatch.
-        db.set_user_state(user_id, "special_request_drivers", state_data)
-        return await _finalize_lead_after_notes(message, context, user_id, state_data)
-
-    if has_issuer:
-        # Only driver note still missing.
-        db.set_user_state(user_id, "special_request_drivers", state_data)
-        await message.reply_text(
-            "📝 Would you like to say any Special Requests to the delivery drivers? (optional)"
-        )
-        return STATE_SPECIAL_REQUEST_DRIVERS
-
-    db.set_user_state(user_id, "special_request_issuers", state_data)
-    await message.reply_text(PHASE2_ISSUERS_PROMPT)
-    return STATE_SPECIAL_REQUEST_ISSUERS
+    # Normalize note placeholders so empty values stay clean downstream.
+    for key in ("special_request_issuers", "special_request_drivers"):
+        val = state_data.get(key)
+        if val is not None and not _has_special_request(val):
+            state_data[key] = ""
+    db.set_user_state(user_id, "special_request_drivers", state_data)
+    return await _finalize_lead_after_notes(message, context, user_id, state_data)
 
 
 async def _ensure_phone_price_before_files(message, context: ContextTypes.DEFAULT_TYPE, user_id: int) -> int:
@@ -3805,9 +3806,10 @@ async def handle_phase2(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
     state_data["pending_phone_number"] = phone_number
     state_data["pending_price"] = price
     context.user_data.pop("phase2_before_files", None)
-    db.set_user_state(user_id, "special_request_issuers", state_data)
-    await msg.reply_text(PHASE2_ISSUERS_PROMPT)
-    return STATE_SPECIAL_REQUEST_ISSUERS
+    # Notes are optional and editable from the AI review screen — never block
+    # dispatch on them. Save state then jump straight into finalize/review.
+    db.set_user_state(user_id, "special_request_drivers", state_data)
+    return await _prompt_issuer_special_request(msg, context, user_id)
 
 
 async def handle_special_request_issuers(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -3976,7 +3978,9 @@ async def _finalize_lead_after_notes(
     phase1_data.get("extra_info", "-"),
 ])
     attached_for_dispatch = await _finalize_phase1_media_for_dispatch(
-        context, getattr(message, "chat_id", None)
+        context,
+        getattr(message, "chat_id", None),
+        known_phone=state_data.get("phone_number"),
     )
     if not attached_for_dispatch:
         attached_for_dispatch = state_data.get("attached_files") or []
@@ -4085,7 +4089,9 @@ async def _submit_lead_from_review(message, context, user_id, data):
     ])
 
     attached_for_dispatch = await _finalize_phase1_media_for_dispatch(
-        context, getattr(message, "chat_id", None)
+        context,
+        getattr(message, "chat_id", None),
+        known_phone=phone,
     )
     if not attached_for_dispatch:
         attached_for_dispatch = data.get("attached_files") or []
