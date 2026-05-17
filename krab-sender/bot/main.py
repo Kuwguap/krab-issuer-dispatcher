@@ -137,8 +137,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user = update.effective_user
     keyboard = InlineKeyboardMarkup([
         [
-            InlineKeyboardButton("📋TRANSACTIONS📋", callback_data="view_transactions"),
             InlineKeyboardButton("🛡️INSURANCE🛡️", callback_data="insurance_only"),
+            InlineKeyboardButton("📋TRANSACTIONS📋", callback_data="view_transactions"),
         ]
     ])
     await update.message.reply_text(
@@ -700,13 +700,29 @@ async def handle_confirmation(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """
-    Allow user to cancel the flow.
+    Cancel the bot flow and reset to a clean state.
+
+    Registered both as a ConversationHandler fallback and as a top-level
+    CommandHandler so ``/cancel`` works even when no conversation is active.
     """
     user = update.effective_user
     logger.info("User %s canceled the conversation.", user.full_name)
-    await update.message.reply_text("❌ Operation cancelled. Send a new document to start again.")
-    context.user_data.pop("pending_document", None)
-    context.user_data.pop("client_details", None)
+    # Drop any timed-out insurance reminder job before nuking user_data.
+    prev_job: Job | None = context.user_data.get("insurance_timeout_job")
+    try:
+        if prev_job:
+            prev_job.schedule_removal()
+    except Exception:
+        pass
+    # Wipe everything so the next message starts a fresh session.
+    context.user_data.clear()
+    msg = update.effective_message
+    if msg is not None:
+        await msg.reply_text(
+            "❌ Cancelled transaction — restarting new session.\n\n"
+            "Use /start to open the menu, /insurance for the insurance flow, "
+            "or /transactions to view recent transactions."
+        )
     return ConversationHandler.END
 
 
@@ -721,6 +737,20 @@ async def handle_insurance_only_button(update: Update, context: ContextTypes.DEF
         "To 📧email 🛡️insurance: type the email now\n(Otherwise ignore this message)",
         parse_mode=None,
     )
+    return State.WAITING_FOR_INSURANCE
+
+
+async def handle_insurance_only_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """``/insurance`` command — same flow as the inline 🛡️INSURANCE🛡️ button."""
+    context.user_data["insurance_only_mode"] = True
+    context.user_data["insurance_pending"] = {"recipient_name": None, "reference_id": None}
+    context.user_data["insurance_received"] = False
+    msg = update.effective_message
+    if msg is not None:
+        await msg.reply_text(
+            "To 📧email 🛡️insurance: type the email now\n(Otherwise ignore this message)",
+            parse_mode=None,
+        )
     return State.WAITING_FOR_INSURANCE
 
 
@@ -1084,6 +1114,7 @@ def build_application(config: BotConfig):
         entry_points=[
             MessageHandler(filters.Document.ALL, handle_document),
             CallbackQueryHandler(handle_insurance_only_button, pattern="^insurance_only$"),
+            CommandHandler("insurance", handle_insurance_only_command),
         ],
         states={
             State.WAITING_FOR_CLIENT_DETAILS: [
@@ -1109,6 +1140,8 @@ def build_application(config: BotConfig):
     app.add_handler(CallbackQueryHandler(handle_tx_page_callback, pattern=r"^tx_page_\d+$"))
     # Conversation handler should come before generic text handlers
     app.add_handler(conv_handler)
+    # Global /cancel (works outside conversation too — clears all state).
+    app.add_handler(CommandHandler("cancel", cancel))
     # Handler for access code input (comes after conversation handler to avoid conflicts)
     app.add_handler(
         MessageHandler(
