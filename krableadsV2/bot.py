@@ -1630,6 +1630,13 @@ def _default_phase1_review_source_label() -> str:
     return "Facebook"
 
 
+def _resolve_contact_source_label(data: dict | None) -> str:
+    """Return a persisted lead source label, defaulting to configured Facebook."""
+    raw = (data or {}).get("selected_source_label")
+    label = str(raw or "").strip()
+    return label or _default_phase1_review_source_label()
+
+
 async def _send_phase1_ai_review(target_message, state_data: dict, context, user_id) -> None:
     # Default dispatch selections on the review row (🏢 🚗 📊): all groups, all eligible drivers, Facebook.
     groups = db.get_all_groups()
@@ -4067,6 +4074,7 @@ async def _finalize_lead_after_notes(
         "special_request_note": state_data.get("special_request_issuers", "") or "",
         "email": (state_data.get("email") or "") or None,
         "driver_license_id": (state_data.get("driver_license_id") or "") or None,
+        "contact_info_source": _resolve_contact_source_label(state_data),
         "phase1_attached_files": attached_for_dispatch,
     }
     lead = db.create_lead(final_lead_data)
@@ -4240,7 +4248,7 @@ async def _submit_lead_from_review(message, context, user_id, data):
         "special_request_drivers": data.get("special_request_drivers", ""),
         "email": (data.get("email") or "") or None,
         "driver_license_id": (data.get("driver_license_id") or "") or None,
-        "contact_info_source": data.get("selected_source_label", ""),
+        "contact_info_source": _resolve_contact_source_label(data),
         "phase1_attached_files": attached_for_dispatch,
     })
     if not lead:
@@ -4412,6 +4420,7 @@ async def handle_group_selection(update: Update, context: ContextTypes.DEFAULT_T
             "special_request_note": lead_data.get("special_request_issuers", "") or "",
             "email": (lead_data.get("email") or "") or None,
             "driver_license_id": (lead_data.get("driver_license_id") or "") or None,
+            "contact_info_source": _resolve_contact_source_label(lead_data),
             "phase1_attached_files": lead_data.get("attached_files") or [],
         }
         lead = db.create_lead(final_lead_data)
@@ -4603,6 +4612,7 @@ async def handle_group_selection(update: Update, context: ContextTypes.DEFAULT_T
         "special_request_note": lead_data.get("special_request_issuers", "") or "",
         "email": (lead_data.get("email") or "") or None,
         "driver_license_id": (lead_data.get("driver_license_id") or "") or None,
+        "contact_info_source": _resolve_contact_source_label(lead_data),
         "phase1_attached_files": lead_data.get("attached_files") or [],
     }
     lead = db.create_lead(final_lead_data)
@@ -4806,6 +4816,7 @@ async def handle_driver_selection(update: Update, context: ContextTypes.DEFAULT_
         "special_request_note": lead_data.get("special_request_issuers", "") or "",
         "email": (lead_data.get("email") or "") or None,
         "driver_license_id": (lead_data.get("driver_license_id") or "") or None,
+        "contact_info_source": _resolve_contact_source_label(lead_data),
         "phase1_attached_files": lead_data.get("attached_files") or [],
     }
 
