@@ -275,14 +275,30 @@ def _driver_keyboard_lead_and_receipt() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([[_DRIVER_ADD_LEAD_BTN, _DRIVER_ADD_RECEIPT_BTN], [_DRIVER_HELP_BTN]])
 
 
-def _keyboard_lead_accept_decline(lead_id: str) -> InlineKeyboardMarkup:
-    """New-lead offer: Accept / Different Driver (decline callback)."""
-    return InlineKeyboardMarkup([
+def _keyboard_lead_accept_decline(
+    lead_id: str,
+    reference_id: str | None = None,
+) -> InlineKeyboardMarkup:
+    """New-lead offer: Accept / Different Driver, plus Upload Receipt.
+
+    The Upload Receipt button sends the driver into the same receipt-upload
+    flow used by the strike / ``/receipts`` menu (callback ``receipt_for_<ref>``).
+    It only proceeds once the driver has accepted this lead — the receipt
+    handler enforces that — so tapping it before Accept shows a friendly
+    "accept first" message.
+    """
+    rows = [
         [
             InlineKeyboardButton("✅ Accept", callback_data=f"accept_lead_{lead_id}"),
             InlineKeyboardButton("🔄 Different Driver", callback_data=f"decline_lead_{lead_id}"),
         ],
-    ])
+    ]
+    ref = (reference_id or "").strip()
+    if ref:
+        rows.append([
+            InlineKeyboardButton("🧾 Upload Receipt", callback_data=f"receipt_for_{ref}"),
+        ])
+    return InlineKeyboardMarkup(rows)
 
 
 def _keyboard_renewal_driver(short_r: str, short_d: str) -> InlineKeyboardMarkup:
@@ -1020,7 +1036,9 @@ async def _send_driver_requests_for_group(
     )
     if spec:
         driver_request_message += f"\n\n📝 Special request (driver): {_sanitize_phones_for_send(spec)}"
-    accept_keyboard = _keyboard_lead_accept_decline(str(lead["id"]))
+    accept_keyboard = _keyboard_lead_accept_decline(
+        str(lead["id"]), reference_id=str(reference_id)
+    )
     assigned_count = 0
     for driver in selected_drivers:
         cid = _parse_chat_id(driver.get("driver_telegram_id"))
@@ -5102,7 +5120,9 @@ async def _background_dispatch_lead_after_driver_pick(
             + _telegram_md1_escape(_sanitize_phones_for_send(driver_note_disp))
         )
 
-    accept_keyboard = _keyboard_lead_accept_decline(str(lead_id))
+    accept_keyboard = _keyboard_lead_accept_decline(
+        str(lead_id), reference_id=str(reference_id) if reference_id else None
+    )
 
     async def _notify_one_driver(driver: dict) -> bool:
         """Deliver offer + optional receipt strike to one driver. Returns True if primary DM sent."""
@@ -5917,7 +5937,9 @@ async def _handle_resend_to_drivers(
             return STATE_SELECT_DRIVER
 
     driver_request_message = _build_driver_resend_request_message(lead)
-    accept_keyboard = _keyboard_lead_accept_decline(str(lead_id))
+    accept_keyboard = _keyboard_lead_accept_decline(
+        str(lead_id), reference_id=str(reference_id) if reference_id else None
+    )
     assigned_count = 0
     for driver in selected_drivers:
         tid = driver.get("driver_telegram_id")
@@ -6924,7 +6946,9 @@ async def handle_receipt_for_ref_callback(update: Update, context: ContextTypes.
     driver = _driver_row_for_telegram_user(query.from_user.id)
     if not driver or not _driver_accepted_this_lead(driver["id"], lead["id"]):
         await query.message.reply_text(
-            "❌ You can only upload receipts for leads you accepted."
+            "❌ Tap **✅ Accept** on this lead first, then **🧾 Upload Receipt**.\n\n"
+            "Receipts can only be uploaded for leads you have accepted.",
+            parse_mode="Markdown",
         )
         return ConversationHandler.END
     context.user_data["receipt_lead_id"] = lead["id"]
