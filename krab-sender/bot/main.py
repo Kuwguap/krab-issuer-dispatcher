@@ -178,11 +178,15 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         file_name,
     )
 
-    await message.reply_text(
+    prompt_msg = await message.reply_text(
         "🏷PDF Complete✅ Thank you❗️\n\n"
         "👤Now TYPE notes📝 :\n\n"
         f"{_get_bot_motivational()}"
     )
+    # Remember this prompt's message id so we can delete it after the user
+    # types their notes — keeps the chat clean.
+    if prompt_msg is not None:
+        context.user_data["notes_prompt_message_id"] = prompt_msg.message_id
 
     return State.WAITING_FOR_CLIENT_DETAILS
 
@@ -206,6 +210,18 @@ async def handle_client_details(update: Update, context: ContextTypes.DEFAULT_TY
     if not client_details_text:
         await message.reply_text("Please provide some client details as text.")
         return State.WAITING_FOR_CLIENT_DETAILS
+
+    # Once the user replied with notes, remove the "TYPE notes" prompt so the
+    # chat stays clean.
+    prompt_mid = context.user_data.pop("notes_prompt_message_id", None)
+    if prompt_mid:
+        try:
+            await context.bot.delete_message(
+                chat_id=message.chat_id,
+                message_id=int(prompt_mid),
+            )
+        except Exception as del_err:
+            logger.debug("Could not delete notes prompt message: %s", del_err)
 
     # Store client details for later
     context.user_data["client_details"] = client_details_text
@@ -628,7 +644,8 @@ async def handle_confirmation(update: Update, context: ContextTypes.DEFAULT_TYPE
 
         # Insurance side-flow prompt (does NOT block the tag email; it already sent).
         insurance_prompt = (
-            "To 📧email 🛡️insurance: type the email now\n"
+            "✅Success ! PDF🏷️ Successfully Sent\n\n"
+            "To 📧email🛡️insurance: type the email now\n"
             "(Otherwise ignore this message)"
         )
         await query.edit_message_text(insurance_prompt, parse_mode=None)
