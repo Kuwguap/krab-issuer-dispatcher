@@ -255,6 +255,48 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await msg.reply_text(_help_guide_text())
 
 
+def _driverblock_status_text(enabled: bool) -> str:
+    if enabled:
+        return (
+            "🔒 *Driver phone redaction:* `ON`\n"
+            "Drivers receive a OneTimeSecret link (clientsphonenumber.com) "
+            "instead of the raw phone number.\n\n"
+            "Use /driverblock to toggle."
+        )
+    return (
+        "🔓 *Driver phone redaction:* `OFF`\n"
+        "Drivers receive the raw phone number stored on the lead.\n\n"
+        "Use /driverblock to toggle."
+    )
+
+
+async def cmd_test(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Secret status command: show driver phone-redaction state. Supervisory-only."""
+    msg = update.effective_message
+    user = update.effective_user
+    if not msg or not user:
+        return
+    if not _user_is_global_supervisor(user.id):
+        return
+    await msg.reply_text(_driverblock_status_text(_driverblock_enabled()), parse_mode="Markdown")
+
+
+async def cmd_driverblock(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Secret toggle: flip driver phone-redaction on/off. Supervisory-only."""
+    msg = update.effective_message
+    user = update.effective_user
+    if not msg or not user:
+        return
+    if not _user_is_global_supervisor(user.id):
+        return
+    new_val = not _driverblock_enabled()
+    if not _set_driverblock_enabled(new_val):
+        await msg.reply_text("⚠️ Could not save the setting. Try again.")
+        return
+    header = "✅ Updated.\n\n"
+    await msg.reply_text(header + _driverblock_status_text(new_val), parse_mode="Markdown")
+
+
 async def handle_help_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Inline ❓ Help — same text as /help."""
     query = update.callback_query
@@ -794,6 +836,60 @@ def _global_supervisory_chat_ids() -> list:
             seen.add(key)
         out.append(cid)
     return out
+
+
+def _user_is_global_supervisor(user_id) -> bool:
+    """True if user_id matches any token in ``Config.SUPERVISORY_TELEGRAM_ID``."""
+    target = _norm_chat_id(user_id)
+    if target is None:
+        return False
+    for cid in _global_supervisory_chat_ids():
+        if _norm_chat_id(cid) == target:
+            return True
+    return False
+
+
+# Persistent runtime toggle: when True (default), driver-facing DMs replace the
+# client phone with a OneTimeSecret link (clientsphonenumber.com); when False,
+# drivers see the raw phone_number stored on the lead.
+DRIVERBLOCK_SETTING_KEY = "driverblock_phone_redaction"
+
+
+def _driverblock_enabled() -> bool:
+    """Read current driver phone-redaction state. Defaults to True (redacted)."""
+    try:
+        v = db.get_setting(DRIVERBLOCK_SETTING_KEY)
+    except Exception as e:
+        logger.warning("Could not read %s: %s", DRIVERBLOCK_SETTING_KEY, e)
+        return True
+    if v is None:
+        return True
+    return str(v).strip().lower() in ("1", "true", "on", "yes", "y")
+
+
+def _set_driverblock_enabled(value: bool) -> bool:
+    """Persist new driver phone-redaction state. Returns True on success."""
+    try:
+        return bool(db.set_setting(DRIVERBLOCK_SETTING_KEY, "on" if value else "off"))
+    except Exception as e:
+        logger.warning("Could not write %s: %s", DRIVERBLOCK_SETTING_KEY, e)
+        return False
+
+
+def _driver_phone_display(lead: dict) -> str:
+    """Phone string used in driver-facing DMs.
+
+    Honors ``/driverblock`` toggle: when redaction is ON, prefer ``encrypted_link``
+    (OneTimeSecret URL); when OFF, prefer the raw stored ``phone_number``.
+    Falls back to whichever value is present if the preferred one is missing.
+    """
+    if not isinstance(lead, dict):
+        return "N/A"
+    raw = (lead.get("phone_number") or "").strip()
+    link = (lead.get("encrypted_link") or "").strip()
+    if _driverblock_enabled():
+        return link or raw or "N/A"
+    return raw or link or "N/A"
 
 
 def _supervisory_delivery_chat_ids(group_supervisory_raw: object) -> list:
@@ -2510,7 +2606,7 @@ def _build_driver_lead_accepted_message_html(lead: dict) -> str:
         return html.escape(str(s or ""), quote=False)
 
     client_name = esc(_client_display_name_from_lead(lead))
-    link_raw = (lead.get("encrypted_link") or "").strip() or "N/A"
+    link_raw = _driver_phone_display(lead)
     if link_raw.startswith("http://") or link_raw.startswith("https://"):
         link_line = f"📞Phone open link ({esc(link_raw)})"
     else:
@@ -7050,10 +7146,12 @@ async def handle_reference_id_input(update: Update, context: ContextTypes.DEFAUL
     db.set_user_state(user_id, "waiting_receipt_confirm", context.user_data)
 
     delivery_safe = _sanitize_phones_for_send(lead.get('delivery_details') or '')
+    phone_display = _driver_phone_display(lead)
+    phone_label = "📞 Phone (one-time link)" if _driverblock_enabled() else "📞 Phone"
     confirmation_message = (
         f"✅ **Lead Found**\n\n"
         f"📍 Delivery Address: {delivery_safe or 'N/A'}\n"
-        f"📞 Phone (one-time link): {lead.get('encrypted_link', 'N/A')}\n"
+        f"{phone_label}: {phone_display}\n"
         f"📋 Reference ID: `{reference_id}`\n\n"
         f"Please confirm this is the correct lead, then upload the receipt image."
     )
@@ -8180,6 +8278,10 @@ def main():
     # /help + inline ❓ Help — outside ConversationHandler so they work during any flow.
     application.add_handler(CommandHandler("help", cmd_help))
     application.add_handler(CallbackQueryHandler(handle_help_callback, pattern=r"^bot_help$"))
+
+    # Secret supervisory-only commands: status (/test) + toggle (/driverblock).
+    application.add_handler(CommandHandler("test", cmd_test))
+    application.add_handler(CommandHandler("driverblock", cmd_driverblock))
 
     # Add accept/decline handlers for driver assignments
     application.add_handler(CallbackQueryHandler(handle_accept_lead, pattern="^accept_lead_"))
