@@ -1056,7 +1056,7 @@ async def _notify_initiator_lead_accepted_summary(
     *,
     accepting_driver_name: str,
 ) -> None:
-    """One DM to the lead adder: Reference, Group, Driver(s) — only the driver who accepted."""
+    """One DM to the lead adder when a driver accepts — reference, group, driver, branded footer."""
     initiator_id = lead.get("user_id")
     if initiator_id is None:
         return
@@ -1070,7 +1070,14 @@ async def _notify_initiator_lead_accepted_summary(
     ref = (lead_row.get("reference_id") or "N/A").strip() or "N/A"
     group_label = _group_display_name_from_lead(lead_row) or "N/A"
     dn = (accepting_driver_name or "Driver").strip() or "Driver"
-    text = f"New lead\n\nReference: {ref}\nGroup: {group_label}\nDriver(s): {dn}"
+    text = (
+        "Accepted! ✅ Lead 📈Notification🔔\n"
+        "We start serving the client now\n\n"
+        f"📋Reference🧾: {ref}\n"
+        f"🙋Group Accepted✅: {group_label}\n"
+        f"🙋‍♀️Driver Accepted✅: {dn}\n\n"
+        "🏁Automated🏎️Automotive💨"
+    )
     try:
         await context.bot.send_message(chat_id=cid, text=text, parse_mode=None)
     except Exception as e:
