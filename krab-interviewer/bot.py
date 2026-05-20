@@ -1121,6 +1121,11 @@ def main() -> None:
         _startup_reenqueue_jobs(application)
 
     logger.info("Polling...")
+    # Render native Python 3.12+ / 3.14: no default asyncio loop on MainThread; PTB needs one.
+    try:
+        asyncio.get_event_loop()
+    except RuntimeError:
+        asyncio.set_event_loop(asyncio.new_event_loop())
     application.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
 
 
