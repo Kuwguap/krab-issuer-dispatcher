@@ -37,7 +37,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-db = Database()
+db: Optional[Database] = None
 
 # Conversation states
 STATE_INTERVIEW_INPUT = 1
@@ -1045,12 +1045,15 @@ def _wait_for_exclusive_polling(bot_token: str, max_wait: int = 120) -> bool:
 
 
 def main() -> None:
+    global db
     logger.info("Krab Interviewer starting...")
     try:
         Config.validate()
     except ValueError as e:
         logger.error("Config: %s", e)
         sys.exit(1)
+
+    db = Database()
 
     token = Config.TELEGRAM_BOT_TOKEN
     if not _wait_for_exclusive_polling(token):

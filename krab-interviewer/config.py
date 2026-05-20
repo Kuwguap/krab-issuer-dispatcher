@@ -11,8 +11,11 @@ load_dotenv(dotenv_path=env_path)
 class Config:
     TELEGRAM_BOT_TOKEN = (os.getenv("TELEGRAM_BOT_TOKEN") or "").strip() or None
     SUPERVISORY_TELEGRAM_ID = os.getenv("SUPERVISORY_TELEGRAM_ID")
-    SUPABASE_URL = os.getenv("SUPABASE_URL")
-    SUPABASE_KEY = os.getenv("SUPABASE_KEY")
+    SUPABASE_URL = (os.getenv("SUPABASE_URL") or "").strip() or None
+    # Prefer SUPABASE_KEY; fall back to SUPABASE_SERVICE_ROLE_KEY (name used on krab-dispatch).
+    SUPABASE_KEY = (
+        (os.getenv("SUPABASE_KEY") or os.getenv("SUPABASE_SERVICE_ROLE_KEY") or "").strip() or None
+    )
     OPENAI_API_KEY = (os.getenv("OPENAI_API_KEY") or "").strip() or None
     OPENAI_VISION_MODEL = (os.getenv("OPENAI_VISION_MODEL") or "gpt-4o").strip() or "gpt-4o"
     DRIVER_CHANNEL_ID = (os.getenv("DRIVER_CHANNEL_ID") or "").strip() or None
@@ -31,5 +34,14 @@ class Config:
             if not getattr(cls, var):
                 missing.append(var)
         if missing:
-            raise ValueError(f"Missing required environment variables: {', '.join(missing)}")
+            hints = []
+            if "SUPABASE_URL" in missing or "SUPABASE_KEY" in missing:
+                hints.append(
+                    "Set SUPABASE_URL + SUPABASE_KEY on Render (krab-interviewer-bot → Environment). "
+                    "Copy from krableadsV2 / Issuer, or use SUPABASE_SERVICE_ROLE_KEY instead of SUPABASE_KEY."
+                )
+            msg = f"Missing required environment variables: {', '.join(missing)}"
+            if hints:
+                msg += ". " + " ".join(hints)
+            raise ValueError(msg)
         return True
