@@ -8,6 +8,7 @@
 #   3. krab-issuer-admin     (Web)    Flask admin dashboard (legacy UI, optional)
 #   4. krab-issuer-bot       (Worker) Krab Issuer Telegram bot
 #   5. paper-investigator    (Worker) Paper Investigator Telegram bot
+#   6. krab-interviewer-bot  (Worker) Krab Interviewer Telegram bot
 #
 # Import:
 #   1. Push this repo to GitHub.
@@ -210,3 +211,39 @@ services:
         sync: false
       - key: OPENAI_MODEL
         sync: false
+
+  # --------------------------------------------------------------------------
+  # 6) Krab Interviewer Telegram bot (background worker)
+  #    Driver interviews, appointments, channel announcements, hire onboarding.
+  # --------------------------------------------------------------------------
+  - type: worker
+    name: krab-interviewer-bot
+    runtime: python
+    rootDir: krab-interviewer
+    plan: starter
+    numInstances: 1
+    maxShutdownDelaySeconds: 60
+    buildCommand: pip install --upgrade pip && pip install -r requirements.txt
+    startCommand: python bot.py
+    envVars:
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false
+      - key: SUPERVISORY_TELEGRAM_ID
+        sync: false
+      - key: SUPABASE_URL
+        sync: false
+      - key: SUPABASE_KEY
+        sync: false
+      - key: OPENAI_API_KEY
+        sync: false
+      - key: OPENAI_VISION_MODEL
+        value: gpt-4o
+      - key: DRIVER_CHANNEL_ID
+        sync: false
+      # Same Postgres as krab-dispatch (recipients table on Hire).
+      - key: KRAB_SENDER_DATABASE_URL
+        sync: false
+      - key: INTERVIEWER_TIMEZONE
+        value: America/New_York
+      - key: KRAB_DISPATCH_BOT_USERNAME
+        value: KrabIssuerBot

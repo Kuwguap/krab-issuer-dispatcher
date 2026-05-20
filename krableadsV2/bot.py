@@ -1484,6 +1484,7 @@ def _extract_phone_price_notes_from_text(text: str) -> tuple[Optional[str], Opti
 # AI Phase 1: human review — field edit keys (keep callback_data short; max 64 bytes)
 PH1_REVIEW_ACCEPT = "ph1_accept"
 PH1_REVIEW_EDIT = "ph1_edit"
+PH1_REVIEW_VIN_CHECK = "ph1_vin_check"
 PH1_EDIT_BACK = "ph1_back"
 PH1_EDIT_MORE = "ph1_more"
 PH1_EDIT_DONE = "ph1_done"
@@ -1631,6 +1632,7 @@ def _build_review_keyboard_with_selections(state_data):
         ],
         [
             InlineKeyboardButton("✏️ Edit", callback_data=PH1_REVIEW_EDIT),
+            InlineKeyboardButton("🔍 Check VIN", callback_data=PH1_REVIEW_VIN_CHECK),
             InlineKeyboardButton("✅ Submit", callback_data=PH1_REVIEW_ACCEPT),
         ],
     ])
@@ -1852,20 +1854,8 @@ async def _continue_phase1_after_ai_review(message, context: ContextTypes.DEFAUL
     _clean_vin_and_car(state_data)
     _sanitize_phase1_pending_phone_price(state_data)
     db.set_user_state(user_id, "phase1", state_data)
-    alert_msg, conflict = _vin_check_after_phase1(state_data)
-    if conflict:
-        api_car, stated_car = conflict
-        context.user_data["vin_choice_api_car"] = api_car
-        context.user_data["vin_choice_stated_car"] = stated_car
-        keyboard = _vin_choice_keyboard(api_car, stated_car)
-        vin_msg = await message.reply_text(
-            _vin_conflict_body(stated_car, api_car),
-            reply_markup=keyboard,
-        )
-        context.user_data["vin_conflict_msg_id"] = vin_msg.message_id
-        return STATE_VIN_CHOICE
-    if alert_msg:
-        await message.reply_text(alert_msg)
+    # VIN lookup is now opt-in via the "🔍 Check VIN" button on the review
+    # screen; Submit no longer triggers a DMV decode automatically.
     # Re-check missing fields against a synthetic blob so detector still works
     blob = "\n".join(
         str(state_data.get(k) or "")
@@ -3165,19 +3155,7 @@ async def handle_phase1(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
         _sanitize_phase1_pending_phone_price(state_data)
         db.set_user_state(user_id, "phase1", state_data)
         await _send_phase1_ai_review(update.message, state_data, context, user_id)
-        alert_msg, conflict = _vin_check_after_phase1(state_data)
-        if conflict:
-            api_car, stated_car = conflict
-            context.user_data["vin_choice_api_car"] = api_car
-            context.user_data["vin_choice_stated_car"] = stated_car
-            keyboard = _vin_choice_keyboard(api_car, stated_car)
-            await update.message.reply_text(
-                _vin_conflict_body(stated_car, api_car),
-                reply_markup=keyboard,
-            )
-            return STATE_VIN_CHOICE
-        if alert_msg:
-            await update.message.reply_text(alert_msg)
+        # VIN decode is opt-in via the review screen's "🔍 Check VIN" button.
         missing = ai_vision.detect_missing_fields(state_data, message_text)
         OPTIONAL_FIELDS = {"insurance_company", "insurance_policy_number", "extra_info", "delivery_date"}
         missing = [f for f in missing if f not in OPTIONAL_FIELDS]
@@ -3572,6 +3550,9 @@ async def handle_phase1_ai_review_callback(update, context):
         context.user_data.pop("phase1_recent_edits", None)
         return await _continue_phase1_after_ai_review(query.message, context, user_id)
 
+    elif data == PH1_REVIEW_VIN_CHECK:
+        return await _handle_phase1_vin_check_button(context, query, user_id, state_data)
+
     elif data == "edit_cancel":
         try:
             await query.message.delete()
@@ -3893,19 +3874,7 @@ async def handle_missing_field(update: Update, context: ContextTypes.DEFAULT_TYP
     db.set_user_state(user_id, "phase1", state_data)
     context.user_data.pop("missing_fields", None)
     context.user_data.pop("missing_field_state_data", None)
-    alert_msg, conflict = _vin_check_after_phase1(state_data)
-    if conflict:
-        api_car, stated_car = conflict
-        context.user_data["vin_choice_api_car"] = api_car
-        context.user_data["vin_choice_stated_car"] = stated_car
-        keyboard = _vin_choice_keyboard(api_car, stated_car)
-        await update.message.reply_text(
-            _vin_conflict_body(stated_car, api_car),
-            reply_markup=keyboard,
-        )
-        return STATE_VIN_CHOICE
-    if alert_msg:
-        await update.message.reply_text(alert_msg)
+    # VIN decode is opt-in via the review screen's "🔍 Check VIN" button.
     return await _ensure_phone_price_before_files(update.message, context, user_id)
 
 
@@ -3943,15 +3912,15 @@ async def handle_vin_choice_callback(update: Update, context: ContextTypes.DEFAU
             await context.bot.delete_message(chat_id=update.effective_chat.id, message_id=vin_msg_id)
         except:
             pass
-    # re-fetch state and update review
+    # Return to the AI review screen — Submit is the only path forward.
     state = db.get_user_state(user_id)
     if state and state.get("data"):
         await _update_review_message_text(context, state["data"])
-    return await _ensure_phone_price_before_files(query.message, context, user_id)
+    return STATE_AI_REVIEW
 
 
 async def handle_vin_retype(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Handle user's new VIN input; re-run lookup and either proceed or show choice again."""
+    """Handle user's new VIN input; re-run lookup and either show choice again or return to review."""
     user_id = update.effective_user.id
     text = (update.message.text or "").strip()
     vin_new = _extract_vin_17(text)
@@ -3974,14 +3943,60 @@ async def handle_vin_retype(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         context.user_data["vin_choice_api_car"] = api_car
         context.user_data["vin_choice_stated_car"] = stated_car
         keyboard = _vin_choice_keyboard(api_car, stated_car)
-        await update.message.reply_text(
+        vin_msg = await update.message.reply_text(
             _vin_conflict_body(stated_car, api_car),
             reply_markup=keyboard,
         )
+        context.user_data["vin_conflict_msg_id"] = vin_msg.message_id
         return STATE_VIN_CHOICE
     if alert_msg:
         await update.message.reply_text(alert_msg)
-    return await _ensure_phone_price_before_files(update.message, context, user_id)
+    await _update_review_message_text(context, state_data)
+    return STATE_AI_REVIEW
+
+
+async def _handle_phase1_vin_check_button(
+    context: ContextTypes.DEFAULT_TYPE, query, user_id: int, state_data: dict,
+) -> int:
+    """Run the DMV VIN decode on demand from the review screen.
+
+    Shows the "Pulling up 17 Digit Vin in DMV portal..." message and the same
+    three inline buttons (Use DMV / Continue / Retype) as the legacy
+    auto-decode flow; after the user picks one, we return to the AI review
+    rather than continuing to phone/notes — Submit is the only path forward.
+    """
+    vin = (state_data.get("vin") or "").strip()
+    if not vin or vin == "-" or len(vin) != 17:
+        await query.message.reply_text(
+            "⚠️ VIN is not 17 characters; cannot run DMV check. Edit the VIN and try again."
+        )
+        return STATE_AI_REVIEW
+    if not Config.is_vin_lookup_configured():
+        await query.message.reply_text("⚠️ VIN lookup is not configured.")
+        return STATE_AI_REVIEW
+    result = vin_lookup.vin_lookup(
+        vin,
+        provider=Config.VIN_PROVIDER,
+        api_key=Config.API_NINJAS_API_KEY,
+    )
+    if not result:
+        await query.message.reply_text(
+            "⚠️ VIN returned no result. Ensure it's 17 characters and try again."
+        )
+        return STATE_AI_REVIEW
+    api_car = (result.get("car_line") or "").strip()
+    if not api_car:
+        await query.message.reply_text("⚠️ DMV did not return a car for this VIN.")
+        return STATE_AI_REVIEW
+    stated = (state_data.get("car") or "").strip()
+    context.user_data["vin_choice_api_car"] = api_car
+    context.user_data["vin_choice_stated_car"] = stated
+    vin_msg = await query.message.reply_text(
+        _vin_conflict_body(stated, api_car),
+        reply_markup=_vin_choice_keyboard(api_car, stated),
+    )
+    context.user_data["vin_conflict_msg_id"] = vin_msg.message_id
+    return STATE_VIN_CHOICE
 
 
 async def handle_phase2(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -8190,7 +8205,7 @@ def main():
             STATE_AI_REVIEW: [
                 CallbackQueryHandler(
                     handle_phase1_ai_review_callback,
-                    pattern=r"^(ph1_accept|ph1_edit|ph1_back|ph1_pick_group|ph1_pick_driver|ph1_pick_source|selgrp_|seldrv_|selsrc_|ph1_sel_back|driver_suspended_|edit_cancel|ph1edit_)"
+                    pattern=r"^(ph1_accept|ph1_edit|ph1_vin_check|ph1_back|ph1_pick_group|ph1_pick_driver|ph1_pick_source|selgrp_|seldrv_|selsrc_|ph1_sel_back|driver_suspended_|edit_cancel|ph1edit_)"
                 ),
             ],
             STATE_AI_EDIT_MENU: [

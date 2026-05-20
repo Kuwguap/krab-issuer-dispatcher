@@ -1,0 +1,44 @@
+# Render Blueprint — Krab Interviewer (this repository)
+#
+# Deploy:
+#   1. Push to https://github.com/Kuwguap/krab-interviewer
+#   2. Render → New + → Blueprint → select krab-interviewer repo
+#   3. Render reads this file at repo root and creates krab-interviewer-bot
+#   4. Environment → set sync: false secrets (new TELEGRAM_BOT_TOKEN, etc.)
+#
+# Monorepo alternative: unity repo root render.yaml also defines this service
+# with rootDir: krab-interviewer when code lives inside the unity monorepo.
+
+previews:
+  generation: off
+
+services:
+  - type: worker
+    name: krab-interviewer-bot
+    runtime: python
+    plan: starter
+    numInstances: 1
+    maxShutdownDelaySeconds: 60
+    buildCommand: pip install --upgrade pip && pip install -r requirements.txt
+    startCommand: python bot.py
+    envVars:
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false
+      - key: SUPERVISORY_TELEGRAM_ID
+        sync: false
+      - key: SUPABASE_URL
+        sync: false
+      - key: SUPABASE_KEY
+        sync: false
+      - key: OPENAI_API_KEY
+        sync: false
+      - key: OPENAI_VISION_MODEL
+        value: gpt-4o
+      - key: DRIVER_CHANNEL_ID
+        sync: false
+      - key: KRAB_SENDER_DATABASE_URL
+        sync: false
+      - key: INTERVIEWER_TIMEZONE
+        value: America/New_York
+      - key: KRAB_DISPATCH_BOT_USERNAME
+        value: KrabIssuerBot
