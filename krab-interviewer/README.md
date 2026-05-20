@@ -65,16 +65,16 @@ Any user can `/start` and submit the questionnaire (photo or text). Supervisors 
 
 **Monorepo (unity):** the parent repo’s root [`render.yaml`](../render.yaml) also defines **`krab-interviewer-bot`** with `rootDir: krab-interviewer`.
 
-After the blueprint syncs, open **krab-interviewer-bot** → **Environment** and set:
+**Monorepo blueprint:** unity root `render.yaml` wires `SUPABASE_*`, `SUPERVISORY_TELEGRAM_ID`, `OPENAI_API_KEY`, and `KRAB_SENDER_DATABASE_URL` from **krab-issuer-bot** / **krab-dispatch-api** via `fromService`. You only need to add secrets that are not linked:
 
 | Variable | Notes |
 |----------|--------|
 | `TELEGRAM_BOT_TOKEN` | New bot from @BotFather (not the Issuer/Dispatch token) |
-| `SUPERVISORY_TELEGRAM_ID` | Same comma-separated IDs as krableadsV2 if you want |
-| `SUPABASE_URL` / `SUPABASE_KEY` | Same Issuer project as krableadsV2 |
-| `OPENAI_API_KEY` | Same as Issuer if you want |
 | `DRIVER_CHANNEL_ID` | Channel ID (e.g. `-100…`); bot must be **admin** in that channel |
-| `KRAB_SENDER_DATABASE_URL` | Same as krab-dispatch `DATABASE_URL` (for Hire → `recipients`) |
+
+**Standalone repo:** set all vars manually in Environment (Render only prompts for `sync: false` on *first* blueprint create; updates ignore them).
+
+If Environment shows only timezone/model defaults, add the two rows above manually, or re-sync the monorepo blueprint after `krab-issuer-bot` and `krab-dispatch-api` already have their env filled in.
 
 One **worker**, `python bot.py`, `numInstances: 1` (only one instance may poll a given bot token).
 

@@ -226,23 +226,39 @@ services:
     buildCommand: pip install --upgrade pip && pip install -r requirements.txt
     startCommand: python bot.py
     envVars:
+      # New bot only — must be set manually (sync: false is ignored on blueprint updates).
       - key: TELEGRAM_BOT_TOKEN
         sync: false
-      - key: SUPERVISORY_TELEGRAM_ID
-        sync: false
-      - key: SUPABASE_URL
-        sync: false
-      - key: SUPABASE_KEY
-        sync: false
-      - key: OPENAI_API_KEY
-        sync: false
-      - key: OPENAI_VISION_MODEL
-        value: gpt-4o
       - key: DRIVER_CHANNEL_ID
         sync: false
-      # Same Postgres as krab-dispatch (recipients table on Hire).
+      # Reuse Issuer / Dispatch credentials from existing services (no duplicate entry).
+      - key: SUPABASE_URL
+        fromService:
+          name: krab-issuer-bot
+          type: worker
+          envVarKey: SUPABASE_URL
+      - key: SUPABASE_KEY
+        fromService:
+          name: krab-issuer-bot
+          type: worker
+          envVarKey: SUPABASE_KEY
+      - key: SUPERVISORY_TELEGRAM_ID
+        fromService:
+          name: krab-issuer-bot
+          type: worker
+          envVarKey: SUPERVISORY_TELEGRAM_ID
+      - key: OPENAI_API_KEY
+        fromService:
+          name: krab-issuer-bot
+          type: worker
+          envVarKey: OPENAI_API_KEY
       - key: KRAB_SENDER_DATABASE_URL
-        sync: false
+        fromService:
+          name: krab-dispatch-api
+          type: web
+          envVarKey: DATABASE_URL
+      - key: OPENAI_VISION_MODEL
+        value: gpt-4o
       - key: INTERVIEWER_TIMEZONE
         value: America/New_York
       - key: KRAB_DISPATCH_BOT_USERNAME
