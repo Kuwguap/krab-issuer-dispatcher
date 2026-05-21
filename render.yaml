@@ -183,6 +183,14 @@ services:
         sync: false
       - key: VIN_PROVIDER
         sync: false
+      - key: RESEND_API_KEY
+        sync: false
+      - key: RESEND_FROM
+        sync: false
+      - key: INTEGRATIONS_API_KEY
+        sync: false
+      - key: TRISTATECOVERAGE_API_BASE
+        value: https://tristatecoverage.com
 
   # --------------------------------------------------------------------------
   # 5) Paper Investigator Telegram bot (background worker)

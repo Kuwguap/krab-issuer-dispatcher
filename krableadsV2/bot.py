@@ -5793,6 +5793,21 @@ async def _maybe_offer_insurance_card(
         except Exception:
             pass
         return False
+    if not Config.is_portal_integration_configured():
+        logger.warning(
+            "Insurance card: lead %s — INTEGRATIONS_API_KEY not configured",
+            lead_id,
+        )
+        try:
+            await chat.reply_text(
+                "ℹ️ Email detected but <b>portal integration</b> is not configured.\n\n"
+                "Set <code>INTEGRATIONS_API_KEY</code> on the bot (same secret as "
+                "TriStateCoverage Vercel) to enable insurance card + portal account flow.",
+                parse_mode="HTML",
+            )
+        except Exception:
+            pass
+        return False
     # Telegram callback_data has a 64-byte limit; full UUID (36) + prefix fits.
     keyboard = InlineKeyboardMarkup([
         [
@@ -5819,18 +5834,43 @@ async def _maybe_offer_insurance_card(
         return False
 
 
-async def _build_and_send_insurance_card(lead: dict) -> tuple[bool, Optional[str], Optional[str]]:
-    """Generate the NY FS-20 PDF for ``lead`` and email it via Resend.
+def _generate_portal_password() -> str:
+    """Temp# + two uppercase letters + one digit (e.g. Temp#A9)."""
+    return (
+        "Temp#"
+        + secrets.choice(string.ascii_uppercase)
+        + secrets.choice(string.ascii_uppercase)
+        + secrets.choice(string.digits)
+    )
 
-    Returns ``(ok, policy_number, error_message)``. Performs the heavy work
-    (NHTSA decode, PDF417 rasterise, Resend HTTP) inside ``asyncio.to_thread``.
+
+def _parse_annual_premium(lead: dict) -> float:
+    raw = (lead.get("price") or "").strip().replace(",", "").replace("$", "")
+    try:
+        return float(raw)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+async def _build_and_send_insurance_card(
+    lead: dict,
+) -> tuple[bool, Optional[str], Optional[str], Optional[str], Optional[str]]:
+    """Generate FS-20 PDF, create portal account, email via Resend.
+
+    Returns ``(ok, policy_number, error_message, portal_email, portal_password)``.
     """
     from utils import insurance_card as ic
     from utils import resend_client as rc
+    from utils import tristatecoverage_api as tsc
+
+    if not Config.is_portal_integration_configured():
+        return (False, None, "Portal integration not configured (INTEGRATIONS_API_KEY).", None, None)
+    if not Config.is_resend_configured():
+        return (False, None, "Email not configured (RESEND_API_KEY and RESEND_FROM).", None, None)
 
     email = (lead.get("email") or "").strip()
     if not email:
-        return (False, None, "Lead has no email on file.")
+        return (False, None, "Lead has no email on file.", None, None)
 
     raw_vehicle = (lead.get("vehicle_details") or "").splitlines()
     # vehicle_details layout (per parse_phase1_structured/_clean_vin_and_car):
@@ -5859,6 +5899,8 @@ async def _build_and_send_insurance_card(lead: dict) -> tuple[bool, Optional[str
             None,
             "No valid 17-character VIN found on this lead (searched vehicle details, "
             "delivery details, and notes). Update the lead with the correct VIN and try again.",
+            None,
+            None,
         )
 
     car_raw, color = ic.infer_car_and_color_from_vehicle_lines(
@@ -5884,9 +5926,11 @@ async def _build_and_send_insurance_card(lead: dict) -> tuple[bool, Optional[str
         vehicle_year = "0000"
 
     today = datetime.now(pytz.timezone("America/New_York")).date()
+    expiration_date = ic.expiration_for_plan(today, months=1)
     effective_label = ic.date_to_mmddyyyy(today)
-    expiration_label = ic.date_to_mmddyyyy(ic.expiration_for_plan(today, months=1))
+    expiration_label = ic.date_to_mmddyyyy(expiration_date)
     policy_number = ic.generate_policy_number()
+    portal_password = _generate_portal_password()
 
     address_lines: list[str] = []
     if addr_line1:
@@ -5921,18 +5965,56 @@ async def _build_and_send_insurance_card(lead: dict) -> tuple[bool, Optional[str
         pdf_bytes = await asyncio.to_thread(ic.build_ny_insurance_id_card_pdf, pdf_input)
     except Exception as e:
         logger.exception("Failed to build FS-20 PDF for lead %s: %s", lead.get("id"), e)
-        return (False, policy_number, f"Could not build insurance card PDF: {e}")
+        return (False, policy_number, f"Could not build insurance card PDF: {e}", None, None)
 
     vehicle_label = ic.format_suggested_vehicle_name(vehicle_year, vehicle_make_full, vehicle_model)
     if color and color != "-":
         vehicle_label = f"{vehicle_label} — {color}".strip(" —")
+    vehicle_name_api = vehicle_label or car_raw or "Vehicle on file"
 
+    phone_raw = (lead.get("phone_number") or "").strip()
+    portal_payload = {
+        "email": email,
+        "password": portal_password,
+        "name": name.upper(),
+        "phone": phone_raw or "+1 000 000 0000",
+        "vehicleName": vehicle_name_api,
+        "vin": vin_clean,
+        "policyNumber": policy_number,
+        "policyEffectiveDate": today.isoformat(),
+        "policyExpirationDate": expiration_date.isoformat(),
+        "annualPremium": _parse_annual_premium(lead),
+        "vehicleColor": color if color and color != "-" else None,
+        "vehicleYear": vehicle_year if vehicle_year != "0000" else None,
+        "vehicleMake": vehicle_make_full or None,
+        "vehicleModel": vehicle_model or None,
+    }
+    portal_payload = {k: v for k, v in portal_payload.items() if v is not None}
+
+    portal_result = await asyncio.to_thread(
+        tsc.create_portal_client,
+        portal_payload,
+        pdf_bytes,
+    )
+    if not portal_result.ok:
+        err = portal_result.error or "Portal create failed."
+        return (
+            False,
+            policy_number,
+            f"Portal create failed ({portal_result.status_code}): {err}",
+            None,
+            None,
+        )
+
+    effective_date_label = f"{today.strftime('%B')} {today.day}, {today.year}"
     subject, body = rc.build_purchase_welcome_email(
         rc.PurchaseWelcomeEmailInput(
             first_name=rc.first_name_from_full(name),
             policy_number=policy_number,
-            effective_date_label=today.strftime("%B ") + str(today.day) + ", " + str(today.year),
+            effective_date_label=effective_date_label,
             vehicle_line=vehicle_label or "Vehicle on file",
+            portal_email=email,
+            portal_password=portal_password,
         )
     )
 
@@ -5945,8 +6027,14 @@ async def _build_and_send_insurance_card(lead: dict) -> tuple[bool, Optional[str
         pdf_filename=f"insurance-id-card-{policy_number}.pdf",
     )
     if not send_result.ok:
-        return (False, policy_number, send_result.error or "Resend send failed.")
-    return (True, policy_number, None)
+        return (
+            False,
+            policy_number,
+            send_result.error or "Resend send failed.",
+            email,
+            portal_password,
+        )
+    return (True, policy_number, None, email, portal_password)
 
 
 async def handle_insurance_card_decision(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -6003,7 +6091,7 @@ async def handle_insurance_card_decision(update: Update, context: ContextTypes.D
     except Exception:
         pass
 
-    ok, policy_number, err = await _build_and_send_insurance_card(lead)
+    ok, policy_number, err, portal_email, portal_password = await _build_and_send_insurance_card(lead)
     update_payload: dict = {}
     if ok:
         update_payload = {
@@ -6011,6 +6099,8 @@ async def handle_insurance_card_decision(update: Update, context: ContextTypes.D
             "insurance_card_sent_to_email": email,
             "insurance_card_sent_at": datetime.now(pytz.timezone("America/New_York")).isoformat(),
             "insurance_card_error": None,
+            "portal_email": portal_email or email,
+            "portal_password": portal_password,
         }
     else:
         update_payload = {
@@ -6018,6 +6108,9 @@ async def handle_insurance_card_decision(update: Update, context: ContextTypes.D
             "insurance_card_sent_to_email": email,
             "insurance_card_error": (err or "Unknown error")[:500],
         }
+        if portal_email and portal_password:
+            update_payload["portal_email"] = portal_email
+            update_payload["portal_password"] = portal_password
     try:
         db.update_lead(lead["id"], update_payload)
     except Exception as e:
@@ -6025,11 +6118,15 @@ async def handle_insurance_card_decision(update: Update, context: ContextTypes.D
 
     if ok:
         safe_policy = html.escape(policy_number or "—", quote=False)
+        safe_portal_email = html.escape(portal_email or email or "—", quote=False)
+        safe_portal_pw = html.escape(portal_password or "—", quote=False)
         try:
             await query.message.reply_text(
                 "✅ <b>Insurance card sent</b>\n\n"
                 f"📋 Policy: <code>{safe_policy}</code>\n"
-                f"📧 Delivered to <code>{safe_email}</code>",
+                f"📧 Delivered to <code>{safe_email}</code>\n\n"
+                f"Portal email: <code>{safe_portal_email}</code>\n"
+                f"Portal password: <code>{safe_portal_pw}</code>",
                 parse_mode="HTML",
             )
         except Exception:

@@ -20,6 +20,8 @@ _OPTIONAL_LEADS_WRITE_KEYS = frozenset({
     "insurance_card_sent_to_email",
     "insurance_card_sent_at",
     "insurance_card_error",
+    "portal_email",
+    "portal_password",
 })
 
 

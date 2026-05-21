@@ -56,6 +56,9 @@ class PurchaseWelcomeEmailInput:
     policy_number: str
     effective_date_label: str   # e.g. "May 8, 2026"
     vehicle_line: str           # e.g. "2021 Nissan Sentra — Black"
+    portal_email: str
+    portal_password: str
+    portal_website: str = "TriStateCoverage.com/login"
 
 
 def _format_effective_date(d: date) -> str:
@@ -66,12 +69,15 @@ def _format_effective_date(d: date) -> str:
 def build_purchase_welcome_email(input_: PurchaseWelcomeEmailInput) -> tuple[str, str]:
     """Return (subject, body) for the policy-issued welcome email.
 
-    The body matches the blueprint's plain-text template exactly (ASCII
-    apostrophes, em-dash divider). The PDF is sent as an attachment alongside.
+    Plain-text body with Portal Login block; PDF attached separately via Resend.
     """
     subject = f"Your policy is active — {input_.policy_number}"
+    portal_site = (input_.portal_website or "TriStateCoverage.com/login").strip()
     body = (
+        f"Your policy is active — {input_.policy_number}\n\n\n\n"
+        "Tri State Coverage\n\n"
         f"Hi {input_.first_name},\n\n"
+        "Good news — your auto insurance policy has been activated successfully ! "
         "Thank you for choosing Tri State Coverage for your auto insurance needs.\n\n"
         "Your policy is now active and coverage has been successfully issued.\n\n"
         "Your proof of insurance (PDF) is attached to this email.\n\n"
@@ -85,13 +91,16 @@ def build_purchase_welcome_email(input_: PurchaseWelcomeEmailInput) -> tuple[str
         "• Set up automatic payments\n"
         "• Access your policy anytime through your online dashboard\n\n"
         "Log into your TRISTATECOVERAGE account anytime to manage your policy online.\n\n"
+        "Portal Login:\n"
+        f"Website: {portal_site}\n"
+        f"Email: {input_.portal_email}\n"
+        f"Password: {input_.portal_password}\n\n"
         "Thank you again for choosing Tri State Coverage.\n\n"
         "Sincerely,\n"
-        "The Tri State Coverage Team\n\n"
-        "Www.TriStateCoverage.com (http://www.tristatecoverage.com/)\n"
+        "Tri State Coverage Team\n"
+        "Tri State Coverage (https://www.tristatecoverage.com/?utm_source=chatgpt.com)\n\n"
         "Tri State Coverage Inc\n"
-        "1 N Central Rd 6th floor suite 629\n"
-        "Fort Lee, NJ 07024\n"
+        "Thank you again for choosing Tri State Coverage.\n"
     )
     return subject, body
 

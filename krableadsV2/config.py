@@ -76,6 +76,17 @@ class Config:
     INSURANCE_ISSUER_ADDRESS = (os.getenv("INSURANCE_ISSUER_ADDRESS") or "P.O. BOX 6027|DEARBORN, MI 48121-6027").strip()
     INSURANCE_CARRIER_NAME = (os.getenv("INSURANCE_CARRIER_NAME") or "746 AMERICAN ROAD INSURANCE COMPANY").strip()
 
+    # TriStateCoverage portal (POST /api/integrations/clients) — creates dashboard account.
+    TRISTATECOVERAGE_API_BASE = (
+        os.getenv("TRISTATECOVERAGE_API_BASE") or "https://tristatecoverage.com"
+    ).strip().rstrip("/")
+    INTEGRATIONS_API_KEY = (os.getenv("INTEGRATIONS_API_KEY") or "").strip().lstrip("=") or None
+
+    @classmethod
+    def is_portal_integration_configured(cls) -> bool:
+        """True if TriStateCoverage integrations API key is set."""
+        return bool(cls.INTEGRATIONS_API_KEY)
+
     @classmethod
     def is_vin_lookup_configured(cls) -> bool:
         """True if VIN lookup is available (nhtsa always, or api_ninjas when key set)."""
