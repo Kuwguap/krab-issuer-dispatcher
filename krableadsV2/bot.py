@@ -5834,14 +5834,12 @@ async def _maybe_offer_insurance_card(
         return False
 
 
+PORTAL_DEFAULT_PASSWORD = "Temp#A9"
+
+
 def _generate_portal_password() -> str:
-    """Temp# + two uppercase letters + one digit (e.g. Temp#A9)."""
-    return (
-        "Temp#"
-        + secrets.choice(string.ascii_uppercase)
-        + secrets.choice(string.ascii_uppercase)
-        + secrets.choice(string.digits)
-    )
+    """Fixed portal password for all new TriStateCoverage accounts."""
+    return PORTAL_DEFAULT_PASSWORD
 
 
 def _parse_annual_premium(lead: dict) -> float:
