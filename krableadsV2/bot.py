@@ -434,6 +434,103 @@ def _get_suspended_driver_ids() -> set[str]:
     return s
 
 
+async def _notify_suspension_lifted(
+    context: ContextTypes.DEFAULT_TYPE,
+    *,
+    driver: dict,
+    pending_after: list,
+    reply_message=None,
+) -> None:
+    """Notify driver and all global supervisory IDs when receipt penalty suspension ends."""
+    global _SUSP_DRIVER_IDS_CACHE
+    _SUSP_DRIVER_IDS_CACHE = None
+
+    driver_name = (driver.get("driver_name") or "Driver").strip()
+    n_pending = len(pending_after)
+    driver_txt = (
+        "✅ **Suspension lifted!**\n"
+        "You're back in action 👊💥\n"
+        "🚗 You will now receive new leads again.\n"
+        "🔔 Turn on Telegram notifications to grab them fast!\n\n"
+        "🧾 Upload receipts immediately after every delivery.\n"
+        f"⚠️ **{SUSPENSION_THRESHOLD}** missing receipts = automatic suspension again.\n\n"
+        f"Outstanding receipts remaining: **{n_pending}**"
+    )
+    kb = _driver_keyboard_lead_and_receipt()
+    driver_chat = _parse_chat_id(driver.get("driver_telegram_id"))
+    sent_driver = False
+    if driver_chat is not None:
+        try:
+            await context.bot.send_message(
+                chat_id=driver_chat,
+                text=driver_txt,
+                parse_mode="Markdown",
+                reply_markup=kb,
+            )
+            sent_driver = True
+        except BadRequest:
+            try:
+                await context.bot.send_message(
+                    chat_id=driver_chat,
+                    text=driver_txt.replace("*", ""),
+                    reply_markup=kb,
+                )
+                sent_driver = True
+            except Exception as e:
+                logger.warning("Could not DM driver suspension-lifted notice: %s", e)
+        except Exception as e:
+            logger.warning("Could not DM driver suspension-lifted notice: %s", e)
+    if not sent_driver and reply_message is not None:
+        try:
+            await reply_message.reply_text(
+                driver_txt,
+                parse_mode="Markdown",
+                reply_markup=kb,
+            )
+        except BadRequest:
+            await reply_message.reply_text(
+                driver_txt.replace("*", ""),
+                reply_markup=kb,
+            )
+
+    ref_parts = []
+    for p in pending_after or []:
+        ref = (p.get("reference_id") or "").strip()
+        if ref and ref.upper() != "N/A":
+            ref_parts.append(_telegram_md1_escape(ref))
+    refs_line = (
+        f"\nReceipt references: {', '.join(ref_parts)}"
+        if ref_parts
+        else "\nReceipt references: (none on file)"
+    )
+    dn_esc = _telegram_md1_escape(driver_name)
+    sup_txt = _prefix_supervisory_message(
+        f"✅ **Suspension removed**\n\n"
+        f"Driver: **{dn_esc}**\n"
+        f"Remaining receipts: {n_pending}"
+        f"{refs_line}"
+    )
+    sup_plain = (
+        f"✅ Suspension removed\n\n"
+        f"Driver: {driver_name}\n"
+        f"Remaining receipts: {n_pending}"
+        + (f"\nReceipt references: {', '.join(ref_parts)}" if ref_parts else "\nReceipt references: (none on file)")
+    )
+    sup_ids = _global_supervisory_chat_ids()
+    if not sup_ids:
+        logger.warning("Suspension lifted but SUPERVISORY_TELEGRAM_ID is empty — no supervisory alert sent")
+    for sup_id in sup_ids:
+        try:
+            await context.bot.send_message(chat_id=sup_id, text=sup_txt, parse_mode="Markdown")
+        except BadRequest:
+            try:
+                await context.bot.send_message(chat_id=sup_id, text=sup_plain)
+            except Exception as e:
+                logger.warning("Could not send suspension-lifted alert to supervisory %s: %s", sup_id, e)
+        except Exception as e:
+            logger.warning("Could not send suspension-lifted alert to supervisory %s: %s", sup_id, e)
+
+
 def _norm_chat_id(cid) -> int | str | None:
     """Normalize Telegram chat id for set deduplication (int when possible)."""
     if cid is None:
@@ -7539,78 +7636,12 @@ async def handle_receipt_image(update: Update, context: ContextTypes.DEFAULT_TYP
         if was_suspended and dr_check:
             pending_after = db.get_driver_pending_receipts(dr_check["id"])
             if len(pending_after) < SUSPENSION_THRESHOLD:
-                await update.message.reply_text(
-                    "✅ **Suspension lifted!**\n"
-                    "You’re back in action 👊💥\n"
-                    "🚗 You will now receive new leads again\n"
-                    "🔔 Turn on your notifications 🛜 to grab them fast!\n\n"
-                    "—Important Message❗️\n"
-                    "Please keep $100 available 24/7 in your bank 🏦 account "
-                    "to upload receipts on time🧾 instantly upon delivery‼️\n\n"
-                    "🏦 Keep $100 available at all times for instant receipt uploads 🧾⚡\n"
-                    "💵 Keep $100 available in your account 🏦 for immediate receipt uploads 🧾\n"
-                    "⚠️ Maintain a $100 balance 🏦 so receipts can be uploaded instantly 🧾\n"
-                    "🚗 Keep $100 ready in your account 🏦 for fast receipt uploads 🧾⚡️\n\n"
-                    "🚗 **Critical Reminders for Reactivated Drivers**\n\n"
-                    "📲 **Stay Ready**\n"
-                    "🔔 Turn on Telegram notifications.\n"
-                    "📱 Keep your phone charged and internet on.\n"
-                    "⚡ Respond quickly to new leads.\n\n"
-                    "🧾 **Receipt Rules**\n"
-                    "🧾 Upload receipts immediately after every delivery.\n"
-                    "⚠️ 3 missing receipts = automatic suspension.\n"
-                    "📸 Make sure receipt photos are clear and readable.\n\n"
-                    "💰 **Financial Readiness**\n"
-                    "🏦 Keep at least $100 available for instant receipt uploads.\n"
-                    "💵 Do not spend receipt funds before submitting them.\n\n"
-                    "🖨️ **Equipment Checklist**\n"
-                    "🖨️ Keep your printer working and stocked with paper.\n"
-                    "🚗 Keep your vehicle fueled and ready.\n"
-                    "🔋 Carry a charger and backup battery.\n\n"
-                    "📍 **Delivery Best Practices**\n"
-                    "📍 Confirm the client’s address before leaving.\n"
-                    "📞 Call or message the client if needed.\n"
-                    "🤝 Be professional and courteous.\n\n"
-                    "⏰ **Availability**\n"
-                    "🟢 Stay online during your working hours.\n"
-                    "❌ If unavailable, notify dispatch immediately.\n\n"
-                    "📈 **Performance Matters**\n"
-                    "🚀 Fast responses and timely receipts help you receive more leads.\n"
-                    "⭐ Reliable drivers are prioritized for future dispatches.\n\n"
-                    "🛡️ **Security**\n"
-                    "🔒 Keep client information confidential.\n"
-                    "📄 Double-check documents before delivery.\n\n"
-                    "_________________\n"
-                    "🚗 Stay online, keep notifications on, upload receipts immediately, "
-                    "maintain $100 in your account, and remember: 3 missing receipts = "
-                    "automatic suspension. 🚀🧾⚠️\n\n"
-                    "✅ **Suspension lifted!**\n"
-                    "You’re back in action 👊💥\n"
-                    "🚗 You will now receive new leads again",
-                    parse_mode="Markdown",
-                    reply_markup=_driver_keyboard_lead_and_receipt(),
+                await _notify_suspension_lifted(
+                    context,
+                    driver=dr_check,
+                    pending_after=pending_after,
+                    reply_message=update.message,
                 )
-                dn_esc = _telegram_md1_escape(driver_name)
-                try:
-                    _lift = _prefix_supervisory_message(
-                        f"✅ **Suspension removed**\n\n"
-                        f"Driver: **{dn_esc}**\n"
-                        f"Remaining receipts: {len(pending_after)}"
-                    )
-                    for sup_id in _global_supervisory_chat_ids():
-                        try:
-                            await context.bot.send_message(
-                                chat_id=sup_id,
-                                text=_lift,
-                                parse_mode="Markdown",
-                            )
-                        except BadRequest:
-                            await context.bot.send_message(
-                                chat_id=sup_id,
-                                text=f"✅ Suspension removed\n\nDriver: {driver_name}\nRemaining receipts: {len(pending_after)}",
-                            )
-                except Exception as e:
-                    logger.warning("Could not send suspension-lifted alert to supervisory: %s", e)
     else:
         await update.message.reply_text(
             "❌ Error uploading receipt. Please try again or contact support."
