@@ -5834,7 +5834,7 @@ async def _maybe_offer_insurance_card(
         return False
 
 
-PORTAL_DEFAULT_PASSWORD = "Temp#A9"
+PORTAL_DEFAULT_PASSWORD = "Temp#A99"
 
 
 def _generate_portal_password() -> str:
