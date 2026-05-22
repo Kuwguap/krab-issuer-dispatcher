@@ -1678,9 +1678,11 @@ def _format_phase1_field_lines(state_data: dict) -> str:
 def _format_phase1_ai_review_text(state_data: dict) -> str:
     """Human-readable summary of how the bot understood Phase 1 (AI path). Plain text (safe for special chars)."""
     return (
-        "📝 Here's how I understood your lead:\n\n"
+        "📝 Review & ✍️Edit Before Dispatching ✅\n\n"
         + _format_phase1_field_lines(state_data)
-        + "\n\nTap Accept to continue, or tap Edit to make changes."
+        + "\n\nTap ✅Dispatch when finished"
+        + "\nTap ✏️Edit to make changes"
+        + "\nTap 🔍Vin to lookup car info"
     )
 
 
@@ -1729,7 +1731,7 @@ def _build_review_keyboard_with_selections(state_data):
         ],
         [
             InlineKeyboardButton("✏️ Edit", callback_data=PH1_REVIEW_EDIT),
-            InlineKeyboardButton("🔍 Check VIN", callback_data=PH1_REVIEW_VIN_CHECK),
+            InlineKeyboardButton("🔍 VIN", callback_data=PH1_REVIEW_VIN_CHECK),
             InlineKeyboardButton("✅ Submit", callback_data=PH1_REVIEW_ACCEPT),
         ],
     ])
@@ -1951,7 +1953,7 @@ async def _continue_phase1_after_ai_review(message, context: ContextTypes.DEFAUL
     _clean_vin_and_car(state_data)
     _sanitize_phase1_pending_phone_price(state_data)
     db.set_user_state(user_id, "phase1", state_data)
-    # VIN lookup is now opt-in via the "🔍 Check VIN" button on the review
+    # VIN lookup is now opt-in via the "🔍 VIN" button on the review
     # screen; Submit no longer triggers a DMV decode automatically.
     # Re-check missing fields against a synthetic blob so detector still works
     blob = "\n".join(
@@ -3252,7 +3254,7 @@ async def handle_phase1(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
         _sanitize_phase1_pending_phone_price(state_data)
         db.set_user_state(user_id, "phase1", state_data)
         await _send_phase1_ai_review(update.message, state_data, context, user_id)
-        # VIN decode is opt-in via the review screen's "🔍 Check VIN" button.
+        # VIN decode is opt-in via the review screen's "🔍 VIN" button.
         missing = ai_vision.detect_missing_fields(state_data, message_text)
         OPTIONAL_FIELDS = {"insurance_company", "insurance_policy_number", "extra_info", "delivery_date"}
         missing = [f for f in missing if f not in OPTIONAL_FIELDS]
