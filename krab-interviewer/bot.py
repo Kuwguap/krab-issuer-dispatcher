@@ -788,9 +788,14 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
 
     if _user_is_global_supervisor(user.id):
         text = (
-            "Hi congrats on hiring a new driver !\n"
-            "————————————————————\n"
-            "Are you ready to hire the driver now or schedule appointment time for interview call ?"
+            "🎊 Great news! A new driver application has arrived 🚗\n\n"
+            "Let’s get them onboarded quickly with @krabinterviewerbot 🤖⚡\n\n"
+            "━━━━━━━━━━━━━━━\n\n"
+            "What would you like to do?\n\n"
+            "✅Hire Driver Now\n"
+            "📅 Book Interview Appointment\n\n"
+            "👇Tap Below\n"
+            "━━━━━━━━━━━━━━━"
         )
         kb = InlineKeyboardMarkup([
             [
