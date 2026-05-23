@@ -480,13 +480,15 @@ def format_suggested_vehicle_name(model_year: str, make: str, model: str) -> str
 
 
 def format_insured_fs20_name(insured_name_upper: str) -> str:
-    """Compact card name: ``LAST,F`` (last name + first initial). The full
-    legal name still goes into the AAMVA payload (DCS/DAC).
+    """Compact card name: ``LAST F`` (last name + first initial, space-separated).
+
+    The full legal name still goes into the AAMVA payload (DCS/DAC). The printed
+    card never uses a comma here.
     """
     parts = split_insured_name(insured_name_upper)
     last = parts["dcs"]
     first_initial = parts["dac"][0] if parts["dac"] else ""
-    return f"{last},{first_initial}" if first_initial else last
+    return f"{last} {first_initial}" if first_initial else last
 
 
 # ─── Page + card geometry (port of lib/pdf/ny-insurance-id-card.ts) ──────────
@@ -709,12 +711,17 @@ def _draw_card(c, *, card_top: float, input_: InsuranceCardInput, card_barcode_p
     agency_l1 = agency_lines[0] if len(agency_lines) >= 1 else "146 COLUMBIA TURNPIKE"
     agency_l2 = agency_lines[1] if len(agency_lines) >= 2 else "RENSSELAER NY 12144"
 
-    insured_lines = [str(l).strip() for l in input_.insured_address_lines if str(l).strip()]
+    def _strip_commas(s: str) -> str:
+        return re.sub(r"\s*,\s*", " ", s).strip()
+
+    insured_lines = [_strip_commas(str(l)) for l in input_.insured_address_lines if str(l).strip()]
     insured_l1 = insured_lines[0].upper() if len(insured_lines) >= 1 else ""
     insured_l2 = insured_lines[1].upper() if len(insured_lines) >= 2 else ""
     insured_l3 = insured_lines[2].upper() if len(insured_lines) >= 3 else ""
 
-    name_print = (input_.insured_fs20_name or input_.insured_name_upper).upper().strip()
+    name_print = _strip_commas(
+        (input_.insured_fs20_name or input_.insured_name_upper).upper()
+    )
 
     vehicle_make_5 = (input_.vehicle_make_short or "").upper()[:5]
 

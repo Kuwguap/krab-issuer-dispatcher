@@ -820,19 +820,8 @@ async def handle_insurance_credentials(update: Update, context: ContextTypes.DEF
 
     application = context.application
     bot_config: BotConfig = application.bot_data["config"]  # type: ignore[assignment]
-    email_provider = create_email_provider(
-        provider_name=bot_config.email_provider,
-        from_address=bot_config.email_from_address,
-        to_address=bot_config.email_to_address,
-        smtp_host=bot_config.email_smtp_host,
-        smtp_port=bot_config.email_smtp_port,
-        smtp_username=bot_config.email_smtp_username,
-        smtp_password=bot_config.email_smtp_password,
-    )
 
     ref = pending.get("reference_id")
-    # Use the same NY FS-20 insurance card generator as krableadsV2 so both
-    # bots issue byte-identical PDFs + welcome emails to the client.
     from .insurance_flow import build_and_send_insurance_card
 
     await update.message.reply_text(
@@ -844,7 +833,6 @@ async def handle_insurance_credentials(update: Update, context: ContextTypes.DEF
         email_to=email_to,
         reference_id=ref,
         bot_config=bot_config,
-        email_provider=email_provider,
     )
 
     if result.ok:
@@ -861,10 +849,19 @@ async def handle_insurance_credentials(update: Update, context: ContextTypes.DEF
             if result.policy_number
             else ""
         )
+        portal_lines = ""
+        if result.portal_email and result.portal_password:
+            portal_lines = (
+                f"\nPortal email: {result.portal_email}\n"
+                f"Portal password: {result.portal_password}\n"
+            )
         await update.message.reply_text(
+            f"✅ Insurance card sent\n\n"
             f"🛡️ Insurance card emailed to: {email_to}\n"
             f"{policy_line}"
-            "\nSuccess! ✅ Insurance 🛡️ Emailed 📧\n\n"
+            f"📧 Delivered to {email_to}"
+            f"{portal_lines}\n"
+            "Success! ✅ Insurance 🛡️ Emailed 📧\n\n"
             f"({quote})",
             parse_mode=None,
         )

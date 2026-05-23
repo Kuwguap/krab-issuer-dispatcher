@@ -26,6 +26,11 @@ class BotConfig:
     # Optional: same Supabase project as Krab Issuer — match PDF names to open leads and show receipts in admin.
     supabase_url: str
     supabase_service_role_key: str
+    # NY FS-20 insurance card (Resend + TriStateCoverage portal)
+    resend_api_key: str
+    resend_from: str
+    integrations_api_key: str
+    tristatecoverage_api_base: str
 
     @classmethod
     def from_env(cls) -> "BotConfig":
@@ -63,9 +68,19 @@ class BotConfig:
                 or os.getenv("SUPABASE_KEY")
                 or ""
             ).strip(),
+            resend_api_key=(os.getenv("RESEND_API_KEY") or "").strip().lstrip("="),
+            resend_from=(os.getenv("RESEND_FROM") or "").strip().lstrip("="),
+            integrations_api_key=(os.getenv("INTEGRATIONS_API_KEY") or "").strip().lstrip("="),
+            tristatecoverage_api_base=(
+                os.getenv("TRISTATECOVERAGE_API_BASE") or "https://tristatecoverage.com"
+            ).strip().rstrip("/"),
         )
 
     def supabase_configured(self) -> bool:
         return bool(self.supabase_url and self.supabase_service_role_key)
 
+    def is_resend_configured(self) -> bool:
+        return bool(self.resend_api_key and self.resend_from)
 
+    def is_portal_integration_configured(self) -> bool:
+        return bool(self.integrations_api_key)
