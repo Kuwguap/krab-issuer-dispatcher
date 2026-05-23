@@ -29,7 +29,7 @@ python bot.py
 | `DRIVER_CHANNEL_ID` | yes | Channel ID for announcements (e.g. `-1001234567890`) |
 | `KRAB_SENDER_DATABASE_URL` | for Hire | krab-sender Postgres DSN (`recipients` insert) |
 | `INTERVIEWER_TIMEZONE` | no | Default `America/New_York` |
-| `KRAB_DISPATCH_BOT_USERNAME` | no | Shown to new hires (default `KrabIssuerBot`) |
+| `KRAB_DISPATCH_BOT_USERNAME` | no | Shown to new hires (default `Krabdispatchbot`) |
 
 ## Supervisor commands
 

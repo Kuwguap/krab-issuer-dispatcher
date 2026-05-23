@@ -192,14 +192,13 @@ def _format_paper_girl_ship_request(shipment: dict) -> str:
     addr = (shipment.get("driver_address") or "-").strip()
     phone = (shipment.get("driver_phone") or "-").strip()
     return (
-        "📦 New driver!\n\n"
-        f"Please ship {qty} papers to:\n"
-        f"{name}\n"
-        f"{addr}\n"
-        f"{phone}\n\n"
-        "Upload receipt 🧾!\n\n"
-        "Send today fast! 💨\n"
-        "Maximum in the morning latest!"
+        "📦 New Driver Shipment\n\n"
+        f"Please ship {qty} papers today to:\n\n"
+        f"👤 {name}\n"
+        f"📍 {addr}\n"
+        f"📞 {phone}\n\n"
+        "🧾 Please upload receipt after shipping\n"
+        "⚡ Send ASAP — First thing in the morning latest!"
     )
 
 
@@ -785,6 +784,29 @@ async def check_pending_jobs(context: ContextTypes.DEFAULT_TYPE) -> None:
             await _run_announcement_by_id(context, jid)
 
 
+async def paper_girl_receipt_reminder_job(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Every 6 hours, nudge Paper Girl about shipments still awaiting tracking."""
+    pg_cid = _parse_chat_id(Config.PAPER_GIRL_TELEGRAM_ID)
+    if not pg_cid:
+        return
+    pending = [
+        s for s in shipments_db.list_shipments(50)
+        if (s.get("status") or "") == "awaiting_tracking"
+    ]
+    if not pending:
+        return
+    lines = ["⏰ Receipt reminder — shipments still awaiting tracking:\n"]
+    for s in pending:
+        name = (s.get("driver_name") or "?")[:30]
+        qty = s.get("quantity", "?")
+        lines.append(f"• {name} — {qty} papers")
+    lines.append("\nUpload the USPS receipt photo or tracking number when ready 🧾")
+    try:
+        await context.bot.send_message(chat_id=pg_cid, text="\n".join(lines))
+    except Exception as e:
+        logger.warning("paper girl receipt reminder failed: %s", e)
+
+
 def _startup_reenqueue_jobs(application: Application) -> None:
     if not application.job_queue:
         logger.warning("Job queue not available")
@@ -1257,9 +1279,18 @@ async def handle_interview_callbacks(update: Update, context: ContextTypes.DEFAU
 
         await _post_to_driver_channel(context, kind="text", body=hire_msg, media_file_id=None)
 
+        welcome_handle = (
+            username_display
+            if username_display and username_display.startswith("@")
+            else f"@{welcome_first}"
+        )
         driver_dm = (
-            f"🎉 Welcome {welcome_first}! You've been hired.\n\n"
-            f"Start taking leads with @{dispatch_bot}.\n"
+            f"🎉 Welcome to the Team, {welcome_handle}! 🚗🔥\n\n"
+            "You’re officially hired and now part of the family 💪\n"
+            "Let’s get money, move fast, and serve clients together!\n\n"
+            f"📲 Start receiving leads now at @{dispatch_bot}\n"
+            "🔔 Keep notifications ON so you never miss a lead.\n\n"
+            "🚀 Welcome aboard — let’s get to work!"
         )
         join_kb = None
         if channel_invite:
@@ -1707,7 +1738,7 @@ async def handle_shipment_callbacks(update: Update, context: ContextTypes.DEFAUL
         context.user_data["active_shipment_id"] = sid
         dname = (shipment.get("driver_name") or "Driver").strip()
         sent = await query.message.reply_text(
-            f"📥 Send the tracking number (text) or a photo of the USPS receipt for **{dname}**.",
+            f"📥 Please upload the tracking number photo/text of the USPS receipt 🧾 for **{dname}**!",
             parse_mode="Markdown",
         )
         if sent:
@@ -2044,6 +2075,12 @@ def main() -> None:
 
     if application.job_queue:
         application.job_queue.run_repeating(check_pending_jobs, interval=30, first=15)
+        application.job_queue.run_repeating(
+            paper_girl_receipt_reminder_job,
+            interval=6 * 60 * 60,
+            first=6 * 60 * 60,
+            name="paper_girl_receipt_reminder",
+        )
         _startup_reenqueue_jobs(application)
 
     logger.info("Polling...")

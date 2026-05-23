@@ -41,4 +41,4 @@ services:
       - key: INTERVIEWER_TIMEZONE
         value: America/New_York
       - key: KRAB_DISPATCH_BOT_USERNAME
-        value: KrabIssuerBot
+        value: Krabdispatchbot
