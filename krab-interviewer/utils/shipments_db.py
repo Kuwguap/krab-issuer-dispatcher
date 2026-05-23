@@ -128,3 +128,44 @@ def get_bot_setting(key: str) -> Optional[Dict[str, Any]]:
     except Exception as e:
         logger.error("get_bot_setting: %s", e)
         return None
+
+
+def set_supervisor_email(telegram_id: str, email: str) -> bool:
+    payload = {
+        "telegram_id": str(telegram_id).strip(),
+        "email": (email or "").strip(),
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+    }
+    try:
+        _get_client().table("supervisor_emails").upsert(payload).execute()
+        return True
+    except Exception as e:
+        logger.error("set_supervisor_email: %s", e)
+        return False
+
+
+def get_supervisor_email(telegram_id: str) -> Optional[str]:
+    try:
+        r = (
+            _get_client()
+            .table("supervisor_emails")
+            .select("email")
+            .eq("telegram_id", str(telegram_id).strip())
+            .limit(1)
+            .execute()
+        )
+        if r.data:
+            return (r.data[0].get("email") or "").strip() or None
+        return None
+    except Exception as e:
+        logger.error("get_supervisor_email: %s", e)
+        return None
+
+
+def list_supervisor_emails() -> List[Dict[str, Any]]:
+    try:
+        r = _get_client().table("supervisor_emails").select("*").execute()
+        return r.data or []
+    except Exception as e:
+        logger.error("list_supervisor_emails: %s", e)
+        return []

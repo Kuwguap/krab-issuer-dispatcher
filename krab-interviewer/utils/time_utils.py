@@ -1,31 +1,71 @@
 """Parse user-supplied datetimes for appointments and scheduled announcements."""
 from __future__ import annotations
 
+import logging
 import re
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Optional
 
 import pytz
 
+logger = logging.getLogger(__name__)
+
+
+def _tz(tz_name: str) -> pytz.BaseTzInfo:
+    try:
+        return pytz.timezone(tz_name)
+    except Exception:
+        return pytz.timezone("America/New_York")
+
+
+def _try_dateparser(text: str, tz_name: str) -> Optional[datetime]:
+    """Parse natural language like 'May 26 7pm', 'Sunday 12pm', 'Next Tuesday 8pm'."""
+    try:
+        import dateparser
+    except ImportError:
+        logger.warning("dateparser not installed; skipping NL parse")
+        return None
+
+    tz = _tz(tz_name)
+    now = datetime.now(tz)
+    try:
+        dt = dateparser.parse(
+            text,
+            settings={
+                "TIMEZONE": tz_name,
+                "RETURN_AS_TIMEZONE_AWARE": True,
+                "PREFER_DATES_FROM": "future",
+                "RELATIVE_BASE": now,
+            },
+        )
+    except Exception as e:
+        logger.warning("dateparser failed on %r: %s", text, e)
+        return None
+    if dt is None:
+        return None
+    if dt.tzinfo is None:
+        dt = tz.localize(dt)
+    else:
+        dt = dt.astimezone(tz)
+    return dt
+
 
 def parse_user_datetime(text: str, tz_name: str) -> Optional[datetime]:
     """
-    Parse strings like ``2026-05-25 14:30``, ``5/25/2026 2:30pm``, ``tomorrow 3pm``.
+    Parse natural language ('May 26 7pm', 'Sunday 12pm', 'Next Tuesday 8pm'),
+    structured formats ('2026-05-25 14:30', '5/25/2026 2:30pm'), or 'tomorrow 3pm'.
     Returns timezone-aware datetime in ``tz_name``, or None.
     """
     raw = (text or "").strip()
     if not raw:
         return None
-    try:
-        tz = pytz.timezone(tz_name)
-    except Exception:
-        tz = pytz.timezone("America/New_York")
+    tz = _tz(tz_name)
 
     lower = raw.lower()
     now = datetime.now(tz)
 
     if lower.startswith("tomorrow"):
-        base = now + __import__("datetime").timedelta(days=1)
+        base = now + timedelta(days=1)
         rest = lower.replace("tomorrow", "").strip()
         if not rest:
             return base.replace(hour=9, minute=0, second=0, microsecond=0)
@@ -66,6 +106,10 @@ def parse_user_datetime(text: str, tz_name: str) -> Optional[datetime]:
             return tz.localize(dt)
         except ValueError:
             return None
+
+    nl = _try_dateparser(raw, tz_name)
+    if nl is not None:
+        return nl
 
     return None
 

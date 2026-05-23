@@ -9,7 +9,8 @@ import logging
 import re
 import sys
 import uuid as _uuid_mod
-from datetime import datetime, timezone
+import calendar as _calendar_mod
+from datetime import date as _date, datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
 
 import pytz
@@ -54,22 +55,25 @@ STATE_ANNOUNCE_SCHEDULE_TIME = 6
 STATE_ANNOUNCE_SCHEDULE_CONTENT = 7
 STATE_AWAIT_TRACKING = 8
 STATE_SET_TRAINING_VIDEO = 9
+STATE_AWAIT_SUPERVISOR_EMAIL = 10
 
 INTERVIEW_QUESTIONNAIRE_PROMPT = (
-    "Enter driver interview call info below:\n"
-    "Photo or text data parse\n"
-    " 1. 🧑 Full Name (First Last)\n"
+    "🚗 DRIVER INTERVIEW 📞CALL FORM📋\n\n"
+    "⚡ AI Smart Data Parse Enabled\n"
+    "📸 You may upload screenshots, photos, or documents\n\n"
     " 2. ⏳ Work Commitment\n"
     " 3. 📱 Phone Number\n"
     " 4. 📧 Email Address\n"
+    " 1. 🧑 Full Name\n"
     " 5. 🏠 Mailing Address\n"
     " 6. 🪪 Driver's License (send to text/email)\n"
-    " 7. 💬 Telegram Username (must download app)\n"
+    " 7. 💬 Telegram Username (download settings @username)\n"
     " 8. 🚨 Emergency Contact\n"
     " 9. 👥 Referral (if any)\n"
     "10. 💰 Payment Method\n"
     "11. ⚒️ Profession skill\n"
-    "12. 💬 Telegram ID"
+    "12. 💬 Telegram ID\n\n"
+    "✅ Please double-check all information before submitting"
 )
 
 FIELD_LABELS = {
@@ -639,16 +643,18 @@ async def _fire_appointment_reminder(context: ContextTypes.DEFAULT_TYPE) -> None
     interview = db.get_interview_by_id(appt.get("interview_id", ""))
     if not interview:
         return
-    ref = (interview.get("first_name") or interview.get("telegram_username") or "Driver")
+    full = (interview.get("full_name") or "").strip()
+    ref = full or (interview.get("first_name") or interview.get("telegram_username") or "Driver")
     when = format_dt_display(
         datetime.fromisoformat(str(appt["scheduled_at"]).replace("Z", "+00:00")),
         Config.INTERVIEWER_TIMEZONE,
     )
+    reference = str(interview.get("id", ""))[:8]
     msg = (
         f"📆 Interview appointment reminder\n\n"
         f"Driver: {ref}\n"
         f"Time: {when}\n"
-        f"Reference: {str(interview.get('id', ''))[:8]}"
+        f"Reference: {reference}"
     )
     targets = set()
     creator = _parse_chat_id(appt.get("created_by_telegram_id"))
@@ -657,11 +663,27 @@ async def _fire_appointment_reminder(context: ContextTypes.DEFAULT_TYPE) -> None
     tid = _parse_chat_id(interview.get("telegram_id"))
     if tid:
         targets.add(tid)
+    for cid in _global_supervisory_chat_ids():
+        targets.add(cid)
     for chat_id in targets:
         try:
             await context.bot.send_message(chat_id=chat_id, text=msg)
         except Exception as e:
             logger.warning("appointment reminder to %s: %s", chat_id, e)
+
+    for row in shipments_db.list_supervisor_emails():
+        email_addr = (row.get("email") or "").strip()
+        if not email_addr:
+            continue
+        ok_em, err_em = resend_client.send_appointment_reminder_email(
+            to_address=email_addr,
+            driver_name=ref,
+            appointment_display=when,
+            reference=reference,
+        )
+        if not ok_em:
+            logger.warning("appointment email to %s failed: %s", email_addr, err_em)
+
     db.mark_appointment_reminded(appt_id)
 
 
@@ -870,9 +892,9 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
 
     if _user_is_global_supervisor(user.id):
         text = (
-            "🎊 Great news! A new driver application has arrived 🚗\n\n"
-            "Let’s get them onboarded quickly with @krabinterviewerbot 🤖⚡\n\n"
-            "━━━━━━━━━━━━━━━\n\n"
+            "🎊 Great news! You hired a new driver to join the Team ! 🚗\n"
+            "Let’s get them started quickly with @krabinterviewerbot 🤖⚡\n\n"
+            "━━━━━━━━━━━━━━━\n"
             "What would you like to do?\n\n"
             "✅Hire Driver Now\n"
             "📅 Book Interview Appointment\n\n"
@@ -881,8 +903,8 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         )
         kb = InlineKeyboardMarkup([
             [
-                InlineKeyboardButton("Now", callback_data="int_now"),
-                InlineKeyboardButton("Appointment", callback_data="int_appt"),
+                InlineKeyboardButton("🙋‍♂️Now", callback_data="int_now"),
+                InlineKeyboardButton("📆 Appointment", callback_data="int_appt"),
             ],
         ])
         await msg.reply_text(text, reply_markup=kb)
@@ -984,6 +1006,41 @@ async def _send_interview_detail(message, context, interview_id: str) -> None:
         await message.reply_text(f"🪪 License file:\n{lic}")
 
 
+async def cmd_setemail(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    user = update.effective_user
+    msg = update.effective_message
+    if not user or not msg:
+        return ConversationHandler.END
+    if not _user_is_global_supervisor(user.id):
+        return ConversationHandler.END
+    existing = shipments_db.get_supervisor_email(str(user.id))
+    note = f"\n\nCurrent: `{existing}`" if existing else ""
+    await msg.reply_text(
+        "📧 Send your email address to receive appointment reminders." + note,
+        parse_mode="Markdown",
+    )
+    return STATE_AWAIT_SUPERVISOR_EMAIL
+
+
+async def handle_supervisor_email(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    msg = update.effective_message
+    user = update.effective_user
+    if not msg or not user:
+        return ConversationHandler.END
+    if not _user_is_global_supervisor(user.id):
+        return ConversationHandler.END
+    text = (msg.text or "").strip()
+    if not re.match(r"^[^@\s]+@[^@\s]+\.[^@\s]+$", text):
+        await msg.reply_text("That doesn't look like a valid email. Try again or /cancel.")
+        return STATE_AWAIT_SUPERVISOR_EMAIL
+    ok = shipments_db.set_supervisor_email(str(user.id), text)
+    if ok:
+        await msg.reply_text(f"✅ Saved `{text}`. You'll receive appointment reminders here.", parse_mode="Markdown")
+    else:
+        await msg.reply_text("❌ Could not save email. Run migration_supervisor_emails.sql?")
+    return ConversationHandler.END
+
+
 async def cmd_announce(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     if not _user_is_global_supervisor(update.effective_user.id):
         return ConversationHandler.END
@@ -1016,17 +1073,19 @@ async def handle_interview_callbacks(update: Update, context: ContextTypes.DEFAU
 
     if data == "int_now":
         await _clear_pending_prompts(context, chat_id)
+        if query.message:
+            await _safe_delete_chat_message(context, chat_id, query.message.message_id)
         context.user_data["is_supervisor_created"] = True
         if query.message:
             await query.message.reply_text(INTERVIEW_QUESTIONNAIRE_PROMPT)
         return STATE_INTERVIEW_INPUT
 
     if data == "int_appt":
-        await query.message.reply_text(
-            "📆 Send the appointment date and time for the interview call "
-            f"(e.g. 2026-05-25 14:30 {Config.INTERVIEWER_TIMEZONE.split('/')[-1]}):"
-        )
+        if query.message:
+            await _safe_delete_chat_message(context, chat_id, query.message.message_id)
         context.user_data["schedule_only_before_interview"] = True
+        if query.message:
+            await _send_appointment_prompt(query.message, context)
         return STATE_INT_SCHEDULE_APPT
 
     iid = context.user_data.get("active_interview_id") or _interview_id_from_callback(data)
@@ -1091,10 +1150,8 @@ async def handle_interview_callbacks(update: Update, context: ContextTypes.DEFAU
         iid = iid or _resolve_interview_id_from_callback(data, "int_sched_")
         if iid:
             context.user_data["active_interview_id"] = iid
-            sent = await query.message.reply_text(
-                f"📆 Send date and time (e.g. 2026-05-25 14:30):"
-            )
-            _track_pending_prompt(context, sent.message_id)
+            if query.message:
+                await _send_appointment_prompt(query.message, context)
             return STATE_INT_SCHEDULE_APPT
 
     if data.startswith("int_edit_"):
@@ -1243,32 +1300,134 @@ async def handle_interview_callbacks(update: Update, context: ContextTypes.DEFAU
     return STATE_INTERVIEW_INPUT
 
 
-async def handle_schedule_appt_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    msg = update.effective_message
-    user = update.effective_user
-    text = (msg.text or "").strip()
-    dt = parse_user_datetime(text, Config.INTERVIEWER_TIMEZONE)
-    if not dt:
-        await msg.reply_text("Could not parse date/time. Try again (e.g. 2026-05-25 14:30).")
-        return STATE_INT_SCHEDULE_APPT
+# --- Calendar picker for appointments ---
 
-    await _clear_pending_prompts(context, msg.chat_id)
+_DAY_HEADERS = ["Mo", "Tu", "We", "Th", "Fr", "Sa", "Su"]
+_HOUR_CHOICES = [8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21]
+_MINUTE_CHOICES = [0, 15, 30, 45]
+
+
+def _appt_tz():
     try:
-        await msg.delete()
+        return pytz.timezone(Config.INTERVIEWER_TIMEZONE)
     except Exception:
-        pass
+        return pytz.timezone("America/New_York")
+
+
+def _build_calendar_keyboard(year: int, month: int) -> InlineKeyboardMarkup:
+    cal = _calendar_mod.Calendar(firstweekday=0)
+    weeks = cal.monthdatescalendar(year, month)
+    today = datetime.now(_appt_tz()).date()
+    header = [InlineKeyboardButton(_calendar_mod.month_name[month] + f" {year}", callback_data="cal_noop")]
+    rows: List[List[InlineKeyboardButton]] = [header]
+    rows.append([InlineKeyboardButton(d, callback_data="cal_noop") for d in _DAY_HEADERS])
+    for week in weeks:
+        row = []
+        for d in week:
+            if d.month != month:
+                row.append(InlineKeyboardButton(" ", callback_data="cal_noop"))
+            elif d < today:
+                row.append(InlineKeyboardButton("·", callback_data="cal_noop"))
+            else:
+                label = f"·{d.day}·" if d == today else str(d.day)
+                row.append(
+                    InlineKeyboardButton(label, callback_data=f"cal_day_{d.isoformat()}")
+                )
+        rows.append(row)
+
+    prev_month = month - 1 or 12
+    prev_year = year - 1 if month == 1 else year
+    next_month = 1 if month == 12 else month + 1
+    next_year = year + 1 if month == 12 else year
+    rows.append([
+        InlineKeyboardButton("◀️", callback_data=f"cal_nav_{prev_year}-{prev_month:02d}"),
+        InlineKeyboardButton("Cancel", callback_data="cal_cancel"),
+        InlineKeyboardButton("▶️", callback_data=f"cal_nav_{next_year}-{next_month:02d}"),
+    ])
+    return InlineKeyboardMarkup(rows)
+
+
+def _build_hour_keyboard(day_iso: str) -> InlineKeyboardMarkup:
+    rows: List[List[InlineKeyboardButton]] = []
+    row: List[InlineKeyboardButton] = []
+    for h in _HOUR_CHOICES:
+        label = datetime.strptime(f"{h:02d}:00", "%H:%M").strftime("%-I%p") if False else (
+            datetime(2000, 1, 1, h, 0).strftime("%I%p").lstrip("0")
+        )
+        row.append(InlineKeyboardButton(label, callback_data=f"cal_hr_{day_iso}_{h:02d}"))
+        if len(row) == 4:
+            rows.append(row)
+            row = []
+    if row:
+        rows.append(row)
+    today_iso = datetime.now(_appt_tz()).strftime("%Y-%m")
+    target_month = day_iso[:7]
+    rows.append([
+        InlineKeyboardButton("⬅️ Day", callback_data=f"cal_nav_{target_month}"),
+        InlineKeyboardButton("Cancel", callback_data="cal_cancel"),
+    ])
+    return InlineKeyboardMarkup(rows)
+
+
+def _build_minute_keyboard(day_iso: str, hour: int) -> InlineKeyboardMarkup:
+    rows: List[List[InlineKeyboardButton]] = [[]]
+    for m in _MINUTE_CHOICES:
+        label = f"{hour:02d}:{m:02d}"
+        rows[0].append(
+            InlineKeyboardButton(label, callback_data=f"cal_set_{day_iso}_{hour:02d}-{m:02d}")
+        )
+    rows.append([
+        InlineKeyboardButton("⬅️ Hour", callback_data=f"cal_day_{day_iso}"),
+        InlineKeyboardButton("Cancel", callback_data="cal_cancel"),
+    ])
+    return InlineKeyboardMarkup(rows)
+
+
+def _appt_text_prompt() -> str:
+    return (
+        "📆 Pick a date and time below, or type the appointment time.\n\n"
+        "AI understands: `May 26 7pm`, `Sunday 12pm`, `Next Tuesday 8pm`, "
+        "`2026-05-25 14:30`, `tomorrow 3pm`."
+    )
+
+
+async def _send_appointment_prompt(message, context: ContextTypes.DEFAULT_TYPE) -> None:
+    today = datetime.now(_appt_tz()).date()
+    sent = await message.reply_text(
+        _appt_text_prompt(),
+        reply_markup=_build_calendar_keyboard(today.year, today.month),
+        parse_mode="Markdown",
+    )
+    if sent:
+        _track_pending_prompt(context, sent.message_id)
+
+
+async def _finalize_appointment(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    *,
+    dt: datetime,
+    via_message=None,
+) -> int:
+    msg = via_message or update.effective_message
+    user = update.effective_user
+    await _clear_pending_prompts(context, msg.chat_id if msg else None)
+
+    when_label = format_dt_display(dt, Config.INTERVIEWER_TIMEZONE)
 
     if context.user_data.pop("schedule_only_before_interview", False):
-        await msg.reply_text(
-            f"📆 Appointment noted for {format_dt_display(dt, Config.INTERVIEWER_TIMEZONE)}.\n"
-            "Tap **Now** when ready to enter driver info, or send questionnaire data."
-        )
+        if msg:
+            await msg.reply_text(
+                f"📆 Appointment noted for {when_label}.\n"
+                "Tap **🙋‍♂️Now** when ready to enter driver info."
+            )
         context.user_data["pending_pre_interview_appt"] = dt.isoformat()
         return STATE_INTERVIEW_INPUT
 
     iid = context.user_data.get("active_interview_id")
     if not iid:
-        await msg.reply_text("No active interview. Use /start")
+        if msg:
+            await msg.reply_text("No active interview. Use /start")
         return ConversationHandler.END
 
     appt = db.create_appointment(iid, dt, str(user.id))
@@ -1277,9 +1436,115 @@ async def handle_schedule_appt_text(update: Update, context: ContextTypes.DEFAUL
         _schedule_appointment_job(context.application, appt)
     interview = db.get_interview_by_id(iid)
     if interview:
-        interview["_appointment_display"] = format_dt_display(dt, Config.INTERVIEWER_TIMEZONE)
+        interview["_appointment_display"] = when_label
         await _refresh_understanding_card(context, interview)
+    if msg:
+        await msg.reply_text(f"✅ Appointment set for {when_label}.")
     return STATE_INTERVIEW_INPUT
+
+
+async def handle_calendar_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    await _safe_answer_callback_query(query)
+    data = query.data or ""
+    message = query.message
+
+    if data == "cal_noop":
+        return STATE_INT_SCHEDULE_APPT
+
+    if data == "cal_cancel":
+        if message:
+            await _safe_delete_chat_message(context, message.chat_id, message.message_id)
+        context.user_data.pop("schedule_only_before_interview", None)
+        return STATE_INTERVIEW_INPUT
+
+    if data.startswith("cal_nav_"):
+        ym = data.replace("cal_nav_", "")
+        try:
+            year, month = [int(x) for x in ym.split("-")]
+        except (ValueError, AttributeError):
+            return STATE_INT_SCHEDULE_APPT
+        if message:
+            try:
+                await context.bot.edit_message_reply_markup(
+                    chat_id=message.chat_id,
+                    message_id=message.message_id,
+                    reply_markup=_build_calendar_keyboard(year, month),
+                )
+            except Exception as e:
+                logger.debug("calendar nav edit: %s", e)
+        return STATE_INT_SCHEDULE_APPT
+
+    if data.startswith("cal_day_"):
+        day_iso = data.replace("cal_day_", "")
+        if message:
+            try:
+                await context.bot.edit_message_text(
+                    chat_id=message.chat_id,
+                    message_id=message.message_id,
+                    text=f"⏰ Pick an hour for {day_iso}:",
+                    reply_markup=_build_hour_keyboard(day_iso),
+                )
+            except Exception as e:
+                logger.debug("calendar day edit: %s", e)
+        return STATE_INT_SCHEDULE_APPT
+
+    if data.startswith("cal_hr_"):
+        rest = data.replace("cal_hr_", "")
+        try:
+            day_iso, hr_str = rest.rsplit("_", 1)
+            hour = int(hr_str)
+        except (ValueError, AttributeError):
+            return STATE_INT_SCHEDULE_APPT
+        if message:
+            try:
+                await context.bot.edit_message_text(
+                    chat_id=message.chat_id,
+                    message_id=message.message_id,
+                    text=f"🕐 Pick minute for {day_iso} {hour:02d}:xx",
+                    reply_markup=_build_minute_keyboard(day_iso, hour),
+                )
+            except Exception as e:
+                logger.debug("calendar hour edit: %s", e)
+        return STATE_INT_SCHEDULE_APPT
+
+    if data.startswith("cal_set_"):
+        rest = data.replace("cal_set_", "")
+        try:
+            day_iso, hm = rest.rsplit("_", 1)
+            hour, minute = [int(x) for x in hm.split("-")]
+            y, m, d = [int(x) for x in day_iso.split("-")]
+        except (ValueError, AttributeError):
+            return STATE_INT_SCHEDULE_APPT
+        tz = _appt_tz()
+        try:
+            dt = tz.localize(datetime(y, m, d, hour, minute))
+        except Exception:
+            return STATE_INT_SCHEDULE_APPT
+        if message:
+            await _safe_delete_chat_message(context, message.chat_id, message.message_id)
+        return await _finalize_appointment(update, context, dt=dt, via_message=message)
+
+    return STATE_INT_SCHEDULE_APPT
+
+
+async def handle_schedule_appt_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    msg = update.effective_message
+    text = (msg.text or "").strip()
+    dt = parse_user_datetime(text, Config.INTERVIEWER_TIMEZONE)
+    if not dt:
+        await msg.reply_text(
+            "Could not parse date/time. Try `May 26 7pm`, `Sunday 12pm`, "
+            "`Next Tuesday 8pm`, or use the calendar above.",
+            parse_mode="Markdown",
+        )
+        return STATE_INT_SCHEDULE_APPT
+
+    try:
+        await msg.delete()
+    except Exception:
+        pass
+    return await _finalize_appointment(update, context, dt=dt)
 
 
 async def handle_upload_license(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -1698,6 +1963,7 @@ def main() -> None:
             CommandHandler("announce", cmd_announce),
             CommandHandler("announce_schedule", cmd_announce_schedule),
             CommandHandler("set_training_video", cmd_set_training_video),
+            CommandHandler("setemail", cmd_setemail),
         ],
         states={
             STATE_INTERVIEW_INPUT: [
@@ -1731,7 +1997,11 @@ def main() -> None:
                 ),
             ],
             STATE_INT_SCHEDULE_APPT: [
+                CallbackQueryHandler(handle_calendar_callbacks, pattern=r"^cal_"),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, handle_schedule_appt_text),
+            ],
+            STATE_AWAIT_SUPERVISOR_EMAIL: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_supervisor_email),
             ],
             STATE_INT_UPLOAD_LICENSE: [
                 MessageHandler(filters.PHOTO | filters.Document.ALL, handle_upload_license),
