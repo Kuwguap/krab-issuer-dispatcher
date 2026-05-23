@@ -258,6 +258,11 @@ def _format_shipments_list(rows: List[dict]) -> str:
     return "\n".join(parts)
 
 
+async def _reply_shipments_list(message) -> None:
+    rows = shipments_db.list_shipments(50)
+    await message.reply_text(_format_shipments_list(rows), parse_mode="Markdown")
+
+
 async def _safe_answer_callback_query(query) -> None:
     try:
         await query.answer()
@@ -917,6 +922,12 @@ async def cmd_interviews(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     )
 
 
+async def cmd_shipments(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not _user_can_manage_shipments(update.effective_user.id):
+        return
+    await _reply_shipments_list(update.effective_message)
+
+
 async def cmd_drivers(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not _user_is_global_supervisor(update.effective_user.id):
         return
@@ -1404,10 +1415,8 @@ async def handle_shipment_callbacks(update: Update, context: ContextTypes.DEFAUL
         return STATE_INTERVIEW_INPUT
 
     if data == "ship_view_all":
-        rows = shipments_db.list_shipments(50)
-        text = _format_shipments_list(rows)
         if query.message:
-            await query.message.reply_text(text, parse_mode="Markdown")
+            await _reply_shipments_list(query.message)
         return STATE_INTERVIEW_INPUT
 
     if data.startswith("ship_track_"):
@@ -1752,6 +1761,7 @@ def main() -> None:
 
     application.add_handler(conv)
     application.add_handler(CommandHandler("interviews", cmd_interviews))
+    application.add_handler(CommandHandler("shipments", cmd_shipments))
     application.add_handler(CommandHandler("drivers", cmd_drivers))
     application.add_handler(CommandHandler("open", cmd_open))
     application.add_handler(
