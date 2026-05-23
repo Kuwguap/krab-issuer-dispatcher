@@ -22,6 +22,14 @@ class Config:
     KRAB_SENDER_DATABASE_URL = (os.getenv("KRAB_SENDER_DATABASE_URL") or "").strip() or None
     INTERVIEWER_TIMEZONE = (os.getenv("INTERVIEWER_TIMEZONE") or "America/New_York").strip()
     KRAB_DISPATCH_BOT_USERNAME = (os.getenv("KRAB_DISPATCH_BOT_USERNAME") or "KrabIssuerBot").strip()
+    PAPER_GIRL_TELEGRAM_ID = (os.getenv("PAPER_GIRL_TELEGRAM_ID") or "").strip() or None
+    DEFAULT_PAPER_QTY = int(os.getenv("DEFAULT_PAPER_QTY") or "10")
+    RESEND_API_KEY = (os.getenv("RESEND_API_KEY") or "").strip() or None
+    RESEND_FROM = (os.getenv("RESEND_FROM") or "").strip() or None
+    USPS_TRACK_URL_BASE = (
+        os.getenv("USPS_TRACK_URL_BASE")
+        or "https://tools.usps.com/go/TrackConfirmAction?tLabels="
+    ).strip()
 
     @classmethod
     def is_ai_configured(cls) -> bool:

@@ -26,9 +26,13 @@ from telegram.ext import (
 
 from config import Config
 from utils import ai_vision
+from utils import ai_tracking
 from utils.ai_vision import INTERVIEW_FIELD_KEYS, AIVisionQuotaError
+from utils.ai_tracking import AITrackingQuotaError
 from utils.database import Database
 from utils import recipients_db
+from utils import shipments_db
+from utils import resend_client
 from utils.time_utils import format_dt_display, parse_user_datetime
 
 logging.basicConfig(
@@ -47,6 +51,8 @@ STATE_INT_UPLOAD_LICENSE = 4
 STATE_ANNOUNCE_WAIT = 5
 STATE_ANNOUNCE_SCHEDULE_TIME = 6
 STATE_ANNOUNCE_SCHEDULE_CONTENT = 7
+STATE_AWAIT_TRACKING = 8
+STATE_SET_TRAINING_VIDEO = 9
 
 INTERVIEW_QUESTIONNAIRE_PROMPT = (
     "Enter driver interview call info below:\n"
@@ -152,6 +158,73 @@ def _user_is_global_supervisor(user_id) -> bool:
         if _norm_chat_id(cid) == target:
             return True
     return False
+
+
+def _user_is_paper_girl(user_id) -> bool:
+    pg = _parse_chat_id(Config.PAPER_GIRL_TELEGRAM_ID)
+    if pg is None:
+        return False
+    return _norm_chat_id(user_id) == _norm_chat_id(pg)
+
+
+def _user_can_manage_shipments(user_id) -> bool:
+    return _user_is_global_supervisor(user_id) or _user_is_paper_girl(user_id)
+
+
+def _build_usps_tracking_url(tracking_number: str) -> str:
+    tn = re.sub(r"\D", "", tracking_number or "")
+    base = (Config.USPS_TRACK_URL_BASE or "").strip()
+    if not base:
+        base = "https://tools.usps.com/go/TrackConfirmAction?tLabels="
+    return f"{base}{tn}"
+
+
+def _format_paper_girl_ship_request(shipment: dict) -> str:
+    qty = int(shipment.get("quantity") or Config.DEFAULT_PAPER_QTY)
+    name = (shipment.get("driver_name") or "Driver").strip()
+    addr = (shipment.get("driver_address") or "-").strip()
+    phone = (shipment.get("driver_phone") or "-").strip()
+    return (
+        "📦 New driver!\n\n"
+        f"Please ship {qty} papers to:\n"
+        f"{name}\n"
+        f"{addr}\n"
+        f"{phone}\n\n"
+        "Upload receipt 🧾!\n\n"
+        "Send today fast! 💨\n"
+        "Maximum in the morning latest!"
+    )
+
+
+def _paper_girl_ship_keyboard(shipment_id: str) -> InlineKeyboardMarkup:
+    sid = _short_uuid(shipment_id)
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton(
+                "👉📥 Upload tracking number",
+                callback_data=f"ship_track_{sid}",
+            ),
+        ],
+        [
+            InlineKeyboardButton(
+                "👉📦 View all shipments",
+                callback_data="ship_view_all",
+            ),
+        ],
+    ])
+
+
+def _format_shipments_list(rows: List[dict]) -> str:
+    if not rows:
+        return "📦 No shipments yet."
+    lines = ["📦 **Shipments** (newest first)\n"]
+    for s in rows:
+        name = (s.get("driver_name") or "?")[:24]
+        qty = s.get("quantity", "?")
+        st = s.get("status", "?")
+        tr = (s.get("tracking_number") or "-")[:22]
+        lines.append(f"• {name} | {qty} papers | {st} | {tr}")
+    return "\n".join(lines)
 
 
 async def _safe_answer_callback_query(query) -> None:
@@ -304,6 +377,169 @@ async def _post_to_driver_channel(
     except Exception as e:
         logger.error("channel post failed: %s", e)
         return False
+
+
+# --- Paper shipments (hire -> paper girl -> tracking -> driver) ---
+
+
+async def _send_training_video_to_chat(
+    context: ContextTypes.DEFAULT_TYPE,
+    chat_id: int,
+    *,
+    caption_override: Optional[str] = None,
+) -> bool:
+    setting = shipments_db.get_bot_setting("training_video")
+    if not setting or not setting.get("media_file_id"):
+        return False
+    kind = (setting.get("media_kind") or "video").strip().lower()
+    fid = setting["media_file_id"]
+    cap = caption_override or (setting.get("caption") or "").strip() or None
+    try:
+        if kind == "photo":
+            await context.bot.send_photo(chat_id=chat_id, photo=fid, caption=cap)
+        elif kind == "document":
+            await context.bot.send_document(chat_id=chat_id, document=fid, caption=cap)
+        elif kind == "animation":
+            await context.bot.send_animation(chat_id=chat_id, animation=fid, caption=cap)
+        else:
+            await context.bot.send_video(chat_id=chat_id, video=fid, caption=cap)
+        return True
+    except Exception as e:
+        logger.warning("send training video to %s: %s", chat_id, e)
+        return False
+
+
+async def _create_and_notify_paper_girl(
+    context: ContextTypes.DEFAULT_TYPE,
+    interview: dict,
+    *,
+    created_by_telegram_id: str,
+) -> tuple[Optional[dict], Optional[str]]:
+    """Create shipment row and DM Paper Girl. Returns (shipment, warning)."""
+    fn = (interview.get("first_name") or "").strip()
+    addr = (interview.get("mailing_address") or "").strip()
+    phone = (interview.get("phone_number") or "").strip()
+    em = (interview.get("email") or "").strip()
+    tid = (interview.get("telegram_id") or "").strip()
+    iid = interview.get("id")
+
+    shipment = shipments_db.create_shipment(
+        interview_id=iid,
+        driver_name=fn or "Driver",
+        driver_address=addr or None,
+        driver_phone=phone or None,
+        driver_email=em or None,
+        driver_telegram_id=tid or None,
+        quantity=Config.DEFAULT_PAPER_QTY,
+        created_by_telegram_id=created_by_telegram_id,
+    )
+    if not shipment:
+        return None, "Could not create paper_shipments row (run migration_paper_shipments.sql?)"
+
+    pg_cid = _parse_chat_id(Config.PAPER_GIRL_TELEGRAM_ID)
+    if not pg_cid:
+        return shipment, "PAPER_GIRL_TELEGRAM_ID is not set — shipment saved but Paper Girl was not notified."
+
+    try:
+        await context.bot.send_message(
+            chat_id=pg_cid,
+            text=_format_paper_girl_ship_request(shipment),
+            reply_markup=_paper_girl_ship_keyboard(shipment["id"]),
+        )
+    except Exception as e:
+        logger.error("notify paper girl: %s", e)
+        return shipment, f"Paper Girl DM failed: {e}"
+
+    return shipment, None
+
+
+async def _notify_driver_of_shipment(
+    context: ContextTypes.DEFAULT_TYPE,
+    shipment: dict,
+) -> tuple[bool, List[str]]:
+    """Forward tracking to driver via Telegram + email. Returns (ok, warnings)."""
+    warnings: List[str] = []
+    tracking = (shipment.get("tracking_number") or "").strip()
+    if not tracking:
+        return False, ["No tracking number on shipment"]
+
+    usps_url = _build_usps_tracking_url(tracking)
+    zip_code = (shipment.get("tracking_zip") or "").strip()
+    name = (shipment.get("driver_name") or "Driver").strip()
+    qty = int(shipment.get("quantity") or Config.DEFAULT_PAPER_QTY)
+    zip_line = zip_code if zip_code else "—"
+
+    tg_msg = (
+        "📦 Your training papers are on the way!\n\n"
+        f"USPS Tracking: {tracking}\n"
+        f"Track here: {usps_url}\n"
+        f"Destination ZIP: {zip_line}\n\n"
+        "Tips:\n"
+        "• Don't open until day of\n"
+        "• Print on letter-size paper\n"
+        "• Watch the training video below 👇"
+    )
+
+    driver_tid = _parse_chat_id(shipment.get("driver_telegram_id"))
+    if driver_tid:
+        try:
+            await context.bot.send_message(chat_id=driver_tid, text=tg_msg)
+            receipt_fid = (shipment.get("receipt_file_id") or "").strip()
+            if receipt_fid:
+                try:
+                    await context.bot.send_photo(
+                        chat_id=driver_tid,
+                        photo=receipt_fid,
+                        caption="🧾 USPS receipt",
+                    )
+                except Exception as e:
+                    warnings.append(f"Receipt photo to driver: {e}")
+            if not await _send_training_video_to_chat(context, driver_tid):
+                warnings.append("Training video not configured (/set_training_video)")
+        except Exception as e:
+            warnings.append(f"Telegram DM to driver: {e}")
+    else:
+        warnings.append("Driver telegram_id missing")
+
+    driver_email = (shipment.get("driver_email") or "").strip()
+    if driver_email:
+        ok_em, err_em = resend_client.send_driver_tracking_email(
+            to_address=driver_email,
+            driver_name=name,
+            tracking_number=tracking,
+            tracking_url=usps_url,
+            zip_code=zip_code or None,
+            qty=qty,
+        )
+        if not ok_em:
+            warnings.append(f"Email: {err_em or 'send failed'}")
+    else:
+        warnings.append("Driver email missing — skipped Resend")
+
+    shipments_db.update_shipment(shipment["id"], {"status": "driver_notified"})
+    shipment["status"] = "driver_notified"
+
+    summary = (
+        f"✅ Tracking sent for **{name}**\n"
+        f"Tracking: `{tracking}`\n"
+        f"USPS: {usps_url}"
+    )
+    if warnings:
+        summary += "\n\n⚠️ " + "\n".join(warnings)
+
+    for cid in _global_supervisory_chat_ids():
+        try:
+            await context.bot.send_message(chat_id=cid, text=summary, parse_mode="Markdown")
+        except Exception:
+            pass
+    pg_cid = _parse_chat_id(Config.PAPER_GIRL_TELEGRAM_ID)
+    if pg_cid:
+        try:
+            await context.bot.send_message(chat_id=pg_cid, text=summary, parse_mode="Markdown")
+        except Exception:
+            pass
+
+    return driver_tid is not None or bool(driver_email), warnings
 
 
 # --- JobQueue ---
@@ -832,10 +1068,21 @@ async def handle_interview_callbacks(update: Update, context: ContextTypes.DEFAU
             await context.bot.send_message(chat_id=int(tid), text=welcome)
         except Exception:
             pass
+        ship, ship_warn = await _create_and_notify_paper_girl(
+            context,
+            interview,
+            created_by_telegram_id=str(user.id),
+        )
+        hire_lines = []
         if errors:
-            await query.message.reply_text("⚠️ Hired with warnings:\n" + "\n".join(errors))
+            hire_lines.append("⚠️ Hired with warnings:\n" + "\n".join(errors))
         else:
-            await query.message.reply_text("✅ Driver hired and added to Issuer + Dispatch.")
+            hire_lines.append("✅ Driver hired and added to Issuer + Dispatch.")
+        if ship:
+            hire_lines.append(f"📦 Paper shipment queued ({Config.DEFAULT_PAPER_QTY} papers).")
+        if ship_warn:
+            hire_lines.append(f"⚠️ {ship_warn}")
+        await query.message.reply_text("\n".join(hire_lines))
         return STATE_INTERVIEW_INPUT
 
     return STATE_INTERVIEW_INPUT
@@ -998,6 +1245,215 @@ async def handle_announce_message(update: Update, context: ContextTypes.DEFAULT_
     return ConversationHandler.END
 
 
+async def handle_shipment_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    await _safe_answer_callback_query(query)
+    data = query.data or ""
+    user = query.from_user
+    if not _user_can_manage_shipments(user.id):
+        if query.message:
+            await query.message.reply_text("⛔ Not authorized for shipments.")
+        return STATE_INTERVIEW_INPUT
+
+    if data == "ship_view_all":
+        rows = shipments_db.list_shipments(25)
+        text = _format_shipments_list(rows)
+        if query.message:
+            await query.message.reply_text(text, parse_mode="Markdown")
+        return STATE_INTERVIEW_INPUT
+
+    if data.startswith("ship_track_"):
+        try:
+            sid = _long_uuid(data.replace("ship_track_", ""))
+        except Exception:
+            if query.message:
+                await query.message.reply_text("Invalid shipment reference.")
+            return STATE_INTERVIEW_INPUT
+        shipment = shipments_db.get_shipment(sid)
+        if not shipment:
+            if query.message:
+                await query.message.reply_text("Shipment not found.")
+            return STATE_INTERVIEW_INPUT
+        if (shipment.get("status") or "") == "driver_notified":
+            if query.message:
+                await query.message.reply_text(
+                    f"Already notified for **{shipment.get('driver_name')}** "
+                    f"(tracking: {shipment.get('tracking_number') or '-'}).",
+                    parse_mode="Markdown",
+                )
+            return STATE_INTERVIEW_INPUT
+        context.user_data["active_shipment_id"] = sid
+        dname = (shipment.get("driver_name") or "Driver").strip()
+        sent = await query.message.reply_text(
+            f"📥 Send the tracking number (text) or a photo of the USPS receipt for **{dname}**.",
+            parse_mode="Markdown",
+        )
+        if sent:
+            _track_pending_prompt(context, sent.message_id)
+        return STATE_AWAIT_TRACKING
+
+    return STATE_INTERVIEW_INPUT
+
+
+async def handle_tracking_input(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    msg = update.effective_message
+    user = update.effective_user
+    if not msg or not user:
+        return STATE_AWAIT_TRACKING
+    if not _user_can_manage_shipments(user.id):
+        await msg.reply_text("⛔ Not authorized.")
+        return ConversationHandler.END
+
+    sid = context.user_data.get("active_shipment_id")
+    if not sid:
+        await msg.reply_text("No active shipment. Tap Upload tracking on a shipment message.")
+        return STATE_INTERVIEW_INPUT
+
+    shipment = shipments_db.get_shipment(sid)
+    if not shipment:
+        context.user_data.pop("active_shipment_id", None)
+        await msg.reply_text("Shipment not found.")
+        return STATE_INTERVIEW_INPUT
+
+    tracking = ""
+    zip_code = ""
+    receipt_file_id = None
+    receipt_chat_id = msg.chat_id
+    receipt_message_id = msg.message_id
+
+    if msg.photo:
+        photo = msg.photo[-1]
+        receipt_file_id = photo.file_id
+        try:
+            tg_file = await context.bot.get_file(photo.file_id)
+            data = await tg_file.download_as_bytearray()
+            extracted = ai_tracking.extract_tracking_zip(bytes(data), "image/jpeg")
+            tracking = (extracted.get("tracking_number") or "").strip()
+            zip_code = (extracted.get("zip") or "").strip()
+        except AITrackingQuotaError:
+            await msg.reply_text("❌ OpenAI quota exceeded. Please type the tracking number.")
+            return STATE_AWAIT_TRACKING
+        except Exception as e:
+            logger.error("tracking extract: %s", e)
+            await msg.reply_text("❌ Could not read receipt. Please type the tracking number.")
+            return STATE_AWAIT_TRACKING
+        if not tracking:
+            await msg.reply_text(
+                "Could not find a tracking number in that photo.\n"
+                "Please send the tracking number as text."
+            )
+            return STATE_AWAIT_TRACKING
+    elif msg.document and (msg.document.mime_type or "").lower().startswith("image/"):
+        receipt_file_id = msg.document.file_id
+        mime = msg.document.mime_type or "image/jpeg"
+        try:
+            tg_file = await context.bot.get_file(msg.document.file_id)
+            data = await tg_file.download_as_bytearray()
+            extracted = ai_tracking.extract_tracking_zip(bytes(data), mime)
+            tracking = (extracted.get("tracking_number") or "").strip()
+            zip_code = (extracted.get("zip") or "").strip()
+        except AITrackingQuotaError:
+            await msg.reply_text("❌ OpenAI quota exceeded. Please type the tracking number.")
+            return STATE_AWAIT_TRACKING
+        except Exception as e:
+            logger.error("tracking extract doc: %s", e)
+            await msg.reply_text("❌ Could not read receipt. Please type the tracking number.")
+            return STATE_AWAIT_TRACKING
+        if not tracking:
+            await msg.reply_text("Could not find tracking in image. Send tracking number as text.")
+            return STATE_AWAIT_TRACKING
+    else:
+        text = (msg.text or msg.caption or "").strip()
+        if not text:
+            await msg.reply_text("Send a tracking number (text) or receipt photo.")
+            return STATE_AWAIT_TRACKING
+        extracted = ai_tracking.extract_tracking_from_text(text)
+        tracking = (extracted.get("tracking_number") or "").strip()
+        zip_code = (extracted.get("zip") or "").strip()
+        if not tracking:
+            await msg.reply_text("Could not parse tracking number. Send 15+ digit USPS tracking.")
+            return STATE_AWAIT_TRACKING
+
+    await _clear_pending_prompts(context, msg.chat_id)
+
+    updates: Dict[str, Any] = {
+        "tracking_number": tracking,
+        "tracking_zip": zip_code or None,
+        "status": "tracking_received",
+    }
+    if receipt_file_id:
+        updates["receipt_file_id"] = receipt_file_id
+        updates["receipt_chat_id"] = receipt_chat_id
+        updates["receipt_message_id"] = receipt_message_id
+
+    shipments_db.update_shipment(sid, updates)
+    shipment = shipments_db.get_shipment(sid) or {**shipment, **updates}
+    context.user_data.pop("active_shipment_id", None)
+
+    await msg.reply_text("⏳ Notifying driver…")
+    ok, warns = await _notify_driver_of_shipment(context, shipment)
+    if ok and not warns:
+        await msg.reply_text(f"✅ Driver notified for {shipment.get('driver_name', 'driver')}.")
+    elif ok:
+        await msg.reply_text(
+            f"✅ Driver notified with warnings:\n" + "\n".join(f"• {w}" for w in warns)
+        )
+    else:
+        await msg.reply_text(
+            "⚠️ Tracking saved but driver notify had issues:\n"
+            + "\n".join(f"• {w}" for w in warns)
+        )
+    return STATE_INTERVIEW_INPUT
+
+
+async def cmd_set_training_video(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if not _user_is_global_supervisor(update.effective_user.id):
+        return ConversationHandler.END
+    await update.effective_message.reply_text(
+        "🎬 Training video setup\n\n"
+        "Send the video now (video, animation, or document).\n"
+        "Optional caption in the same message is saved for new hires.\n\n"
+        "This video is auto-sent to each driver when they receive tracking info.\n"
+        "Use /announce to broadcast to the drivers channel anytime."
+    )
+    return STATE_SET_TRAINING_VIDEO
+
+
+async def handle_set_training_video(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    msg = update.effective_message
+    user = update.effective_user
+    if not msg or not _user_is_global_supervisor(user.id):
+        return ConversationHandler.END
+
+    kind = "text"
+    media_id = None
+    cap = (msg.caption or "").strip() or None
+    if msg.video:
+        kind, media_id = "video", msg.video.file_id
+    elif msg.animation:
+        kind, media_id = "animation", msg.animation.file_id
+    elif msg.document:
+        kind, media_id = "document", msg.document.file_id
+    elif msg.photo:
+        kind, media_id = "photo", msg.photo[-1].file_id
+    else:
+        await msg.reply_text("Please send a video, animation, document, or photo.")
+        return STATE_SET_TRAINING_VIDEO
+
+    ok = shipments_db.set_bot_setting(
+        "training_video",
+        value="stored",
+        media_kind=kind,
+        media_file_id=media_id,
+        caption=cap,
+    )
+    if ok:
+        await msg.reply_text("✅ Training video saved. New hires will receive it with tracking info.")
+    else:
+        await msg.reply_text("❌ Could not save (run migration_paper_shipments.sql?).")
+    return ConversationHandler.END
+
+
 async def handle_announce_schedule_time(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     text = (update.effective_message.text or "").strip()
     dt = parse_user_datetime(text, Config.INTERVIEWER_TIMEZONE)
@@ -1067,6 +1523,7 @@ def main() -> None:
             CommandHandler("start", cmd_start),
             CommandHandler("announce", cmd_announce),
             CommandHandler("announce_schedule", cmd_announce_schedule),
+            CommandHandler("set_training_video", cmd_set_training_video),
         ],
         states={
             STATE_INTERVIEW_INPUT: [
@@ -1077,6 +1534,26 @@ def main() -> None:
                 CallbackQueryHandler(
                     handle_interview_callbacks,
                     pattern=r"^(int_|int_ef_)",
+                ),
+                CallbackQueryHandler(
+                    handle_shipment_callbacks,
+                    pattern=r"^ship_",
+                ),
+            ],
+            STATE_AWAIT_TRACKING: [
+                MessageHandler(
+                    filters.PHOTO | filters.Document.ALL | (filters.TEXT & ~filters.COMMAND),
+                    handle_tracking_input,
+                ),
+                CallbackQueryHandler(
+                    handle_shipment_callbacks,
+                    pattern=r"^ship_",
+                ),
+            ],
+            STATE_SET_TRAINING_VIDEO: [
+                MessageHandler(
+                    filters.PHOTO | filters.VIDEO | filters.ANIMATION | filters.Document.ALL,
+                    handle_set_training_video,
                 ),
             ],
             STATE_INT_SCHEDULE_APPT: [
@@ -1114,6 +1591,9 @@ def main() -> None:
     application.add_handler(CommandHandler("open", cmd_open))
     application.add_handler(
         CallbackQueryHandler(handle_interview_callbacks, pattern=r"^(int_|int_ef_|int_open_|int_drv_)"),
+    )
+    application.add_handler(
+        CallbackQueryHandler(handle_shipment_callbacks, pattern=r"^ship_"),
     )
 
     if application.job_queue:
