@@ -19,10 +19,13 @@ class Config:
     OPENAI_API_KEY = (os.getenv("OPENAI_API_KEY") or "").strip() or None
     OPENAI_VISION_MODEL = (os.getenv("OPENAI_VISION_MODEL") or "gpt-4o").strip() or "gpt-4o"
     DRIVER_CHANNEL_ID = (os.getenv("DRIVER_CHANNEL_ID") or "").strip() or None
+    DRIVER_CHANNEL_LINK = (os.getenv("DRIVER_CHANNEL_LINK") or "https://t.me/TriStateTags").strip()
     KRAB_SENDER_DATABASE_URL = (os.getenv("KRAB_SENDER_DATABASE_URL") or "").strip() or None
     INTERVIEWER_TIMEZONE = (os.getenv("INTERVIEWER_TIMEZONE") or "America/New_York").strip()
-    KRAB_DISPATCH_BOT_USERNAME = (os.getenv("KRAB_DISPATCH_BOT_USERNAME") or "KrabIssuerBot").strip()
+    KRAB_ISSUER_BOT_USERNAME = (os.getenv("KRAB_ISSUER_BOT_USERNAME") or "Krabissuerbot").strip()
+    KRAB_DISPATCH_BOT_USERNAME = (os.getenv("KRAB_DISPATCH_BOT_USERNAME") or "KrabDispatchBot").strip()
     PAPER_GIRL_TELEGRAM_ID = (os.getenv("PAPER_GIRL_TELEGRAM_ID") or "").strip() or None
+    PAPER_GIRL_USERNAME = (os.getenv("PAPER_GIRL_USERNAME") or "").strip() or None
     DEFAULT_PAPER_QTY = int(os.getenv("DEFAULT_PAPER_QTY") or "10")
     RESEND_API_KEY = (os.getenv("RESEND_API_KEY") or "").strip() or None
     RESEND_FROM = (os.getenv("RESEND_FROM") or "").strip() or None

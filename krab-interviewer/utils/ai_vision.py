@@ -1,4 +1,4 @@
-"""OpenAI extraction for driver interview questionnaire (11 fields)."""
+"""OpenAI extraction for driver interview questionnaire (12 fields)."""
 from __future__ import annotations
 
 import base64
@@ -9,6 +9,7 @@ from typing import Any, Optional
 logger = logging.getLogger(__name__)
 
 INTERVIEW_FIELD_KEYS = [
+    "full_name",
     "work_commitment",
     "phone_number",
     "email",
@@ -25,29 +26,32 @@ INTERVIEW_FIELD_KEYS = [
 INTERVIEW_STRUCTURE_PROMPT = """You are extracting driver onboarding / interview information from an image, screenshot, or pasted text.
 
 STRICT RULES:
-- Output ONLY a plain text block with exactly 11 lines. One line per field—nothing else on that line.
+- Output ONLY a plain text block with exactly 12 lines. One line per field—nothing else on that line.
 - If a value is missing or unreadable, put a single dash "-" after the colon.
+- FullName: first and last name together (e.g. John Doe).
 - Phone: only numbers explicitly labelled as phone/cell/mobile/contact.
 - Email: one valid email or "-".
 - Telegram username: with or without @ prefix.
 - Telegram ID: numeric Telegram user id if visible, else "-".
 
 Order and labels (exactly one value per line):
-1) WorkCommitment: <hours per week, availability, schedule commitment>
-2) Phone: <phone number>
-3) Email: <email address>
-4) MailingAddress: <full mailing address>
-5) DriverLicenseID: <driver license number>
-6) TelegramUsername: <telegram @username>
-7) EmergencyContact: <name and phone of emergency contact>
-8) Referral: <who referred them, or ->
-9) PaymentMethod: <CashApp/Venmo/Zelle/etc>
-10) ProfessionSkill: <job skills / profession>
-11) TelegramID: <numeric telegram id if stated>
+1) FullName: <full legal name, first and last>
+2) WorkCommitment: <hours per week, availability, schedule commitment>
+3) Phone: <phone number>
+4) Email: <email address>
+5) MailingAddress: <full mailing address>
+6) DriverLicenseID: <driver license number>
+7) TelegramUsername: <telegram @username>
+8) EmergencyContact: <name and phone of emergency contact>
+9) Referral: <who referred them, or ->
+10) PaymentMethod: <CashApp/Venmo/Zelle/etc>
+11) ProfessionSkill: <job skills / profession>
+12) TelegramID: <numeric telegram id if stated>
 
-Output nothing else—no explanation, no markdown, no line numbers. Only these 11 lines."""
+Output nothing else—no explanation, no markdown, no line numbers. Only these 12 lines."""
 
 _LABEL_TO_KEY = {
+    "fullname": "full_name",
     "workcommitment": "work_commitment",
     "phone": "phone_number",
     "email": "email",
@@ -66,12 +70,24 @@ class AIVisionQuotaError(Exception):
     pass
 
 
+def split_full_name(full: str) -> tuple[str, str]:
+    """Return (first, last) from a single full-name string."""
+    parts = [p for p in (full or "").strip().split() if p]
+    if not parts:
+        return "", ""
+    if len(parts) == 1:
+        return parts[0][:64], ""
+    first = parts[0][:64]
+    last = " ".join(parts[1:])[:128]
+    return first, last
+
+
 def _empty_interview_dict() -> dict[str, str]:
     return {k: "" for k in INTERVIEW_FIELD_KEYS}
 
 
 def parse_interview_structured(raw: str) -> dict[str, str]:
-    """Parse 11-line AI output into field dict."""
+    """Parse 12-line AI output into field dict."""
     out = _empty_interview_dict()
     if not raw or not str(raw).strip():
         return out
@@ -94,6 +110,11 @@ def parse_interview_structured(raw: str) -> dict[str, str]:
 
 
 def _derive_first_name(data: dict[str, str]) -> str:
+    full = (data.get("full_name") or "").strip()
+    if full:
+        first, _ = split_full_name(full)
+        if first:
+            return first
     un = (data.get("telegram_username") or "").strip().lstrip("@")
     if un:
         return un.split()[0][:64]
@@ -169,7 +190,7 @@ def extract_interview_from_text(text: str) -> dict[str, str]:
     try:
         raw = _call_openai_text(
             INTERVIEW_STRUCTURE_PROMPT,
-            f"Extract the 11 fields from this interview information:\n\n{text.strip()}",
+            f"Extract the 12 fields from this interview information:\n\n{text.strip()}",
         )
     except Exception as e:
         err = str(e).lower()

@@ -17,6 +17,7 @@ from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
+    ChatJoinRequestHandler,
     CommandHandler,
     ContextTypes,
     ConversationHandler,
@@ -57,20 +58,22 @@ STATE_SET_TRAINING_VIDEO = 9
 INTERVIEW_QUESTIONNAIRE_PROMPT = (
     "Enter driver interview call info below:\n"
     "Photo or text data parse\n"
-    " 1. ⏳ Work Commitment\n"
-    " 2. 📱 Phone Number\n"
-    " 3. 📧 Email Address\n"
-    " 4. 🏠 Mailing Address\n"
-    " 5. 🪪 Driver's License (send to text/email)\n"
-    " 6. 💬 Telegram Username (must download app)\n"
-    " 7. 🚨 Emergency Contact\n"
-    " 8. 👥 Referral (if any)\n"
-    " 9. 💰 Payment Method\n"
-    "10. ⚒️ Profession skill\n"
-    "11. 💬 Telegram ID"
+    " 1. 🧑 Full Name (First Last)\n"
+    " 2. ⏳ Work Commitment\n"
+    " 3. 📱 Phone Number\n"
+    " 4. 📧 Email Address\n"
+    " 5. 🏠 Mailing Address\n"
+    " 6. 🪪 Driver's License (send to text/email)\n"
+    " 7. 💬 Telegram Username (must download app)\n"
+    " 8. 🚨 Emergency Contact\n"
+    " 9. 👥 Referral (if any)\n"
+    "10. 💰 Payment Method\n"
+    "11. ⚒️ Profession skill\n"
+    "12. 💬 Telegram ID"
 )
 
 FIELD_LABELS = {
+    "full_name": "🧑 Full Name",
     "work_commitment": "⏳ Work Commitment",
     "phone_number": "📱 Phone Number",
     "email": "📧 Email Address",
@@ -214,17 +217,45 @@ def _paper_girl_ship_keyboard(shipment_id: str) -> InlineKeyboardMarkup:
     ])
 
 
+def _driver_display_name(interview: dict) -> str:
+    """Prefer full_name; fall back to first_name."""
+    full = (interview.get("full_name") or "").strip()
+    if full:
+        return full
+    fn = (interview.get("first_name") or "").strip()
+    return fn or "Driver"
+
+
 def _format_shipments_list(rows: List[dict]) -> str:
     if not rows:
         return "📦 No shipments yet."
-    lines = ["📦 **Shipments** (newest first)\n"]
-    for s in rows:
-        name = (s.get("driver_name") or "?")[:24]
-        qty = s.get("quantity", "?")
-        st = s.get("status", "?")
-        tr = (s.get("tracking_number") or "-")[:22]
-        lines.append(f"• {name} | {qty} papers | {st} | {tr}")
-    return "\n".join(lines)
+
+    pending = [
+        r for r in rows
+        if (r.get("status") or "") in ("awaiting_tracking", "tracking_received")
+    ]
+    done = [r for r in rows if (r.get("status") or "") == "driver_notified"]
+    cancelled = [r for r in rows if (r.get("status") or "") == "cancelled"]
+
+    def fmt(r: dict) -> str:
+        name = (r.get("driver_name") or "?")[:24]
+        qty = r.get("quantity", "?")
+        tr = (r.get("tracking_number") or "-")[:22]
+        return f"• {name} | {qty} papers | {tr}"
+
+    parts = ["📦 **Shipments**"]
+    if pending:
+        parts.append("\n⏳ **Pending**")
+        parts.extend(fmt(r) for r in pending)
+    if done:
+        parts.append("\n✅ **Completed**")
+        parts.extend(fmt(r) for r in done)
+    if cancelled:
+        parts.append("\n🚫 **Cancelled**")
+        parts.extend(fmt(r) for r in cancelled)
+    if len(parts) == 1:
+        return "📦 No shipments yet."
+    return "\n".join(parts)
 
 
 async def _safe_answer_callback_query(query) -> None:
@@ -263,8 +294,12 @@ def _format_interview_understanding(interview: dict) -> str:
     for i, key in enumerate(INTERVIEW_FIELD_KEYS, 1):
         label = FIELD_LABELS.get(key, key)
         lines.append(f"{i}. {label}: {_display_val(interview.get(key))}")
+    fn_full = _display_val(interview.get("full_name"))
+    if fn_full != "-":
+        first, last = ai_vision.split_full_name(fn_full)
+        lines.append(f"\n👤 First: {first or '-'} | Last: {last or '-'}")
     fn = _display_val(interview.get("first_name"))
-    if fn != "-":
+    if fn != "-" and fn_full == "-":
         lines.append(f"\n👤 First name (hire): {fn}")
     lic = (interview.get("drivers_license_file_url") or "").strip()
     if lic:
@@ -379,6 +414,48 @@ async def _post_to_driver_channel(
         return False
 
 
+# --- Driver channel onboarding ---
+
+async def _create_driver_channel_invite(
+    context: ContextTypes.DEFAULT_TYPE,
+    driver_name: str,
+) -> Optional[str]:
+    """Create a one-time invite link to the drivers channel. Returns URL or None."""
+    cid = _parse_chat_id(Config.DRIVER_CHANNEL_ID)
+    if not cid:
+        return None
+    try:
+        link = await context.bot.create_chat_invite_link(
+            chat_id=cid,
+            name=f"Hire: {driver_name}"[:32] if driver_name else "Hire",
+            member_limit=1,
+            creates_join_request=False,
+        )
+        return getattr(link, "invite_link", None)
+    except Exception as e:
+        logger.warning("create_chat_invite_link failed: %s", e)
+        return None
+
+
+async def _add_driver_to_channel(
+    context: ContextTypes.DEFAULT_TYPE,
+    driver_telegram_id: str,
+) -> bool:
+    """Best-effort add to channel. Bots can't add users to channels directly;
+    we approve a join request if one is pending. Returns True on success.
+    """
+    cid = _parse_chat_id(Config.DRIVER_CHANNEL_ID)
+    tid = _parse_chat_id(driver_telegram_id)
+    if not cid or not tid:
+        return False
+    try:
+        await context.bot.approve_chat_join_request(chat_id=cid, user_id=tid)
+        return True
+    except Exception as e:
+        logger.debug("approve_chat_join_request (probably no pending request): %s", e)
+        return False
+
+
 # --- Paper shipments (hire -> paper girl -> tracking -> driver) ---
 
 
@@ -416,7 +493,7 @@ async def _create_and_notify_paper_girl(
     created_by_telegram_id: str,
 ) -> tuple[Optional[dict], Optional[str]]:
     """Create shipment row and DM Paper Girl. Returns (shipment, warning)."""
-    fn = (interview.get("first_name") or "").strip()
+    fn = _driver_display_name(interview)
     addr = (interview.get("mailing_address") or "").strip()
     phone = (interview.get("phone_number") or "").strip()
     em = (interview.get("email") or "").strip()
@@ -1038,22 +1115,23 @@ async def handle_interview_callbacks(update: Update, context: ContextTypes.DEFAU
         if not interview:
             await query.message.reply_text("Interview not found.")
             return STATE_INTERVIEW_INPUT
-        fn = (interview.get("first_name") or "").strip()
-        if not fn:
+        driver_name = _driver_display_name(interview)
+        if not (interview.get("full_name") or "").strip() and not (interview.get("first_name") or "").strip():
             un = (interview.get("telegram_username") or "").lstrip("@").strip()
-            fn = un.split()[0] if un else ""
-            if fn:
-                db.update_interview(iid, {"first_name": fn})
-                interview["first_name"] = fn
+            derived = un.split()[0] if un else ""
+            if derived:
+                db.update_interview(iid, {"first_name": derived})
+                interview["first_name"] = derived
+                driver_name = derived
         tid = (interview.get("telegram_id") or "").strip()
         em = (interview.get("email") or "").strip()
-        if not fn or not tid or not em:
+        if driver_name == "Driver" or not tid or not em:
             await query.message.reply_text(
-                "❌ Hire requires first name, Telegram ID, and email. Use ✍️ Edit to fill them."
+                "❌ Hire requires full name, Telegram ID, and email. Use ✍️ Edit to fill them."
             )
             return STATE_INTERVIEW_INPUT
-        ok_d, err_d = db.create_driver(fn, tid, interview.get("phone_number"))
-        ok_r, err_r = recipients_db.add_recipient(fn, em)
+        ok_d, err_d = db.create_driver(driver_name, tid, interview.get("phone_number"))
+        ok_r, err_r = recipients_db.add_recipient(driver_name, em)
         errors = []
         if not ok_d and err_d:
             errors.append(f"Issuer drivers: {err_d}")
@@ -1064,30 +1142,91 @@ async def handle_interview_callbacks(update: Update, context: ContextTypes.DEFAU
         interview["status"] = "hired"
         await _clear_pending_prompts(context, chat_id)
         await _refresh_understanding_card(context, interview)
-        welcome = (
-            f"🎉 Welcome {fn}! You've been hired.\n"
-            f"Start taking leads with @{Config.KRAB_DISPATCH_BOT_USERNAME.lstrip('@')}."
-        )
-        await _post_to_driver_channel(context, kind="text", body=welcome, media_file_id=None)
+
+        welcome_first, _ = ai_vision.split_full_name(driver_name)
+        if not welcome_first:
+            welcome_first = (interview.get("first_name") or "").strip() or driver_name.split()[0]
+
+        channel_invite = await _create_driver_channel_invite(context, driver_name)
         try:
-            await context.bot.send_message(chat_id=int(tid), text=welcome)
-        except Exception:
-            pass
+            await _add_driver_to_channel(context, tid)
+        except Exception as e:
+            logger.warning("Could not auto-add driver %s to channel: %s", tid, e)
+
         ship, ship_warn = await _create_and_notify_paper_girl(
             context,
             interview,
             created_by_telegram_id=str(user.id),
         )
-        hire_lines = []
+
+        username_display = (interview.get("telegram_username") or "").strip()
+        if username_display and not username_display.startswith("@"):
+            username_display = "@" + username_display
+        if not username_display:
+            username_display = driver_name if driver_name != "Driver" else "-"
+
+        issuer_bot = Config.KRAB_ISSUER_BOT_USERNAME.lstrip("@")
+        dispatch_bot = Config.KRAB_DISPATCH_BOT_USERNAME.lstrip("@")
+        channel_link = (Config.DRIVER_CHANNEL_LINK or "").strip() or "https://t.me/TriStateTags"
+        pg_handle = (Config.PAPER_GIRL_USERNAME or "").strip().lstrip("@")
+        pg_tag = f"@{pg_handle} " if pg_handle else ""
+        qty = Config.DEFAULT_PAPER_QTY
+
+        hire_msg = (
+            "🎉 DRIVER HIRED SUCCESSFULLY ✅\n\n"
+            f"👤 USERNAME: {username_display}\n"
+            f"📧 EMAIL: {em}\n"
+            f"ℹ️CHATID:{tid}\n\n"
+            "🚀 Added to:\n"
+            f"• @{issuer_bot}\n"
+            f"• @{dispatch_bot}\n"
+            f"• {channel_link}\n\n"
+            f"📦 {qty} papers are now being prepared & shipped by papergirl "
+            f"{pg_tag}please push & follow up\n\n"
+            "📬 Tracking number coming shortly…\n"
+            "⚡ Driver is now officially ACTIVE & ready to receive leads!"
+        )
+
+        await _post_to_driver_channel(context, kind="text", body=hire_msg, media_file_id=None)
+
+        driver_dm = (
+            f"🎉 Welcome {welcome_first}! You've been hired.\n\n"
+            f"Start taking leads with @{dispatch_bot}.\n"
+        )
+        join_kb = None
+        if channel_invite:
+            channel_btn_label = "🔗 Join @TriStateTags"
+            link = (Config.DRIVER_CHANNEL_LINK or "").strip()
+            if link and "t.me/" in link:
+                handle = link.rstrip("/").split("/")[-1]
+                if handle:
+                    channel_btn_label = f"🔗 Join @{handle.lstrip('@')}"
+            join_kb = InlineKeyboardMarkup([
+                [InlineKeyboardButton(channel_btn_label, url=channel_invite)],
+            ])
+        try:
+            await context.bot.send_message(
+                chat_id=int(tid),
+                text=driver_dm,
+                reply_markup=join_kb,
+            )
+        except Exception as e:
+            logger.warning("Driver welcome DM failed: %s", e)
+
+        warnings_lines: List[str] = []
         if errors:
-            hire_lines.append("⚠️ Hired with warnings:\n" + "\n".join(errors))
-        else:
-            hire_lines.append("✅ Driver hired and added to Issuer + Dispatch.")
-        if ship:
-            hire_lines.append(f"📦 Paper shipment queued ({Config.DEFAULT_PAPER_QTY} papers).")
+            warnings_lines.extend(errors)
         if ship_warn:
-            hire_lines.append(f"⚠️ {ship_warn}")
-        await query.message.reply_text("\n".join(hire_lines))
+            warnings_lines.append(ship_warn)
+        if not channel_invite:
+            warnings_lines.append("Channel invite link not created (check DRIVER_CHANNEL_ID + bot admin rights).")
+
+        sup_lines = [hire_msg]
+        if ship:
+            sup_lines.append(f"\n📦 Paper shipment queued ({qty} papers).")
+        if warnings_lines:
+            sup_lines.append("\n⚠️ Warnings:\n" + "\n".join(f"• {w}" for w in warnings_lines))
+        await query.message.reply_text("\n".join(sup_lines))
         return STATE_INTERVIEW_INPUT
 
     return STATE_INTERVIEW_INPUT
@@ -1183,6 +1322,10 @@ async def handle_edit_field_text(update: Update, context: ContextTypes.DEFAULT_T
     if key == "telegram_username" and val and not val.startswith("@"):
         val = "@" + val
         updates[key] = val
+    if key == "full_name" and val:
+        first, _ = ai_vision.split_full_name(val)
+        if first:
+            updates["first_name"] = first
     db.update_interview(iid, updates)
     interview = db.get_interview_by_id(iid)
     if interview and key == "telegram_username" and val:
@@ -1261,7 +1404,7 @@ async def handle_shipment_callbacks(update: Update, context: ContextTypes.DEFAUL
         return STATE_INTERVIEW_INPUT
 
     if data == "ship_view_all":
-        rows = shipments_db.list_shipments(25)
+        rows = shipments_db.list_shipments(50)
         text = _format_shipments_list(rows)
         if query.message:
             await query.message.reply_text(text, parse_mode="Markdown")
@@ -1470,6 +1613,23 @@ async def handle_announce_schedule_time(update: Update, context: ContextTypes.DE
     return STATE_ANNOUNCE_SCHEDULE_CONTENT
 
 
+async def handle_chat_join_request(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    req = update.chat_join_request
+    if not req:
+        return
+    target_cid = _parse_chat_id(Config.DRIVER_CHANNEL_ID)
+    if target_cid and _norm_chat_id(req.chat.id) != _norm_chat_id(target_cid):
+        return
+    try:
+        await context.bot.approve_chat_join_request(
+            chat_id=req.chat.id,
+            user_id=req.from_user.id,
+        )
+        logger.info("Auto-approved join request from %s in %s", req.from_user.id, req.chat.id)
+    except Exception as e:
+        logger.warning("approve_chat_join_request failed: %s", e)
+
+
 async def cancel_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     context.user_data.clear()
     await update.effective_message.reply_text("Cancelled.")
@@ -1600,6 +1760,7 @@ def main() -> None:
     application.add_handler(
         CallbackQueryHandler(handle_shipment_callbacks, pattern=r"^ship_"),
     )
+    application.add_handler(ChatJoinRequestHandler(handle_chat_join_request))
 
     if application.job_queue:
         application.job_queue.run_repeating(check_pending_jobs, interval=30, first=15)
