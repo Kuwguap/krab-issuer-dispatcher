@@ -994,6 +994,55 @@ async def cmd_drivers(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     )
 
 
+async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user = update.effective_user
+    msg = update.effective_message
+    if not user or not msg:
+        return
+
+    is_sup = _user_is_global_supervisor(user.id)
+    is_pg = _user_is_paper_girl(user.id)
+
+    sections: list[str] = ["🤖 *Krab Interviewer — Commands*"]
+
+    sections.append(
+        "\n*Everyone*\n"
+        "• /start — begin driver questionnaire (or supervisor hire menu)\n"
+        "• /cancel — cancel the current flow\n"
+        "• /help — show this message"
+    )
+
+    if is_sup:
+        sections.append(
+            "\n*Supervisor*\n"
+            "• /interviews — list recent interviews (tap to open)\n"
+            "• /drivers — list Issuer drivers (tap for profile)\n"
+            "• /open <id> — open one interview by id\n"
+            "• /announce — post next message to drivers channel now\n"
+            "• /announce_schedule — schedule a channel post\n"
+            "• /set_training_video — save the \"how to print paper\" video for new hires\n"
+            "• /setemail — save your email for appointment reminders\n"
+            "• /shipments — pending + completed paper shipments"
+        )
+
+    if is_pg and not is_sup:
+        sections.append(
+            "\n*Paper Girl*\n"
+            "• /shipments — pending + completed paper shipments\n"
+            "(Use the 📥 Upload tracking number button on each shipment DM.)"
+        )
+
+    sections.append(
+        "\n*Buttons (no command needed)*\n"
+        "• 🙋‍♂️ Now / 📆 Appointment — choose flow on /start\n"
+        "• ✅ Hire — hire a driver from a review card\n"
+        "• 🪪 Upload license / ✍️ Edit / 📆 Schedule appointment\n"
+        "• 📥 Upload tracking number / 📦 View all shipments"
+    )
+
+    await msg.reply_text("\n".join(sections), parse_mode="Markdown")
+
+
 async def cmd_open(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not _user_is_global_supervisor(update.effective_user.id):
         return
@@ -2061,6 +2110,7 @@ def main() -> None:
     )
 
     application.add_handler(conv)
+    application.add_handler(CommandHandler("help", cmd_help))
     application.add_handler(CommandHandler("interviews", cmd_interviews))
     application.add_handler(CommandHandler("shipments", cmd_shipments))
     application.add_handler(CommandHandler("drivers", cmd_drivers))
