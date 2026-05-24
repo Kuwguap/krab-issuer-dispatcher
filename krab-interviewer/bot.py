@@ -995,57 +995,27 @@ async def cmd_drivers(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
 
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    user = update.effective_user
     msg = update.effective_message
-    if not user or not msg:
+    if not msg:
         return
 
-    is_sup = _user_is_global_supervisor(user.id)
-    is_pg = _user_is_paper_girl(user.id)
-
-    sections: list[str] = ["🤖 <b>Krab Interviewer — Commands</b>"]
-
-    sections.append(
-        "\n<b>Everyone</b>\n"
-        "• /start — begin driver questionnaire (or supervisor hire menu)\n"
-        "• /cancel — cancel the current flow\n"
-        "• /help — show this message"
-    )
-
-    if is_sup:
-        sections.append(
-            "\n<b>Supervisor</b>\n"
-            "• /interviews — list recent interviews (tap to open)\n"
-            "• /drivers — list Issuer drivers (tap for profile)\n"
-            "• /open &lt;id&gt; — open one interview by id\n"
-            "• /announce — post next message to drivers channel now\n"
-            "• /announce_schedule — schedule a channel post\n"
-            "• /set_training_video — save the \"how to print paper\" video for new hires\n"
-            "• /setemail — save your email for appointment reminders\n"
-            "• /shipments — pending + completed paper shipments"
-        )
-
-    if is_pg and not is_sup:
-        sections.append(
-            "\n<b>Paper Girl</b>\n"
-            "• /shipments — pending + completed paper shipments\n"
-            "(Use the 📥 Upload tracking number button on each shipment DM.)"
-        )
-
-    sections.append(
-        "\n<b>Buttons (no command needed)</b>\n"
-        "• 🙋‍♂️ Now / 📆 Appointment — choose flow on /start\n"
-        "• ✅ Hire — hire a driver from a review card\n"
-        "• 🪪 Upload license / ✍️ Edit / 📆 Schedule appointment\n"
-        "• 📥 Upload tracking number / 📦 View all shipments"
+    text = (
+        "🤖 <b>Krab Interviewer — Commands</b>\n\n"
+        "1. /start — begin driver questionnaire (or supervisor hire menu)\n"
+        "2. /cancel — cancel the current flow\n"
+        "3. /interviews — list recent interviews (tap to open)\n"
+        "4. /drivers — list Issuer drivers (tap for profile)\n"
+        "5. /open &lt;id&gt; — open one interview by id\n"
+        "6. /announce — post next message to drivers channel now\n"
+        "7. /announce_schedule — schedule a channel post\n"
+        "8. /set_training_video — save the \"how to print paper\" video for new hires"
     )
 
     try:
-        await msg.reply_text("\n".join(sections), parse_mode="HTML")
+        await msg.reply_text(text, parse_mode="HTML")
     except Exception as e:
         logger.warning("cmd_help HTML send failed: %s; retrying plain", e)
-        plain = "\n".join(sections).replace("<b>", "").replace("</b>", "")
-        plain = plain.replace("&lt;", "<").replace("&gt;", ">")
+        plain = text.replace("<b>", "").replace("</b>", "").replace("&lt;", "<").replace("&gt;", ">")
         await msg.reply_text(plain)
 
 
