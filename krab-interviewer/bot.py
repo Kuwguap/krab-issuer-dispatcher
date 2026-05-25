@@ -56,6 +56,7 @@ STATE_ANNOUNCE_SCHEDULE_CONTENT = 7
 STATE_AWAIT_TRACKING = 8
 STATE_SET_TRAINING_VIDEO = 9
 STATE_AWAIT_SUPERVISOR_EMAIL = 10
+STATE_TRAINING_MENU = 11
 
 INTERVIEW_QUESTIONNAIRE_PROMPT = (
     "🚗 DRIVER INTERVIEW 📞CALL FORM📋\n\n"
@@ -467,31 +468,60 @@ async def _add_driver_to_channel(
 # --- Paper shipments (hire -> paper girl -> tracking -> driver) ---
 
 
+async def _send_one_media(
+    context: ContextTypes.DEFAULT_TYPE,
+    chat_id: int,
+    *,
+    kind: str,
+    file_id: str,
+    caption: Optional[str] = None,
+) -> bool:
+    try:
+        if kind == "photo":
+            await context.bot.send_photo(chat_id=chat_id, photo=file_id, caption=caption)
+        elif kind == "document":
+            await context.bot.send_document(chat_id=chat_id, document=file_id, caption=caption)
+        elif kind == "animation":
+            await context.bot.send_animation(chat_id=chat_id, animation=file_id, caption=caption)
+        else:
+            await context.bot.send_video(chat_id=chat_id, video=file_id, caption=caption)
+        return True
+    except Exception as e:
+        logger.warning("send training media (%s) to %s: %s", kind, chat_id, e)
+        return False
+
+
 async def _send_training_video_to_chat(
     context: ContextTypes.DEFAULT_TYPE,
     chat_id: int,
     *,
     caption_override: Optional[str] = None,
 ) -> bool:
-    setting = shipments_db.get_bot_setting("training_video")
-    if not setting or not setting.get("media_file_id"):
+    videos = shipments_db.list_training_videos()
+    if not videos:
+        legacy = shipments_db.get_bot_setting("training_video")
+        if legacy and legacy.get("media_file_id"):
+            videos = [{
+                "media_kind": legacy.get("media_kind") or "video",
+                "media_file_id": legacy["media_file_id"],
+                "caption": legacy.get("caption"),
+            }]
+    if not videos:
         return False
-    kind = (setting.get("media_kind") or "video").strip().lower()
-    fid = setting["media_file_id"]
-    cap = caption_override or (setting.get("caption") or "").strip() or None
-    try:
-        if kind == "photo":
-            await context.bot.send_photo(chat_id=chat_id, photo=fid, caption=cap)
-        elif kind == "document":
-            await context.bot.send_document(chat_id=chat_id, document=fid, caption=cap)
-        elif kind == "animation":
-            await context.bot.send_animation(chat_id=chat_id, animation=fid, caption=cap)
+
+    sent_any = False
+    for idx, v in enumerate(videos):
+        fid = v.get("media_file_id")
+        if not fid:
+            continue
+        kind = (v.get("media_kind") or "video").strip().lower()
+        if idx == 0 and caption_override:
+            cap: Optional[str] = caption_override
         else:
-            await context.bot.send_video(chat_id=chat_id, video=fid, caption=cap)
-        return True
-    except Exception as e:
-        logger.warning("send training video to %s: %s", chat_id, e)
-        return False
+            cap = (v.get("caption") or "").strip() or None
+        if await _send_one_media(context, chat_id, kind=kind, file_id=fid, caption=cap):
+            sent_any = True
+    return sent_any
 
 
 async def _create_and_notify_paper_girl(
@@ -1884,17 +1914,185 @@ async def handle_tracking_input(update: Update, context: ContextTypes.DEFAULT_TY
     return STATE_INTERVIEW_INPUT
 
 
+def _training_menu_keyboard(count: int) -> InlineKeyboardMarkup:
+    rows = [
+        [
+            InlineKeyboardButton("➕ Add video", callback_data="train_add"),
+            InlineKeyboardButton(f"📋 View all ({count})", callback_data="train_list"),
+        ],
+        [InlineKeyboardButton("❌ Close", callback_data="train_close")],
+    ]
+    return InlineKeyboardMarkup(rows)
+
+
+def _training_kind_icon(kind: str) -> str:
+    return {
+        "video": "🎬",
+        "animation": "🎞️",
+        "document": "📄",
+        "photo": "🖼️",
+    }.get((kind or "").lower(), "🎬")
+
+
+def _training_short_caption(cap: Optional[str], limit: int = 40) -> str:
+    if not cap:
+        return ""
+    cap = cap.strip().splitlines()[0]
+    if len(cap) > limit:
+        cap = cap[: limit - 1] + "…"
+    return cap
+
+
+async def _show_training_menu(
+    context: ContextTypes.DEFAULT_TYPE,
+    chat_id: int,
+    *,
+    edit_message_id: Optional[int] = None,
+) -> None:
+    videos = shipments_db.list_training_videos()
+    count = len(videos)
+    if count == 0:
+        text = (
+            "🎬 Training videos\n\n"
+            "No videos saved yet.\n"
+            "Tap ➕ Add video to upload your first one.\n\n"
+            "All saved videos are auto-sent to each new hire with their tracking info."
+        )
+    else:
+        text = (
+            f"🎬 Training videos\n\n"
+            f"You have {count} video(s) saved.\n"
+            "They are auto-sent to each new hire with tracking info."
+        )
+    kb = _training_menu_keyboard(count)
+    if edit_message_id is not None:
+        try:
+            await context.bot.edit_message_text(
+                chat_id=chat_id, message_id=edit_message_id, text=text, reply_markup=kb
+            )
+            return
+        except Exception:
+            pass
+    await context.bot.send_message(chat_id=chat_id, text=text, reply_markup=kb)
+
+
+async def _show_training_list(
+    context: ContextTypes.DEFAULT_TYPE,
+    chat_id: int,
+    *,
+    edit_message_id: Optional[int] = None,
+) -> None:
+    videos = shipments_db.list_training_videos()
+    if not videos:
+        await _show_training_menu(context, chat_id, edit_message_id=edit_message_id)
+        return
+
+    lines = [f"🎬 Saved training videos ({len(videos)})\n"]
+    rows: List[List[InlineKeyboardButton]] = []
+    for idx, v in enumerate(videos, start=1):
+        kind = (v.get("media_kind") or "video").lower()
+        icon = _training_kind_icon(kind)
+        cap = _training_short_caption(v.get("caption"))
+        desc = f"{idx}. {icon} {kind}"
+        if cap:
+            desc += f" — {cap}"
+        lines.append(desc)
+        vid = v.get("id")
+        rows.append([
+            InlineKeyboardButton(f"▶️ #{idx}", callback_data=f"train_preview_{vid}"),
+            InlineKeyboardButton(f"🗑 Remove #{idx}", callback_data=f"train_remove_{vid}"),
+        ])
+    rows.append([
+        InlineKeyboardButton("➕ Add another", callback_data="train_add"),
+        InlineKeyboardButton("⬅️ Back", callback_data="train_back"),
+    ])
+    text = "\n".join(lines)
+    kb = InlineKeyboardMarkup(rows)
+    if edit_message_id is not None:
+        try:
+            await context.bot.edit_message_text(
+                chat_id=chat_id, message_id=edit_message_id, text=text, reply_markup=kb
+            )
+            return
+        except Exception:
+            pass
+    await context.bot.send_message(chat_id=chat_id, text=text, reply_markup=kb)
+
+
 async def cmd_set_training_video(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    if not _user_is_global_supervisor(update.effective_user.id):
+    user = update.effective_user
+    msg = update.effective_message
+    if not user or not msg or not _user_is_global_supervisor(user.id):
         return ConversationHandler.END
-    await update.effective_message.reply_text(
-        "🎬 Training video setup\n\n"
-        "Send the video now (video, animation, or document).\n"
-        "Optional caption in the same message is saved for new hires.\n\n"
-        "This video is auto-sent to each driver when they receive tracking info.\n"
-        "Use /announce to broadcast to the drivers channel anytime."
-    )
-    return STATE_SET_TRAINING_VIDEO
+    await _show_training_menu(context, msg.chat_id)
+    return STATE_TRAINING_MENU
+
+
+async def handle_training_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    q = update.callback_query
+    if not q:
+        return STATE_TRAINING_MENU
+    await q.answer()
+    user = update.effective_user
+    if not user or not _user_is_global_supervisor(user.id):
+        return ConversationHandler.END
+
+    data = (q.data or "").strip()
+    chat_id = q.message.chat_id if q.message else update.effective_chat.id
+    msg_id = q.message.message_id if q.message else None
+
+    if data == "train_close":
+        try:
+            await q.edit_message_reply_markup(reply_markup=None)
+        except Exception:
+            pass
+        await context.bot.send_message(chat_id=chat_id, text="Closed.")
+        return ConversationHandler.END
+
+    if data == "train_back":
+        await _show_training_menu(context, chat_id, edit_message_id=msg_id)
+        return STATE_TRAINING_MENU
+
+    if data == "train_list":
+        await _show_training_list(context, chat_id, edit_message_id=msg_id)
+        return STATE_TRAINING_MENU
+
+    if data == "train_add":
+        try:
+            await q.edit_message_text(
+                "📤 Send the video now (video, animation, document, or photo).\n"
+                "An optional caption in the same message will be saved with it.\n\n"
+                "Send /cancel to abort."
+            )
+        except Exception:
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text="📤 Send the video now (video, animation, document, or photo).",
+            )
+        return STATE_SET_TRAINING_VIDEO
+
+    if data.startswith("train_preview_"):
+        vid = data[len("train_preview_"):]
+        v = shipments_db.get_training_video(vid)
+        if not v:
+            await context.bot.send_message(chat_id=chat_id, text="Video not found.")
+            return STATE_TRAINING_MENU
+        kind = (v.get("media_kind") or "video").strip().lower()
+        fid = v.get("media_file_id")
+        cap = (v.get("caption") or "").strip() or None
+        if fid:
+            await _send_one_media(context, chat_id, kind=kind, file_id=fid, caption=cap)
+        return STATE_TRAINING_MENU
+
+    if data.startswith("train_remove_"):
+        vid = data[len("train_remove_"):]
+        ok = shipments_db.delete_training_video(vid)
+        if not ok:
+            await context.bot.send_message(chat_id=chat_id, text="❌ Could not remove.")
+        await _show_training_list(context, chat_id, edit_message_id=msg_id)
+        return STATE_TRAINING_MENU
+
+    return STATE_TRAINING_MENU
 
 
 async def handle_set_training_video(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -1903,7 +2101,7 @@ async def handle_set_training_video(update: Update, context: ContextTypes.DEFAUL
     if not msg or not _user_is_global_supervisor(user.id):
         return ConversationHandler.END
 
-    kind = "text"
+    kind = None
     media_id = None
     cap = (msg.caption or "").strip() or None
     if msg.video:
@@ -1918,18 +2116,23 @@ async def handle_set_training_video(update: Update, context: ContextTypes.DEFAUL
         await msg.reply_text("Please send a video, animation, document, or photo.")
         return STATE_SET_TRAINING_VIDEO
 
-    ok = shipments_db.set_bot_setting(
-        "training_video",
-        value="stored",
+    row = shipments_db.add_training_video(
         media_kind=kind,
         media_file_id=media_id,
         caption=cap,
+        added_by_telegram_id=str(user.id),
     )
-    if ok:
-        await msg.reply_text("✅ Training video saved. New hires will receive it with tracking info.")
+    if row:
+        await msg.reply_text(
+            f"✅ {_training_kind_icon(kind)} {kind.capitalize()} added. "
+            "New hires will receive every saved video with their tracking info."
+        )
     else:
-        await msg.reply_text("❌ Could not save (run migration_paper_shipments.sql?).")
-    return ConversationHandler.END
+        await msg.reply_text(
+            "❌ Could not save (run database/migration_training_videos.sql in Supabase)."
+        )
+    await _show_training_menu(context, msg.chat_id)
+    return STATE_TRAINING_MENU
 
 
 async def handle_announce_schedule_time(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -2046,11 +2249,15 @@ def main() -> None:
                     pattern=r"^ship_",
                 ),
             ],
+            STATE_TRAINING_MENU: [
+                CallbackQueryHandler(handle_training_callbacks, pattern=r"^train_"),
+            ],
             STATE_SET_TRAINING_VIDEO: [
                 MessageHandler(
                     filters.PHOTO | filters.VIDEO | filters.ANIMATION | filters.Document.ALL,
                     handle_set_training_video,
                 ),
+                CallbackQueryHandler(handle_training_callbacks, pattern=r"^train_"),
             ],
             STATE_INT_SCHEDULE_APPT: [
                 CallbackQueryHandler(handle_calendar_callbacks, pattern=r"^cal_"),

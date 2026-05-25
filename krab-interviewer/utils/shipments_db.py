@@ -130,6 +130,70 @@ def get_bot_setting(key: str) -> Optional[Dict[str, Any]]:
         return None
 
 
+def add_training_video(
+    *,
+    media_kind: str,
+    media_file_id: str,
+    caption: Optional[str] = None,
+    added_by_telegram_id: Optional[str] = None,
+) -> Optional[Dict[str, Any]]:
+    payload = {
+        "media_kind": media_kind,
+        "media_file_id": media_file_id,
+        "caption": (caption or "").strip() or None,
+        "added_by_telegram_id": (
+            str(added_by_telegram_id).strip() if added_by_telegram_id else None
+        ),
+    }
+    try:
+        r = _get_client().table("training_videos").insert(payload).execute()
+        return r.data[0] if r.data else None
+    except Exception as e:
+        logger.error("add_training_video: %s", e)
+        return None
+
+
+def list_training_videos(limit: int = 50) -> List[Dict[str, Any]]:
+    try:
+        r = (
+            _get_client()
+            .table("training_videos")
+            .select("*")
+            .order("created_at", desc=False)
+            .limit(limit)
+            .execute()
+        )
+        return r.data or []
+    except Exception as e:
+        logger.error("list_training_videos: %s", e)
+        return []
+
+
+def get_training_video(video_id: str) -> Optional[Dict[str, Any]]:
+    try:
+        r = (
+            _get_client()
+            .table("training_videos")
+            .select("*")
+            .eq("id", video_id)
+            .limit(1)
+            .execute()
+        )
+        return r.data[0] if r.data else None
+    except Exception as e:
+        logger.error("get_training_video: %s", e)
+        return None
+
+
+def delete_training_video(video_id: str) -> bool:
+    try:
+        _get_client().table("training_videos").delete().eq("id", video_id).execute()
+        return True
+    except Exception as e:
+        logger.error("delete_training_video: %s", e)
+        return False
+
+
 def set_supervisor_email(telegram_id: str, email: str) -> bool:
     payload = {
         "telegram_id": str(telegram_id).strip(),
