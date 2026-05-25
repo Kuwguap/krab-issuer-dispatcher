@@ -580,7 +580,7 @@ async def _notify_driver_of_shipment(
                 except Exception as e:
                     warnings.append(f"Receipt photo to driver: {e}")
             if not await _send_training_video_to_chat(context, driver_tid):
-                warnings.append("Training video not configured (/set_training_video)")
+                warnings.append("Training video not configured (/training)")
         except Exception as e:
             warnings.append(f"Telegram DM to driver: {e}")
     else:
@@ -1008,7 +1008,7 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "5. 📂 /open &lt;id&gt; — open one interview by id\n"
         "6. 📢 /announce — post next message to drivers channel now\n"
         "7. 🗓️📢 /announce_schedule — schedule a channel post\n"
-        "8. 🎥📚 /set_training_video — save the \"how to print paper\" video for new hires"
+        "8. 🎥📚 /training — save the \"how to print paper\" video for new hires"
     )
 
     try:
@@ -2018,7 +2018,7 @@ def main() -> None:
             CommandHandler("start", cmd_start),
             CommandHandler("announce", cmd_announce),
             CommandHandler("announce_schedule", cmd_announce_schedule),
-            CommandHandler("set_training_video", cmd_set_training_video),
+            CommandHandler("training", cmd_set_training_video),
             CommandHandler("setemail", cmd_setemail),
         ],
         states={
