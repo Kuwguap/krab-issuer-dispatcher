@@ -57,6 +57,7 @@ STATE_AWAIT_TRACKING = 8
 STATE_SET_TRAINING_VIDEO = 9
 STATE_AWAIT_SUPERVISOR_EMAIL = 10
 STATE_TRAINING_MENU = 11
+STATE_DRV_EDIT_VALUE = 12
 
 INTERVIEW_QUESTIONNAIRE_PROMPT = (
     "🚗 DRIVER INTERVIEW 📞CALL FORM📋\n\n"
@@ -1000,6 +1001,48 @@ async def cmd_shipments(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     await _reply_shipments_list(update.effective_message)
 
 
+def _driver_profile_lines(driver: dict) -> List[str]:
+    return [
+        f"🚗 {driver.get('driver_name', '?')}",
+        f"📱 {driver.get('phone_number') or '-'}",
+        f"💬 Telegram ID: {driver.get('driver_telegram_id') or '-'}",
+    ]
+
+
+def _driver_profile_keyboard(driver_short: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("✏️ Edit", callback_data=f"drv_edit_{driver_short}"),
+            InlineKeyboardButton("🗑 Delete", callback_data=f"drv_del_{driver_short}"),
+        ],
+    ])
+
+
+def _resolve_driver_by_short(short: str) -> Optional[dict]:
+    for d in db.get_all_drivers():
+        did = str(d.get("id") or "")
+        if not did:
+            continue
+        try:
+            if _short_uuid(did) == short:
+                return d
+        except Exception:
+            pass
+        if did.startswith(short):
+            return d
+    return None
+
+
+async def _send_driver_profile_card(
+    msg, context: ContextTypes.DEFAULT_TYPE, driver: dict
+) -> None:
+    short = _short_uuid(str(driver["id"]))
+    await msg.reply_text(
+        "\n".join(_driver_profile_lines(driver)),
+        reply_markup=_driver_profile_keyboard(short),
+    )
+
+
 async def cmd_drivers(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not _user_is_global_supervisor(update.effective_user.id):
         return
@@ -1174,21 +1217,11 @@ async def handle_interview_callbacks(update: Update, context: ContextTypes.DEFAU
 
     if data.startswith("int_drv_"):
         short = data.replace("int_drv_", "")
-        drivers = db.get_all_drivers()
-        driver = None
-        for d in drivers:
-            if _short_uuid(d["id"]) == short or str(d["id"]).startswith(short):
-                driver = d
-                break
+        driver = _resolve_driver_by_short(short)
         if not driver:
             await query.message.reply_text("Driver not found.")
             return STATE_INTERVIEW_INPUT
-        lines = [
-            f"🚗 {driver.get('driver_name', '?')}",
-            f"📱 {driver.get('phone_number') or '-'}",
-            f"💬 Telegram ID: {driver.get('driver_telegram_id') or '-'}",
-        ]
-        await query.message.reply_text("\n".join(lines))
+        await _send_driver_profile_card(query.message, context, driver)
         tid = str(driver.get("driver_telegram_id") or "").strip()
         if tid:
             li = db.get_latest_interview_for_telegram_id(tid)
@@ -2040,6 +2073,198 @@ async def _show_training_list(
     await context.bot.send_message(chat_id=chat_id, text=text, reply_markup=kb)
 
 
+_DRV_EDIT_FIELDS = {
+    "name": ("driver_name", "Driver name"),
+    "phone": ("phone_number", "Phone number"),
+}
+
+
+def _driver_edit_menu_keyboard(driver_short: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("Name", callback_data=f"drv_ef_name_{driver_short}")],
+        [InlineKeyboardButton("Phone", callback_data=f"drv_ef_phone_{driver_short}")],
+        [InlineKeyboardButton("⬅️ Back", callback_data=f"drv_back_{driver_short}")],
+    ])
+
+
+def _driver_delete_confirm_keyboard(driver_short: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton(
+                "✅ Yes, delete", callback_data=f"drv_delc_{driver_short}"
+            ),
+            InlineKeyboardButton("⬅️ Cancel", callback_data=f"drv_back_{driver_short}"),
+        ],
+    ])
+
+
+async def handle_driver_callbacks(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> int:
+    q = update.callback_query
+    if not q:
+        return STATE_INTERVIEW_INPUT
+    await q.answer()
+    user = update.effective_user
+    if not user or not _user_is_global_supervisor(user.id):
+        return ConversationHandler.END
+
+    data = (q.data or "").strip()
+    msg = q.message
+
+    if data.startswith("drv_back_"):
+        short = data[len("drv_back_"):]
+        driver = _resolve_driver_by_short(short)
+        if not driver:
+            try:
+                await q.edit_message_text("Driver not found.")
+            except Exception:
+                pass
+            return STATE_INTERVIEW_INPUT
+        try:
+            await q.edit_message_text(
+                "\n".join(_driver_profile_lines(driver)),
+                reply_markup=_driver_profile_keyboard(short),
+            )
+        except Exception:
+            await _send_driver_profile_card(msg, context, driver)
+        return STATE_INTERVIEW_INPUT
+
+    if data.startswith("drv_edit_"):
+        short = data[len("drv_edit_"):]
+        driver = _resolve_driver_by_short(short)
+        if not driver:
+            try:
+                await q.edit_message_text("Driver not found.")
+            except Exception:
+                pass
+            return STATE_INTERVIEW_INPUT
+        try:
+            await q.edit_message_text(
+                "✏️ Edit driver — pick a field:\n\n"
+                + "\n".join(_driver_profile_lines(driver)),
+                reply_markup=_driver_edit_menu_keyboard(short),
+            )
+        except Exception:
+            pass
+        return STATE_INTERVIEW_INPUT
+
+    if data.startswith("drv_ef_"):
+        m = re.match(r"^drv_ef_([a-z_]+)_([A-Za-z0-9_-]+)$", data)
+        if not m:
+            return STATE_INTERVIEW_INPUT
+        field_key = m.group(1)
+        short = m.group(2)
+        if field_key not in _DRV_EDIT_FIELDS:
+            return STATE_INTERVIEW_INPUT
+        driver = _resolve_driver_by_short(short)
+        if not driver:
+            try:
+                await q.edit_message_text("Driver not found.")
+            except Exception:
+                pass
+            return STATE_INTERVIEW_INPUT
+        context.user_data["drv_edit_id"] = str(driver["id"])
+        context.user_data["drv_edit_short"] = short
+        context.user_data["drv_edit_field"] = field_key
+        label = _DRV_EDIT_FIELDS[field_key][1]
+        sent = await msg.reply_text(
+            f"✍️ Send new value for: {label}\n(Type - to clear, /cancel to abort)"
+        )
+        _track_pending_prompt(context, sent.message_id)
+        return STATE_DRV_EDIT_VALUE
+
+    if data.startswith("drv_del_"):
+        short = data[len("drv_del_"):]
+        driver = _resolve_driver_by_short(short)
+        if not driver:
+            try:
+                await q.edit_message_text("Driver not found.")
+            except Exception:
+                pass
+            return STATE_INTERVIEW_INPUT
+        nm = driver.get("driver_name") or "this driver"
+        try:
+            await q.edit_message_text(
+                f"🗑 Delete {nm}?\n\n" + "\n".join(_driver_profile_lines(driver)),
+                reply_markup=_driver_delete_confirm_keyboard(short),
+            )
+        except Exception:
+            pass
+        return STATE_INTERVIEW_INPUT
+
+    if data.startswith("drv_delc_"):
+        short = data[len("drv_delc_"):]
+        driver = _resolve_driver_by_short(short)
+        if not driver:
+            try:
+                await q.edit_message_text("Driver not found.")
+            except Exception:
+                pass
+            return STATE_INTERVIEW_INPUT
+        ok = db.delete_driver(str(driver["id"]))
+        if ok:
+            try:
+                await q.edit_message_text(
+                    f"🗑 Deleted: {driver.get('driver_name') or '(unnamed)'}",
+                    reply_markup=None,
+                )
+            except Exception:
+                await msg.reply_text(
+                    f"🗑 Deleted: {driver.get('driver_name') or '(unnamed)'}"
+                )
+        else:
+            await msg.reply_text("❌ Could not delete driver.")
+        return STATE_INTERVIEW_INPUT
+
+    return STATE_INTERVIEW_INPUT
+
+
+async def handle_driver_edit_value(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> int:
+    user = update.effective_user
+    msg = update.effective_message
+    if not user or not msg or not _user_is_global_supervisor(user.id):
+        return ConversationHandler.END
+
+    did = context.user_data.get("drv_edit_id")
+    field_key = context.user_data.get("drv_edit_field")
+    short = context.user_data.get("drv_edit_short")
+    if not did or field_key not in _DRV_EDIT_FIELDS:
+        await msg.reply_text("No driver field selected.")
+        return STATE_INTERVIEW_INPUT
+
+    text = (msg.text or "").strip()
+    column = _DRV_EDIT_FIELDS[field_key][0]
+    label = _DRV_EDIT_FIELDS[field_key][1]
+    new_value: Optional[str]
+    if text == "-":
+        new_value = None
+    elif not text:
+        await msg.reply_text("Empty value. Try again or /cancel.")
+        return STATE_DRV_EDIT_VALUE
+    else:
+        new_value = text
+
+    ok = db.update_driver(did, {column: new_value})
+    if not ok:
+        await msg.reply_text("❌ Update failed.")
+        return STATE_INTERVIEW_INPUT
+
+    for key in ("drv_edit_id", "drv_edit_field", "drv_edit_short"):
+        context.user_data.pop(key, None)
+
+    driver = db.get_driver_by_id(did) or {"id": did}
+    await msg.reply_text(f"✅ {label} updated.")
+    if short:
+        await msg.reply_text(
+            "\n".join(_driver_profile_lines(driver)),
+            reply_markup=_driver_profile_keyboard(short),
+        )
+    return STATE_INTERVIEW_INPUT
+
+
 async def cmd_set_training_video(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     user = update.effective_user
     msg = update.effective_message
@@ -2267,6 +2492,7 @@ def main() -> None:
             CommandHandler("announce_schedule", cmd_announce_schedule),
             CommandHandler("training", cmd_set_training_video),
             CommandHandler("setemail", cmd_setemail),
+            CallbackQueryHandler(handle_driver_callbacks, pattern=r"^drv_ef_"),
         ],
         states={
             STATE_INTERVIEW_INPUT: [
@@ -2295,6 +2521,10 @@ def main() -> None:
             ],
             STATE_TRAINING_MENU: [
                 CallbackQueryHandler(handle_training_callbacks, pattern=r"^train_"),
+            ],
+            STATE_DRV_EDIT_VALUE: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_driver_edit_value),
+                CallbackQueryHandler(handle_driver_callbacks, pattern=r"^drv_"),
             ],
             STATE_SET_TRAINING_VIDEO: [
                 MessageHandler(
@@ -2347,6 +2577,9 @@ def main() -> None:
     )
     application.add_handler(
         CallbackQueryHandler(handle_shipment_callbacks, pattern=r"^ship_"),
+    )
+    application.add_handler(
+        CallbackQueryHandler(handle_driver_callbacks, pattern=r"^drv_"),
     )
     application.add_handler(ChatJoinRequestHandler(handle_chat_join_request))
 

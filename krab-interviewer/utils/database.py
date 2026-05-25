@@ -336,6 +336,24 @@ class Database:
             logger.error("get_driver_by_id: %s", e)
             return None
 
+    def update_driver(self, driver_id: str, updates: Dict[str, Any]) -> bool:
+        if not updates:
+            return False
+        try:
+            self.client.table("drivers").update(updates).eq("id", driver_id).execute()
+            return True
+        except Exception as e:
+            logger.error("update_driver: %s", e)
+            return False
+
+    def delete_driver(self, driver_id: str) -> bool:
+        try:
+            self.client.table("drivers").delete().eq("id", driver_id).execute()
+            return True
+        except Exception as e:
+            logger.error("delete_driver: %s", e)
+            return False
+
     # --- storage ---
 
     def upload_driver_license_to_storage(
