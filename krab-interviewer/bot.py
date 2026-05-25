@@ -1001,14 +1001,14 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     text = (
         "🤖 <b>Krab Interviewer — Commands</b>\n\n"
-        "1. /start — begin driver questionnaire (or supervisor hire menu)\n"
-        "2. /cancel — cancel the current flow\n"
-        "3. /interviews — list recent interviews (tap to open)\n"
-        "4. /drivers — list Issuer drivers (tap for profile)\n"
-        "5. /open &lt;id&gt; — open one interview by id\n"
-        "6. /announce — post next message to drivers channel now\n"
-        "7. /announce_schedule — schedule a channel post\n"
-        "8. /set_training_video — save the \"how to print paper\" video for new hires"
+        "1. ✅ /start — begin driver questionnaire (or supervisor hire menu)\n"
+        "2. ❌ /cancel — cancel the current flow\n"
+        "3. 🎤 /interviews — list recent interviews (tap to open)\n"
+        "4. 🚗 /drivers — list Issuer drivers (tap for profile)\n"
+        "5. 📂 /open &lt;id&gt; — open one interview by id\n"
+        "6. 📢 /announce — post next message to drivers channel now\n"
+        "7. 🗓️📢 /announce_schedule — schedule a channel post\n"
+        "8. 🎥📚 /set_training_video — save the \"how to print paper\" video for new hires"
     )
 
     try:
