@@ -592,7 +592,7 @@ async def _notify_driver_of_shipment(
         "Tips:\n"
         "• Don't open until day of\n"
         "• Print on letter-size paper\n"
-        "• Watch the training video below 👇"
+        "• Re-watch your training videos anytime with /training"
     )
 
     driver_tid = _parse_chat_id(shipment.get("driver_telegram_id"))
@@ -609,8 +609,6 @@ async def _notify_driver_of_shipment(
                     )
                 except Exception as e:
                     warnings.append(f"Receipt photo to driver: {e}")
-            if not await _send_training_video_to_chat(context, driver_tid):
-                warnings.append("Training video not configured (/training)")
         except Exception as e:
             warnings.append(f"Telegram DM to driver: {e}")
     else:
@@ -1038,7 +1036,7 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "5. 📂 /open &lt;id&gt; — open one interview by id\n"
         "6. 📢 /announce — post next message to drivers channel now\n"
         "7. 🗓️📢 /announce_schedule — schedule a channel post\n"
-        "8. 🎥📚 /training — save the \"how to print paper\" video for new hires"
+        "8. 🎥📚 /training — view training videos (supervisors: add or remove)"
     )
 
     try:
@@ -1367,11 +1365,33 @@ async def handle_interview_callbacks(update: Update, context: ContextTypes.DEFAU
         except Exception as e:
             logger.warning("Driver welcome DM failed: %s", e)
 
+        training_warn: Optional[str] = None
+        try:
+            driver_chat_id = int(tid)
+        except Exception:
+            driver_chat_id = None
+        if driver_chat_id:
+            try:
+                await context.bot.send_message(
+                    chat_id=driver_chat_id,
+                    text=(
+                        "🎬 Training time! Watch these to learn the workflow.\n"
+                        "You can replay them anytime with /training."
+                    ),
+                )
+            except Exception as e:
+                logger.warning("Training intro DM failed: %s", e)
+            sent_any = await _send_training_video_to_chat(context, driver_chat_id)
+            if not sent_any:
+                training_warn = "No training videos configured (supervisor: run /training)."
+
         warnings_lines: List[str] = []
         if errors:
             warnings_lines.extend(errors)
         if ship_warn:
             warnings_lines.append(ship_warn)
+        if training_warn:
+            warnings_lines.append(training_warn)
         if not channel_invite:
             warnings_lines.append("Channel invite link not created (check DRIVER_CHANNEL_ID + bot admin rights).")
 
@@ -2022,10 +2042,33 @@ async def _show_training_list(
 async def cmd_set_training_video(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     user = update.effective_user
     msg = update.effective_message
-    if not user or not msg or not _user_is_global_supervisor(user.id):
+    if not user or not msg:
         return ConversationHandler.END
-    await _show_training_menu(context, msg.chat_id)
-    return STATE_TRAINING_MENU
+
+    if _user_is_global_supervisor(user.id):
+        await _show_training_menu(context, msg.chat_id)
+        return STATE_TRAINING_MENU
+
+    videos = shipments_db.list_training_videos()
+    if not videos:
+        legacy = shipments_db.get_bot_setting("training_video")
+        if legacy and legacy.get("media_file_id"):
+            videos = [{
+                "media_kind": legacy.get("media_kind") or "video",
+                "media_file_id": legacy["media_file_id"],
+                "caption": legacy.get("caption"),
+            }]
+
+    if not videos:
+        await msg.reply_text(
+            "🎬 No training videos available yet.\n"
+            "Check back soon — your supervisor will upload them."
+        )
+        return ConversationHandler.END
+
+    await msg.reply_text(f"🎬 Training videos ({len(videos)}) — here you go 👇")
+    await _send_training_video_to_chat(context, msg.chat_id)
+    return ConversationHandler.END
 
 
 async def handle_training_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
