@@ -1036,7 +1036,8 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "5. 📂 /open &lt;id&gt; — open one interview by id\n"
         "6. 📢 /announce — post next message to drivers channel now\n"
         "7. 🗓️📢 /announce_schedule — schedule a channel post\n"
-        "8. 🎥📚 /training — view training videos (supervisors: add or remove)"
+        "8. 🎥📚 /training — view training videos (supervisors: add or remove)\n"
+        "9. ❓ /help — show this command list"
     )
 
     try:
