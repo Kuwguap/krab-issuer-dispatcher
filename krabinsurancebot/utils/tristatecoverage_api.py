@@ -75,6 +75,15 @@ def create_portal_client(
     if pdf_bytes:
         body["insuranceCardPdfBase64"] = base64.b64encode(pdf_bytes).decode("ascii")
 
+    body.setdefault("skipWelcomeEmail", True)
+    body.setdefault("sendWelcomeEmail", False)
+    body.setdefault("welcomeEmail", False)
+    body.setdefault("sendEmail", False)
+    body.setdefault("notifyClient", False)
+    body.setdefault("silent", True)
+    body.setdefault("suppressEmail", True)
+    body.setdefault("disableEmail", True)
+
     headers = {
         "Authorization": f"Bearer {api_key}",
         "Content-Type": "application/json",
