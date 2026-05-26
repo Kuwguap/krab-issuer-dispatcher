@@ -9,7 +9,7 @@
 #   4. krab-issuer-bot       (Worker) Krab Issuer Telegram bot
 #   5. paper-investigator    (Worker) Paper Investigator Telegram bot
 #   6. krab-interviewer-bot  (Worker) Krab Interviewer Telegram bot
-#   7. krabinsurancebot      (Worker) Standalone insurance Telegram bot
+#   7. krab-insurance-bot    (Worker) Standalone insurance-card Telegram bot
 #
 # Import:
 #   1. Push this repo to GitHub.
@@ -19,7 +19,7 @@
 # ============================================================================
 
 previews:
-  generation: "off"
+  generation: off
 
 services:
   # --------------------------------------------------------------------------
@@ -107,6 +107,43 @@ services:
         sync: false
       - key: OPENAI_API_KEY
         sync: false
+      - key: RESEND_API_KEY
+        fromService:
+          name: krab-issuer-bot
+          type: worker
+          envVarKey: RESEND_API_KEY
+      - key: RESEND_FROM
+        fromService:
+          name: krab-issuer-bot
+          type: worker
+          envVarKey: RESEND_FROM
+      - key: INTEGRATIONS_API_KEY
+        fromService:
+          name: krab-issuer-bot
+          type: worker
+          envVarKey: INTEGRATIONS_API_KEY
+      - key: TRISTATECOVERAGE_API_BASE
+        value: https://tristatecoverage.com
+      - key: INSURANCE_ISSUER_NAME
+        fromService:
+          name: krab-issuer-bot
+          type: worker
+          envVarKey: INSURANCE_ISSUER_NAME
+      - key: INSURANCE_ISSUER_PHONE
+        fromService:
+          name: krab-issuer-bot
+          type: worker
+          envVarKey: INSURANCE_ISSUER_PHONE
+      - key: INSURANCE_ISSUER_ADDRESS
+        fromService:
+          name: krab-issuer-bot
+          type: worker
+          envVarKey: INSURANCE_ISSUER_ADDRESS
+      - key: INSURANCE_CARRIER_NAME
+        fromService:
+          name: krab-issuer-bot
+          type: worker
+          envVarKey: INSURANCE_CARRIER_NAME
 
   # --------------------------------------------------------------------------
   # 3) Krab Issuer admin dashboard (Flask)
@@ -275,9 +312,10 @@ services:
 
   # --------------------------------------------------------------------------
   # 7) Standalone Krab Insurance Telegram bot (background worker)
+  #    Independent insurance-card flow (image/text/PDF -> FS-20 + portal + email)
   # --------------------------------------------------------------------------
   - type: worker
-    name: krabinsurancebot
+    name: krab-insurance-bot
     runtime: docker
     rootDir: krabinsurancebot
     dockerfilePath: ./Dockerfile
@@ -301,6 +339,14 @@ services:
         sync: false
       - key: TRISTATECOVERAGE_API_BASE
         value: https://tristatecoverage.com
+      - key: INSURANCE_ISSUER_NAME
+        sync: false
+      - key: INSURANCE_ISSUER_PHONE
+        sync: false
+      - key: INSURANCE_ISSUER_ADDRESS
+        sync: false
+      - key: INSURANCE_CARRIER_NAME
+        sync: false
       - key: VIN_PROVIDER
         value: nhtsa
       - key: API_NINJAS_API_KEY
