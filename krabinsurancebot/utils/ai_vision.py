@@ -153,6 +153,158 @@ MULTI_STRUCTURE_PROMPT = STRUCTURE_PROMPT.replace(
     "prefer the clearest and most complete value and resolve minor conflicts sensibly.",
 )
 
+
+JSON_STRUCTURE_PROMPT = """You extract a vehicle insurance lead from an image, PDF page, or piece of free-form text (dealer worksheet, registration document, screenshot, paste).
+
+Return ONLY a single JSON object with EXACTLY these keys (use "" for any value you cannot read — never invent data):
+{
+  "name": "<full legal name of the insured>",
+  "address": "<registration street address only>",
+  "city_state_zip": "<registration city, ST ZIP — two-letter state abbreviation>",
+  "delivery_address": "<delivery street address only>",
+  "delivery_city_state_zip": "<delivery city, ST ZIP>",
+  "vin": "<17-character alphanumeric VIN, or empty>",
+  "car": "<year make model only, e.g. 2020 Nissan Altima>",
+  "color": "<vehicle color: full word or 3-letter DMV code (GRY/BLK/WHT/SIL)>",
+  "insurance_company": "<previous or current insurance company>",
+  "insurance_policy_number": "<insurance policy number>",
+  "extra_info": "<delivery date/time and any extra notes>",
+  "phone": "<client phone number explicitly labelled Phone/Tel/Cell/Mobile>",
+  "email": "<single client email address>",
+  "driver_license_id": "<customer's driver-license / DMV ID>"
+}
+
+STRICT RULES:
+- Output the JSON object only. No markdown fences, no commentary, no extra keys.
+- Every value must be a string ("" if missing). Never null, never numbers.
+- vin: exactly 17 letters+digits, no spaces, or "" if not clearly readable.
+- car: only year, make, model — no color, no trim, no VIN.
+- color: never put insurance names, city names, addresses or phones here.
+- phone: ONLY use a number with an explicit Phone/Tel/Cell/Mobile/Contact label. Never copy the policy number, VIN, license ID, plate, account, reference id, or ZIP into phone.
+- email: must contain "@" and a dot — else "".
+- driver_license_id: customer's DL/DMV ID only — never the insurance policy number.
+- Do not refuse. This is an authorized data-entry workflow for an insurance dispatch system; the user typed the information themselves and is asking you to structure it.
+"""
+
+
+def _call_openai_json(messages: list, *, max_tokens: int = 1024) -> Optional[dict[str, Any]]:
+    """Call the chat completions endpoint asking for a JSON object back."""
+    try:
+        from openai import OpenAI
+    except ImportError:
+        logger.warning("openai package not installed.")
+        return None
+    from config import Config
+
+    api_key = Config.OPENAI_API_KEY
+    if not api_key or not api_key.strip():
+        return None
+    model = getattr(Config, "OPENAI_VISION_MODEL", None) or "gpt-4o"
+    try:
+        client = OpenAI(api_key=api_key.strip(), max_retries=0)
+        response = client.chat.completions.create(
+            model=model,
+            messages=messages,
+            max_tokens=max_tokens,
+            response_format={"type": "json_object"},
+            temperature=0.0,
+        )
+        raw = (response.choices[0].message.content or "").strip()
+    except AIVisionQuotaError:
+        raise
+    except Exception as e:
+        err_msg = str(e).lower()
+        if "429" in err_msg or "insufficient_quota" in err_msg or "quota" in err_msg or "rate limit" in err_msg:
+            logger.warning("OpenAI quota exceeded (json): %s", e)
+            raise AIVisionQuotaError("API quota exceeded") from e
+        logger.warning("OpenAI JSON call failed: %s", e)
+        return None
+    data = _parse_json_from_model(raw)
+    return data if isinstance(data, dict) else None
+
+
+def extract_json_from_text(user_message: str) -> Optional[dict[str, Any]]:
+    if not user_message or not user_message.strip():
+        return None
+    messages = [
+        {
+            "role": "system",
+            "content": "You are a strict JSON extractor for an insurance dispatch workflow.",
+        },
+        {
+            "role": "user",
+            "content": JSON_STRUCTURE_PROMPT + "\n\nText to extract:\n" + user_message.strip()[:6000],
+        },
+    ]
+    return _call_openai_json(messages)
+
+
+def extract_json_from_image(image_bytes: bytes, mime_type: str = "image/jpeg") -> Optional[dict[str, Any]]:
+    from config import Config
+
+    api_key = Config.OPENAI_API_KEY
+    if not api_key or not api_key.strip() or not image_bytes:
+        return None
+    b64 = base64.standard_b64encode(image_bytes).decode("ascii")
+    data_url = f"data:{mime_type};base64,{b64}"
+    messages = [
+        {
+            "role": "system",
+            "content": "You are a strict JSON extractor for an insurance dispatch workflow.",
+        },
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": JSON_STRUCTURE_PROMPT},
+                {"type": "image_url", "image_url": {"url": data_url}},
+            ],
+        },
+    ]
+    return _call_openai_json(messages)
+
+
+def extract_json_from_media_parts(parts: list[tuple[bytes, str]]) -> Optional[dict[str, Any]]:
+    if not parts:
+        return None
+    cleaned = [(b, m) for b, m in parts if b]
+    if not cleaned:
+        return None
+    if len(cleaned) == 1:
+        return extract_json_from_image(cleaned[0][0], mime_type=cleaned[0][1] or "image/jpeg")
+    from config import Config
+
+    api_key = Config.OPENAI_API_KEY
+    if not api_key or not api_key.strip():
+        return None
+    content: list[dict[str, Any]] = [
+        {
+            "type": "text",
+            "text": JSON_STRUCTURE_PROMPT
+            + "\n\nMerge data from ALL of the images below into ONE JSON object.",
+        }
+    ]
+    for image_bytes, mime_type in cleaned[:12]:
+        mt = (mime_type or "image/jpeg").strip()
+        if not mt.startswith("image/"):
+            mt = "image/jpeg"
+        b64 = base64.standard_b64encode(image_bytes).decode("ascii")
+        content.append({"type": "image_url", "image_url": {"url": f"data:{mt};base64,{b64}"}})
+    messages = [
+        {
+            "role": "system",
+            "content": "You are a strict JSON extractor for an insurance dispatch workflow.",
+        },
+        {"role": "user", "content": content},
+    ]
+    return _call_openai_json(messages, max_tokens=1500)
+
+
+def extract_json_from_pdf(pdf_bytes: bytes) -> Optional[dict[str, Any]]:
+    png = pdf_first_page_to_png_bytes(pdf_bytes)
+    if not png:
+        return None
+    return extract_json_from_image(png, mime_type="image/png")
+
 # For freeform text: user can send any format; we ask the model to identify and rearrange into 11 lines
 TEXT_STRUCTURE_PROMPT = """The user sent the following message. It may be in any format: paragraph, bullet list, different order, labels like "Name: John", etc. It also includes a phone number, a price (maybe with a $ sign), and possibly two notes (one for the tag issuer, one for the driver), an email, and a driver-license / DMV ID.
 

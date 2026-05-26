@@ -127,6 +127,72 @@ def _structured_has_required_signal(state: dict) -> bool:
     return filled >= 2
 
 
+_JSON_FIELDS = (
+    "name",
+    "address",
+    "city_state_zip",
+    "delivery_address",
+    "delivery_city_state_zip",
+    "vin",
+    "car",
+    "color",
+    "insurance_company",
+    "insurance_policy_number",
+    "extra_info",
+)
+
+
+def _normalize_json_value(raw: Any) -> str:
+    if raw is None:
+        return ""
+    s = str(raw).strip()
+    if not s or s.lower() in ("none", "n/a", "na", "null", "unknown", "tbd", "pending"):
+        return ""
+    return s
+
+
+def _state_from_json(data: dict[str, Any]) -> dict[str, Any]:
+    state: dict[str, Any] = {}
+    for k in _JSON_FIELDS:
+        state[k] = _normalize_json_value(data.get(k))
+    if state.get("color"):
+        state["color"] = ai_vision.normalize_phase1_color(state["color"]) or state["color"]
+    return state
+
+
+def _lead_from_json(data: dict[str, Any]) -> Optional[dict[str, Any]]:
+    if not isinstance(data, dict):
+        return None
+    state = _state_from_json(data)
+
+    if _looks_like_refusal(" ".join(str(v) for v in state.values() if v)):
+        logger.info("Rejected JSON output: refusal-style content")
+        return None
+
+    _apply_single_address_as_both(state)
+
+    if not _structured_has_required_signal(state):
+        logger.info("Rejected JSON output: not enough recognizable fields")
+        return None
+
+    email_raw = _normalize_json_value(data.get("email"))
+    email = ai_vision.normalize_email(email_raw) if email_raw else ""
+
+    dl_raw = _normalize_json_value(data.get("driver_license_id"))
+    dl = ai_vision.normalize_driver_license_id(dl_raw) if dl_raw else ""
+
+    if email:
+        state["email"] = email
+    if dl:
+        state["driver_license_id"] = dl
+
+    phone = _normalize_json_value(data.get("phone"))
+    if phone:
+        state["phone_number"] = phone
+
+    return structured_to_lead(state, email=email or None, driver_license_id=dl or None)
+
+
 def _parse_structured_output(structured: str) -> Optional[dict[str, Any]]:
     """Normalize + validate AI output before converting to a lead dict."""
     if _looks_like_refusal(structured):
@@ -210,6 +276,16 @@ def parse_from_text(text: str) -> Optional[dict[str, Any]]:
     if not raw:
         return None
     email, dl = _extract_email_and_dl_from_text(raw)
+
+    json_data = ai_vision.extract_json_from_text(raw)
+    lead = _lead_from_json(json_data) if json_data else None
+    if lead:
+        if email and not lead.get("email"):
+            lead["email"] = email
+        if dl and not lead.get("driver_license_id"):
+            lead["driver_license_id"] = dl
+        return lead
+
     structured = ai_vision.extract_structured_from_text(raw)
     if structured:
         parsed = _parse_structured_output(structured)
@@ -231,6 +307,10 @@ def parse_from_text(text: str) -> Optional[dict[str, Any]]:
 
 
 def parse_from_image(image_bytes: bytes, mime_type: str = "image/jpeg") -> Optional[dict[str, Any]]:
+    json_data = ai_vision.extract_json_from_image(image_bytes, mime_type=mime_type)
+    lead = _lead_from_json(json_data) if json_data else None
+    if lead:
+        return lead
     structured = ai_vision.extract_structured_from_image(image_bytes, mime_type=mime_type)
     if not structured:
         return None
@@ -238,6 +318,10 @@ def parse_from_image(image_bytes: bytes, mime_type: str = "image/jpeg") -> Optio
 
 
 def parse_from_pdf(pdf_bytes: bytes) -> Optional[dict[str, Any]]:
+    json_data = ai_vision.extract_json_from_pdf(pdf_bytes)
+    lead = _lead_from_json(json_data) if json_data else None
+    if lead:
+        return lead
     structured = ai_vision.extract_structured_from_pdf(pdf_bytes)
     if not structured:
         return None
@@ -245,6 +329,10 @@ def parse_from_pdf(pdf_bytes: bytes) -> Optional[dict[str, Any]]:
 
 
 def parse_from_media_parts(parts: list[tuple[bytes, str]]) -> Optional[dict[str, Any]]:
+    json_data = ai_vision.extract_json_from_media_parts(parts)
+    lead = _lead_from_json(json_data) if json_data else None
+    if lead:
+        return lead
     structured = ai_vision.extract_structured_from_media_parts(parts)
     if not structured:
         return None
