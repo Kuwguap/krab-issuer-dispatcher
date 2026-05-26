@@ -98,16 +98,41 @@ def _looks_like_refusal(text: str) -> bool:
     s = (text or "").strip().lower()
     if not s:
         return False
-    return (
-        "i'm sorry" in s
-        or "i am sorry" in s
-        or "can't help with that" in s
-        or "cannot help with that" in s
+    refusal_markers = (
+        "i'm sorry",
+        "i am sorry",
+        "i'm not able",
+        "i am not able",
+        "i cannot",
+        "i can't",
+        "can't assist",
+        "cannot assist",
+        "can't help",
+        "cannot help",
+        "unable to help",
+        "unable to assist",
+        "won't be able",
     )
+    return any(m in s for m in refusal_markers)
+
+
+def _structured_has_required_signal(state: dict) -> bool:
+    """Reject obviously empty parses (refusals or non-data uploads)."""
+    keys = ("name", "address", "city_state_zip", "vin", "car", "delivery_address")
+    filled = 0
+    for k in keys:
+        v = (state.get(k) or "").strip()
+        if v and v != "-":
+            filled += 1
+    return filled >= 2
 
 
 def _parse_structured_output(structured: str) -> Optional[dict[str, Any]]:
     """Normalize + validate AI output before converting to a lead dict."""
+    if _looks_like_refusal(structured):
+        logger.info("Rejected AI output: refusal-style content (raw)")
+        return None
+
     normalized = _normalize_ai_phase1_text(structured)
     lines = [ln.strip() for ln in normalized.splitlines() if ln.strip()]
     if len(lines) < ai_vision.PHASE1_LINE_COUNT:
@@ -123,7 +148,11 @@ def _parse_structured_output(structured: str) -> Optional[dict[str, Any]]:
         return None
 
     if _looks_like_refusal(state.get("name") or ""):
-        logger.info("Rejected AI output: refusal-style content")
+        logger.info("Rejected AI output: refusal-style content (name)")
+        return None
+
+    if not _structured_has_required_signal(state):
+        logger.info("Rejected AI output: not enough recognizable fields")
         return None
 
     email, dl = _extract_email_and_dl_from_text(normalized)

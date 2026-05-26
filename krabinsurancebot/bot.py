@@ -413,7 +413,10 @@ async def handle_phase1_callbacks(update: Update, context: ContextTypes.DEFAULT_
             return STATE_PHASE1_INPUT
         lead = pl.parse_from_media_parts(pending)
         if not lead:
-            await q.message.reply_text("AI could not read those images. Try clearer photos or paste text.")
+            await q.message.reply_text(
+                "⚠️ AI could not extract client info from those images.\n\n"
+                "Try a clearer photo, or paste the 11-line text block."
+            )
             return STATE_PHASE1_INPUT
         context.user_data.pop("pending_media", None)
         await q.message.reply_text(_format_review(lead), parse_mode="HTML", reply_markup=_review_keyboard())
