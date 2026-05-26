@@ -37,7 +37,6 @@ STATE_REVIEW = 2
 STATE_EDIT_FIELD_PICK = 3
 STATE_EDIT_FIELD_VALUE = 4
 STATE_AWAIT_EMAIL = 5
-STATE_AWAIT_PLAN = 6
 
 PHASE1_VISION_CANCEL_CB = "p1_cancel"
 PHASE1_VISION_PHOTO_CB = "p1_photo"
@@ -49,6 +48,7 @@ PLAN_OPTIONS = (
     (6, "6 months"),
     (12, "12 months"),
 )
+DEFAULT_PLAN_MONTHS = 1
 
 EDITABLE_FIELDS = {
     "name": "Name",
@@ -102,25 +102,21 @@ def _phase1_keyboard() -> InlineKeyboardMarkup:
     ])
 
 
-def _review_keyboard() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([
+def _review_keyboard(selected_months: int = DEFAULT_PLAN_MONTHS) -> InlineKeyboardMarkup:
+    rows: list[list[InlineKeyboardButton]] = [
         [InlineKeyboardButton("✅ Send insurance card", callback_data="review_ok")],
-        [InlineKeyboardButton("✏️ Edit field", callback_data="review_edit")],
-        [InlineKeyboardButton("❌ Cancel", callback_data="review_cancel")],
-    ])
-
-
-def _plan_keyboard() -> InlineKeyboardMarkup:
-    rows = []
+    ]
     pair: list[InlineKeyboardButton] = []
     for months, label in PLAN_OPTIONS:
-        pair.append(InlineKeyboardButton(label, callback_data=f"plan_{months}"))
+        marker = "🔘 " if months == selected_months else ""
+        pair.append(InlineKeyboardButton(f"{marker}{label}", callback_data=f"review_plan_{months}"))
         if len(pair) == 2:
             rows.append(pair)
             pair = []
     if pair:
         rows.append(pair)
-    rows.append([InlineKeyboardButton("❌ Cancel", callback_data="plan_cancel")])
+    rows.append([InlineKeyboardButton("✏️ Edit field", callback_data="review_edit")])
+    rows.append([InlineKeyboardButton("❌ Cancel", callback_data="review_cancel")])
     return InlineKeyboardMarkup(rows)
 
 
@@ -132,11 +128,15 @@ def _edit_fields_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(rows)
 
 
-def _format_review(lead: dict[str, Any]) -> str:
+def _format_review(lead: dict[str, Any], selected_months: int = DEFAULT_PLAN_MONTHS) -> str:
     vd = (lead.get("vehicle_details") or "").splitlines()
     def ln(i: int) -> str:
         return vd[i].strip() if i < len(vd) else "—"
     em = (lead.get("email") or "").strip() or "— (will ask)"
+    plan_label = next(
+        (label for m, label in PLAN_OPTIONS if m == selected_months),
+        f"{selected_months} months",
+    )
     return (
         "📋 <b>Review client data</b>\n\n"
         f"Name: {html.escape(ln(0))}\n"
@@ -146,7 +146,8 @@ def _format_review(lead: dict[str, Any]) -> str:
         f"Car: {html.escape(ln(6))}\n"
         f"Color: {html.escape(ln(7))}\n"
         f"Email: {html.escape(em)}\n"
-        f"DL ID: {html.escape((lead.get('driver_license_id') or '—'))}\n\n"
+        f"DL ID: {html.escape((lead.get('driver_license_id') or '—'))}\n"
+        f"Duration: <b>{html.escape(plan_label)}</b>\n\n"
         "Tap <b>Send insurance card</b> when ready."
     )
 
@@ -328,12 +329,25 @@ async def build_and_send_insurance_card(
     return (True, policy_number, None, email, portal_password)
 
 
+def _current_plan_months(context: ContextTypes.DEFAULT_TYPE) -> int:
+    months = int(context.user_data.get("plan_months") or DEFAULT_PLAN_MONTHS)
+    if months not in {m for m, _ in PLAN_OPTIONS}:
+        return DEFAULT_PLAN_MONTHS
+    return months
+
+
 async def _go_to_review(update: Update, context: ContextTypes.DEFAULT_TYPE, lead: dict) -> int:
     context.user_data["lead"] = lead
     context.user_data.pop("pending_media", None)
+    context.user_data.setdefault("plan_months", DEFAULT_PLAN_MONTHS)
+    months = _current_plan_months(context)
     msg = update.effective_message
     if msg:
-        await msg.reply_text(_format_review(lead), parse_mode="HTML", reply_markup=_review_keyboard())
+        await msg.reply_text(
+            _format_review(lead, months),
+            parse_mode="HTML",
+            reply_markup=_review_keyboard(months),
+        )
     return STATE_REVIEW
 
 
@@ -496,8 +510,14 @@ async def handle_phase1_callbacks(update: Update, context: ContextTypes.DEFAULT_
             )
             return STATE_PHASE1_INPUT
         context.user_data.pop("pending_media", None)
-        await q.message.reply_text(_format_review(lead), parse_mode="HTML", reply_markup=_review_keyboard())
         context.user_data["lead"] = lead
+        context.user_data.setdefault("plan_months", DEFAULT_PLAN_MONTHS)
+        months = _current_plan_months(context)
+        await q.message.reply_text(
+            _format_review(lead, months),
+            parse_mode="HTML",
+            reply_markup=_review_keyboard(months),
+        )
         return STATE_REVIEW
 
     return STATE_PHASE1_INPUT
@@ -518,17 +538,32 @@ async def handle_review_callbacks(update: Update, context: ContextTypes.DEFAULT_
         await q.message.reply_text("Pick a field to edit:", reply_markup=_edit_fields_keyboard())
         return STATE_EDIT_FIELD_PICK
 
+    if data.startswith("review_plan_"):
+        try:
+            months = int(data.rsplit("_", 1)[1])
+        except (ValueError, IndexError):
+            return STATE_REVIEW
+        if months not in {m for m, _ in PLAN_OPTIONS}:
+            return STATE_REVIEW
+        if months == _current_plan_months(context):
+            return STATE_REVIEW
+        context.user_data["plan_months"] = months
+        try:
+            await q.edit_message_text(
+                _format_review(lead, months),
+                parse_mode="HTML",
+                reply_markup=_review_keyboard(months),
+            )
+        except Exception:
+            logger.exception("Failed to refresh review keyboard")
+        return STATE_REVIEW
+
     if data == "review_ok":
         em = (lead.get("email") or "").strip()
         if not em:
             await q.message.reply_text("📧 What email should we send the insurance card to?")
             return STATE_AWAIT_EMAIL
-        await q.message.reply_text(
-            "📅 <b>Select policy duration</b>",
-            parse_mode="HTML",
-            reply_markup=_plan_keyboard(),
-        )
-        return STATE_AWAIT_PLAN
+        return await _send_card_flow(q.message, context, lead)
 
     return STATE_REVIEW
 
@@ -540,7 +575,12 @@ async def handle_edit_pick(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
     if data == "ef_back":
         lead = context.user_data.get("lead") or {}
-        await q.message.reply_text(_format_review(lead), parse_mode="HTML", reply_markup=_review_keyboard())
+        months = _current_plan_months(context)
+        await q.message.reply_text(
+            _format_review(lead, months),
+            parse_mode="HTML",
+            reply_markup=_review_keyboard(months),
+        )
         return STATE_REVIEW
 
     if data.startswith("ef_"):
@@ -586,7 +626,12 @@ async def handle_edit_value(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     lead["vehicle_details"] = "\n".join(vd)
     context.user_data["lead"] = lead
     context.user_data.pop("edit_field", None)
-    await update.effective_message.reply_text(_format_review(lead), parse_mode="HTML", reply_markup=_review_keyboard())
+    months = _current_plan_months(context)
+    await update.effective_message.reply_text(
+        _format_review(lead, months),
+        parse_mode="HTML",
+        reply_markup=_review_keyboard(months),
+    )
     return STATE_REVIEW
 
 
@@ -599,44 +644,7 @@ async def handle_await_email(update: Update, context: ContextTypes.DEFAULT_TYPE)
     lead = context.user_data.get("lead") or {}
     lead["email"] = em
     context.user_data["lead"] = lead
-    await update.effective_message.reply_text(
-        "📅 <b>Select policy duration</b>",
-        parse_mode="HTML",
-        reply_markup=_plan_keyboard(),
-    )
-    return STATE_AWAIT_PLAN
-
-
-async def handle_plan_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    q = update.callback_query
-    await q.answer()
-    data = q.data or ""
-
-    if data == "plan_cancel":
-        context.user_data.clear()
-        await q.edit_message_text("Cancelled.")
-        return ConversationHandler.END
-
-    if data.startswith("plan_"):
-        try:
-            months = int(data.split("_", 1)[1])
-        except (ValueError, IndexError):
-            await q.message.reply_text("Invalid plan selection. Try again.", reply_markup=_plan_keyboard())
-            return STATE_AWAIT_PLAN
-        if months not in {m for m, _ in PLAN_OPTIONS}:
-            await q.message.reply_text("Invalid plan selection. Try again.", reply_markup=_plan_keyboard())
-            return STATE_AWAIT_PLAN
-
-        context.user_data["plan_months"] = months
-        try:
-            await q.edit_message_reply_markup(reply_markup=None)
-        except Exception:
-            pass
-
-        lead = context.user_data.get("lead") or {}
-        return await _send_card_flow(q.message, context, lead)
-
-    return STATE_AWAIT_PLAN
+    return await _send_card_flow(update.effective_message, context, lead)
 
 
 async def _send_card_flow(msg, context: ContextTypes.DEFAULT_TYPE, lead: dict) -> int:
@@ -727,9 +735,6 @@ def main() -> None:
             ],
             STATE_AWAIT_EMAIL: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, handle_await_email),
-            ],
-            STATE_AWAIT_PLAN: [
-                CallbackQueryHandler(handle_plan_callbacks, pattern=r"^plan_"),
             ],
         },
         fallbacks=[
