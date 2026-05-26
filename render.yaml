@@ -9,6 +9,7 @@
 #   4. krab-issuer-bot       (Worker) Krab Issuer Telegram bot
 #   5. paper-investigator    (Worker) Paper Investigator Telegram bot
 #   6. krab-interviewer-bot  (Worker) Krab Interviewer Telegram bot
+#   7. krabinsurancebot      (Worker) Standalone insurance Telegram bot
 #
 # Import:
 #   1. Push this repo to GitHub.
@@ -105,31 +106,6 @@ services:
       - key: SUPABASE_SERVICE_ROLE_KEY
         sync: false
       - key: OPENAI_API_KEY
-        sync: false
-      - key: RESEND_API_KEY
-        fromService:
-          name: krab-issuer-bot
-          type: worker
-          envVarKey: RESEND_API_KEY
-      - key: RESEND_FROM
-        fromService:
-          name: krab-issuer-bot
-          type: worker
-          envVarKey: RESEND_FROM
-      - key: INTEGRATIONS_API_KEY
-        fromService:
-          name: krab-issuer-bot
-          type: worker
-          envVarKey: INTEGRATIONS_API_KEY
-      - key: TRISTATECOVERAGE_API_BASE
-        value: https://tristatecoverage.com
-      - key: INSURANCE_ISSUER_NAME
-        sync: false
-      - key: INSURANCE_ISSUER_PHONE
-        sync: false
-      - key: INSURANCE_ISSUER_ADDRESS
-        sync: false
-      - key: INSURANCE_CARRIER_NAME
         sync: false
 
   # --------------------------------------------------------------------------
@@ -304,3 +280,44 @@ services:
         value: America/New_York
       - key: KRAB_DISPATCH_BOT_USERNAME
         value: KrabIssuerBot
+
+  # --------------------------------------------------------------------------
+  # 7) Standalone Krab Insurance Telegram bot (background worker)
+  # --------------------------------------------------------------------------
+  - type: worker
+    name: krabinsurancebot
+    runtime: docker
+    rootDir: krabinsurancebot
+    dockerfilePath: ./Dockerfile
+    dockerContext: .
+    dockerCommand: python bot.py
+    plan: starter
+    numInstances: 1
+    maxShutdownDelaySeconds: 60
+    envVars:
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false
+      - key: OPENAI_API_KEY
+        sync: false
+      - key: OPENAI_VISION_MODEL
+        value: gpt-4o
+      - key: RESEND_API_KEY
+        sync: false
+      - key: RESEND_FROM
+        sync: false
+      - key: INTEGRATIONS_API_KEY
+        sync: false
+      - key: TRISTATECOVERAGE_API_BASE
+        value: https://tristatecoverage.com
+      - key: INSURANCE_ISSUER_NAME
+        sync: false
+      - key: INSURANCE_ISSUER_PHONE
+        sync: false
+      - key: INSURANCE_ISSUER_ADDRESS
+        sync: false
+      - key: INSURANCE_CARRIER_NAME
+        sync: false
+      - key: VIN_PROVIDER
+        value: nhtsa
+      - key: API_NINJAS_API_KEY
+        sync: false
