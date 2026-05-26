@@ -24,6 +24,7 @@ from telegram.ext import (
 from config import Config
 from utils import ai_vision
 from utils import parse_lead as pl
+from utils import transactions as tx
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -55,43 +56,41 @@ EDITABLE_FIELDS = {
 PORTAL_DEFAULT_PASSWORD = "Temp#A9"
 
 PHASE1_INTRO = (
-    "🛡️ <b>Krab Insurance Bot</b>\n\n"
-    "Send client info to issue a NY FS-20 insurance card:\n"
-    "• Photo or PDF of registration / insurance docs\n"
-    "• Or paste the 11-line text block\n\n"
-    "Include an <b>email</b> in the image or text so we can send the card.\n\n"
-    "You can send multiple photos, then tap <b>Done</b>."
+    "🚗 <b>Insurance</b> 🪪<b>Card Generator</b> 🤖\n\n"
+    "Hey! 👋 Please send me:\n\n"
+    "📸 Driver's License\n"
+    "📸 Title or Registration (for VIN)\n"
+    "⌨️ Or type your:\n"
+    "• Full Name\n"
+    "• Address\n"
+    "• VIN Number\n"
+    "• Driver's License Number\n\n"
+    "⚡ Send multiple photos — I'll collect everything automatically "
+    "and generate your insurance card instantly"
 )
 
 HELP_TEXT = (
-    "🛡️ <b>Krab Insurance Bot</b>\n\n"
+    "🚗 <b>Insurance Card Generator</b> 🤖\n\n"
     "<b>Commands</b>\n"
     "/start — begin a new insurance card\n"
-    "/cancel — cancel current flow\n"
-    "/help — this message\n\n"
-    "<b>11-line text format</b>\n"
-    "1. Name\n"
-    "2. Address\n"
-    "3. City, State, ZIP\n"
-    "4. Delivery address\n"
-    "5. Delivery city, State, ZIP\n"
-    "6. VIN\n"
-    "7. Car\n"
-    "8. Color\n"
-    "9. Insurance company\n"
-    "10. Insurance policy #\n"
-    "11. Extra info\n\n"
-    "Or send a photo/PDF — AI will read it."
+    "/transactions — view your past insurance cards\n"
+    "/cancel — cancel the current flow\n"
+    "/help — show this message\n\n"
+    "<b>How it works</b>\n"
+    "📸 Send a photo of your Driver's License and Title/Registration\n"
+    "⌨️ Or type your Full Name, Address, VIN, and DL Number\n\n"
+    "You can send multiple photos, then tap <b>✅ Done</b>.\n"
+    "Include an <b>email</b> in the image or text so we can send the card."
 )
 
 
 def _phase1_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
         [
-            InlineKeyboardButton("📷 Add photo", callback_data=PHASE1_VISION_PHOTO_CB),
+            InlineKeyboardButton("❌ Cancel", callback_data=PHASE1_VISION_CANCEL_CB),
+            InlineKeyboardButton("➕ Photo", callback_data=PHASE1_VISION_PHOTO_CB),
             InlineKeyboardButton("✅ Done", callback_data=PHASE1_VISION_DONE_CB),
         ],
-        [InlineKeyboardButton("❌ Cancel", callback_data=PHASE1_VISION_CANCEL_CB)],
     ])
 
 
@@ -313,15 +312,62 @@ async def _go_to_review(update: Update, context: ContextTypes.DEFAULT_TYPE, lead
     return STATE_REVIEW
 
 
+def _remember_user(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user = update.effective_user
+    if user is not None:
+        context.user_data["tg_user_id"] = user.id
+        context.user_data["tg_username"] = user.username or user.full_name
+
+
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     context.user_data.clear()
+    _remember_user(update, context)
     context.user_data["pending_media"] = []
-    await update.effective_message.reply_text(PHASE1_INTRO, parse_mode="HTML", reply_markup=_phase1_keyboard())
+    await update.effective_message.reply_text(PHASE1_INTRO, parse_mode="HTML")
     return STATE_PHASE1_INPUT
 
 
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     await update.effective_message.reply_text(HELP_TEXT, parse_mode="HTML")
+    return ConversationHandler.END
+
+
+async def cmd_transactions(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    user = update.effective_user
+    if user is None:
+        return ConversationHandler.END
+
+    entries = tx.list_for_user(user.id, limit=20)
+    if not entries:
+        await update.effective_message.reply_text(
+            "📭 No transactions yet.\n\nUse /start to issue your first insurance card."
+        )
+        return ConversationHandler.END
+
+    lines: list[str] = [f"📒 <b>Your last {len(entries)} transaction(s)</b>\n"]
+    for e in entries:
+        ts_raw = (e.get("ts") or "").rstrip("Z")
+        try:
+            ts_display = datetime.fromisoformat(ts_raw).strftime("%Y-%m-%d %H:%M UTC")
+        except ValueError:
+            ts_display = ts_raw or "—"
+        status = "✅" if e.get("success") else "❌"
+        policy = e.get("policy_number") or "—"
+        email_to = e.get("email") or "—"
+        name = e.get("name") or "—"
+        vehicle = e.get("vehicle") or "—"
+        block = (
+            f"{status} <b>{html.escape(ts_display)}</b>\n"
+            f"📋 Policy: <code>{html.escape(policy)}</code>\n"
+            f"👤 {html.escape(name)}\n"
+            f"🚗 {html.escape(vehicle)}\n"
+            f"📧 {html.escape(email_to)}"
+        )
+        if not e.get("success") and e.get("error"):
+            block += f"\n⚠️ {html.escape(str(e.get('error')))}"
+        lines.append(block)
+
+    await update.effective_message.reply_text("\n\n".join(lines), parse_mode="HTML")
     return ConversationHandler.END
 
 
@@ -357,7 +403,7 @@ async def handle_phase1_photo(update: Update, context: ContextTypes.DEFAULT_TYPE
     pending: list = context.user_data.setdefault("pending_media", [])
     pending.append((bytes(data), "image/jpeg"))
     await update.effective_message.reply_text(
-        f"📷 Photo saved ({len(pending)} file(s)). Send more or tap Done.",
+        f"📸 Received {len(pending)} photo(s).",
         reply_markup=_phase1_keyboard(),
     )
     return STATE_PHASE1_INPUT
@@ -383,7 +429,7 @@ async def handle_phase1_document(update: Update, context: ContextTypes.DEFAULT_T
         pending: list = context.user_data.setdefault("pending_media", [])
         pending.append((raw, mime))
         await update.effective_message.reply_text(
-            f"📷 Image saved ({len(pending)}). Tap Done when ready.",
+            f"📸 Received {len(pending)} photo(s).",
             reply_markup=_phase1_keyboard(),
         )
         return STATE_PHASE1_INPUT
@@ -528,6 +574,28 @@ async def _send_card_flow(msg, context: ContextTypes.DEFAULT_TYPE, lead: dict) -
         parse_mode="HTML",
     )
     ok, policy_number, err, portal_email, portal_password = await build_and_send_insurance_card(lead)
+
+    vd_lines = (lead.get("vehicle_details") or "").splitlines()
+    insured_name = (vd_lines[0].strip() if vd_lines else "") or None
+    vehicle_label = (vd_lines[6].strip() if len(vd_lines) > 6 else "") or None
+
+    user_id = context.user_data.get("tg_user_id")
+    username = context.user_data.get("tg_username")
+
+    try:
+        tx.record(
+            user_id=user_id,
+            username=username,
+            policy_number=policy_number,
+            email=email or None,
+            vehicle=vehicle_label,
+            name=insured_name,
+            success=ok,
+            error=None if ok else (err or "unknown"),
+        )
+    except Exception:
+        logger.exception("Failed to record transaction")
+
     if ok:
         await msg.reply_text(
             "✅ <b>Insurance card sent</b>\n\n"
@@ -584,12 +652,15 @@ def main() -> None:
         fallbacks=[
             CommandHandler("cancel", cancel_cmd),
             CommandHandler("help", cmd_help),
+            CommandHandler("transactions", cmd_transactions),
         ],
         allow_reentry=True,
     )
 
     app.add_handler(conv)
     app.add_handler(CommandHandler("help", cmd_help))
+    app.add_handler(CommandHandler("transactions", cmd_transactions))
+    app.add_handler(CommandHandler("cancel", cancel_cmd))
 
     logger.info("Krab Insurance Bot polling...")
     app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
