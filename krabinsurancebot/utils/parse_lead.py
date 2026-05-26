@@ -1,10 +1,13 @@
 """Parse Phase 1 intake into a lead dict for insurance card issuance."""
 from __future__ import annotations
 
+import logging
 import re
 from typing import Any, Optional
 
 from utils import ai_vision
+
+logger = logging.getLogger(__name__)
 
 
 def parse_phase1_structured(message_text: str) -> dict[str, Any]:
@@ -78,6 +81,55 @@ def _extract_email_and_dl_from_text(text: str) -> tuple[Optional[str], Optional[
     return (email_val, dl_val)
 
 
+def _normalize_ai_phase1_text(raw_text: str) -> str:
+    """Normalize AI output into plain lines (strip numbering/bullets)."""
+    text = (raw_text or "").replace("\r\n", "\n").strip()
+    out: list[str] = []
+    for ln in text.splitlines():
+        s = ln.strip()
+        if not s:
+            continue
+        s = re.sub(r"^\s*(?:\d{1,2}[.)]|[-*])\s*", "", s).strip()
+        out.append(s)
+    return "\n".join(out)
+
+
+def _looks_like_refusal(text: str) -> bool:
+    s = (text or "").strip().lower()
+    if not s:
+        return False
+    return (
+        "i'm sorry" in s
+        or "i am sorry" in s
+        or "can't help with that" in s
+        or "cannot help with that" in s
+    )
+
+
+def _parse_structured_output(structured: str) -> Optional[dict[str, Any]]:
+    """Normalize + validate AI output before converting to a lead dict."""
+    normalized = _normalize_ai_phase1_text(structured)
+    lines = [ln.strip() for ln in normalized.splitlines() if ln.strip()]
+    if len(lines) < ai_vision.PHASE1_LINE_COUNT:
+        logger.info("Rejected AI output: expected >=11 lines, got %d", len(lines))
+        return None
+
+    normalized_11 = "\n".join(lines[: ai_vision.PHASE1_LINE_COUNT])
+    state = parse_phase1_structured(normalized_11)
+    _apply_single_address_as_both(state)
+    valid, _errors = ai_vision.validate_phase1_extraction(normalized_11, state)
+    if not valid:
+        logger.info("Rejected AI output: validation failed")
+        return None
+
+    if _looks_like_refusal(state.get("name") or ""):
+        logger.info("Rejected AI output: refusal-style content")
+        return None
+
+    email, dl = _extract_email_and_dl_from_text(normalized)
+    return structured_to_lead(state, email=email, driver_license_id=dl)
+
+
 def _apply_single_address_as_both(state: dict) -> None:
     def _has(v: str) -> bool:
         return bool(v and str(v).strip() and str(v).strip() != "-")
@@ -131,7 +183,14 @@ def parse_from_text(text: str) -> Optional[dict[str, Any]]:
     email, dl = _extract_email_and_dl_from_text(raw)
     structured = ai_vision.extract_structured_from_text(raw)
     if structured:
-        state = parse_phase1_structured(structured)
+        parsed = _parse_structured_output(structured)
+        if parsed:
+            if email and not parsed.get("email"):
+                parsed["email"] = email
+            if dl and not parsed.get("driver_license_id"):
+                parsed["driver_license_id"] = dl
+            return parsed
+        state = parse_phase1_structured(raw)
     else:
         state = parse_phase1_structured(raw)
     _apply_single_address_as_both(state)
@@ -146,27 +205,18 @@ def parse_from_image(image_bytes: bytes, mime_type: str = "image/jpeg") -> Optio
     structured = ai_vision.extract_structured_from_image(image_bytes, mime_type=mime_type)
     if not structured:
         return None
-    email, dl = _extract_email_and_dl_from_text(structured)
-    state = parse_phase1_structured(structured)
-    _apply_single_address_as_both(state)
-    return structured_to_lead(state, email=email, driver_license_id=dl)
+    return _parse_structured_output(structured)
 
 
 def parse_from_pdf(pdf_bytes: bytes) -> Optional[dict[str, Any]]:
     structured = ai_vision.extract_structured_from_pdf(pdf_bytes)
     if not structured:
         return None
-    email, dl = _extract_email_and_dl_from_text(structured)
-    state = parse_phase1_structured(structured)
-    _apply_single_address_as_both(state)
-    return structured_to_lead(state, email=email, driver_license_id=dl)
+    return _parse_structured_output(structured)
 
 
 def parse_from_media_parts(parts: list[tuple[bytes, str]]) -> Optional[dict[str, Any]]:
     structured = ai_vision.extract_structured_from_media_parts(parts)
     if not structured:
         return None
-    email, dl = _extract_email_and_dl_from_text(structured)
-    state = parse_phase1_structured(structured)
-    _apply_single_address_as_both(state)
-    return structured_to_lead(state, email=email, driver_license_id=dl)
+    return _parse_structured_output(structured)
