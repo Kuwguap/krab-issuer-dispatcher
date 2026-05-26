@@ -37,10 +37,18 @@ STATE_REVIEW = 2
 STATE_EDIT_FIELD_PICK = 3
 STATE_EDIT_FIELD_VALUE = 4
 STATE_AWAIT_EMAIL = 5
+STATE_AWAIT_PLAN = 6
 
 PHASE1_VISION_CANCEL_CB = "p1_cancel"
 PHASE1_VISION_PHOTO_CB = "p1_photo"
 PHASE1_VISION_DONE_CB = "p1_done"
+
+PLAN_OPTIONS = (
+    (1, "1 month"),
+    (3, "3 months"),
+    (6, "6 months"),
+    (12, "12 months"),
+)
 
 EDITABLE_FIELDS = {
     "name": "Name",
@@ -102,6 +110,20 @@ def _review_keyboard() -> InlineKeyboardMarkup:
     ])
 
 
+def _plan_keyboard() -> InlineKeyboardMarkup:
+    rows = []
+    pair: list[InlineKeyboardButton] = []
+    for months, label in PLAN_OPTIONS:
+        pair.append(InlineKeyboardButton(label, callback_data=f"plan_{months}"))
+        if len(pair) == 2:
+            rows.append(pair)
+            pair = []
+    if pair:
+        rows.append(pair)
+    rows.append([InlineKeyboardButton("❌ Cancel", callback_data="plan_cancel")])
+    return InlineKeyboardMarkup(rows)
+
+
 def _edit_fields_keyboard() -> InlineKeyboardMarkup:
     rows = []
     for key, label in EDITABLE_FIELDS.items():
@@ -139,6 +161,8 @@ def _parse_annual_premium(lead: dict) -> float:
 
 async def build_and_send_insurance_card(
     lead: dict,
+    *,
+    months: int = 1,
 ) -> tuple[bool, Optional[str], Optional[str], Optional[str], Optional[str]]:
     """Returns (ok, policy_number, error, portal_email, portal_password)."""
     from utils import insurance_card as ic
@@ -200,7 +224,8 @@ async def build_and_send_insurance_card(
         vehicle_year = "0000"
 
     today = datetime.now(pytz.timezone("America/New_York")).date()
-    expiration_date = ic.expiration_for_plan(today, months=1)
+    plan_months = max(1, int(months or 1))
+    expiration_date = ic.expiration_for_plan(today, months=plan_months)
     effective_label = ic.date_to_mmddyyyy(today)
     expiration_label = ic.date_to_mmddyyyy(expiration_date)
     policy_number = ic.generate_policy_number()
@@ -356,9 +381,15 @@ async def cmd_transactions(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         email_to = e.get("email") or "—"
         name = e.get("name") or "—"
         vehicle = e.get("vehicle") or "—"
+        plan_months_raw = e.get("plan_months")
+        if isinstance(plan_months_raw, int) and plan_months_raw > 0:
+            plan_label = f"{plan_months_raw} month{'s' if plan_months_raw != 1 else ''}"
+        else:
+            plan_label = "—"
         block = (
             f"{status} <b>{html.escape(ts_display)}</b>\n"
             f"📋 Policy: <code>{html.escape(policy)}</code>\n"
+            f"📅 Duration: {html.escape(plan_label)}\n"
             f"👤 {html.escape(name)}\n"
             f"🚗 {html.escape(vehicle)}\n"
             f"📧 {html.escape(email_to)}"
@@ -492,7 +523,12 @@ async def handle_review_callbacks(update: Update, context: ContextTypes.DEFAULT_
         if not em:
             await q.message.reply_text("📧 What email should we send the insurance card to?")
             return STATE_AWAIT_EMAIL
-        return await _send_card_flow(q.message, context, lead)
+        await q.message.reply_text(
+            "📅 <b>Select policy duration</b>",
+            parse_mode="HTML",
+            reply_markup=_plan_keyboard(),
+        )
+        return STATE_AWAIT_PLAN
 
     return STATE_REVIEW
 
@@ -563,17 +599,59 @@ async def handle_await_email(update: Update, context: ContextTypes.DEFAULT_TYPE)
     lead = context.user_data.get("lead") or {}
     lead["email"] = em
     context.user_data["lead"] = lead
-    return await _send_card_flow(update.effective_message, context, lead)
+    await update.effective_message.reply_text(
+        "📅 <b>Select policy duration</b>",
+        parse_mode="HTML",
+        reply_markup=_plan_keyboard(),
+    )
+    return STATE_AWAIT_PLAN
+
+
+async def handle_plan_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    q = update.callback_query
+    await q.answer()
+    data = q.data or ""
+
+    if data == "plan_cancel":
+        context.user_data.clear()
+        await q.edit_message_text("Cancelled.")
+        return ConversationHandler.END
+
+    if data.startswith("plan_"):
+        try:
+            months = int(data.split("_", 1)[1])
+        except (ValueError, IndexError):
+            await q.message.reply_text("Invalid plan selection. Try again.", reply_markup=_plan_keyboard())
+            return STATE_AWAIT_PLAN
+        if months not in {m for m, _ in PLAN_OPTIONS}:
+            await q.message.reply_text("Invalid plan selection. Try again.", reply_markup=_plan_keyboard())
+            return STATE_AWAIT_PLAN
+
+        context.user_data["plan_months"] = months
+        try:
+            await q.edit_message_reply_markup(reply_markup=None)
+        except Exception:
+            pass
+
+        lead = context.user_data.get("lead") or {}
+        return await _send_card_flow(q.message, context, lead)
+
+    return STATE_AWAIT_PLAN
 
 
 async def _send_card_flow(msg, context: ContextTypes.DEFAULT_TYPE, lead: dict) -> int:
     email = (lead.get("email") or "").strip()
     safe_email = html.escape(email, quote=False)
+    plan_months = int(context.user_data.get("plan_months") or 1)
+    plan_label = next((label for m, label in PLAN_OPTIONS if m == plan_months), f"{plan_months} months")
     await msg.reply_text(
-        f"⏳ Building NY FS-20 insurance card and emailing <code>{safe_email}</code>…",
+        f"⏳ Building <b>{html.escape(plan_label)}</b> NY FS-20 insurance card and emailing "
+        f"<code>{safe_email}</code>…",
         parse_mode="HTML",
     )
-    ok, policy_number, err, portal_email, portal_password = await build_and_send_insurance_card(lead)
+    ok, policy_number, err, portal_email, portal_password = await build_and_send_insurance_card(
+        lead, months=plan_months
+    )
 
     vd_lines = (lead.get("vehicle_details") or "").splitlines()
     insured_name = (vd_lines[0].strip() if vd_lines else "") or None
@@ -592,6 +670,7 @@ async def _send_card_flow(msg, context: ContextTypes.DEFAULT_TYPE, lead: dict) -
             name=insured_name,
             success=ok,
             error=None if ok else (err or "unknown"),
+            plan_months=plan_months,
         )
     except Exception:
         logger.exception("Failed to record transaction")
@@ -600,6 +679,7 @@ async def _send_card_flow(msg, context: ContextTypes.DEFAULT_TYPE, lead: dict) -
         await msg.reply_text(
             "✅ <b>Insurance card sent</b>\n\n"
             f"📋 Policy: <code>{html.escape(policy_number or '—')}</code>\n"
+            f"📅 Duration: <b>{html.escape(plan_label)}</b>\n"
             f"📧 Delivered to <code>{safe_email}</code>\n\n"
             f"Portal email: <code>{html.escape(portal_email or email)}</code>\n"
             f"Portal password: <code>{html.escape(portal_password or '—')}</code>",
@@ -647,6 +727,9 @@ def main() -> None:
             ],
             STATE_AWAIT_EMAIL: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, handle_await_email),
+            ],
+            STATE_AWAIT_PLAN: [
+                CallbackQueryHandler(handle_plan_callbacks, pattern=r"^plan_"),
             ],
         },
         fallbacks=[

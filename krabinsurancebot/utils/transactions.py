@@ -44,6 +44,7 @@ def record(
     name: str | None,
     success: bool,
     error: str | None = None,
+    plan_months: int | None = None,
 ) -> None:
     entry = {
         "ts": datetime.utcnow().isoformat(timespec="seconds") + "Z",
@@ -55,6 +56,7 @@ def record(
         "name": name,
         "success": bool(success),
         "error": error,
+        "plan_months": plan_months,
     }
     with _LOCK:
         data = _load()
