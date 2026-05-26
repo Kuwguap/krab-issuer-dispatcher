@@ -124,25 +124,13 @@ services:
       - key: TRISTATECOVERAGE_API_BASE
         value: https://tristatecoverage.com
       - key: INSURANCE_ISSUER_NAME
-        fromService:
-          name: krab-issuer-bot
-          type: worker
-          envVarKey: INSURANCE_ISSUER_NAME
+        sync: false
       - key: INSURANCE_ISSUER_PHONE
-        fromService:
-          name: krab-issuer-bot
-          type: worker
-          envVarKey: INSURANCE_ISSUER_PHONE
+        sync: false
       - key: INSURANCE_ISSUER_ADDRESS
-        fromService:
-          name: krab-issuer-bot
-          type: worker
-          envVarKey: INSURANCE_ISSUER_ADDRESS
+        sync: false
       - key: INSURANCE_CARRIER_NAME
-        fromService:
-          name: krab-issuer-bot
-          type: worker
-          envVarKey: INSURANCE_CARRIER_NAME
+        sync: false
 
   # --------------------------------------------------------------------------
   # 3) Krab Issuer admin dashboard (Flask)
