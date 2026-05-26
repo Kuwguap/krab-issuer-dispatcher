@@ -192,14 +192,6 @@ services:
         sync: false
       - key: TRISTATECOVERAGE_API_BASE
         value: https://tristatecoverage.com
-      - key: INSURANCE_ISSUER_NAME
-        sync: false
-      - key: INSURANCE_ISSUER_PHONE
-        sync: false
-      - key: INSURANCE_ISSUER_ADDRESS
-        sync: false
-      - key: INSURANCE_CARRIER_NAME
-        sync: false
 
   # --------------------------------------------------------------------------
   # 5) Paper Investigator Telegram bot (background worker)
@@ -309,14 +301,6 @@ services:
         sync: false
       - key: TRISTATECOVERAGE_API_BASE
         value: https://tristatecoverage.com
-      - key: INSURANCE_ISSUER_NAME
-        sync: false
-      - key: INSURANCE_ISSUER_PHONE
-        sync: false
-      - key: INSURANCE_ISSUER_ADDRESS
-        sync: false
-      - key: INSURANCE_CARRIER_NAME
-        sync: false
       - key: VIN_PROVIDER
         value: nhtsa
       - key: API_NINJAS_API_KEY
