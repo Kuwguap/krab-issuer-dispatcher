@@ -1,7 +1,7 @@
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
-from fastapi import Depends, FastAPI, Header, HTTPException, Query, status
+from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, status
 from fastapi.responses import RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
@@ -141,11 +141,34 @@ def require_admin(
         )
 
 
+# Public-path exceptions for the admin lock screen. The Krab Dispatch tab on
+# /backend lets non-authenticated users register a new driver chatID without
+# unlocking the dashboard. Only the POST is exempt - read endpoints stay locked.
+_PUBLIC_ISSUER_PATHS = {
+    ("POST", "/issuer-admin/drivers"),
+}
+
+
+def require_admin_or_public(
+    request: Request,
+    x_admin_password: Optional[str] = Header(None, alias="X-Admin-Password"),
+    config: ApiConfig = Depends(get_api_config),
+) -> None:
+    path = request.url.path.rstrip("/") or "/"
+    if (request.method.upper(), path) in _PUBLIC_ISSUER_PATHS:
+        return
+    if x_admin_password is None or x_admin_password != config.admin_password:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid admin credentials",
+        )
+
+
 app.include_router(
     issuer_admin_router,
     prefix="/issuer-admin",
     tags=["issuer-admin"],
-    dependencies=[Depends(require_admin)],
+    dependencies=[Depends(require_admin_or_public)],
 )
 
 
