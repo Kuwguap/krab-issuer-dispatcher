@@ -1629,13 +1629,63 @@ PH1_EDIT_PROMPT_LABEL = {
 }
 
 
+# Tokens that mark a business/company name (case-insensitive). Used to keep
+# company names like "Global Transport LLC" from getting bisected into a
+# first-name "Global" / last-name "Transport LLC" pair by the simple split.
+_CORP_SUFFIX_TOKENS = frozenset({
+    "llc", "l.l.c.", "l.l.c",
+    "inc", "inc.",
+    "corp", "corp.", "corporation",
+    "ltd", "ltd.", "limited",
+    "co", "co.", "company",
+    "pllc", "p.l.l.c.",
+    "lp", "l.p.", "llp", "l.l.p.",
+    "pc", "p.c.",
+    "trust", "group", "holdings", "enterprises",
+})
+
+
 def _name_parts_from_full(name: str) -> tuple:
+    """Split the registered-owner string into (first_name, last_name) for the edit UI.
+
+    Convention: the user types first name + last name (when there is one) BEFORE
+    the business name. So:
+      - "John Doe"                          -> ("John", "Doe")
+      - "Isabelle Reyes"                    -> ("Isabelle", "Reyes")
+      - "Global Transport LLC"              -> ("-", "Global Transport LLC")
+      - "John Doe Global Transport LLC"     -> ("John", "Doe Global Transport LLC")
+    """
     n = (name or "").strip()
     if not n or n == "-":
         return ("-", "-")
-    parts = n.split(None, 1)
-    first = parts[0]
-    last = parts[1] if len(parts) > 1 else "-"
+    tokens = n.split()
+    if not tokens:
+        return ("-", "-")
+
+    suffix_idx = next(
+        (
+            i
+            for i, t in enumerate(tokens)
+            if t.lower().rstrip(",").rstrip(".") in _CORP_SUFFIX_TOKENS
+            or t.lower() in _CORP_SUFFIX_TOKENS
+        ),
+        -1,
+    )
+    if suffix_idx >= 0:
+        tokens_before = tokens[:suffix_idx]
+        # Whole string looks like a company name (≤ 2 tokens before the
+        # corp suffix, e.g. "Global Transport LLC") — keep it intact.
+        if len(tokens_before) < 3:
+            return ("-", n)
+        # Person-and-company: keep the first token as first name, and put the
+        # last name + the rest of the business name in the "last name" slot
+        # so the company suffix is preserved verbatim.
+        first = tokens_before[0]
+        last = " ".join(tokens[1:])
+        return (first, last)
+
+    first = tokens[0]
+    last = " ".join(tokens[1:]) if len(tokens) > 1 else "-"
     return (first, last)
 
 

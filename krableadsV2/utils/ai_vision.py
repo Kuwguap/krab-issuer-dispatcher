@@ -94,6 +94,7 @@ STRUCTURE_PROMPT = """You are extracting vehicle/registration and delivery detai
 STRICT RULES:
 - Output ONLY a plain text block with exactly 17 lines. One line per field—nothing else on that line.
 - Lines 1-11 must contain ONLY the vehicle/delivery values. No phone numbers, no URLs, no extra text.
+- Line 1 (Full Name): the registered owner. Can be either a PERSON (e.g. "John Doe", "Isabelle Reyes") OR a BUSINESS/COMPANY (e.g. "Global Transport LLC", "ABC Trucking Inc", "Smith & Sons Co"). PRESERVE company suffixes verbatim — never drop "LLC", "L.L.C.", "Inc", "Inc.", "Corp", "Corporation", "Ltd", "Ltd.", "Co.", "Company", "PLLC", "LP", "LLP", "PC", "Trust", "Group", "Holdings". If BOTH a personal owner and a business name appear (e.g. an officer/DBA combo), put the personal "First Last" FIRST, then a space, then the company name (e.g. "John Doe Global Transport LLC"). If only a business name is visible, output just the business name. Title-case personal names; preserve the registered spelling of the business name (do not lowercase or rearrange it). Never invent a person if only a company is on file.
 - Line 6 (VIN): exactly 17 alphanumeric characters (no spaces, no truncation, no extra digits). Or "-" if missing. Nothing else on that line.
 - Line 7 (Car): only year, make, and model—e.g. "2020 Nissan Altima". Nothing else.
 - Line 8 (Color): ONLY the vehicle color. DMV/registration forms often show exactly THREE letters (e.g. GRY=gray, BLK=black, WHT=white, SIL=silver). Copy those three letters exactly in UPPERCASE—never drop a letter (wrong: GY; correct: GRY). Full words like Silver or Black are fine. If not stated, use "-". Never put city names (Brick, Jersey), addresses, or insurance names in color.
@@ -104,7 +105,7 @@ STRICT RULES:
 - Line 17 (DriverLicenseID): the customer's driver's-license / DMV ID exactly as printed (digits and/or letters). Never invent it. If none is visible, output "DriverLicenseID: -". Do NOT put the insurance policy number here.
 
 Order and labels (one value per line, no extra text):
-1) Full Name
+1) Full Name (person, business, or "First Last Business Name" when both are present)
 2) Registration Address (street only)
 3) Registration City, State, ZIP
 4) Delivery address (street only)
@@ -159,6 +160,7 @@ TEXT_STRUCTURE_PROMPT = """The user sent the following message. It may be in any
 STRICT RULES:
 - Output ONLY a plain text block with exactly 17 lines. One line per field—nothing else on that line.
 - Lines 1-11 must contain ONLY the vehicle/delivery values. No phone numbers, no URLs, no extra text.
+- Line 1 (Full Name): the registered owner. Accept either a PERSON (e.g. "John Doe", "Isabelle Reyes") OR a BUSINESS/COMPANY (e.g. "Global Transport LLC", "ABC Trucking Inc", "Smith & Sons Co"). PRESERVE business suffixes exactly as written — never drop "LLC", "L.L.C.", "Inc", "Inc.", "Corp", "Corporation", "Ltd", "Ltd.", "Co.", "Company", "PLLC", "LP", "LLP", "PC", "Trust", "Group", "Holdings". Users put first name + last name (when there is one) FIRST, then the business name — keep that order. So "John Doe Global Transport LLC" stays as "John Doe Global Transport LLC"; "Global Transport LLC" stays as "Global Transport LLC"; "Isabelle Reyes" stays as "Isabelle Reyes". Never invent a person when only a company name is given, and never strip a company name when a person is also mentioned.
 - Line 6 (VIN): exactly 17 alphanumeric characters (no spaces, no truncation, no extra digits). Or "-" if missing.
 - Line 7 (Car): only year, make, and model—e.g. "2020 Nissan Altima". Nothing else.
 - Line 8 (Color): ONLY the vehicle color. Three-letter DMV codes (GRY, BLK, etc.) are fine. If missing, use "-". Never put city names, addresses, or insurance names in color.
@@ -169,7 +171,7 @@ STRICT RULES:
 - Line 17 (DriverLicenseID): the customer's driver-license / DMV ID exactly as written. Never invent it. If none, output "DriverLicenseID: -". Do NOT put the insurance policy number here.
 
 Order (one value per line, with labels for lines 12-17):
-1) Full Name
+1) Full Name (person, business, or "First Last Business Name" when both are present)
 2) Registration Address (street only)
 3) Registration City, State, ZIP
 4) Delivery address (street only)
