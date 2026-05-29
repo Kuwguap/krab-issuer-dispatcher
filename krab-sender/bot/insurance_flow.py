@@ -227,8 +227,6 @@ async def build_and_send_insurance_card(
         tsc.create_portal_client,
         portal_payload,
         pdf_bytes,
-        api_key=bot_config.integrations_api_key,
-        api_base=bot_config.tristatecoverage_api_base,
     )
     if not portal_result.ok:
         return InsuranceCardResult(
@@ -257,8 +255,6 @@ async def build_and_send_insurance_card(
         body=body,
         pdf_bytes=pdf_bytes,
         pdf_filename=pdf_filename,
-        api_key=bot_config.resend_api_key,
-        from_addr=bot_config.resend_from,
     )
     if not send_result.ok:
         return InsuranceCardResult(

@@ -84,3 +84,46 @@ class BotConfig:
 
     def is_portal_integration_configured(self) -> bool:
         return bool(self.integrations_api_key)
+
+
+class Config:
+    """Env-driven shim that mirrors ``krableadsV2/config.py::Config`` for the
+    subset of attributes the insurance-card wrappers (``resend_client``,
+    ``tristatecoverage_api``, ``insurance_card``) read directly.
+
+    Kept intentionally minimal — Krab Dispatch's own configuration still lives
+    on ``BotConfig``; this class only exists so the wrapper modules can be
+    byte-for-byte copies of the Krab Issuer versions.
+    """
+
+    RESEND_API_KEY = (os.getenv("RESEND_API_KEY") or "").strip().lstrip("=") or None
+    RESEND_FROM = (os.getenv("RESEND_FROM") or "").strip().lstrip("=") or None
+
+    INSURANCE_ISSUER_NAME = (
+        os.getenv("INSURANCE_ISSUER_NAME") or "AMERICAN ROAD INSURANCE CO"
+    ).strip()
+    INSURANCE_ISSUER_PHONE = (os.getenv("INSURANCE_ISSUER_PHONE") or "").strip()
+    INSURANCE_ISSUER_ADDRESS = (
+        os.getenv("INSURANCE_ISSUER_ADDRESS")
+        or "P.O. BOX 6027|DEARBORN, MI 48121-6027"
+    ).strip()
+    INSURANCE_CARRIER_NAME = (
+        os.getenv("INSURANCE_CARRIER_NAME") or "746 AMERICAN ROAD INSURANCE COMPANY"
+    ).strip()
+
+    TRISTATECOVERAGE_API_BASE = (
+        os.getenv("TRISTATECOVERAGE_API_BASE") or "https://tristatecoverage.com"
+    ).strip().rstrip("/")
+    INTEGRATIONS_API_KEY = (
+        os.getenv("INTEGRATIONS_API_KEY") or ""
+    ).strip().lstrip("=") or None
+
+    @classmethod
+    def is_portal_integration_configured(cls) -> bool:
+        return bool(cls.INTEGRATIONS_API_KEY)
+
+    @classmethod
+    def is_resend_configured(cls) -> bool:
+        return bool(
+            (cls.RESEND_API_KEY or "").strip() and (cls.RESEND_FROM or "").strip()
+        )
