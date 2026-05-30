@@ -24,6 +24,7 @@ from telegram.ext import (
 from config import Config
 from utils import ai_vision
 from utils import parse_lead as pl
+from utils import state_detection as sd
 from utils import transactions as tx
 
 logging.basicConfig(
@@ -49,6 +50,8 @@ PLAN_OPTIONS = (
     (12, "12 months"),
 )
 DEFAULT_PLAN_MONTHS = 1
+CARD_STATE_OPTIONS = ("NY", "NJ")
+DEFAULT_CARD_STATE = "NY"
 
 EDITABLE_FIELDS = {
     "name": "Name",
@@ -148,7 +151,10 @@ def _phase1_keyboard() -> InlineKeyboardMarkup:
     ])
 
 
-def _review_keyboard(selected_months: int = DEFAULT_PLAN_MONTHS) -> InlineKeyboardMarkup:
+def _review_keyboard(
+    selected_months: int = DEFAULT_PLAN_MONTHS,
+    selected_state: str = DEFAULT_CARD_STATE,
+) -> InlineKeyboardMarkup:
     rows: list[list[InlineKeyboardButton]] = [
         [InlineKeyboardButton("✅ Send insurance card", callback_data="review_ok")],
     ]
@@ -161,6 +167,13 @@ def _review_keyboard(selected_months: int = DEFAULT_PLAN_MONTHS) -> InlineKeyboa
             pair = []
     if pair:
         rows.append(pair)
+    state_row = []
+    for state in CARD_STATE_OPTIONS:
+        marker = "✅ " if state == selected_state else ""
+        state_row.append(
+            InlineKeyboardButton(f"{marker}🇺🇸 {state}", callback_data=f"review_state_{state}")
+        )
+    rows.append(state_row)
     rows.append([InlineKeyboardButton("✏️ Edit field", callback_data="review_edit")])
     rows.append([InlineKeyboardButton("❌ Cancel", callback_data="review_cancel")])
     return InlineKeyboardMarkup(rows)
@@ -174,7 +187,11 @@ def _edit_fields_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(rows)
 
 
-def _format_review(lead: dict[str, Any], selected_months: int = DEFAULT_PLAN_MONTHS) -> str:
+def _format_review(
+    lead: dict[str, Any],
+    selected_months: int = DEFAULT_PLAN_MONTHS,
+    selected_state: str = DEFAULT_CARD_STATE,
+) -> str:
     vd = (lead.get("vehicle_details") or "").splitlines()
     def ln(i: int) -> str:
         return vd[i].strip() if i < len(vd) else "—"
@@ -183,6 +200,7 @@ def _format_review(lead: dict[str, Any], selected_months: int = DEFAULT_PLAN_MON
         (label for m, label in PLAN_OPTIONS if m == selected_months),
         f"{selected_months} months",
     )
+    state_label = "New Jersey (NJ TEI)" if selected_state == "NJ" else "New York (NY FS-20)"
     return (
         "📋 <b>Review client data</b>\n\n"
         f"Name: {html.escape(ln(0))}\n"
@@ -193,7 +211,8 @@ def _format_review(lead: dict[str, Any], selected_months: int = DEFAULT_PLAN_MON
         f"Color: {html.escape(ln(7))}\n"
         f"Email: {html.escape(em)}\n"
         f"DL ID: {html.escape((lead.get('driver_license_id') or '—'))}\n"
-        f"Duration: <b>{html.escape(plan_label)}</b>\n\n"
+        f"Duration: <b>{html.escape(plan_label)}</b>\n"
+        f"State: <b>{html.escape(state_label)}</b>\n\n"
         "Tap <b>Send insurance card</b> when ready."
     )
 
@@ -210,20 +229,19 @@ async def build_and_send_insurance_card(
     lead: dict,
     *,
     months: int = 1,
-) -> tuple[bool, Optional[str], Optional[str], Optional[str], Optional[str]]:
-    """Returns (ok, policy_number, error, portal_email, portal_password)."""
+    card_state: str = DEFAULT_CARD_STATE,
+) -> tuple[bool, Optional[str], Optional[str], Optional[str], Optional[str], Optional[str]]:
+    """Returns (ok, policy_number, error, portal_email, portal_password, portal_warning)."""
     from utils import insurance_card as ic
+    from utils import nj_card_api as nj
     from utils import resend_client as rc
     from utils import tristatecoverage_api as tsc
 
-    if not Config.is_portal_integration_configured():
-        return (False, None, "Portal integration not configured (INTEGRATIONS_API_KEY).", None, None)
-    if not Config.is_resend_configured():
-        return (False, None, "Email not configured (RESEND_API_KEY and RESEND_FROM).", None, None)
-
     email = (lead.get("email") or "").strip()
     if not email:
-        return (False, None, "No email on file.", None, None)
+        return (False, None, "No email on file.", None, None, None)
+
+    state = card_state if card_state in CARD_STATE_OPTIONS else sd.detect_card_state(lead)
 
     raw_vehicle = (lead.get("vehicle_details") or "").splitlines()
 
@@ -249,6 +267,7 @@ async def build_and_send_insurance_card(
             False,
             None,
             "No valid 17-character VIN found. Update the VIN and try again.",
+            None,
             None,
             None,
         )
@@ -286,6 +305,53 @@ async def build_and_send_insurance_card(
     if not address_lines:
         address_lines = ["UNKNOWN ADDRESS"]
 
+    phone_raw = (lead.get("phone_number") or "").strip()
+
+    if state == "NJ":
+        if not Config.is_nj_configured():
+            return (
+                False,
+                None,
+                "NJ insurance card not configured (BARCODE_APP_BASE_URL).",
+                None,
+                None,
+                None,
+            )
+        nj_payload = nj.build_nj_email_payload(
+            policy_number=policy_number,
+            effective_mm_dd_yyyy=effective_label,
+            expiration_mm_dd_yyyy=expiration_label,
+            vehicle_year=vehicle_year if vehicle_year != "0000" else "",
+            vehicle_make=vehicle_make_full or "UNKNOWN",
+            vehicle_model=vehicle_model or "UNKNOWN",
+            vin=vin_clean,
+            insured_name_upper=name.upper(),
+            insured_address_lines=address_lines,
+            email=email,
+            first_name=rc.first_name_from_full(name),
+            phone=phone_raw or None,
+            annual_premium=_parse_annual_premium(lead) or None,
+        )
+        nj_result = await asyncio.to_thread(nj.send_nj_insurance_email, nj_payload)
+        if not nj_result.ok:
+            err = nj_result.error or "NJ card API failed."
+            if nj_result.status_code:
+                err = f"{err} (HTTP {nj_result.status_code})"
+            return (False, policy_number, err, None, None, None)
+        return (
+            True,
+            nj_result.policy_number or policy_number,
+            None,
+            nj_result.email or email,
+            None,
+            nj_result.portal_warning,
+        )
+
+    if not Config.is_portal_integration_configured():
+        return (False, None, "Portal integration not configured (INTEGRATIONS_API_KEY).", None, None, None)
+    if not Config.is_resend_configured():
+        return (False, None, "Email not configured (RESEND_API_KEY and RESEND_FROM).", None, None, None)
+
     issuer = ic.CardIssuer(
         carrier_name=Config.INSURANCE_CARRIER_NAME,
         agency_phone=Config.INSURANCE_ISSUER_PHONE,
@@ -313,14 +379,13 @@ async def build_and_send_insurance_card(
         pdf_bytes = await asyncio.to_thread(ic.build_ny_insurance_id_card_pdf, pdf_input)
     except Exception as e:
         logger.exception("PDF build failed: %s", e)
-        return (False, policy_number, f"Could not build insurance card PDF: {e}", None, None)
+        return (False, policy_number, f"Could not build insurance card PDF: {e}", None, None, None)
 
     vehicle_label = ic.format_suggested_vehicle_name(vehicle_year, vehicle_make_full, vehicle_model)
     if color and color != "-":
         vehicle_label = f"{vehicle_label} — {color}".strip(" —")
     vehicle_name_api = vehicle_label or car_raw or "Vehicle on file"
 
-    phone_raw = (lead.get("phone_number") or "").strip()
     portal_payload = {
         "email": email,
         "password": portal_password,
@@ -348,6 +413,7 @@ async def build_and_send_insurance_card(
             f"Portal create failed ({portal_result.status_code}): {err}",
             None,
             None,
+            None,
         )
 
     effective_date_label = f"{today.strftime('%B')} {today.day}, {today.year}"
@@ -371,8 +437,8 @@ async def build_and_send_insurance_card(
         pdf_filename=f"insurance-id-card-{policy_number}.pdf",
     )
     if not send_result.ok:
-        return (False, policy_number, send_result.error or "Resend send failed.", email, portal_password)
-    return (True, policy_number, None, email, portal_password)
+        return (False, policy_number, send_result.error or "Resend send failed.", email, portal_password, None)
+    return (True, policy_number, None, email, portal_password, None)
 
 
 def _current_plan_months(context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -382,19 +448,30 @@ def _current_plan_months(context: ContextTypes.DEFAULT_TYPE) -> int:
     return months
 
 
+def _current_card_state(context: ContextTypes.DEFAULT_TYPE, lead: dict | None = None) -> str:
+    state = (context.user_data.get("card_state") or "").strip().upper()
+    if state in CARD_STATE_OPTIONS:
+        return state
+    if lead:
+        return sd.detect_card_state(lead)
+    return DEFAULT_CARD_STATE
+
+
 async def _go_to_review(update: Update, context: ContextTypes.DEFAULT_TYPE, lead: dict) -> int:
     context.user_data["lead"] = lead
     context.user_data.pop("pending_media", None)
     context.user_data.setdefault("plan_months", DEFAULT_PLAN_MONTHS)
+    context.user_data.setdefault("card_state", sd.detect_card_state(lead))
     months = _current_plan_months(context)
+    card_state = _current_card_state(context, lead)
     chat = update.effective_chat
     if chat is not None:
         await _send_clean(
             context,
             chat.id,
-            _format_review(lead, months),
+            _format_review(lead, months, card_state),
             parse_mode="HTML",
-            reply_markup=_review_keyboard(months),
+            reply_markup=_review_keyboard(months, card_state),
         )
     return STATE_REVIEW
 
@@ -450,10 +527,12 @@ async def cmd_transactions(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             plan_label = f"{plan_months_raw} month{'s' if plan_months_raw != 1 else ''}"
         else:
             plan_label = "—"
+        card_state = (e.get("state") or "NY").upper()
         block = (
             f"{status} <b>{html.escape(ts_display)}</b>\n"
             f"📋 Policy: <code>{html.escape(policy)}</code>\n"
             f"📅 Duration: {html.escape(plan_label)}\n"
+            f"🗺 State: {html.escape(card_state)}\n"
             f"👤 {html.escape(name)}\n"
             f"🚗 {html.escape(vehicle)}\n"
             f"📧 {html.escape(email_to)}"
@@ -577,13 +656,15 @@ async def handle_phase1_callbacks(update: Update, context: ContextTypes.DEFAULT_
         context.user_data.pop("pending_media", None)
         context.user_data["lead"] = lead
         context.user_data.setdefault("plan_months", DEFAULT_PLAN_MONTHS)
+        context.user_data.setdefault("card_state", sd.detect_card_state(lead))
         months = _current_plan_months(context)
+        card_state = _current_card_state(context, lead)
         await _send_clean(
             context,
             chat_id,
-            _format_review(lead, months),
+            _format_review(lead, months, card_state),
             parse_mode="HTML",
-            reply_markup=_review_keyboard(months),
+            reply_markup=_review_keyboard(months, card_state),
         )
         return STATE_REVIEW
 
@@ -622,15 +703,35 @@ async def handle_review_callbacks(update: Update, context: ContextTypes.DEFAULT_
         if months == _current_plan_months(context):
             return STATE_REVIEW
         context.user_data["plan_months"] = months
+        card_state = _current_card_state(context, lead)
         try:
             await q.edit_message_text(
-                _format_review(lead, months),
+                _format_review(lead, months, card_state),
                 parse_mode="HTML",
-                reply_markup=_review_keyboard(months),
+                reply_markup=_review_keyboard(months, card_state),
             )
             _track_message(context, q.message)
         except Exception:
             logger.exception("Failed to refresh review keyboard")
+        return STATE_REVIEW
+
+    if data.startswith("review_state_"):
+        state = data.rsplit("_", 1)[-1].upper()
+        if state not in CARD_STATE_OPTIONS:
+            return STATE_REVIEW
+        if state == _current_card_state(context, lead):
+            return STATE_REVIEW
+        context.user_data["card_state"] = state
+        months = _current_plan_months(context)
+        try:
+            await q.edit_message_text(
+                _format_review(lead, months, state),
+                parse_mode="HTML",
+                reply_markup=_review_keyboard(months, state),
+            )
+            _track_message(context, q.message)
+        except Exception:
+            logger.exception("Failed to refresh review state keyboard")
         return STATE_REVIEW
 
     if data == "review_ok":
@@ -656,12 +757,13 @@ async def handle_edit_pick(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     if data == "ef_back":
         lead = context.user_data.get("lead") or {}
         months = _current_plan_months(context)
+        card_state = _current_card_state(context, lead)
         await _send_clean(
             context,
             chat_id,
-            _format_review(lead, months),
+            _format_review(lead, months, card_state),
             parse_mode="HTML",
-            reply_markup=_review_keyboard(months),
+            reply_markup=_review_keyboard(months, card_state),
         )
         return STATE_REVIEW
 
@@ -700,6 +802,7 @@ async def handle_edit_value(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         vd[1] = text if text != "-" else ""
     elif key == "city_state_zip":
         vd[2] = text if text != "-" else ""
+        context.user_data["card_state"] = sd.detect_card_state({"vehicle_details": "\n".join(vd)})
     elif key == "vin":
         vd[5] = text if text != "-" else ""
     elif key == "car":
@@ -711,12 +814,13 @@ async def handle_edit_value(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     context.user_data["lead"] = lead
     context.user_data.pop("edit_field", None)
     months = _current_plan_months(context)
+    card_state = _current_card_state(context, lead)
     await _send_clean(
         context,
         update.effective_chat.id,
-        _format_review(lead, months),
+        _format_review(lead, months, card_state),
         parse_mode="HTML",
-        reply_markup=_review_keyboard(months),
+        reply_markup=_review_keyboard(months, card_state),
     )
     return STATE_REVIEW
 
@@ -740,15 +844,17 @@ async def _send_card_flow(msg, context: ContextTypes.DEFAULT_TYPE, lead: dict) -
     safe_email = html.escape(email, quote=False)
     plan_months = int(context.user_data.get("plan_months") or 1)
     plan_label = next((label for m, label in PLAN_OPTIONS if m == plan_months), f"{plan_months} months")
+    card_state = _current_card_state(context, lead)
+    card_label = "NJ Temporary Evidence of Insurance" if card_state == "NJ" else "NY FS-20 insurance card"
     await _send_clean(
         context,
         chat_id,
-        f"⏳ Building <b>{html.escape(plan_label)}</b> NY FS-20 insurance card and emailing "
+        f"⏳ Building <b>{html.escape(plan_label)}</b> {html.escape(card_label)} and emailing "
         f"<code>{safe_email}</code>…",
         parse_mode="HTML",
     )
-    ok, policy_number, err, portal_email, portal_password = await build_and_send_insurance_card(
-        lead, months=plan_months
+    ok, policy_number, err, portal_email, portal_password, portal_warning = await build_and_send_insurance_card(
+        lead, months=plan_months, card_state=card_state
     )
 
     vd_lines = (lead.get("vehicle_details") or "").splitlines()
@@ -769,22 +875,34 @@ async def _send_card_flow(msg, context: ContextTypes.DEFAULT_TYPE, lead: dict) -
             success=ok,
             error=None if ok else (err or "unknown"),
             plan_months=plan_months,
+            state=card_state,
         )
     except Exception:
         logger.exception("Failed to record transaction")
 
     if ok:
-        await _send_clean(
-            context,
-            chat_id,
-            "✅ <b>Insurance card sent</b>\n\n"
-            f"📋 Policy: <code>{html.escape(policy_number or '—')}</code>\n"
-            f"📅 Duration: <b>{html.escape(plan_label)}</b>\n"
-            f"📧 Delivered to <code>{safe_email}</code>\n\n"
-            f"Portal email: <code>{html.escape(portal_email or email)}</code>\n"
-            f"Portal password: <code>{html.escape(portal_password or '—')}</code>",
-            parse_mode="HTML",
-        )
+        if card_state == "NJ":
+            success_text = (
+                "✅ <b>Card issued</b> — emailed to "
+                f"<code>{safe_email}</code>.\n"
+                "Portal: TriStateCoverage.com/login"
+            )
+            if portal_warning:
+                success_text += f"\n\nℹ️ {html.escape(portal_warning)}"
+            await _send_clean(context, chat_id, success_text, parse_mode="HTML")
+        else:
+            await _send_clean(
+                context,
+                chat_id,
+                "✅ <b>Insurance card sent</b>\n\n"
+                f"📋 Policy: <code>{html.escape(policy_number or '—')}</code>\n"
+                f"📅 Duration: <b>{html.escape(plan_label)}</b>\n"
+                f"🗺 State: <b>{html.escape(card_state)}</b>\n"
+                f"📧 Delivered to <code>{safe_email}</code>\n\n"
+                f"Portal email: <code>{html.escape(portal_email or email)}</code>\n"
+                f"Portal password: <code>{html.escape(portal_password or '—')}</code>",
+                parse_mode="HTML",
+            )
     else:
         await _send_clean(
             context,

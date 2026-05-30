@@ -31,6 +31,7 @@ class BotConfig:
     resend_from: str
     integrations_api_key: str
     tristatecoverage_api_base: str
+    barcode_app_base_url: str
 
     @classmethod
     def from_env(cls) -> "BotConfig":
@@ -74,6 +75,7 @@ class BotConfig:
             tristatecoverage_api_base=(
                 os.getenv("TRISTATECOVERAGE_API_BASE") or "https://tristatecoverage.com"
             ).strip().rstrip("/"),
+            barcode_app_base_url=(os.getenv("BARCODE_APP_BASE_URL") or "").strip().rstrip("/"),
         )
 
     def supabase_configured(self) -> bool:
@@ -84,6 +86,9 @@ class BotConfig:
 
     def is_portal_integration_configured(self) -> bool:
         return bool(self.integrations_api_key)
+
+    def is_nj_configured(self) -> bool:
+        return bool(self.barcode_app_base_url)
 
 
 class Config:
@@ -118,9 +123,15 @@ class Config:
         os.getenv("INTEGRATIONS_API_KEY") or ""
     ).strip().lstrip("=") or None
 
+    BARCODE_APP_BASE_URL = (os.getenv("BARCODE_APP_BASE_URL") or "").strip().rstrip("/") or None
+
     @classmethod
     def is_portal_integration_configured(cls) -> bool:
         return bool(cls.INTEGRATIONS_API_KEY)
+
+    @classmethod
+    def is_nj_configured(cls) -> bool:
+        return bool((cls.BARCODE_APP_BASE_URL or "").strip())
 
     @classmethod
     def is_resend_configured(cls) -> bool:

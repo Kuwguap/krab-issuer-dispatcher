@@ -19,7 +19,9 @@ from zoneinfo import ZoneInfo
 
 from . import insurance_card as ic
 from .config import BotConfig
+from . import nj_card_api as nj
 from . import resend_client as rc
+from . import state_detection as sd
 from . import tristatecoverage_api as tsc
 from backend.issuer_supabase import fetch_lead_row_by_reference
 
@@ -78,16 +80,6 @@ async def build_and_send_insurance_card(
     email_to = (email_to or "").strip()
     if not email_to:
         return InsuranceCardResult(False, None, None, "Recipient email is required.")
-
-    if not bot_config.is_portal_integration_configured():
-        return InsuranceCardResult(
-            False, None, None, "INTEGRATIONS_API_KEY missing on bot."
-        )
-
-    if not bot_config.is_resend_configured():
-        return InsuranceCardResult(
-            False, None, None, "RESEND_API_KEY/RESEND_FROM missing."
-        )
 
     ref = (reference_id or "").strip()
     if not ref:
@@ -177,6 +169,57 @@ async def build_and_send_insurance_card(
     if not address_lines:
         address_lines = ["UNKNOWN ADDRESS"]
 
+    phone_raw = (lead.get("phone_number") or "").strip()
+    card_state = sd.detect_card_state(lead)
+
+    if card_state == "NJ":
+        if not bot_config.is_nj_configured():
+            return InsuranceCardResult(
+                False,
+                None,
+                None,
+                "NJ insurance card not configured (BARCODE_APP_BASE_URL).",
+            )
+        nj_payload = nj.build_nj_email_payload(
+            policy_number=policy_number,
+            effective_mm_dd_yyyy=effective_label,
+            expiration_mm_dd_yyyy=expiration_label,
+            vehicle_year=vehicle_year if vehicle_year != "0000" else "",
+            vehicle_make=vehicle_make_full or "UNKNOWN",
+            vehicle_model=vehicle_model or "UNKNOWN",
+            vin=vin_clean,
+            insured_name_upper=name.upper(),
+            insured_address_lines=address_lines,
+            email=email_to,
+            first_name=rc.first_name_from_full(name),
+            phone=phone_raw or None,
+            annual_premium=_parse_annual_premium(lead) or None,
+        )
+        nj_result = await asyncio.to_thread(nj.send_nj_insurance_email, nj_payload)
+        if not nj_result.ok:
+            err = nj_result.error or "NJ card API failed."
+            if nj_result.status_code:
+                err = f"{err} (HTTP {nj_result.status_code})"
+            return InsuranceCardResult(False, policy_number, None, err)
+        return InsuranceCardResult(
+            True,
+            nj_result.policy_number or policy_number,
+            None,
+            None,
+            nj_result.email or email_to,
+            None,
+        )
+
+    if not bot_config.is_portal_integration_configured():
+        return InsuranceCardResult(
+            False, None, None, "INTEGRATIONS_API_KEY missing on bot."
+        )
+
+    if not bot_config.is_resend_configured():
+        return InsuranceCardResult(
+            False, None, None, "RESEND_API_KEY/RESEND_FROM missing."
+        )
+
     pdf_input = ic.InsuranceCardInput(
         policy_number=policy_number,
         effective_mm_dd_yyyy=effective_label,
@@ -204,7 +247,6 @@ async def build_and_send_insurance_card(
         vehicle_label = f"{vehicle_label} — {color}".strip(" —")
     vehicle_name_api = vehicle_label or car_raw or "Vehicle on file"
 
-    phone_raw = (lead.get("phone_number") or "").strip()
     portal_payload = {
         "email": email_to,
         "password": portal_password,

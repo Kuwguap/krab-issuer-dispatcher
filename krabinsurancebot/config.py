@@ -35,6 +35,14 @@ class Config:
     VIN_PROVIDER = (os.getenv("VIN_PROVIDER") or "nhtsa").strip().lower()
     API_NINJAS_API_KEY = (os.getenv("API_NINJAS_API_KEY") or "").strip() or None
 
+    INTEGRATIONS_API_KEY = (os.getenv("INTEGRATIONS_API_KEY") or "").strip().lstrip("=") or None
+
+    BARCODE_APP_BASE_URL = (os.getenv("BARCODE_APP_BASE_URL") or "").strip().rstrip("/") or None
+
+    @classmethod
+    def is_nj_configured(cls) -> bool:
+        return bool((cls.BARCODE_APP_BASE_URL or "").strip())
+
     @classmethod
     def is_ai_vision_configured(cls) -> bool:
         return bool(cls.OPENAI_API_KEY)

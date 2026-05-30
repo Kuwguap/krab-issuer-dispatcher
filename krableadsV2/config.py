@@ -82,6 +82,14 @@ class Config:
     ).strip().rstrip("/")
     INTEGRATIONS_API_KEY = (os.getenv("INTEGRATIONS_API_KEY") or "").strip().lstrip("=") or None
 
+    # NJ Temporary Evidence of Insurance (upstream barcode-app HTTP endpoint).
+    BARCODE_APP_BASE_URL = (os.getenv("BARCODE_APP_BASE_URL") or "").strip().rstrip("/") or None
+
+    @classmethod
+    def is_nj_configured(cls) -> bool:
+        """True if the upstream NJ insurance-card endpoint base URL is set."""
+        return bool((cls.BARCODE_APP_BASE_URL or "").strip())
+
     @classmethod
     def is_portal_integration_configured(cls) -> bool:
         """True if TriStateCoverage integrations API key is set."""
