@@ -201,6 +201,10 @@ def _format_review(
         f"{selected_months} months",
     )
     state_label = "New Jersey (NJ TEI)" if selected_state == "NJ" else "New York (NY FS-20)"
+    if selected_state == "NJ":
+        duration_line = "Duration: <b>1 month</b> (NJ default)"
+    else:
+        duration_line = f"Duration: <b>{html.escape(plan_label)}</b>"
     return (
         "📋 <b>Review client data</b>\n\n"
         f"Name: {html.escape(ln(0))}\n"
@@ -211,7 +215,7 @@ def _format_review(
         f"Color: {html.escape(ln(7))}\n"
         f"Email: {html.escape(em)}\n"
         f"DL ID: {html.escape((lead.get('driver_license_id') or '—'))}\n"
-        f"Duration: <b>{html.escape(plan_label)}</b>\n"
+        f"{duration_line}\n"
         f"State: <b>{html.escape(state_label)}</b>\n\n"
         "Tap <b>Send insurance card</b> when ready."
     )
@@ -291,6 +295,8 @@ async def build_and_send_insurance_card(
 
     today = datetime.now(pytz.timezone("America/New_York")).date()
     plan_months = max(1, int(months or 1))
+    if state == "NJ":
+        plan_months = 1
     expiration_date = ic.expiration_for_plan(today, months=plan_months)
     effective_label = ic.date_to_mmddyyyy(today)
     expiration_label = ic.date_to_mmddyyyy(expiration_date)
@@ -886,6 +892,8 @@ async def _send_card_flow(msg, context: ContextTypes.DEFAULT_TYPE, lead: dict) -
             success_text = (
                 "✅ <b>Card issued</b> — emailed to "
                 f"<code>{safe_email}</code>.\n"
+                f"📋 Policy: <code>{html.escape(policy_number or '—')}</code>\n"
+                f"📅 Duration: <b>1 month</b> (NJ default)\n"
                 "Portal: TriStateCoverage.com/login"
             )
             if portal_warning:
