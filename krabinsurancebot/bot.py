@@ -50,8 +50,21 @@ PLAN_OPTIONS = (
     (12, "12 months"),
 )
 DEFAULT_PLAN_MONTHS = 1
+PLAN_MONTH_VALUES = tuple(m for m, _ in PLAN_OPTIONS)
 CARD_STATE_OPTIONS = ("NY", "NJ")
 DEFAULT_CARD_STATE = "NY"
+
+
+def _next_plan_months(current: int) -> int:
+    try:
+        idx = PLAN_MONTH_VALUES.index(current)
+    except ValueError:
+        return PLAN_MONTH_VALUES[0]
+    return PLAN_MONTH_VALUES[(idx + 1) % len(PLAN_MONTH_VALUES)]
+
+
+def _plan_label(months: int) -> str:
+    return next((label for m, label in PLAN_OPTIONS if m == months), f"{months} months")
 
 EDITABLE_FIELDS = {
     "name": "Name",
@@ -154,26 +167,21 @@ def _phase1_keyboard() -> InlineKeyboardMarkup:
 def _review_keyboard(
     selected_months: int = DEFAULT_PLAN_MONTHS,
     selected_state: str = DEFAULT_CARD_STATE,
+    *,
+    has_email: bool = True,
 ) -> InlineKeyboardMarkup:
-    rows: list[list[InlineKeyboardButton]] = [
-        [InlineKeyboardButton("✅ Send insurance card", callback_data="review_ok")],
-    ]
-    pair: list[InlineKeyboardButton] = []
-    for months, label in PLAN_OPTIONS:
-        marker = "🔘 " if months == selected_months else ""
-        pair.append(InlineKeyboardButton(f"{marker}{label}", callback_data=f"review_plan_{months}"))
-        if len(pair) == 2:
-            rows.append(pair)
-            pair = []
-    if pair:
-        rows.append(pair)
-    state_row = []
-    for state in CARD_STATE_OPTIONS:
-        marker = "✅ " if state == selected_state else ""
-        state_row.append(
-            InlineKeyboardButton(f"{marker}🇺🇸 {state}", callback_data=f"review_state_{state}")
-        )
-    rows.append(state_row)
+    rows: list[list[InlineKeyboardButton]] = []
+    if has_email:
+        rows.append([InlineKeyboardButton("✅ Send insurance card", callback_data="review_ok")])
+    else:
+        rows.append([InlineKeyboardButton("✉️ Add email", callback_data="review_add_email")])
+    if selected_state != "NJ":
+        rows.append([
+            InlineKeyboardButton(
+                f"📅 Duration: {_plan_label(selected_months)} ▶",
+                callback_data="review_plan_cycle",
+            )
+        ])
     rows.append([InlineKeyboardButton("✏️ Edit field", callback_data="review_edit")])
     rows.append([InlineKeyboardButton("❌ Cancel", callback_data="review_cancel")])
     return InlineKeyboardMarkup(rows)
@@ -195,16 +203,18 @@ def _format_review(
     vd = (lead.get("vehicle_details") or "").splitlines()
     def ln(i: int) -> str:
         return vd[i].strip() if i < len(vd) else "—"
-    em = (lead.get("email") or "").strip() or "— (will ask)"
-    plan_label = next(
-        (label for m, label in PLAN_OPTIONS if m == selected_months),
-        f"{selected_months} months",
-    )
+    raw_email = (lead.get("email") or "").strip()
+    em = raw_email or "— (tap Add email)"
     state_label = "New Jersey (NJ TEI)" if selected_state == "NJ" else "New York (NY FS-20)"
     if selected_state == "NJ":
         duration_line = "Duration: <b>1 month</b> (NJ default)"
     else:
-        duration_line = f"Duration: <b>{html.escape(plan_label)}</b>"
+        duration_line = f"Duration: <b>{html.escape(_plan_label(selected_months))}</b>"
+    footer = (
+        "Tap <b>Send insurance card</b> when ready."
+        if raw_email
+        else "Tap <b>Add email</b>, then <b>Send insurance card</b>."
+    )
     return (
         "📋 <b>Review client data</b>\n\n"
         f"Name: {html.escape(ln(0))}\n"
@@ -216,8 +226,8 @@ def _format_review(
         f"Email: {html.escape(em)}\n"
         f"DL ID: {html.escape((lead.get('driver_license_id') or '—'))}\n"
         f"{duration_line}\n"
-        f"State: <b>{html.escape(state_label)}</b>\n\n"
-        "Tap <b>Send insurance card</b> when ready."
+        f"State: <b>{html.escape(state_label)}</b> (auto-detected)\n\n"
+        f"{footer}"
     )
 
 
@@ -468,9 +478,10 @@ async def _go_to_review(update: Update, context: ContextTypes.DEFAULT_TYPE, lead
     context.user_data["lead"] = lead
     context.user_data.pop("pending_media", None)
     context.user_data.setdefault("plan_months", DEFAULT_PLAN_MONTHS)
-    context.user_data.setdefault("card_state", sd.detect_card_state(lead))
+    context.user_data["card_state"] = sd.detect_card_state(lead)
     months = _current_plan_months(context)
     card_state = _current_card_state(context, lead)
+    has_email = bool((lead.get("email") or "").strip())
     chat = update.effective_chat
     if chat is not None:
         await _send_clean(
@@ -478,7 +489,7 @@ async def _go_to_review(update: Update, context: ContextTypes.DEFAULT_TYPE, lead
             chat.id,
             _format_review(lead, months, card_state),
             parse_mode="HTML",
-            reply_markup=_review_keyboard(months, card_state),
+            reply_markup=_review_keyboard(months, card_state, has_email=has_email),
         )
     return STATE_REVIEW
 
@@ -663,15 +674,16 @@ async def handle_phase1_callbacks(update: Update, context: ContextTypes.DEFAULT_
         context.user_data.pop("pending_media", None)
         context.user_data["lead"] = lead
         context.user_data.setdefault("plan_months", DEFAULT_PLAN_MONTHS)
-        context.user_data.setdefault("card_state", sd.detect_card_state(lead))
+        context.user_data["card_state"] = sd.detect_card_state(lead)
         months = _current_plan_months(context)
         card_state = _current_card_state(context, lead)
+        has_email = bool((lead.get("email") or "").strip())
         await _send_clean(
             context,
             chat_id,
             _format_review(lead, months, card_state),
             parse_mode="HTML",
-            reply_markup=_review_keyboard(months, card_state),
+            reply_markup=_review_keyboard(months, card_state, has_email=has_email),
         )
         return STATE_REVIEW
 
@@ -684,6 +696,7 @@ async def handle_review_callbacks(update: Update, context: ContextTypes.DEFAULT_
     data = q.data or ""
     lead = context.user_data.get("lead") or {}
     chat_id = q.message.chat.id
+    has_email = bool((lead.get("email") or "").strip())
 
     if data == "review_cancel":
         context.user_data.clear()
@@ -700,56 +713,46 @@ async def handle_review_callbacks(update: Update, context: ContextTypes.DEFAULT_
         )
         return STATE_EDIT_FIELD_PICK
 
-    if data.startswith("review_plan_"):
-        try:
-            months = int(data.rsplit("_", 1)[1])
-        except (ValueError, IndexError):
-            return STATE_REVIEW
-        if months not in {m for m, _ in PLAN_OPTIONS}:
-            return STATE_REVIEW
-        if months == _current_plan_months(context):
-            return STATE_REVIEW
-        context.user_data["plan_months"] = months
+    if data == "review_plan_cycle":
         card_state = _current_card_state(context, lead)
+        if card_state == "NJ":
+            return STATE_REVIEW
+        current = _current_plan_months(context)
+        new_months = _next_plan_months(current)
+        context.user_data["plan_months"] = new_months
         try:
             await q.edit_message_text(
-                _format_review(lead, months, card_state),
+                _format_review(lead, new_months, card_state),
                 parse_mode="HTML",
-                reply_markup=_review_keyboard(months, card_state),
+                reply_markup=_review_keyboard(new_months, card_state, has_email=has_email),
             )
             _track_message(context, q.message)
         except Exception:
-            logger.exception("Failed to refresh review keyboard")
+            logger.exception("Failed to refresh duration cycle")
         return STATE_REVIEW
 
-    if data.startswith("review_state_"):
-        state = data.rsplit("_", 1)[-1].upper()
-        if state not in CARD_STATE_OPTIONS:
-            return STATE_REVIEW
-        if state == _current_card_state(context, lead):
-            return STATE_REVIEW
-        context.user_data["card_state"] = state
-        months = _current_plan_months(context)
-        try:
-            await q.edit_message_text(
-                _format_review(lead, months, state),
-                parse_mode="HTML",
-                reply_markup=_review_keyboard(months, state),
-            )
-            _track_message(context, q.message)
-        except Exception:
-            logger.exception("Failed to refresh review state keyboard")
-        return STATE_REVIEW
+    if data == "review_add_email":
+        await _send_clean(
+            context,
+            chat_id,
+            "✉️ Send the client's email address now:",
+        )
+        return STATE_AWAIT_EMAIL
 
     if data == "review_ok":
-        em = (lead.get("email") or "").strip()
-        if not em:
-            await _send_clean(
-                context,
-                chat_id,
-                "📧 What email should we send the insurance card to?",
-            )
-            return STATE_AWAIT_EMAIL
+        if not has_email:
+            months = _current_plan_months(context)
+            card_state = _current_card_state(context, lead)
+            try:
+                await q.edit_message_text(
+                    _format_review(lead, months, card_state),
+                    parse_mode="HTML",
+                    reply_markup=_review_keyboard(months, card_state, has_email=False),
+                )
+                _track_message(context, q.message)
+            except Exception:
+                pass
+            return STATE_REVIEW
         return await _send_card_flow(q.message, context, lead)
 
     return STATE_REVIEW
@@ -765,12 +768,13 @@ async def handle_edit_pick(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         lead = context.user_data.get("lead") or {}
         months = _current_plan_months(context)
         card_state = _current_card_state(context, lead)
+        has_email = bool((lead.get("email") or "").strip())
         await _send_clean(
             context,
             chat_id,
             _format_review(lead, months, card_state),
             parse_mode="HTML",
-            reply_markup=_review_keyboard(months, card_state),
+            reply_markup=_review_keyboard(months, card_state, has_email=has_email),
         )
         return STATE_REVIEW
 
@@ -822,12 +826,13 @@ async def handle_edit_value(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     context.user_data.pop("edit_field", None)
     months = _current_plan_months(context)
     card_state = _current_card_state(context, lead)
+    has_email = bool((lead.get("email") or "").strip())
     await _send_clean(
         context,
         update.effective_chat.id,
         _format_review(lead, months, card_state),
         parse_mode="HTML",
-        reply_markup=_review_keyboard(months, card_state),
+        reply_markup=_review_keyboard(months, card_state, has_email=has_email),
     )
     return STATE_REVIEW
 
@@ -842,16 +847,25 @@ async def handle_await_email(update: Update, context: ContextTypes.DEFAULT_TYPE)
     lead = context.user_data.get("lead") or {}
     lead["email"] = em
     context.user_data["lead"] = lead
-    return await _send_card_flow(update.effective_message, context, lead)
+    months = _current_plan_months(context)
+    card_state = _current_card_state(context, lead)
+    await _send_clean(
+        context,
+        chat_id,
+        _format_review(lead, months, card_state),
+        parse_mode="HTML",
+        reply_markup=_review_keyboard(months, card_state, has_email=True),
+    )
+    return STATE_REVIEW
 
 
 async def _send_card_flow(msg, context: ContextTypes.DEFAULT_TYPE, lead: dict) -> int:
     chat_id = msg.chat.id
     email = (lead.get("email") or "").strip()
     safe_email = html.escape(email, quote=False)
-    plan_months = int(context.user_data.get("plan_months") or 1)
-    plan_label = next((label for m, label in PLAN_OPTIONS if m == plan_months), f"{plan_months} months")
     card_state = _current_card_state(context, lead)
+    plan_months = 1 if card_state == "NJ" else int(context.user_data.get("plan_months") or 1)
+    plan_label = _plan_label(plan_months)
     card_label = "NJ Temporary Evidence of Insurance" if card_state == "NJ" else "NY FS-20 insurance card"
     await _send_clean(
         context,
