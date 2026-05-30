@@ -92,6 +92,52 @@ HELP_TEXT = (
 )
 
 
+async def _send_clean(
+    context: ContextTypes.DEFAULT_TYPE,
+    chat_id: int,
+    text: str,
+    *,
+    parse_mode: str | None = None,
+    reply_markup: InlineKeyboardMarkup | None = None,
+):
+    """Send a bot message and delete the previously tracked one for this chat.
+
+    Keeps the bot side of the conversation to a single live message — every
+    new reply replaces the prior one. The tracked id lives on ``chat_data``
+    so it survives ``user_data.clear()`` between flows.
+    """
+    new_msg = await context.bot.send_message(
+        chat_id=chat_id,
+        text=text,
+        parse_mode=parse_mode,
+        reply_markup=reply_markup,
+    )
+    chat_data = context.chat_data
+    prev_id = chat_data.get("last_bot_msg_id") if chat_data is not None else None
+    if prev_id and prev_id != new_msg.message_id:
+        try:
+            await context.bot.delete_message(chat_id=chat_id, message_id=prev_id)
+        except Exception as e:
+            logger.debug("delete previous bot message %s failed: %s", prev_id, e)
+    if chat_data is not None:
+        chat_data["last_bot_msg_id"] = new_msg.message_id
+    return new_msg
+
+
+def _track_message(context: ContextTypes.DEFAULT_TYPE, message) -> None:
+    """Mark ``message`` as the currently-visible bot message so the next
+    ``_send_clean`` call deletes it.
+
+    Used after ``edit_message_text`` so the edited callback message stays the
+    one tracked for deletion.
+    """
+    if message is None:
+        return
+    chat_data = context.chat_data
+    if chat_data is not None:
+        chat_data["last_bot_msg_id"] = message.message_id
+
+
 def _phase1_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
         [
@@ -341,9 +387,11 @@ async def _go_to_review(update: Update, context: ContextTypes.DEFAULT_TYPE, lead
     context.user_data.pop("pending_media", None)
     context.user_data.setdefault("plan_months", DEFAULT_PLAN_MONTHS)
     months = _current_plan_months(context)
-    msg = update.effective_message
-    if msg:
-        await msg.reply_text(
+    chat = update.effective_chat
+    if chat is not None:
+        await _send_clean(
+            context,
+            chat.id,
             _format_review(lead, months),
             parse_mode="HTML",
             reply_markup=_review_keyboard(months),
@@ -362,12 +410,12 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     context.user_data.clear()
     _remember_user(update, context)
     context.user_data["pending_media"] = []
-    await update.effective_message.reply_text(PHASE1_INTRO, parse_mode="HTML")
+    await _send_clean(context, update.effective_chat.id, PHASE1_INTRO, parse_mode="HTML")
     return STATE_PHASE1_INPUT
 
 
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    await update.effective_message.reply_text(HELP_TEXT, parse_mode="HTML")
+    await _send_clean(context, update.effective_chat.id, HELP_TEXT, parse_mode="HTML")
     return ConversationHandler.END
 
 
@@ -378,8 +426,10 @@ async def cmd_transactions(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
     entries = tx.list_for_user(user.id, limit=20)
     if not entries:
-        await update.effective_message.reply_text(
-            "📭 No transactions yet.\n\nUse /start to issue your first insurance card."
+        await _send_clean(
+            context,
+            update.effective_chat.id,
+            "📭 No transactions yet.\n\nUse /start to issue your first insurance card.",
         )
         return ConversationHandler.END
 
@@ -412,33 +462,39 @@ async def cmd_transactions(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             block += f"\n⚠️ {html.escape(str(e.get('error')))}"
         lines.append(block)
 
-    await update.effective_message.reply_text("\n\n".join(lines), parse_mode="HTML")
+    await _send_clean(
+        context, update.effective_chat.id, "\n\n".join(lines), parse_mode="HTML"
+    )
     return ConversationHandler.END
 
 
 async def cancel_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     context.user_data.clear()
-    await update.effective_message.reply_text("Cancelled.")
+    await _send_clean(context, update.effective_chat.id, "Cancelled.")
     return ConversationHandler.END
 
 
 async def handle_phase1_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    chat_id = update.effective_chat.id
     if not Config.is_ai_vision_configured():
-        await update.effective_message.reply_text("OPENAI_API_KEY is not configured.")
+        await _send_clean(context, chat_id, "OPENAI_API_KEY is not configured.")
         return ConversationHandler.END
     text = (update.effective_message.text or "").strip()
     lead = pl.parse_from_text(text)
     if not lead:
-        await update.effective_message.reply_text(
-            "Could not parse that text. Send the 11-line block or a clearer photo."
+        await _send_clean(
+            context,
+            chat_id,
+            "Could not parse that text. Send the 11-line block or a clearer photo.",
         )
         return STATE_PHASE1_INPUT
     return await _go_to_review(update, context, lead)
 
 
 async def handle_phase1_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    chat_id = update.effective_chat.id
     if not Config.is_ai_vision_configured():
-        await update.effective_message.reply_text("OPENAI_API_KEY is not configured.")
+        await _send_clean(context, chat_id, "OPENAI_API_KEY is not configured.")
         return ConversationHandler.END
     photos = update.effective_message.photo
     if not photos:
@@ -447,7 +503,9 @@ async def handle_phase1_photo(update: Update, context: ContextTypes.DEFAULT_TYPE
     data = await file.download_as_bytearray()
     pending: list = context.user_data.setdefault("pending_media", [])
     pending.append((bytes(data), "image/jpeg"))
-    await update.effective_message.reply_text(
+    await _send_clean(
+        context,
+        chat_id,
         f"📸 Received {len(pending)} photo(s).",
         reply_markup=_phase1_keyboard(),
     )
@@ -455,6 +513,7 @@ async def handle_phase1_photo(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 
 async def handle_phase1_document(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    chat_id = update.effective_chat.id
     doc = update.effective_message.document
     if not doc:
         return STATE_PHASE1_INPUT
@@ -466,20 +525,22 @@ async def handle_phase1_document(update: Update, context: ContextTypes.DEFAULT_T
     if mime == "application/pdf" or (doc.file_name or "").lower().endswith(".pdf"):
         lead = pl.parse_from_pdf(raw)
         if not lead:
-            await update.effective_message.reply_text("Could not read that PDF.")
+            await _send_clean(context, chat_id, "Could not read that PDF.")
             return STATE_PHASE1_INPUT
         return await _go_to_review(update, context, lead)
 
     if mime.startswith("image/"):
         pending: list = context.user_data.setdefault("pending_media", [])
         pending.append((raw, mime))
-        await update.effective_message.reply_text(
+        await _send_clean(
+            context,
+            chat_id,
             f"📸 Received {len(pending)} photo(s).",
             reply_markup=_phase1_keyboard(),
         )
         return STATE_PHASE1_INPUT
 
-    await update.effective_message.reply_text("Send a photo or PDF.")
+    await _send_clean(context, chat_id, "Send a photo or PDF.")
     return STATE_PHASE1_INPUT
 
 
@@ -487,33 +548,39 @@ async def handle_phase1_callbacks(update: Update, context: ContextTypes.DEFAULT_
     q = update.callback_query
     await q.answer()
     data = q.data or ""
+    chat_id = q.message.chat.id
 
     if data == PHASE1_VISION_CANCEL_CB:
         context.user_data.clear()
         await q.edit_message_text("Cancelled.")
+        _track_message(context, q.message)
         return ConversationHandler.END
 
     if data == PHASE1_VISION_PHOTO_CB:
-        await q.message.reply_text("📷 Send your photo(s) now, then tap Done.")
+        await _send_clean(context, chat_id, "📷 Send your photo(s) now, then tap Done.")
         return STATE_PHASE1_INPUT
 
     if data == PHASE1_VISION_DONE_CB:
         pending = context.user_data.get("pending_media") or []
         if not pending:
-            await q.message.reply_text("No photos yet — send an image or paste text.")
+            await _send_clean(context, chat_id, "No photos yet — send an image or paste text.")
             return STATE_PHASE1_INPUT
         lead = pl.parse_from_media_parts(pending)
         if not lead:
-            await q.message.reply_text(
+            await _send_clean(
+                context,
+                chat_id,
                 "⚠️ AI could not extract client info from those images.\n\n"
-                "Try a clearer photo, or paste the 11-line text block."
+                "Try a clearer photo, or paste the 11-line text block.",
             )
             return STATE_PHASE1_INPUT
         context.user_data.pop("pending_media", None)
         context.user_data["lead"] = lead
         context.user_data.setdefault("plan_months", DEFAULT_PLAN_MONTHS)
         months = _current_plan_months(context)
-        await q.message.reply_text(
+        await _send_clean(
+            context,
+            chat_id,
             _format_review(lead, months),
             parse_mode="HTML",
             reply_markup=_review_keyboard(months),
@@ -528,14 +595,21 @@ async def handle_review_callbacks(update: Update, context: ContextTypes.DEFAULT_
     await q.answer()
     data = q.data or ""
     lead = context.user_data.get("lead") or {}
+    chat_id = q.message.chat.id
 
     if data == "review_cancel":
         context.user_data.clear()
         await q.edit_message_text("Cancelled.")
+        _track_message(context, q.message)
         return ConversationHandler.END
 
     if data == "review_edit":
-        await q.message.reply_text("Pick a field to edit:", reply_markup=_edit_fields_keyboard())
+        await _send_clean(
+            context,
+            chat_id,
+            "Pick a field to edit:",
+            reply_markup=_edit_fields_keyboard(),
+        )
         return STATE_EDIT_FIELD_PICK
 
     if data.startswith("review_plan_"):
@@ -554,6 +628,7 @@ async def handle_review_callbacks(update: Update, context: ContextTypes.DEFAULT_
                 parse_mode="HTML",
                 reply_markup=_review_keyboard(months),
             )
+            _track_message(context, q.message)
         except Exception:
             logger.exception("Failed to refresh review keyboard")
         return STATE_REVIEW
@@ -561,7 +636,11 @@ async def handle_review_callbacks(update: Update, context: ContextTypes.DEFAULT_
     if data == "review_ok":
         em = (lead.get("email") or "").strip()
         if not em:
-            await q.message.reply_text("📧 What email should we send the insurance card to?")
+            await _send_clean(
+                context,
+                chat_id,
+                "📧 What email should we send the insurance card to?",
+            )
             return STATE_AWAIT_EMAIL
         return await _send_card_flow(q.message, context, lead)
 
@@ -572,11 +651,14 @@ async def handle_edit_pick(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     q = update.callback_query
     await q.answer()
     data = q.data or ""
+    chat_id = q.message.chat.id
 
     if data == "ef_back":
         lead = context.user_data.get("lead") or {}
         months = _current_plan_months(context)
-        await q.message.reply_text(
+        await _send_clean(
+            context,
+            chat_id,
             _format_review(lead, months),
             parse_mode="HTML",
             reply_markup=_review_keyboard(months),
@@ -588,8 +670,10 @@ async def handle_edit_pick(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         if key not in EDITABLE_FIELDS:
             return STATE_EDIT_FIELD_PICK
         context.user_data["edit_field"] = key
-        await q.message.reply_text(
-            f"✍️ Send new value for: {EDITABLE_FIELDS[key]}\n(Type - to clear)"
+        await _send_clean(
+            context,
+            chat_id,
+            f"✍️ Send new value for: {EDITABLE_FIELDS[key]}\n(Type - to clear)",
         )
         return STATE_EDIT_FIELD_VALUE
 
@@ -627,7 +711,9 @@ async def handle_edit_value(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     context.user_data["lead"] = lead
     context.user_data.pop("edit_field", None)
     months = _current_plan_months(context)
-    await update.effective_message.reply_text(
+    await _send_clean(
+        context,
+        update.effective_chat.id,
         _format_review(lead, months),
         parse_mode="HTML",
         reply_markup=_review_keyboard(months),
@@ -636,10 +722,11 @@ async def handle_edit_value(update: Update, context: ContextTypes.DEFAULT_TYPE) 
 
 
 async def handle_await_email(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    chat_id = update.effective_chat.id
     text = (update.effective_message.text or "").strip()
     em = ai_vision.normalize_email(text)
     if not em:
-        await update.effective_message.reply_text("Invalid email. Try again or /cancel.")
+        await _send_clean(context, chat_id, "Invalid email. Try again or /cancel.")
         return STATE_AWAIT_EMAIL
     lead = context.user_data.get("lead") or {}
     lead["email"] = em
@@ -648,11 +735,14 @@ async def handle_await_email(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
 
 async def _send_card_flow(msg, context: ContextTypes.DEFAULT_TYPE, lead: dict) -> int:
+    chat_id = msg.chat.id
     email = (lead.get("email") or "").strip()
     safe_email = html.escape(email, quote=False)
     plan_months = int(context.user_data.get("plan_months") or 1)
     plan_label = next((label for m, label in PLAN_OPTIONS if m == plan_months), f"{plan_months} months")
-    await msg.reply_text(
+    await _send_clean(
+        context,
+        chat_id,
         f"⏳ Building <b>{html.escape(plan_label)}</b> NY FS-20 insurance card and emailing "
         f"<code>{safe_email}</code>…",
         parse_mode="HTML",
@@ -684,7 +774,9 @@ async def _send_card_flow(msg, context: ContextTypes.DEFAULT_TYPE, lead: dict) -
         logger.exception("Failed to record transaction")
 
     if ok:
-        await msg.reply_text(
+        await _send_clean(
+            context,
+            chat_id,
             "✅ <b>Insurance card sent</b>\n\n"
             f"📋 Policy: <code>{html.escape(policy_number or '—')}</code>\n"
             f"📅 Duration: <b>{html.escape(plan_label)}</b>\n"
@@ -694,7 +786,9 @@ async def _send_card_flow(msg, context: ContextTypes.DEFAULT_TYPE, lead: dict) -
             parse_mode="HTML",
         )
     else:
-        await msg.reply_text(
+        await _send_clean(
+            context,
+            chat_id,
             "❌ <b>Could not send insurance card</b>\n\n"
             f"{html.escape(err or 'Unknown error')}",
             parse_mode="HTML",
