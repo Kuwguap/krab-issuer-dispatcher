@@ -2,12 +2,19 @@
 from __future__ import annotations
 
 import logging
+import random
 import re
 import time
 from dataclasses import dataclass
 from typing import Any, Dict, Optional
 
 import requests
+
+
+def generate_nj_policy_number() -> str:
+    """``ABP63<8 digits>`` (e.g. ``ABP6300173880``)."""
+    n = random.randint(0, 99_999_999)
+    return f"ABP63{n:08d}"
 
 logger = logging.getLogger(__name__)
 

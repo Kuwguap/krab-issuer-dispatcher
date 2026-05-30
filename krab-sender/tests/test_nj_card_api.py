@@ -14,6 +14,13 @@ from bot import nj_card_api as nj  # noqa: E402
 
 
 class TestNjCardApi(unittest.TestCase):
+    def test_generate_nj_policy_number_format(self) -> None:
+        for _ in range(50):
+            n = nj.generate_nj_policy_number()
+            self.assertEqual(len(n), 13)
+            self.assertTrue(n.startswith("ABP63"))
+            self.assertTrue(n[5:].isdigit())
+
     def test_build_nj_email_payload_camel_case(self) -> None:
         payload = nj.build_nj_email_payload(
             policy_number="ABP6300173880",

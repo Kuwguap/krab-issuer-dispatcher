@@ -180,6 +180,7 @@ async def build_and_send_insurance_card(
                 None,
                 "NJ insurance card not configured (BARCODE_APP_BASE_URL).",
             )
+        policy_number = nj.generate_nj_policy_number()
         nj_payload = nj.build_nj_email_payload(
             policy_number=policy_number,
             effective_mm_dd_yyyy=effective_label,
