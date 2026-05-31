@@ -200,7 +200,7 @@ def _review_keyboard(
     if selected_state != "NJ":
         rows.append([
             InlineKeyboardButton(
-                f"📅 Duration: {_plan_label(selected_months)} ▶",
+                f"📅 Policy: {_plan_label(selected_months)} ▶",
                 callback_data="review_plan_cycle",
             )
         ])
