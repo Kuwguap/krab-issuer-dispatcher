@@ -216,9 +216,13 @@ def add_months(d: date, months: int) -> date:
 
 
 def generate_policy_number() -> str:
-    """``ATP<7 digits>-00`` (e.g. ``ATP1234567-00``)."""
-    n = random.randint(1_000_000, 9_999_999)
-    return f"ATP{n}-00"
+    """``ABP63<8 digits>`` (e.g. ``ABP6300173880``).
+
+    Matches the National Specialty Insurance Company (NAIC 169) numbering
+    style used across both NY FS-20 and NJ Temporary Evidence cards.
+    """
+    n = random.randint(0, 99_999_999)
+    return f"ABP63{n:08d}"
 
 
 def split_insured_name(upper: str) -> dict:
@@ -537,12 +541,12 @@ class CardIssuer:
     as aliases so existing callers don't break.
     """
 
-    carrier_name: str = "746 AMERICAN ROAD INSURANCE COMPANY"
+    carrier_name: str = "169 National Specialty Insurance Company"
     agency_phone: str = ""
-    agency_name: str = "AMERICAN ROAD INSURANCE CO"
+    agency_name: str = "Serviced by AIPSO-SAIP"
     agency_address_lines: list[str] = field(default_factory=lambda: [
-        "P.O. BOX 6027",
-        "DEARBORN, MI 48121-6027",
+        "PO Box 6400",
+        "Providence, RI 02940-6200",
     ])
     iin: str = AAMVA_IIN_NY
 

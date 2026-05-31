@@ -48,10 +48,10 @@ def _format_effective_date_label(d) -> str:
 
 
 def _issuer_from_env() -> ic.CardIssuer:
-    carrier_name = (os.getenv("INSURANCE_CARRIER_NAME") or "746 AMERICAN ROAD INSURANCE COMPANY").strip()
-    agency_name = (os.getenv("INSURANCE_ISSUER_NAME") or "AMERICAN ROAD INSURANCE CO").strip()
+    carrier_name = (os.getenv("INSURANCE_CARRIER_NAME") or "169 National Specialty Insurance Company").strip()
+    agency_name = (os.getenv("INSURANCE_ISSUER_NAME") or "Serviced by AIPSO-SAIP").strip()
     agency_phone = (os.getenv("INSURANCE_ISSUER_PHONE") or "").strip()
-    agency_address = (os.getenv("INSURANCE_ISSUER_ADDRESS") or "P.O. BOX 6027|DEARBORN, MI 48121-6027").strip()
+    agency_address = (os.getenv("INSURANCE_ISSUER_ADDRESS") or "PO Box 6400|Providence, RI 02940-6200").strip()
     return ic.CardIssuer(
         carrier_name=carrier_name,
         agency_name=agency_name,

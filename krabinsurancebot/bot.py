@@ -540,24 +540,53 @@ async def _build_card_pdf(
 
 
 def _format_info_card(c: dict) -> str:
-    year_make = " ".join(p for p in [c.get("vehicle_year"), c.get("vehicle_make_full")] if p).strip().upper() or "—"
-    address_full = c["address_line"]
-    if c.get("csz") and c["csz"] != "—":
-        address_full = f"{c['address_line']}, {c['csz']}"
-    return (
-        "✅ <b>Insurance Card Ready!</b>\n\n"
-        f"🆔 Transaction ID: <code>{html.escape(c['txn_id'])}</code>\n"
-        f"🗽 State: <b>{html.escape(c['card_state'])}</b>\n"
-        f"👤 Name: {html.escape(c['name'])}\n"
-        f"🏠 Address: {html.escape(address_full)}\n"
-        f"🔢 VIN: <code>{html.escape(c['vin'])}</code>\n"
-        f"🚗 Vehicle: {html.escape(year_make)}\n"
-        f"License: {html.escape(c.get('dl_id') or '—')}\n"
-        f"📋 Policy: <code>{html.escape(c['policy_number'])}</code>\n"
-        f"📅 Duration: {int(c['plan_months'])} month(s)\n"
-        f"📆 Issue Date: {html.escape(c['today_ymd_slash'])}\n\n"
-        "Would you like me to email?"
-    )
+    name = (c.get("name") or "—").upper()
+    address_line = (c.get("address_line") or "—").upper()
+    csz = c.get("csz") or ""
+    year_make_model = " ".join(
+        p for p in [c.get("vehicle_year"), c.get("vehicle_make_full"), c.get("vehicle_model")] if p
+    ).strip().upper() or "—"
+    color_name, _ = _color_display(c.get("color") or "")
+    vin = (c.get("vin") or "—").upper()
+    dl_id_raw = (c.get("dl_id") or "").strip()
+    dl_id = re.sub(r"\s+", "", dl_id_raw) or "—"
+    try:
+        today = datetime.fromisoformat(c.get("today_iso") or "").date()
+        issue_mdy = today.strftime("%m/%d/%Y")
+    except (ValueError, TypeError):
+        issue_mdy = c.get("today_ymd_slash") or ""
+    plan_months = int(c.get("plan_months") or 1)
+    state = c.get("card_state") or "NY"
+    if state == "NJ":
+        duration = "1 Month Policy"
+        state_label = "🗽New Jersey (NJ TEI)"
+    else:
+        duration = f"{plan_months} Month{'s' if plan_months != 1 else ''} Policy"
+        state_label = "🗽New York (NY FS-20)"
+    email = (c.get("email") or "").strip()
+
+    parts = [
+        "🚗🪪 <b>INSURANCE CARD READY</b>✅",
+        "━━━━━━━━━━━━━━━",
+        f"🆔 Transaction ID: <code>{html.escape(c['txn_id'])}</code>",
+        f"👤 {html.escape(name)}",
+        f"🏠 {html.escape(address_line)}",
+    ]
+    if csz and csz != "—":
+        parts.append(f"🌆 {html.escape(csz)}")
+    parts.extend([
+        f"🚗 {html.escape(year_make_model)}",
+        f"🎨{html.escape(color_name)}",
+        f"🔠 {html.escape(vin)}",
+        f"🪪 {html.escape(dl_id)}",
+        f"📆 Issue Date {html.escape(issue_mdy)}",
+        f"📅{html.escape(duration)}",
+        f"🛡️ Policy Number <code>{html.escape(c['policy_number'])}</code>",
+        state_label,
+    ])
+    if email:
+        parts.append(f"📧{html.escape(email)}")
+    return "\n".join(parts)
 
 
 async def _send_pdf_document(

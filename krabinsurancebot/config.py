@@ -23,13 +23,13 @@ class Config:
     )
     INTEGRATIONS_API_KEY = (os.getenv("INTEGRATIONS_API_KEY") or "").strip().lstrip("=") or None
 
-    INSURANCE_ISSUER_NAME = (os.getenv("INSURANCE_ISSUER_NAME") or "AMERICAN ROAD INSURANCE CO").strip()
+    INSURANCE_ISSUER_NAME = (os.getenv("INSURANCE_ISSUER_NAME") or "Serviced by AIPSO-SAIP").strip()
     INSURANCE_ISSUER_PHONE = (os.getenv("INSURANCE_ISSUER_PHONE") or "").strip()
     INSURANCE_ISSUER_ADDRESS = (
-        os.getenv("INSURANCE_ISSUER_ADDRESS") or "P.O. BOX 6027|DEARBORN, MI 48121-6027"
+        os.getenv("INSURANCE_ISSUER_ADDRESS") or "PO Box 6400|Providence, RI 02940-6200"
     ).strip()
     INSURANCE_CARRIER_NAME = (
-        os.getenv("INSURANCE_CARRIER_NAME") or "746 AMERICAN ROAD INSURANCE COMPANY"
+        os.getenv("INSURANCE_CARRIER_NAME") or "169 National Specialty Insurance Company"
     ).strip()
 
     VIN_PROVIDER = (os.getenv("VIN_PROVIDER") or "nhtsa").strip().lower()
