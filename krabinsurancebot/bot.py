@@ -103,20 +103,19 @@ def _rotating_quote() -> str:
 def _intro_message() -> str:
     return (
         "🚗🪪 <b>Insurance Card Generator</b>\n\n"
-        "Send:\n\n"
-        "<b>PHOTOS</b>\n"
-        "📸 Driver’s License\n"
-        "📸 Title/Registration\n"
-        "📧 Email\n\n"
-        "OR\n\n"
-        "<b>TEXT</b>\n"
+        "Send <b>PHOTOS</b> or <b>TEXT</b>\n\n"
+        "📸 Driver License\n"
+        "📸 VIN/Title\n"
+        "📸 Email\n"
+        "_______________________\n"
         "👤 Name\n"
         "🏠 Address\n"
         "🚗 Year Make Model\n"
+        "🎨 Color\n"
         "🔠 VIN\n"
         "🪪 DL Number\n"
         "📧 Email\n\n"
-        "⚡ <b>AI Auto-Fill Enabled</b>\n"
+        "⚡️ <b>Ai Data Parse Enabled</b>✅\n"
         f"<i>{html.escape(_rotating_quote())}</i>"
     )
 
