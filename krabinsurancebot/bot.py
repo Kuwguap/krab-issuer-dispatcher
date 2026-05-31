@@ -79,19 +79,42 @@ EDITABLE_FIELDS = {
 
 PORTAL_DEFAULT_PASSWORD = "Temp#A9"
 
-PHASE1_INTRO = (
-    "🚗 <b>Insurance</b> 🪪<b>Card Generator</b> 🤖\n\n"
-    "Hey! 👋 Please send me:\n\n"
-    "📸 Driver's License\n"
-    "📸 Title or Registration (for VIN)\n"
-    "⌨️ Or type your:\n"
-    "• Full Name\n"
-    "• Address\n"
-    "• VIN Number\n"
-    "• Driver's License Number\n\n"
-    "⚡ Send multiple photos — I'll collect everything automatically "
-    "and generate your insurance card instantly"
+MOTIVATIONAL_QUOTES = (
+    "“Coverage today is peace of mind tomorrow.”",
+    "“Drive safe. Stay covered. Live easy.”",
+    "“The best protection is the one already in place.”",
+    "“Small step today, big protection tomorrow.”",
+    "“Smooth roads start with smart coverage.”",
+    "“Insured drivers sleep better.”",
+    "“Confidence on the road begins with the right card.”",
+    "“One card. Total peace of mind.”",
+    "“Be road-ready, always.”",
+    "“Protect the journey, enjoy the ride.”",
 )
+
+
+def _rotating_quote() -> str:
+    from datetime import datetime as _dt, timezone as _tz
+    idx = _dt.now(_tz.utc).minute % len(MOTIVATIONAL_QUOTES)
+    return MOTIVATIONAL_QUOTES[idx]
+
+
+def _intro_message() -> str:
+    return (
+        "🚗🪪 <b>Insurance Card Generator Bot</b> 🤖\n\n"
+        "To generate your insurance card, please send <b>ANY</b> of the following:\n\n"
+        "📸 Driver’s License\n"
+        "📸 Title or Registration (for VIN verification)\n"
+        "OR\n"
+        "⌨️ Type by text:\n"
+        "👤 Full Name\n"
+        "🏠 Address\n"
+        "🚗 VIN Number\n"
+        "🪪 Driver’s License Number\n"
+        "📧 Email Address\n\n"
+        "⚡️ <b>AI Smart Parse Enabled</b>\n"
+        f"<i>{html.escape(_rotating_quote())}</i>"
+    )
 
 HELP_TEXT = (
     "🚗 <b>Insurance Card Generator</b> 🤖\n\n"
@@ -505,7 +528,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     context.user_data.clear()
     _remember_user(update, context)
     context.user_data["pending_media"] = []
-    await _send_clean(context, update.effective_chat.id, PHASE1_INTRO, parse_mode="HTML")
+    await _send_clean(context, update.effective_chat.id, _intro_message(), parse_mode="HTML")
     return STATE_PHASE1_INPUT
 
 
