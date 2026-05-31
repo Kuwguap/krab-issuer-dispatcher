@@ -278,6 +278,32 @@ def _format_city_state_zip(raw: str) -> str:
     return s
 
 
+async def _ensure_vin_decoded(lead: dict) -> None:
+    """Decode the lead VIN via NHTSA once and cache year/make/model on it.
+
+    Used by the review formatter so the operator sees the real Year Make
+    Model on screen instead of whatever raw text the parser captured.
+    """
+    if lead.get("decoded_year") or lead.get("decoded_make") or lead.get("decoded_model"):
+        return
+    from utils import insurance_card as ic
+
+    vd = (lead.get("vehicle_details") or "").splitlines()
+    vin_candidates = [
+        ic.extract_vin_from_text(lead.get("vehicle_details") or ""),
+        ic.normalize_vin(vd[5].strip()) if len(vd) > 5 else "",
+    ]
+    vin = next((v for v in vin_candidates if v and len(v) == 17), "")
+    if not vin:
+        return
+    decoded = await asyncio.to_thread(ic.decode_vin_from_nhtsa, vin)
+    if not decoded:
+        return
+    lead["decoded_year"] = (decoded.get("modelYear") or "").strip()
+    lead["decoded_make"] = (decoded.get("vehicleMake") or "").strip()
+    lead["decoded_model"] = (decoded.get("vehicleModel") or "").strip()
+
+
 def _format_review(
     lead: dict[str, Any],
     selected_months: int = DEFAULT_PLAN_MONTHS,
@@ -291,31 +317,43 @@ def _format_review(
     address = (ln(1) or "—").upper()
     csz = _format_city_state_zip(ln(2))
     vin = (ln(5) or "—").upper()
-    car = (ln(6) or "—").upper()
-    color_name, color_emoji = _color_display(ln(7))
-    dl_id = (lead.get("driver_license_id") or "").strip() or "—"
+
+    decoded_year = (lead.get("decoded_year") or "").strip()
+    decoded_make = (lead.get("decoded_make") or "").strip()
+    decoded_model = (lead.get("decoded_model") or "").strip()
+    if decoded_year or decoded_make or decoded_model:
+        car = " ".join(p for p in [decoded_year, decoded_make, decoded_model] if p).upper()
+    else:
+        car = (ln(6) or "—").upper()
+
+    color_name, _ = _color_display(ln(7))
+    dl_id_raw = (lead.get("driver_license_id") or "").strip()
+    dl_id = re.sub(r"\s+", "", dl_id_raw) or "—"
+    email = (lead.get("email") or "").strip()
 
     if selected_state == "NJ":
-        duration = "1 Month"
+        duration = "1 Month Policy"
         state_label = "🗽New Jersey (NJ TEI)"
     else:
-        duration = _plan_label(selected_months).replace("month", "Month")
+        duration = f"{_plan_label(selected_months).replace('month', 'Month')} Policy"
         state_label = "🗽New York (NY FS-20)"
 
-    return (
-        "🚗🪪 <b>INSURANCE CARD READY</b>\n"
-        "━━━━━━━━━━━━━━━\n"
-        f"👤 {html.escape(name)}\n"
-        f"🏠 {html.escape(address)}\n"
-        f"🌆 {html.escape(csz)}\n"
-        f"🚗 {html.escape(car)}\n"
-        f"{color_emoji} {html.escape(color_name)}\n"
-        f"🔑 VIN\n"
-        f"{html.escape(vin)}\n"
-        f"🪪 {html.escape(dl_id)}\n"
-        f"📅{html.escape(duration)}\n"
-        f"{state_label}"
-    )
+    parts = [
+        "🚗🪪 <b>INSURANCE CARD READY</b>✅",
+        "━━━━━━━━━━━━━━━",
+        f"👤 {html.escape(name)}",
+        f"🏠 {html.escape(address)}",
+        f"🌆 {html.escape(csz)}",
+        f"🚗 {html.escape(car)}",
+        f"🎨{html.escape(color_name)}",
+        f"🔠 {html.escape(vin)}",
+        f"🪪 {html.escape(dl_id)}",
+        f"📅{html.escape(duration)}",
+        state_label,
+    ]
+    if email:
+        parts.append(f"📧{html.escape(email)}")
+    return "\n".join(parts)
 
 
 def _parse_annual_premium(lead: dict) -> float:
@@ -674,6 +712,7 @@ async def _go_to_review(update: Update, context: ContextTypes.DEFAULT_TYPE, lead
             "📧 Send the client's email address now:",
         )
         return STATE_AWAIT_EMAIL
+    await _ensure_vin_decoded(lead)
     months = _current_plan_months(context)
     card_state = _current_card_state(context, lead)
     await _send_clean(
@@ -874,6 +913,7 @@ async def handle_phase1_callbacks(update: Update, context: ContextTypes.DEFAULT_
                 "📧 Send the client's email address now:",
             )
             return STATE_AWAIT_EMAIL
+        await _ensure_vin_decoded(lead)
         months = _current_plan_months(context)
         card_state = _current_card_state(context, lead)
         await _send_clean(
@@ -997,8 +1037,12 @@ async def handle_edit_value(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         vd[7] = ai_vision.normalize_phase1_color(text) if text != "-" else "-"
 
     lead["vehicle_details"] = "\n".join(vd)
+    if key == "vin":
+        for k in ("decoded_year", "decoded_make", "decoded_model"):
+            lead.pop(k, None)
     context.user_data["lead"] = lead
     context.user_data.pop("edit_field", None)
+    await _ensure_vin_decoded(lead)
     months = _current_plan_months(context)
     card_state = _current_card_state(context, lead)
     await _send_clean(
@@ -1021,6 +1065,7 @@ async def handle_await_email(update: Update, context: ContextTypes.DEFAULT_TYPE)
     lead = context.user_data.get("lead") or {}
     lead["email"] = em
     context.user_data["lead"] = lead
+    await _ensure_vin_decoded(lead)
     months = _current_plan_months(context)
     card_state = _current_card_state(context, lead)
     await _send_clean(
