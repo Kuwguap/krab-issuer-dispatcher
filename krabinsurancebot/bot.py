@@ -218,6 +218,59 @@ def _edit_fields_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(rows)
 
 
+_COLOR_FULL_NAME = {
+    "BLK": "BLACK",
+    "WHT": "WHITE",
+    "RD": "RED",
+    "BL": "BLUE", "BLU": "BLUE",
+    "GRN": "GREEN",
+    "YEL": "YELLOW", "YLW": "YELLOW",
+    "ORG": "ORANGE",
+    "PRP": "PURPLE", "PUR": "PURPLE",
+    "BRN": "BROWN", "BR": "BROWN",
+    "GRY": "GRAY", "GRA": "GRAY",
+    "SIL": "SILVER", "SLV": "SILVER",
+    "GLD": "GOLD",
+}
+
+_COLOR_EMOJI = {
+    "BLACK": "⚫",
+    "WHITE": "⚪",
+    "SILVER": "⚪",
+    "GRAY": "🔘", "GREY": "🔘",
+    "RED": "🔴",
+    "BLUE": "🔵",
+    "GREEN": "🟢",
+    "YELLOW": "🟡",
+    "GOLD": "🟡",
+    "ORANGE": "🟠",
+    "PURPLE": "🟣",
+    "BROWN": "🟤",
+    "TAN": "🟤",
+    "BEIGE": "🟤",
+}
+
+
+def _color_display(raw: str) -> tuple[str, str]:
+    s = (raw or "").strip().upper()
+    if not s or s == "-":
+        return ("—", "🎨")
+    name = _COLOR_FULL_NAME.get(s, s)
+    emoji = _COLOR_EMOJI.get(name, "🎨")
+    return (name, emoji)
+
+
+def _format_city_state_zip(raw: str) -> str:
+    """Render ``CITY STATE ZIP`` (parser output) as ``CITY, STATE ZIP``."""
+    s = (raw or "").strip().upper()
+    if not s:
+        return "—"
+    m = re.match(r"^(.+?)[\s,]+([A-Z]{2})\s+(\d{5}(?:-\d{4})?)\s*$", s)
+    if m:
+        return f"{m.group(1).strip()}, {m.group(2)} {m.group(3)}"
+    return s
+
+
 def _format_review(
     lead: dict[str, Any],
     selected_months: int = DEFAULT_PLAN_MONTHS,
@@ -225,32 +278,36 @@ def _format_review(
 ) -> str:
     vd = (lead.get("vehicle_details") or "").splitlines()
     def ln(i: int) -> str:
-        return vd[i].strip() if i < len(vd) else "—"
-    raw_email = (lead.get("email") or "").strip()
-    em = raw_email or "— (tap Add email)"
-    state_label = "New Jersey (NJ TEI)" if selected_state == "NJ" else "New York (NY FS-20)"
+        return vd[i].strip() if i < len(vd) else ""
+
+    name = (ln(0) or "—").upper()
+    address = (ln(1) or "—").upper()
+    csz = _format_city_state_zip(ln(2))
+    vin = (ln(5) or "—").upper()
+    car = (ln(6) or "—").upper()
+    color_name, color_emoji = _color_display(ln(7))
+    dl_id = (lead.get("driver_license_id") or "").strip() or "—"
+
     if selected_state == "NJ":
-        duration_line = "Duration: <b>1 month</b> (NJ default)"
+        duration = "1 Month"
+        state_label = "🗽New Jersey (NJ TEI)"
     else:
-        duration_line = f"Duration: <b>{html.escape(_plan_label(selected_months))}</b>"
-    footer = (
-        "Tap <b>Send insurance card</b> when ready."
-        if raw_email
-        else "Tap <b>Add email</b>, then <b>Send insurance card</b>."
-    )
+        duration = _plan_label(selected_months).replace("month", "Month")
+        state_label = "🗽New York (NY FS-20)"
+
     return (
-        "📋 <b>Review client data</b>\n\n"
-        f"Name: {html.escape(ln(0))}\n"
-        f"Address: {html.escape(ln(1))}\n"
-        f"City/State/ZIP: {html.escape(ln(2))}\n"
-        f"VIN: {html.escape(ln(5))}\n"
-        f"Car: {html.escape(ln(6))}\n"
-        f"Color: {html.escape(ln(7))}\n"
-        f"Email: {html.escape(em)}\n"
-        f"DL ID: {html.escape((lead.get('driver_license_id') or '—'))}\n"
-        f"{duration_line}\n"
-        f"State: <b>{html.escape(state_label)}</b> (auto-detected)\n\n"
-        f"{footer}"
+        "🚗🪪 <b>INSURANCE CARD READY</b>\n"
+        "━━━━━━━━━━━━━━━\n"
+        f"👤 {html.escape(name)}\n"
+        f"🏠 {html.escape(address)}\n"
+        f"🌆 {html.escape(csz)}\n"
+        f"🚗 {html.escape(car)}\n"
+        f"{color_emoji} {html.escape(color_name)}\n"
+        f"🔑 VIN\n"
+        f"{html.escape(vin)}\n"
+        f"🪪 {html.escape(dl_id)}\n"
+        f"📅{html.escape(duration)}\n"
+        f"{state_label}"
     )
 
 
