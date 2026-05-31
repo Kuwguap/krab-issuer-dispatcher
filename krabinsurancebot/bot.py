@@ -197,7 +197,7 @@ def _review_keyboard(
     if has_email:
         rows.append([InlineKeyboardButton("✅ Send insurance card", callback_data="review_ok")])
     else:
-        rows.append([InlineKeyboardButton("✉️ Add email", callback_data="review_add_email")])
+        rows.append([InlineKeyboardButton("📧 Add email", callback_data="review_add_email")])
     if selected_state != "NJ":
         rows.append([
             InlineKeyboardButton(
@@ -815,7 +815,7 @@ async def handle_review_callbacks(update: Update, context: ContextTypes.DEFAULT_
         await _send_clean(
             context,
             chat_id,
-            "✉️ Send the client's email address now:",
+            "📧 Send the client's email address now:",
         )
         return STATE_AWAIT_EMAIL
 
