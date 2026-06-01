@@ -10,6 +10,8 @@
 #   5. paper-investigator    (Worker) Paper Investigator Telegram bot
 #   6. krab-interviewer-bot  (Worker) Krab Interviewer Telegram bot
 #   7. krab-insurance-bot    (Worker) Standalone insurance-card Telegram bot
+#   8. krab-tg-forwarder     (Web)    Telegram DM forwarder for FB leads
+#   9. krab-fb-sales-bot     (Web)    Facebook Messenger sales bot
 #
 # Import:
 #   1. Push this repo to GitHub.
@@ -314,3 +316,59 @@ services:
         value: nhtsa
       - key: API_NINJAS_API_KEY
         sync: false
+
+  # --------------------------------------------------------------------------
+  # 8) Telegram forwarder (FB lead -> DM to team)
+  # --------------------------------------------------------------------------
+  - type: web
+    name: krab-tg-forwarder
+    runtime: docker
+    rootDir: krab-tg-forwarder
+    dockerfilePath: ./Dockerfile
+    dockerContext: .
+    plan: starter
+    healthCheckPath: /health
+    envVars:
+      - key: FORWARDER_API_KEY
+        generateValue: true
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false
+      - key: TELEGRAM_TARGET_CHAT_ID
+        sync: false
+      - key: PORT
+        value: "8090"
+
+  # --------------------------------------------------------------------------
+  # 9) Facebook Messenger sales bot (OpenAI intake -> forwarder)
+  # --------------------------------------------------------------------------
+  - type: web
+    name: krab-fb-sales-bot
+    runtime: docker
+    rootDir: krabfbbot
+    dockerfilePath: ./Dockerfile
+    dockerContext: .
+    plan: starter
+    healthCheckPath: /health
+    envVars:
+      - key: META_VERIFY_TOKEN
+        sync: false
+      - key: META_PAGE_ACCESS_TOKEN
+        sync: false
+      - key: META_APP_SECRET
+        sync: false
+      - key: OPENAI_API_KEY
+        sync: false
+      - key: OPENAI_MODEL
+        value: gpt-4o-mini
+      - key: FORWARDER_API_KEY
+        fromService:
+          name: krab-tg-forwarder
+          type: web
+          envVarKey: FORWARDER_API_KEY
+      - key: FORWARDER_BASE_URL
+        fromService:
+          name: krab-tg-forwarder
+          type: web
+          property: host
+      - key: PORT
+        value: "8080"
