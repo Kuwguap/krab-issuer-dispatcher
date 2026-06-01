@@ -192,6 +192,8 @@ def _phase1_keyboard() -> InlineKeyboardMarkup:
 def _review_keyboard(
     selected_months: int = DEFAULT_PLAN_MONTHS,
     selected_state: str = DEFAULT_CARD_STATE,
+    *,
+    has_email: bool = True,
 ) -> InlineKeyboardMarkup:
     rows: list[list[InlineKeyboardButton]] = [
         [InlineKeyboardButton("✅ Generate insurance card", callback_data="review_ok")],
@@ -203,6 +205,8 @@ def _review_keyboard(
                 callback_data="review_plan_cycle",
             )
         ])
+    email_label = "📧 Edit email" if has_email else "📧 Add email"
+    rows.append([InlineKeyboardButton(email_label, callback_data="review_email")])
     rows.append([InlineKeyboardButton("✏️ Edit field", callback_data="review_edit")])
     rows.append([InlineKeyboardButton("❌ Cancel", callback_data="review_cancel")])
     return InlineKeyboardMarkup(rows)
@@ -630,12 +634,13 @@ async def _go_to_review(update: Update, context: ContextTypes.DEFAULT_TYPE, lead
     await _ensure_vin_decoded(lead)
     months = _current_plan_months(context)
     card_state = _current_card_state(context, lead)
+    has_email = bool((lead.get("email") or "").strip())
     await _send_clean(
         context,
         chat.id,
         _format_review(lead, months, card_state),
         parse_mode="HTML",
-        reply_markup=_review_keyboard(months, card_state),
+        reply_markup=_review_keyboard(months, card_state, has_email=has_email),
     )
     return STATE_REVIEW
 
@@ -831,12 +836,13 @@ async def handle_phase1_callbacks(update: Update, context: ContextTypes.DEFAULT_
         await _ensure_vin_decoded(lead)
         months = _current_plan_months(context)
         card_state = _current_card_state(context, lead)
+        has_email = bool((lead.get("email") or "").strip())
         await _send_clean(
             context,
             chat_id,
             _format_review(lead, months, card_state),
             parse_mode="HTML",
-            reply_markup=_review_keyboard(months, card_state),
+            reply_markup=_review_keyboard(months, card_state, has_email=has_email),
         )
         return STATE_REVIEW
 
@@ -872,16 +878,25 @@ async def handle_review_callbacks(update: Update, context: ContextTypes.DEFAULT_
         current = _current_plan_months(context)
         new_months = _next_plan_months(current)
         context.user_data["plan_months"] = new_months
+        has_email = bool((lead.get("email") or "").strip())
         try:
             await q.edit_message_text(
                 _format_review(lead, new_months, card_state),
                 parse_mode="HTML",
-                reply_markup=_review_keyboard(new_months, card_state),
+                reply_markup=_review_keyboard(new_months, card_state, has_email=has_email),
             )
             _track_message(context, q.message)
         except Exception:
             logger.exception("Failed to refresh duration cycle")
         return STATE_REVIEW
+
+    if data == "review_email":
+        await _send_clean(
+            context,
+            chat_id,
+            "📧 Send the client's email address now:",
+        )
+        return STATE_AWAIT_EMAIL
 
     if data == "review_ok":
         return await _send_preview_flow(q.message, context, lead)
@@ -899,12 +914,13 @@ async def handle_edit_pick(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         lead = context.user_data.get("lead") or {}
         months = _current_plan_months(context)
         card_state = _current_card_state(context, lead)
+        has_email = bool((lead.get("email") or "").strip())
         await _send_clean(
             context,
             chat_id,
             _format_review(lead, months, card_state),
             parse_mode="HTML",
-            reply_markup=_review_keyboard(months, card_state),
+            reply_markup=_review_keyboard(months, card_state, has_email=has_email),
         )
         return STATE_REVIEW
 
@@ -960,12 +976,13 @@ async def handle_edit_value(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     await _ensure_vin_decoded(lead)
     months = _current_plan_months(context)
     card_state = _current_card_state(context, lead)
+    has_email = bool((lead.get("email") or "").strip())
     await _send_clean(
         context,
         update.effective_chat.id,
         _format_review(lead, months, card_state),
         parse_mode="HTML",
-        reply_markup=_review_keyboard(months, card_state),
+        reply_markup=_review_keyboard(months, card_state, has_email=has_email),
     )
     return STATE_REVIEW
 
@@ -988,7 +1005,7 @@ async def handle_await_email(update: Update, context: ContextTypes.DEFAULT_TYPE)
         chat_id,
         _format_review(lead, months, card_state),
         parse_mode="HTML",
-        reply_markup=_review_keyboard(months, card_state),
+        reply_markup=_review_keyboard(months, card_state, has_email=True),
     )
     return STATE_REVIEW
 
