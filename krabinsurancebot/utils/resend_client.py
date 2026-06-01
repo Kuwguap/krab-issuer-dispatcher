@@ -69,10 +69,27 @@ def _format_effective_date(d: date) -> str:
 def build_purchase_welcome_email(input_: PurchaseWelcomeEmailInput) -> tuple[str, str]:
     """Return (subject, body) for the policy-issued welcome email.
 
-    Plain-text body with Portal Login block; PDF attached separately via Resend.
+    The Portal Login block is only rendered when both a portal email and
+    a portal password are provided — "PDF only" deliveries pass an empty
+    password and get a card summary email without any portal credentials.
+    PDF is attached separately via Resend.
     """
     subject = f"Your policy is active — {input_.policy_number}"
+    portal_email = (input_.portal_email or "").strip()
+    portal_password = (input_.portal_password or "").strip()
     portal_site = (input_.portal_website or "TriStateCoverage.com/login").strip()
+
+    if portal_email and portal_password:
+        portal_block = (
+            "Log into your TRISTATECOVERAGE account anytime to manage your policy online.\n\n\n\n"
+            "Portal Login:\n"
+            f"Website: {portal_site}\n"
+            f"Email: {portal_email}\n"
+            f"Password: {portal_password}\n\n\n\n"
+        )
+    else:
+        portal_block = ""
+
     body = (
         f"Your policy is active — {input_.policy_number}\n\n\n\n"
         "Tri State Coverage\n\n"
@@ -90,11 +107,7 @@ def build_purchase_welcome_email(input_: PurchaseWelcomeEmailInput) -> tuple[str
         "• Download proof of insurance\n"
         "• Set up automatic payments\n"
         "• Access your policy anytime through your online dashboard\n\n"
-        "Log into your TRISTATECOVERAGE account anytime to manage your policy online.\n\n\n\n"
-        "Portal Login:\n"
-        f"Website: {portal_site}\n"
-        f"Email: {input_.portal_email}\n"
-        f"Password: {input_.portal_password}\n\n\n\n"
+        f"{portal_block}"
         "Thank you again for choosing Tri State Coverage.\n\n"
         "Sincerely,\n\n\n"
         "Tri State Coverage Team\n\n"
