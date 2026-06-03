@@ -30,7 +30,10 @@ def create_shipment(
     driver_telegram_id: Optional[str],
     quantity: int,
     created_by_telegram_id: str,
-    status: str = "awaiting_tracking",
+    status: str = "pending_accept",
+    driver_city: Optional[str] = None,
+    driver_zip: Optional[str] = None,
+    offer_messages: Optional[List[Dict[str, Any]]] = None,
 ) -> Optional[Dict[str, Any]]:
     payload = {
         "interview_id": interview_id,
@@ -42,6 +45,9 @@ def create_shipment(
         "quantity": int(quantity),
         "status": status,
         "created_by_telegram_id": str(created_by_telegram_id),
+        "driver_city": (driver_city or "").strip() or None,
+        "driver_zip": (driver_zip or "").strip() or None,
+        "offer_messages": offer_messages or [],
     }
     try:
         r = _get_client().table("paper_shipments").insert(payload).execute()
@@ -88,6 +94,49 @@ def list_shipments(limit: int = 25, status: Optional[str] = None) -> List[Dict[s
     except Exception as e:
         logger.error("list_shipments: %s", e)
         return []
+
+
+def try_accept_shipment(
+    shipment_id: str,
+    *,
+    telegram_id: str,
+    accepted_by_name: str,
+) -> Optional[Dict[str, Any]]:
+    """First accept wins — atomic update only when status is pending_accept."""
+    now = datetime.now(timezone.utc).isoformat()
+    updates = {
+        "status": "awaiting_tracking",
+        "accepted_by_telegram_id": str(telegram_id).strip(),
+        "accepted_by_name": (accepted_by_name or "").strip() or None,
+        "accepted_at": now,
+        "updated_at": now,
+    }
+    try:
+        r = (
+            _get_client()
+            .table("paper_shipments")
+            .update(updates)
+            .eq("id", shipment_id)
+            .eq("status", "pending_accept")
+            .execute()
+        )
+        return r.data[0] if r.data else None
+    except Exception as e:
+        logger.error("try_accept_shipment: %s", e)
+        return None
+
+
+def save_offer_messages(shipment_id: str, messages: List[Dict[str, Any]]) -> bool:
+    return update_shipment(shipment_id, {"offer_messages": messages})
+
+
+def append_offer_message(shipment_id: str, chat_id: int, message_id: int) -> bool:
+    row = get_shipment(shipment_id)
+    if not row:
+        return False
+    msgs = list(row.get("offer_messages") or [])
+    msgs.append({"chat_id": chat_id, "message_id": message_id})
+    return update_shipment(shipment_id, {"offer_messages": msgs})
 
 
 def set_bot_setting(

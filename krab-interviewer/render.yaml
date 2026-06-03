@@ -54,3 +54,9 @@ services:
         value: https://tristatetags.com,https://www.tristatetags.com
       - key: KRAB_PUBLIC_BASE_URL
         value: https://krab-interviewer-bot.onrender.com
+      - key: PAPER_GIRL_TELEGRAM_ID
+        sync: false
+      - key: PAPER_GIRL_NOTIFY_CHAT_IDS
+        value: -1003903904177
+      - key: PAPER_GIRL_USERNAME
+        sync: false

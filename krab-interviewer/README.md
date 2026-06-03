@@ -9,6 +9,7 @@ Third brand Telegram bot: driver interviews, appointment reminders, channel anno
    - [`database/migration_krab_interviewer.sql`](database/migration_krab_interviewer.sql)
    - [`database/migration_interview_drafts.sql`](database/migration_interview_drafts.sql) (web form)
    - [`database/migration_telegram_user_directory.sql`](database/migration_telegram_user_directory.sql) (username → Telegram ID for web apply)
+   - [`database/migration_paper_shipment_accept.sql`](database/migration_paper_shipment_accept.sql) (multi paper girl accept flow)
 3. Create Storage bucket **`driver_licenses`** (public read) in Supabase Dashboard.
 4. Add the bot as **admin** to `DRIVER_CHANNEL_ID` (channel for driver announcements).
 5. Install and run:

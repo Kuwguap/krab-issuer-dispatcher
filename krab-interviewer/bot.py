@@ -170,23 +170,136 @@ def _user_is_global_supervisor(user_id) -> bool:
     return False
 
 
+def _paper_girl_user_ids() -> List[int]:
+    """Personal Telegram user IDs for paper girls (comma-separated PAPER_GIRL_TELEGRAM_ID)."""
+    seen: set = set()
+    out: List[int] = []
+    for tok in _raw_supervisory_tokens(Config.PAPER_GIRL_TELEGRAM_ID):
+        cid = _parse_chat_id(tok)
+        if cid is None or cid in seen:
+            continue
+        seen.add(cid)
+        out.append(cid)
+    return out
+
+
+def _paper_girl_notify_chat_ids() -> List[int]:
+    """Paper-girl DMs plus notify groups (PAPER_GIRL_NOTIFY_CHAT_IDS)."""
+    seen: set = set()
+    out: List[int] = []
+    for cid in _paper_girl_user_ids():
+        if cid not in seen:
+            seen.add(cid)
+            out.append(cid)
+    for tok in _raw_supervisory_tokens(Config.PAPER_GIRL_NOTIFY_CHAT_IDS):
+        cid = _parse_chat_id(tok)
+        if cid is None or cid in seen:
+            continue
+        seen.add(cid)
+        out.append(cid)
+    return out
+
+
+def _paper_girl_usernames_tag() -> str:
+    handles: List[str] = []
+    for part in _raw_supervisory_tokens(Config.PAPER_GIRL_USERNAME):
+        h = part.strip().lstrip("@")
+        if h:
+            handles.append(f"@{h}")
+    if not handles:
+        return ""
+    return " ".join(handles) + " "
+
+
 def _user_is_paper_girl(user_id) -> bool:
-    pg = _parse_chat_id(Config.PAPER_GIRL_TELEGRAM_ID)
-    if pg is None:
+    target = _norm_chat_id(user_id)
+    if target is None:
         return False
-    return _norm_chat_id(user_id) == _norm_chat_id(pg)
+    for cid in _paper_girl_user_ids():
+        if _norm_chat_id(cid) == target:
+            return True
+    return False
 
 
 def _user_can_manage_shipments(user_id) -> bool:
     return _user_is_global_supervisor(user_id) or _user_is_paper_girl(user_id)
 
 
-def _build_usps_tracking_url(tracking_number: str) -> str:
-    tn = re.sub(r"\D", "", tracking_number or "")
-    base = (Config.USPS_TRACK_URL_BASE or "").strip()
-    if not base:
-        base = "https://tools.usps.com/go/TrackConfirmAction?tLabels="
-    return f"{base}{tn}"
+def _paper_girl_group_notify_ids() -> List[int]:
+    """Group/supergroup chats from PAPER_GIRL_NOTIFY_CHAT_IDS (not personal DMs)."""
+    seen: set = set()
+    out: List[int] = []
+    user_ids = {_norm_chat_id(x) for x in _paper_girl_user_ids()}
+    for tok in _raw_supervisory_tokens(Config.PAPER_GIRL_NOTIFY_CHAT_IDS):
+        cid = _parse_chat_id(tok)
+        if cid is None or cid in seen:
+            continue
+        if _norm_chat_id(cid) in user_ids:
+            continue
+        seen.add(cid)
+        out.append(cid)
+    return out
+
+
+def _telegram_user_label(user) -> str:
+    if not user:
+        return "Paper Girl"
+    un = (user.username or "").strip()
+    if un:
+        return f"@{un}"
+    name = " ".join(
+        p for p in [(user.first_name or "").strip(), (user.last_name or "").strip()] if p
+    ).strip()
+    return name or str(user.id)
+
+
+def _shipment_acceptor_label(shipment: dict) -> str:
+    name = (shipment.get("accepted_by_name") or "").strip()
+    if name:
+        return name
+    tid = (shipment.get("accepted_by_telegram_id") or "").strip()
+    return f"ID {tid}" if tid else "—"
+
+
+def _parse_city_zip_from_address(address: str) -> tuple[str, str]:
+    """Best-effort city + ZIP from a US mailing address string."""
+    raw = (address or "").strip()
+    if not raw:
+        return "", ""
+    zip_match = re.search(r"\b(\d{5})(?:-\d{4})?\b", raw)
+    zip_code = zip_match.group(1) if zip_match else ""
+    city = ""
+    if zip_match:
+        before = raw[: zip_match.start()].strip().rstrip(",")
+        parts = [p.strip() for p in before.split(",") if p.strip()]
+        if len(parts) >= 2:
+            maybe_state = parts[-1]
+            if re.fullmatch(r"[A-Za-z]{2}", maybe_state) and len(parts) >= 2:
+                city = parts[-2]
+            else:
+                city = parts[-1]
+        elif parts:
+            city = parts[-1]
+    return city, zip_code
+
+
+_EMPTY_INLINE_KB = InlineKeyboardMarkup([])
+
+
+def _format_paper_shipment_offer(shipment: dict) -> str:
+    qty = int(shipment.get("quantity") or Config.DEFAULT_PAPER_QTY)
+    name = (shipment.get("driver_name") or "Driver").strip()
+    city = (shipment.get("driver_city") or "—").strip() or "—"
+    zip_code = (shipment.get("driver_zip") or "—").strip() or "—"
+    return (
+        "📦 **New paper delivery — accept?**\n\n"
+        f"👤 Driver: **{name}**\n"
+        f"🏙 City: **{city}**\n"
+        f"📮 ZIP: **{zip_code}**\n"
+        f"📄 Quantity: **{qty}** papers\n\n"
+        "First paper girl to tap **Accept** ships this order.\n"
+        "Others will see *Order already taken*."
+    )
 
 
 def _format_paper_girl_ship_request(shipment: dict) -> str:
@@ -194,15 +307,32 @@ def _format_paper_girl_ship_request(shipment: dict) -> str:
     name = (shipment.get("driver_name") or "Driver").strip()
     addr = (shipment.get("driver_address") or "-").strip()
     phone = (shipment.get("driver_phone") or "-").strip()
+    city = (shipment.get("driver_city") or "").strip()
+    zip_code = (shipment.get("driver_zip") or "").strip()
+    loc = ", ".join(p for p in [city, zip_code] if p) or "—"
     return (
-        "📦 New Driver Shipment\n\n"
-        f"Please ship {qty} papers today to:\n\n"
+        "📦 **Ship this order**\n\n"
+        f"Please ship **{qty}** papers today to:\n\n"
         f"👤 {name}\n"
+        f"🏙 {loc}\n"
         f"📍 {addr}\n"
         f"📞 {phone}\n\n"
-        "🧾 Please upload receipt after shipping\n"
-        "⚡ Send ASAP — First thing in the morning latest!"
+        "🧾 Upload receipt after shipping\n"
+        "⚡ Send ASAP — first thing in the morning latest!"
     )
+
+
+def _paper_offer_keyboard(shipment_id: str) -> InlineKeyboardMarkup:
+    sid = _short_uuid(shipment_id)
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("✅ Accept", callback_data=f"ship_acc_{sid}"),
+            InlineKeyboardButton("❌ Decline", callback_data=f"ship_dec_{sid}"),
+        ],
+        [
+            InlineKeyboardButton("👉📦 View all shipments", callback_data="ship_view_all"),
+        ],
+    ])
 
 
 def _paper_girl_ship_keyboard(shipment_id: str) -> InlineKeyboardMarkup:
@@ -223,6 +353,98 @@ def _paper_girl_ship_keyboard(shipment_id: str) -> InlineKeyboardMarkup:
     ])
 
 
+def _build_usps_tracking_url(tracking_number: str) -> str:
+    tn = re.sub(r"\D", "", tracking_number or "")
+    base = (Config.USPS_TRACK_URL_BASE or "").strip()
+    if not base:
+        base = "https://tools.usps.com/go/TrackConfirmAction?tLabels="
+    return f"{base}{tn}"
+
+
+def _user_can_work_shipment(user_id, shipment: dict) -> bool:
+    """Supervisors always; paper girls only if they accepted (or legacy unassigned)."""
+    if _user_is_global_supervisor(user_id):
+        return True
+    if not _user_is_paper_girl(user_id):
+        return False
+    accepted_by = (shipment.get("accepted_by_telegram_id") or "").strip()
+    if not accepted_by:
+        return True
+    return _norm_chat_id(user_id) == _norm_chat_id(accepted_by)
+
+
+async def _broadcast_shipment_status(
+    context: ContextTypes.DEFAULT_TYPE,
+    text: str,
+    *,
+    parse_mode: Optional[str] = "Markdown",
+) -> None:
+    seen: set = set()
+    for cid in _global_supervisory_chat_ids() + _paper_girl_notify_chat_ids():
+        if cid in seen:
+            continue
+        seen.add(cid)
+        try:
+            await context.bot.send_message(chat_id=cid, text=text, parse_mode=parse_mode)
+        except Exception as e:
+            logger.warning("shipment broadcast to %s: %s", cid, e)
+
+
+async def _edit_offer_messages_taken(
+    context: ContextTypes.DEFAULT_TYPE,
+    shipment: dict,
+    *,
+    winner_label: str,
+    winner_chat_id: Optional[int] = None,
+    winner_message_id: Optional[int] = None,
+) -> None:
+    taken_text = (
+        "❌ **Order already taken**\n\n"
+        f"Another paper girl accepted this delivery.\n"
+        f"🙋 Accepted by: **{winner_label}**"
+    )
+    for entry in shipment.get("offer_messages") or []:
+        cid = _parse_chat_id(entry.get("chat_id"))
+        mid = entry.get("message_id")
+        if not cid or not mid:
+            continue
+        if winner_chat_id and winner_message_id and cid == winner_chat_id and mid == winner_message_id:
+            continue
+        try:
+            await context.bot.edit_message_text(
+                chat_id=cid,
+                message_id=mid,
+                text=taken_text,
+                parse_mode="Markdown",
+                reply_markup=_EMPTY_INLINE_KB,
+            )
+        except Exception as e:
+            logger.debug("edit offer message %s/%s: %s", cid, mid, e)
+
+
+async def _notify_paper_girl_chats(
+    context: ContextTypes.DEFAULT_TYPE,
+    text: str,
+    *,
+    reply_markup: Optional[InlineKeyboardMarkup] = None,
+    parse_mode: Optional[str] = None,
+) -> List[str]:
+    """Send the same message to every paper-girl DM + notify group. Returns error strings."""
+    errors: List[str] = []
+    for cid in _paper_girl_notify_chat_ids():
+        try:
+            kwargs: dict = {"chat_id": cid, "text": text}
+            if reply_markup is not None:
+                kwargs["reply_markup"] = reply_markup
+            if parse_mode:
+                kwargs["parse_mode"] = parse_mode
+            await context.bot.send_message(**kwargs)
+        except Exception as e:
+            logger.error("paper girl notify chat %s: %s", cid, e)
+            errors.append(f"chat {cid}: {e}")
+    return errors
+
+
 def _driver_display_name(interview: dict) -> str:
     """Prefer full_name; fall back to first_name."""
     full = (interview.get("full_name") or "").strip()
@@ -236,6 +458,7 @@ def _format_shipments_list(rows: List[dict]) -> str:
     if not rows:
         return "📦 No shipments yet."
 
+    pending_accept = [r for r in rows if (r.get("status") or "") == "pending_accept"]
     pending = [
         r for r in rows
         if (r.get("status") or "") in ("awaiting_tracking", "tracking_received")
@@ -247,11 +470,25 @@ def _format_shipments_list(rows: List[dict]) -> str:
         name = (r.get("driver_name") or "?")[:24]
         qty = r.get("quantity", "?")
         tr = (r.get("tracking_number") or "-")[:22]
-        return f"• {name} | {qty} papers | {tr}"
+        city = (r.get("driver_city") or "").strip()
+        zip_code = (r.get("driver_zip") or "").strip()
+        loc = ", ".join(p for p in [city, zip_code] if p)
+        accepter = _shipment_acceptor_label(r)
+        st = (r.get("status") or "")
+        status_note = ""
+        if st == "pending_accept":
+            status_note = " | ⏳ awaiting accept"
+        elif accepter and accepter != "—":
+            status_note = f" | 🙋 {accepter[:20]}"
+        loc_bit = f" | {loc}" if loc else ""
+        return f"• {name}{loc_bit} | {qty} papers | {tr}{status_note}"
 
     parts = ["📦 **Shipments**"]
+    if pending_accept:
+        parts.append("\n🆕 **Awaiting accept**")
+        parts.extend(fmt(r) for r in pending_accept)
     if pending:
-        parts.append("\n⏳ **Pending**")
+        parts.append("\n⏳ **Accepted — pending tracking**")
         parts.extend(fmt(r) for r in pending)
     if done:
         parts.append("\n✅ **Completed**")
@@ -532,13 +769,14 @@ async def _create_and_notify_paper_girl(
     *,
     created_by_telegram_id: str,
 ) -> tuple[Optional[dict], Optional[str]]:
-    """Create shipment row and DM Paper Girl. Returns (shipment, warning)."""
+    """Create shipment and offer accept/decline to each paper girl (first accept wins)."""
     fn = _driver_display_name(interview)
     addr = (interview.get("mailing_address") or "").strip()
     phone = (interview.get("phone_number") or "").strip()
     em = (interview.get("email") or "").strip()
     tid = (interview.get("telegram_id") or "").strip()
     iid = interview.get("id")
+    city, zip_code = _parse_city_zip_from_address(addr)
 
     shipment = shipments_db.create_shipment(
         interview_id=iid,
@@ -549,24 +787,76 @@ async def _create_and_notify_paper_girl(
         driver_telegram_id=tid or None,
         quantity=Config.DEFAULT_PAPER_QTY,
         created_by_telegram_id=created_by_telegram_id,
+        status="pending_accept",
+        driver_city=city or None,
+        driver_zip=zip_code or None,
     )
     if not shipment:
         return None, "Could not create paper_shipments row (run migration_paper_shipments.sql?)"
 
-    pg_cid = _parse_chat_id(Config.PAPER_GIRL_TELEGRAM_ID)
-    if not pg_cid:
-        return shipment, "PAPER_GIRL_TELEGRAM_ID is not set — shipment saved but Paper Girl was not notified."
-
-    try:
-        await context.bot.send_message(
-            chat_id=pg_cid,
-            text=_format_paper_girl_ship_request(shipment),
-            reply_markup=_paper_girl_ship_keyboard(shipment["id"]),
+    pg_ids = _paper_girl_user_ids()
+    if not pg_ids and not _paper_girl_group_notify_ids():
+        return shipment, (
+            "PAPER_GIRL_TELEGRAM_ID / PAPER_GIRL_NOTIFY_CHAT_IDS not set — "
+            "shipment saved but nobody was notified."
         )
-    except Exception as e:
-        logger.error("notify paper girl: %s", e)
-        return shipment, f"Paper Girl DM failed: {e}"
 
+    offer_text = _format_paper_shipment_offer(shipment)
+    offer_kb = _paper_offer_keyboard(shipment["id"])
+    offer_msgs: List[dict] = []
+    errs: List[str] = []
+
+    for cid in pg_ids:
+        try:
+            sent = await context.bot.send_message(
+                chat_id=cid,
+                text=offer_text,
+                parse_mode="Markdown",
+                reply_markup=offer_kb,
+            )
+            if sent:
+                offer_msgs.append({"chat_id": cid, "message_id": sent.message_id})
+        except Exception as e:
+            logger.error("paper offer to %s: %s", cid, e)
+            errs.append(f"DM {cid}: {e}")
+
+    if offer_msgs:
+        shipments_db.save_offer_messages(shipment["id"], offer_msgs)
+        shipment["offer_messages"] = offer_msgs
+
+    pending_group_text = (
+        "📦 **New paper delivery pending**\n\n"
+        f"👤 Driver: **{(shipment.get('driver_name') or 'Driver').strip()}**\n"
+        f"🏙 City: **{(city or '—')}**\n"
+        f"📮 ZIP: **{(zip_code or '—')}**\n"
+        f"📄 Quantity: **{int(shipment.get('quantity') or Config.DEFAULT_PAPER_QTY)}** papers\n\n"
+        "Paper girls were asked in DM — waiting for someone to **Accept**."
+    )
+    for gid in _paper_girl_group_notify_ids():
+        try:
+            await context.bot.send_message(
+                chat_id=gid,
+                text=pending_group_text,
+                parse_mode="Markdown",
+            )
+        except Exception as e:
+            logger.error("paper pending group notify %s: %s", gid, e)
+            errs.append(f"group {gid}: {e}")
+
+    for cid in _global_supervisory_chat_ids():
+        try:
+            await context.bot.send_message(
+                chat_id=cid,
+                text=pending_group_text,
+                parse_mode="Markdown",
+            )
+        except Exception:
+            pass
+
+    if errs and not offer_msgs and not _paper_girl_group_notify_ids():
+        return shipment, "Paper Girl notify failed: " + "; ".join(errs)
+    if errs:
+        return shipment, "Some notifications failed: " + "; ".join(errs)
     return shipment, None
 
 
@@ -636,23 +926,14 @@ async def _notify_driver_of_shipment(
 
     summary = (
         f"✅ Tracking sent for **{name}**\n"
+        f"🙋 Shipped by: **{_shipment_acceptor_label(shipment)}**\n"
         f"Tracking: `{tracking}`\n"
         f"USPS: {usps_url}"
     )
     if warnings:
         summary += "\n\n⚠️ " + "\n".join(warnings)
 
-    for cid in _global_supervisory_chat_ids():
-        try:
-            await context.bot.send_message(chat_id=cid, text=summary, parse_mode="Markdown")
-        except Exception:
-            pass
-    pg_cid = _parse_chat_id(Config.PAPER_GIRL_TELEGRAM_ID)
-    if pg_cid:
-        try:
-            await context.bot.send_message(chat_id=pg_cid, text=summary, parse_mode="Markdown")
-        except Exception:
-            pass
+    await _broadcast_shipment_status(context, summary)
 
     return driver_tid is not None or bool(driver_email), warnings
 
@@ -828,13 +1109,13 @@ async def abandoned_drafts_sweep_job(context: ContextTypes.DEFAULT_TYPE) -> None
 
 
 async def paper_girl_receipt_reminder_job(context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Every 6 hours, nudge Paper Girl about shipments still awaiting tracking."""
-    pg_cid = _parse_chat_id(Config.PAPER_GIRL_TELEGRAM_ID)
-    if not pg_cid:
+    """Every 6 hours, nudge Paper Girl (+ notify groups) about shipments still awaiting tracking."""
+    if not _paper_girl_notify_chat_ids():
         return
     pending = [
         s for s in shipments_db.list_shipments(50)
         if (s.get("status") or "") == "awaiting_tracking"
+        and (s.get("accepted_by_telegram_id") or "").strip()
     ]
     if not pending:
         return
@@ -844,10 +1125,9 @@ async def paper_girl_receipt_reminder_job(context: ContextTypes.DEFAULT_TYPE) ->
         qty = s.get("quantity", "?")
         lines.append(f"• {name} — {qty} papers")
     lines.append("\nUpload the USPS receipt photo or tracking number when ready 🧾")
-    try:
-        await context.bot.send_message(chat_id=pg_cid, text="\n".join(lines))
-    except Exception as e:
-        logger.warning("paper girl receipt reminder failed: %s", e)
+    errs = await _notify_paper_girl_chats(context, "\n".join(lines))
+    if errs:
+        logger.warning("paper girl receipt reminder failed: %s", "; ".join(errs))
 
 
 def _startup_reenqueue_jobs(application: Application) -> None:
@@ -1379,8 +1659,7 @@ async def handle_interview_callbacks(update: Update, context: ContextTypes.DEFAU
         issuer_bot = Config.KRAB_ISSUER_BOT_USERNAME.lstrip("@")
         dispatch_bot = Config.KRAB_DISPATCH_BOT_USERNAME.lstrip("@")
         channel_link = (Config.DRIVER_CHANNEL_LINK or "").strip() or "https://t.me/TriStateTags"
-        pg_handle = (Config.PAPER_GIRL_USERNAME or "").strip().lstrip("@")
-        pg_tag = f"@{pg_handle} " if pg_handle else ""
+        pg_tag = _paper_girl_usernames_tag()
         qty = Config.DEFAULT_PAPER_QTY
 
         hire_msg = (
@@ -1858,6 +2137,112 @@ async def handle_shipment_callbacks(update: Update, context: ContextTypes.DEFAUL
             await _reply_shipments_list(query.message)
         return STATE_INTERVIEW_INPUT
 
+    if data.startswith("ship_acc_"):
+        try:
+            sid = _long_uuid(data.replace("ship_acc_", ""))
+        except Exception:
+            if query.message:
+                await query.message.reply_text("Invalid shipment reference.")
+            return STATE_INTERVIEW_INPUT
+        shipment = shipments_db.get_shipment(sid)
+        if not shipment or not query.message:
+            if query.message:
+                await query.message.reply_text("Shipment not found.")
+            return STATE_INTERVIEW_INPUT
+
+        st = (shipment.get("status") or "")
+        if st != "pending_accept":
+            if st == "awaiting_tracking" and shipment.get("accepted_by_telegram_id"):
+                winner = _shipment_acceptor_label(shipment)
+                if _norm_chat_id(shipment.get("accepted_by_telegram_id")) == _norm_chat_id(user.id):
+                    await query.message.edit_text(
+                        f"✅ **You accepted this delivery.**\n\n{_format_paper_girl_ship_request(shipment)}",
+                        parse_mode="Markdown",
+                        reply_markup=_paper_girl_ship_keyboard(sid),
+                    )
+                else:
+                    await query.message.edit_text(
+                        "❌ **Order already taken**\n\n"
+                        f"Accepted by: **{winner}**",
+                        parse_mode="Markdown",
+                        reply_markup=_EMPTY_INLINE_KB,
+                    )
+            else:
+                await query.message.edit_text(
+                    "This offer is no longer available.",
+                    reply_markup=_EMPTY_INLINE_KB,
+                )
+            return STATE_INTERVIEW_INPUT
+
+        label = _telegram_user_label(user)
+        won = shipments_db.try_accept_shipment(
+            sid,
+            telegram_id=str(user.id),
+            accepted_by_name=label,
+        )
+        if not won:
+            shipment = shipments_db.get_shipment(sid) or shipment
+            await query.message.edit_text(
+                "❌ **Order already taken**\n\n"
+                f"Accepted by: **{_shipment_acceptor_label(shipment)}**",
+                parse_mode="Markdown",
+                reply_markup=_EMPTY_INLINE_KB,
+            )
+            await _edit_offer_messages_taken(
+                context,
+                shipment,
+                winner_label=_shipment_acceptor_label(shipment),
+            )
+            return STATE_INTERVIEW_INPUT
+
+        shipment = won
+        winner_label = _shipment_acceptor_label(shipment)
+        await query.message.edit_text(
+            f"✅ **You accepted this delivery!**\n\n{_format_paper_girl_ship_request(shipment)}",
+            parse_mode="Markdown",
+            reply_markup=_paper_girl_ship_keyboard(sid),
+        )
+        await _edit_offer_messages_taken(
+            context,
+            shipment,
+            winner_label=winner_label,
+            winner_chat_id=query.message.chat_id,
+            winner_message_id=query.message.message_id,
+        )
+        accepted_broadcast = (
+            "✅ **Paper delivery accepted**\n\n"
+            f"👤 Driver: **{(shipment.get('driver_name') or 'Driver').strip()}**\n"
+            f"🏙 City: **{(shipment.get('driver_city') or '—')}**\n"
+            f"📮 ZIP: **{(shipment.get('driver_zip') or '—')}**\n"
+            f"🙋 Accepted by: **{winner_label}**"
+        )
+        await _broadcast_shipment_status(context, accepted_broadcast)
+        return STATE_INTERVIEW_INPUT
+
+    if data.startswith("ship_dec_"):
+        try:
+            sid = _long_uuid(data.replace("ship_dec_", ""))
+        except Exception:
+            if query.message:
+                await query.message.reply_text("Invalid shipment reference.")
+            return STATE_INTERVIEW_INPUT
+        shipment = shipments_db.get_shipment(sid)
+        if not shipment or not query.message:
+            if query.message:
+                await query.message.reply_text("Shipment not found.")
+            return STATE_INTERVIEW_INPUT
+        if (shipment.get("status") or "") != "pending_accept":
+            await query.message.edit_text(
+                "This offer is no longer available.",
+                reply_markup=_EMPTY_INLINE_KB,
+            )
+            return STATE_INTERVIEW_INPUT
+        await query.message.edit_text(
+            "❌ You declined this paper delivery offer.",
+            reply_markup=_EMPTY_INLINE_KB,
+        )
+        return STATE_INTERVIEW_INPUT
+
     if data.startswith("ship_track_"):
         try:
             sid = _long_uuid(data.replace("ship_track_", ""))
@@ -1869,6 +2254,17 @@ async def handle_shipment_callbacks(update: Update, context: ContextTypes.DEFAUL
         if not shipment:
             if query.message:
                 await query.message.reply_text("Shipment not found.")
+            return STATE_INTERVIEW_INPUT
+        if not _user_can_work_shipment(user.id, shipment):
+            if query.message:
+                await query.message.reply_text(
+                    "⛔ This order was accepted by another paper girl. "
+                    f"Assigned to: {_shipment_acceptor_label(shipment)}"
+                )
+            return STATE_INTERVIEW_INPUT
+        if (shipment.get("status") or "") == "pending_accept":
+            if query.message:
+                await query.message.reply_text("Accept the delivery first before uploading tracking.")
             return STATE_INTERVIEW_INPUT
         if (shipment.get("status") or "") == "driver_notified":
             if query.message:
@@ -1909,6 +2305,12 @@ async def handle_tracking_input(update: Update, context: ContextTypes.DEFAULT_TY
     if not shipment:
         context.user_data.pop("active_shipment_id", None)
         await msg.reply_text("Shipment not found.")
+        return STATE_INTERVIEW_INPUT
+
+    if not _user_can_work_shipment(user.id, shipment):
+        await msg.reply_text(
+            f"⛔ This order belongs to {_shipment_acceptor_label(shipment)}."
+        )
         return STATE_INTERVIEW_INPUT
 
     tracking = ""

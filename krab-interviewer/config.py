@@ -28,6 +28,10 @@ class Config:
         os.getenv("KRAB_INTERVIEWER_BOT_USERNAME") or "krabinterviewerbot"
     ).strip()
     PAPER_GIRL_TELEGRAM_ID = (os.getenv("PAPER_GIRL_TELEGRAM_ID") or "").strip() or None
+    # Extra group/supergroup chats that receive the same paper-girl notifications (comma-separated).
+    PAPER_GIRL_NOTIFY_CHAT_IDS = (
+        os.getenv("PAPER_GIRL_NOTIFY_CHAT_IDS") or "-1003903904177"
+    ).strip()
     PAPER_GIRL_USERNAME = (os.getenv("PAPER_GIRL_USERNAME") or "").strip() or None
     DEFAULT_PAPER_QTY = int(os.getenv("DEFAULT_PAPER_QTY") or "10")
     RESEND_API_KEY = (os.getenv("RESEND_API_KEY") or "").strip() or None
