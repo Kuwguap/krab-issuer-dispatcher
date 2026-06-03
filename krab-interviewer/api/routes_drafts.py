@@ -11,7 +11,13 @@ from pydantic import BaseModel, Field
 from api.deps import DRAFT_COOKIE, current_ip_hash, get_db, get_drafts_db
 from api.notify import notify_supervisors_new_web_interview
 from config import Config
-from utils.ai_vision import INTERVIEW_FIELD_KEYS, normalize_interview_data
+from utils.ai_vision import (
+    AIVisionQuotaError,
+    INTERVIEW_FIELD_KEYS,
+    extract_interview_from_image,
+    extract_interview_from_text,
+    normalize_interview_data,
+)
 from utils.drafts_db import DraftsDatabase, new_draft_cookie
 from utils.database import Database
 from utils.telegram_resolve import (
@@ -44,6 +50,35 @@ class DraftPatchBody(BaseModel):
 
 class ResolveTelegramBody(BaseModel):
     username: str = ""
+
+
+class ParseTextBody(BaseModel):
+    text: str = ""
+
+
+def _mime_from_upload(file: UploadFile) -> str:
+    ct = (file.content_type or "").lower()
+    if ct.startswith("image/"):
+        return ct
+    name = (file.filename or "").lower()
+    if name.endswith(".png"):
+        return "image/png"
+    if name.endswith(".webp"):
+        return "image/webp"
+    if name.endswith(".gif"):
+        return "image/gif"
+    if name.endswith(".heic") or name.endswith(".heif"):
+        return "image/heic"
+    return "image/jpeg"
+
+
+def _merge_extracted_payload(existing: Dict[str, Any], extracted: Dict[str, str]) -> Dict[str, Any]:
+    merged = dict(existing or {})
+    for key in INTERVIEW_FIELD_KEYS:
+        val = (extracted.get(key) or "").strip()
+        if val:
+            merged[key] = val
+    return merged
 
 
 def _apply_telegram_resolution(merged: Dict[str, Any], db: Database) -> Dict[str, Any]:
@@ -192,9 +227,95 @@ async def upload_license(
     url = db.upload_driver_license_to_storage(draft_id, data, file.filename or "license.jpg")
     if not url:
         raise HTTPException(status_code=500, detail="License upload failed")
-    if not drafts.update(draft_id, drivers_license_file_url=url):
+
+    merged = dict(draft.get("payload") or {})
+    parsed = False
+    if Config.is_ai_configured():
+        try:
+            extracted = extract_interview_from_image(data, _mime_from_upload(file))
+            merged = _merge_extracted_payload(merged, extracted)
+            merged = _apply_telegram_resolution(merged, db)
+            parsed = any((merged.get(k) or "").strip() for k in INTERVIEW_FIELD_KEYS)
+        except AIVisionQuotaError:
+            raise HTTPException(status_code=429, detail="OpenAI quota exceeded. Try again later.")
+        except Exception as e:
+            logger.warning("license auto-parse failed: %s", e)
+
+    if not drafts.update(draft_id, drivers_license_file_url=url, payload=merged):
         raise HTTPException(status_code=500, detail="Could not save license URL")
-    return {"ok": True, "driversLicenseFileUrl": url}
+    return {"ok": True, "driversLicenseFileUrl": url, "payload": merged, "parsed": parsed}
+
+
+@router.post("/draft/{draft_id}/parse-image")
+async def parse_draft_image(
+    draft_id: str,
+    file: UploadFile = File(...),
+    ip_hash: str = Depends(current_ip_hash),
+    krab_draft_id: Optional[str] = Cookie(default=None),
+    drafts: DraftsDatabase = Depends(get_drafts_db),
+    db: Database = Depends(get_db),
+):
+    if not Config.is_ai_configured():
+        raise HTTPException(status_code=503, detail="Image parsing is not configured")
+
+    draft = drafts.get_by_id(draft_id)
+    draft = _verify_draft_access(draft, draft_id, ip_hash, krab_draft_id)
+    if draft.get("status") == "submitted":
+        raise HTTPException(status_code=409, detail="Application already submitted")
+
+    data = await file.read()
+    if not data or len(data) > 12 * 1024 * 1024:
+        raise HTTPException(status_code=400, detail="Invalid or too large file")
+
+    try:
+        extracted = extract_interview_from_image(data, _mime_from_upload(file))
+    except AIVisionQuotaError:
+        raise HTTPException(status_code=429, detail="OpenAI quota exceeded. Try again later.")
+    except Exception as e:
+        logger.error("parse_draft_image: %s", e, exc_info=True)
+        raise HTTPException(status_code=422, detail="Could not read image. Try a clearer photo.")
+
+    merged = _merge_extracted_payload(dict(draft.get("payload") or {}), extracted)
+    merged = _apply_telegram_resolution(merged, db)
+    if not drafts.update(draft_id, payload=merged):
+        raise HTTPException(status_code=500, detail="Could not save parsed fields")
+    return {"ok": True, "payload": merged}
+
+
+@router.post("/draft/{draft_id}/parse-text")
+async def parse_draft_text(
+    draft_id: str,
+    body: ParseTextBody,
+    ip_hash: str = Depends(current_ip_hash),
+    krab_draft_id: Optional[str] = Cookie(default=None),
+    drafts: DraftsDatabase = Depends(get_drafts_db),
+    db: Database = Depends(get_db),
+):
+    if not Config.is_ai_configured():
+        raise HTTPException(status_code=503, detail="Text parsing is not configured")
+
+    text = (body.text or "").strip()
+    if len(text) < 10:
+        raise HTTPException(status_code=400, detail="Paste more application text to parse")
+
+    draft = drafts.get_by_id(draft_id)
+    draft = _verify_draft_access(draft, draft_id, ip_hash, krab_draft_id)
+    if draft.get("status") == "submitted":
+        raise HTTPException(status_code=409, detail="Application already submitted")
+
+    try:
+        extracted = extract_interview_from_text(text)
+    except AIVisionQuotaError:
+        raise HTTPException(status_code=429, detail="OpenAI quota exceeded. Try again later.")
+    except Exception as e:
+        logger.error("parse_draft_text: %s", e, exc_info=True)
+        raise HTTPException(status_code=422, detail="Could not parse text. Try clearer formatting.")
+
+    merged = _merge_extracted_payload(dict(draft.get("payload") or {}), extracted)
+    merged = _apply_telegram_resolution(merged, db)
+    if not drafts.update(draft_id, payload=merged):
+        raise HTTPException(status_code=500, detail="Could not save parsed fields")
+    return {"ok": True, "payload": merged}
 
 
 @router.post("/resolve-telegram")

@@ -48,6 +48,8 @@ Order and labels (exactly one value per line):
 11) ProfessionSkill: <job skills / profession>
 12) TelegramID: <numeric telegram id if stated>
 
+If the image is a driver's license, fill FullName, MailingAddress, and DriverLicenseID from the card; use "-" for fields not visible on the license.
+
 Output nothing else—no explanation, no markdown, no line numbers. Only these 12 lines."""
 
 _LABEL_TO_KEY = {
