@@ -8,7 +8,7 @@
 #   3. krab-issuer-admin     (Web)    Flask admin dashboard (legacy UI, optional)
 #   4. krab-issuer-bot       (Worker) Krab Issuer Telegram bot
 #   5. paper-investigator    (Worker) Paper Investigator Telegram bot
-#   6. krab-interviewer-bot  (Worker) Krab Interviewer Telegram bot
+#   6. krab-interviewer-bot  (Web)    Krab Interviewer bot + /api/interview web form
 #   7. krab-insurance-bot    (Worker) Standalone insurance-card Telegram bot
 #   8. krab-tg-forwarder     (Web)    Telegram DM forwarder for FB leads
 #   9. krab-fb-sales-bot     (Web)    Facebook Messenger sales bot
@@ -224,8 +224,8 @@ services:
         sync: false
 
   # --------------------------------------------------------------------------
-  # 6) Krab Interviewer — Telegram bot + public web form (single web service)
-  #    Driver interviews, appointments, channel announcements, hire onboarding.
+  # 6) Krab Interviewer — Web service (bot + FastAPI /api/interview for tristatetags)
+  #    MUST stay type: web. healthCheck: /api/health. See krab-interviewer/DEPLOY-RENDER.md
   # --------------------------------------------------------------------------
   - type: web
     name: krab-interviewer-bot
@@ -238,12 +238,11 @@ services:
     buildCommand: pip install --upgrade pip && pip install -r requirements.txt
     startCommand: python bot.py
     envVars:
-      # New bot only — must be set manually (sync: false is ignored on blueprint updates).
+      # New bot only — set manually if blueprint sync does not apply on updates.
       - key: TELEGRAM_BOT_TOKEN
         sync: false
       - key: DRIVER_CHANNEL_ID
         sync: false
-      # Reuse Issuer / Dispatch credentials from existing services (no duplicate entry).
       - key: SUPABASE_URL
         fromService:
           name: krab-issuer-bot
@@ -274,15 +273,17 @@ services:
       - key: INTERVIEWER_TIMEZONE
         value: America/New_York
       - key: KRAB_DISPATCH_BOT_USERNAME
-        value: KrabIssuerBot
+        value: Krabdispatchbot
+      - key: KRAB_INTERVIEWER_BOT_USERNAME
+        value: krabinterviewerbot
       - key: ADMIN_PASSWORD
         sync: false
       - key: IP_HASH_SALT
         sync: false
       - key: KRAB_API_CORS_ALLOWED_ORIGINS
-        value: "*"
+        value: https://tristatetags.com,https://www.tristatetags.com
       - key: KRAB_PUBLIC_BASE_URL
-        sync: false
+        value: https://krab-interviewer-bot.onrender.com
 
   # --------------------------------------------------------------------------
   # 7) Standalone Krab Insurance Telegram bot (background worker)

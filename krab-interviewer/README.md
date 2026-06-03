@@ -85,6 +85,8 @@ Any user can `/start` and submit the questionnaire (photo or text). Supervisors 
 
 ## Deploy (Render)
 
+**Troubleshooting 404 from tristatetags.com:** see **[`DEPLOY-RENDER.md`](DEPLOY-RENDER.md)** (health check, Web vs Worker, migrations, env).
+
 **This repo (standalone):** push to [github.com/Kuwguap/krab-interviewer](https://github.com/Kuwguap/krab-interviewer), then Render → **New +** → **Blueprint** → select **krab-interviewer**. Render uses [`render.yaml`](render.yaml) at the repo root.
 
 **Monorepo (unity):** the parent repo’s root [`render.yaml`](../render.yaml) also defines **`krab-interviewer-bot`** with `rootDir: krab-interviewer`.

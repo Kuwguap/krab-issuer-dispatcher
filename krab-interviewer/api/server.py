@@ -3,11 +3,14 @@ from __future__ import annotations
 
 import logging
 import os
+import socket
 import threading
+import time
 
 logger = logging.getLogger(__name__)
 
 _server_thread: threading.Thread | None = None
+_server_port: int | None = None
 
 
 def _port() -> int:
@@ -51,3 +54,24 @@ def start_in_background_thread(db_instance=None) -> None:
 
     _server_thread = threading.Thread(target=_run, name="krab-fastapi", daemon=True)
     _server_thread.start()
+    global _server_port
+    _server_port = port
+    _wait_until_listening(port)
+
+
+def _wait_until_listening(port: int, timeout_sec: float = 15.0) -> None:
+    deadline = time.monotonic() + timeout_sec
+    while time.monotonic() < deadline:
+        if not (_server_thread and _server_thread.is_alive()):
+            raise RuntimeError("FastAPI thread exited before binding to port")
+        try:
+            with socket.create_connection(("127.0.0.1", port), timeout=0.3):
+                logger.info("FastAPI ready on port %s", port)
+                return
+        except OSError:
+            time.sleep(0.25)
+    raise RuntimeError(f"FastAPI did not listen on port {port} within {timeout_sec}s")
+
+
+def listening_port() -> int | None:
+    return _server_port

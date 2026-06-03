@@ -6,6 +6,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import logging
+import os
 import re
 import sys
 import uuid as _uuid_mod
@@ -2515,7 +2516,16 @@ def main() -> None:
         from api.server import start_in_background_thread
 
         start_in_background_thread(db)
+        logger.info("FastAPI web API started (draft form + /api/health)")
     except Exception as e:
+        on_render = bool(os.getenv("RENDER") or os.getenv("PORT"))
+        if on_render:
+            logger.error(
+                "FastAPI is required on Render (healthCheckPath /api/health). Fix: %s",
+                e,
+                exc_info=True,
+            )
+            sys.exit(1)
         logger.warning("FastAPI web server not started: %s", e)
 
     token = Config.TELEGRAM_BOT_TOKEN

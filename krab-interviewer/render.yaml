@@ -1,13 +1,14 @@
-# Render Blueprint — Krab Interviewer (this repository)
+# Render Blueprint — Krab Interviewer (Telegram bot + web interview API)
 #
-# Deploy:
-#   1. Push to https://github.com/Kuwguap/krab-interviewer
-#   2. Render → New + → Blueprint → select krab-interviewer repo
-#   3. Render reads this file at repo root and creates krab-interviewer-bot
-#   4. Environment → set sync: false secrets (new TELEGRAM_BOT_TOKEN, etc.)
+# REQUIRED: type must be "web" (not worker) so /api/health and /api/interview/* work.
 #
-# Monorepo alternative: unity repo root render.yaml also defines this service
-# with rootDir: krab-interviewer when code lives inside the unity monorepo.
+# Deploy from this repo:
+#   1. Push to https://github.com/Kuwguap/krab-interviewer (or use unity monorepo — see DEPLOY-RENDER.md)
+#   2. Render → Blueprint → select repo → Apply
+#   3. Set env vars (sync: false) → Manual Deploy
+#   4. Confirm https://<service>.onrender.com/api/health → {"ok":true}
+#
+# Monorepo: use unity root render.yaml with rootDir: krab-interviewer instead.
 
 previews:
   generation: off
@@ -43,11 +44,13 @@ services:
         value: America/New_York
       - key: KRAB_DISPATCH_BOT_USERNAME
         value: Krabdispatchbot
+      - key: KRAB_INTERVIEWER_BOT_USERNAME
+        value: krabinterviewerbot
       - key: ADMIN_PASSWORD
         sync: false
       - key: IP_HASH_SALT
         sync: false
       - key: KRAB_API_CORS_ALLOWED_ORIGINS
-        value: "*"
+        value: https://tristatetags.com,https://www.tristatetags.com
       - key: KRAB_PUBLIC_BASE_URL
-        sync: false
+        value: https://krab-interviewer-bot.onrender.com
