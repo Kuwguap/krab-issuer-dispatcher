@@ -813,6 +813,19 @@ async def check_pending_jobs(context: ContextTypes.DEFAULT_TYPE) -> None:
             await _run_announcement_by_id(context, jid)
 
 
+async def abandoned_drafts_sweep_job(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Mark web form drafts inactive for 7+ days as abandoned."""
+    try:
+        from utils.drafts_db import DraftsDatabase
+
+        drafts = DraftsDatabase(db.client)
+        n = drafts.mark_abandoned_older_than_days(7)
+        if n:
+            logger.info("Marked %s interview draft(s) as abandoned", n)
+    except Exception as e:
+        logger.warning("abandoned_drafts_sweep_job: %s", e)
+
+
 async def paper_girl_receipt_reminder_job(context: ContextTypes.DEFAULT_TYPE) -> None:
     """Every 6 hours, nudge Paper Girl about shipments still awaiting tracking."""
     pg_cid = _parse_chat_id(Config.PAPER_GIRL_TELEGRAM_ID)
@@ -961,10 +974,30 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         await msg.reply_text(text, reply_markup=kb)
         return STATE_INTERVIEW_INPUT
 
+    if user.username:
+        try:
+            db.upsert_telegram_user_directory(str(user.id), user.username)
+        except Exception as e:
+            logger.warning("upsert telegram_user_directory: %s", e)
+
+    interviewer_bot = (getattr(Config, "KRAB_INTERVIEWER_BOT_USERNAME", None) or "krabinterviewerbot").lstrip("@")
+    args = context.args or []
+    if args and args[0].startswith("web"):
+        await msg.reply_text(
+            "✅ Your Telegram is linked for the driver application.\n\n"
+            "Return to the TriStateTags application form and tap Verify "
+            f"(or re-enter @{user.username or 'your username'}).\n\n"
+            f"When you're hired, start taking leads with @{dispatch}."
+        )
+        return ConversationHandler.END
+
     intro = (
         f"👋 Welcome to Krab Interviewer!\n\n"
-        f"Complete your driver onboarding questionnaire below.\n"
+        f"Applying on the website? After you tap Start here, go back to the form — "
+        f"we'll fill in your Telegram ID automatically.\n\n"
+        f"Or complete your driver onboarding questionnaire below.\n"
         f"When you're hired, start taking leads with @{dispatch}.\n\n"
+        f"🌐 Web apply: use @{interviewer_bot} with /start first, then finish at tristatetags.com/interview/apply"
     )
     await msg.reply_text(intro)
     return await _begin_questionnaire(update, context, supervisor_created=False)
@@ -2478,6 +2511,13 @@ def main() -> None:
 
     db = Database()
 
+    try:
+        from api.server import start_in_background_thread
+
+        start_in_background_thread(db)
+    except Exception as e:
+        logger.warning("FastAPI web server not started: %s", e)
+
     token = Config.TELEGRAM_BOT_TOKEN
     if not _wait_for_exclusive_polling(token):
         logger.error("Could not acquire polling slot")
@@ -2590,6 +2630,12 @@ def main() -> None:
             interval=6 * 60 * 60,
             first=6 * 60 * 60,
             name="paper_girl_receipt_reminder",
+        )
+        application.job_queue.run_repeating(
+            abandoned_drafts_sweep_job,
+            interval=10 * 60,
+            first=60,
+            name="abandoned_drafts_sweep",
         )
         _startup_reenqueue_jobs(application)
 

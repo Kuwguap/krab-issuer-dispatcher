@@ -24,6 +24,9 @@ class Config:
     INTERVIEWER_TIMEZONE = (os.getenv("INTERVIEWER_TIMEZONE") or "America/New_York").strip()
     KRAB_ISSUER_BOT_USERNAME = (os.getenv("KRAB_ISSUER_BOT_USERNAME") or "Krabissuerbot").strip()
     KRAB_DISPATCH_BOT_USERNAME = (os.getenv("KRAB_DISPATCH_BOT_USERNAME") or "Krabdispatchbot").strip()
+    KRAB_INTERVIEWER_BOT_USERNAME = (
+        os.getenv("KRAB_INTERVIEWER_BOT_USERNAME") or "krabinterviewerbot"
+    ).strip()
     PAPER_GIRL_TELEGRAM_ID = (os.getenv("PAPER_GIRL_TELEGRAM_ID") or "").strip() or None
     PAPER_GIRL_USERNAME = (os.getenv("PAPER_GIRL_USERNAME") or "").strip() or None
     DEFAULT_PAPER_QTY = int(os.getenv("DEFAULT_PAPER_QTY") or "10")
@@ -33,6 +36,12 @@ class Config:
         os.getenv("USPS_TRACK_URL_BASE")
         or "https://tools.usps.com/go/TrackConfirmAction?tLabels="
     ).strip()
+
+    # Web form + admin dashboard (FastAPI in same process as bot)
+    ADMIN_PASSWORD = (os.getenv("ADMIN_PASSWORD") or "").strip() or None
+    IP_HASH_SALT = (os.getenv("IP_HASH_SALT") or "krab-interviewer").strip()
+    KRAB_API_CORS_ALLOWED_ORIGINS = (os.getenv("KRAB_API_CORS_ALLOWED_ORIGINS") or "*").strip()
+    KRAB_PUBLIC_BASE_URL = (os.getenv("KRAB_PUBLIC_BASE_URL") or "").strip() or None
 
     @classmethod
     def is_ai_configured(cls) -> bool:

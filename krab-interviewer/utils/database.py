@@ -82,6 +82,99 @@ class Database:
             logger.error("update_interview: %s", e)
             return False
 
+    def find_pending_interview_by_telegram_username(
+        self, username: str, *, exclude_id: Optional[str] = None
+    ) -> Optional[Dict[str, Any]]:
+        un = (username or "").strip().lstrip("@").lower()
+        if not un:
+            return None
+        try:
+            r = (
+                self.client.table("interviews")
+                .select("*")
+                .in_("status", ["pending", "scheduled"])
+                .order("created_at", desc=True)
+                .limit(50)
+                .execute()
+            )
+            for row in r.data or []:
+                if exclude_id and str(row.get("id")) == str(exclude_id):
+                    continue
+                row_un = (row.get("telegram_username") or "").strip().lstrip("@").lower()
+                if row_un == un:
+                    return row
+        except Exception as e:
+            logger.error("find_pending_interview_by_telegram_username: %s", e)
+        return None
+
+    def lookup_telegram_id_from_directory(self, username: str) -> Optional[str]:
+        un = (username or "").strip().lstrip("@").lower()
+        if not un:
+            return None
+        try:
+            r = (
+                self.client.table("telegram_user_directory")
+                .select("telegram_id")
+                .ilike("telegram_username", un)
+                .limit(5)
+                .execute()
+            )
+            for row in r.data or []:
+                row_un = (row.get("telegram_username") or "").strip().lstrip("@").lower()
+                if row_un == un:
+                    tid = (row.get("telegram_id") or "").strip()
+                    if tid:
+                        return tid
+        except Exception as e:
+            if "telegram_user_directory" not in str(e):
+                logger.error("lookup_telegram_id_from_directory: %s", e)
+        return None
+
+    def upsert_telegram_user_directory(self, telegram_id: str, username: str) -> bool:
+        un = (username or "").strip().lstrip("@").lower()
+        tid = str(telegram_id).strip()
+        if not un or not tid:
+            return False
+        try:
+            self.client.table("telegram_user_directory").upsert(
+                {
+                    "telegram_id": tid,
+                    "telegram_username": un,
+                    "updated_at": datetime.now(timezone.utc).isoformat(),
+                },
+                on_conflict="telegram_id",
+            ).execute()
+            return True
+        except Exception as e:
+            logger.error("upsert_telegram_user_directory: %s", e)
+            return False
+
+    def lookup_telegram_id_from_interviews(self, username: str) -> Optional[str]:
+        un = (username or "").strip().lstrip("@").lower()
+        if not un:
+            return None
+        try:
+            r = (
+                self.client.table("interviews")
+                .select("telegram_id, telegram_username")
+                .not_.is_("telegram_id", "null")
+                .order("created_at", desc=True)
+                .limit(100)
+                .execute()
+            )
+            for row in r.data or []:
+                row_un = (row.get("telegram_username") or "").strip().lstrip("@").lower()
+                tid = (row.get("telegram_id") or "").strip()
+                if row_un == un and tid and tid != "-":
+                    return tid
+        except Exception as e:
+            logger.error("lookup_telegram_id_from_interviews: %s", e)
+        return None
+
+    def lookup_telegram_id_from_drivers(self, username: str) -> Optional[str]:
+        """Best-effort: drivers table stores telegram id, not username — skip unless we add mapping later."""
+        return None
+
     def get_latest_interview_for_telegram_id(self, telegram_id: str) -> Optional[Dict[str, Any]]:
         try:
             r = (

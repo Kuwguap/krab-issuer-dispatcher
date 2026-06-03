@@ -1,0 +1,127 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Embed driver hiring funnel — Tri State Tags</title>
+  <link rel="stylesheet" href="/static/styles.css" />
+  <link rel="stylesheet" href="/static/funnel.css" />
+  <script src="/static/config.js"></script>
+</head>
+<body class="funnel-page">
+  <div class="container container-wide">
+    <nav class="funnel-nav">
+      <a class="brand" href="/">🚗 Tri State <span>Tags</span></a>
+      <div class="funnel-nav-links">
+        <a href="/interview/embed" class="active">Embed guide</a>
+        <a href="/">Live funnel</a>
+        <a href="/admin">Admin</a>
+      </div>
+    </nav>
+
+    <h1>Attach this hiring funnel to your project</h1>
+    <p class="subtitle">
+      Use path <code>/interview</code> for the application form only, or embed the full funnel from <code>/</code>.
+      API calls always go to <code>KRAB_API_BASE_URL</code> in <a href="/static/config.js">static/config.js</a>.
+    </p>
+
+    <div class="card">
+      <h2>URLs on this service</h2>
+      <table>
+        <thead>
+          <tr><th>Path</th><th>Use case</th></tr>
+        </thead>
+        <tbody>
+          <tr><td><code>/</code></td><td>Full funnel landing (hero, steps, CTA)</td></tr>
+          <tr><td><code>/requirements</code></td><td>Requirements checklist before apply</td></tr>
+          <tr><td><code>/interview</code></td><td><strong>Application form only</strong> — best for embeds</td></tr>
+          <tr><td><code>/how-to-telegram</code></td><td>Telegram install + @username guide</td></tr>
+          <tr><td><code>/interview/embed</code></td><td>This documentation page</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <section class="embed-option">
+      <h3>Option A — Form only (recommended for other sites)</h3>
+      <p>Embed just the application under <code>/interview</code>. Users should still link to requirements and Telegram setup from your site.</p>
+      <div class="code-block"><code id="snippet-form">&lt;iframe
+  src="BASE_URL/interview"
+  width="100%"
+  height="920"
+  style="border:0;border-radius:12px"
+  title="Driver application"
+&gt;&lt;/iframe&gt;</code></div>
+    </section>
+
+    <section class="embed-option">
+      <h3>Option B — Full hiring funnel</h3>
+      <p>Embed the landing page; drivers click through requirements → form on your iframe.</p>
+      <div class="code-block"><code id="snippet-funnel">&lt;iframe
+  src="BASE_URL/"
+  width="100%"
+  height="900"
+  style="border:0;border-radius:12px"
+  title="Become a driver"
+&gt;&lt;/iframe&gt;</code></div>
+    </section>
+
+    <section class="embed-option">
+      <h3>Option C — Custom subdomain (CNAME)</h3>
+      <p>Point <code>apply.yourdomain.com</code> → your Render host (e.g. <code>krab-interviewer-bot.onrender.com</code>), then use relative paths:</p>
+      <div class="code-block"><code>https://apply.yourdomain.com/interview
+https://apply.yourdomain.com/requirements</code></div>
+    </section>
+
+    <section class="embed-option">
+      <h3>Option D — Link out (no iframe)</h3>
+      <div class="code-block"><code>&lt;a href="BASE_URL/requirements"&gt;Driver requirements&lt;/a&gt;
+&lt;a href="BASE_URL/interview" class="button"&gt;Apply now&lt;/a&gt;</code></div>
+    </section>
+
+    <div class="card">
+      <h2>Configure API base</h2>
+      <p>Edit <code>web/static/config.js</code> before deploy (or override in your fork):</p>
+      <div class="code-block"><code>window.KRAB_API_BASE_URL = "https://krab-interviewer-bot.onrender.com";</code></div>
+      <p class="field-hint">When embedding on another origin, keep credentials enabled and set CORS if needed:</p>
+      <div class="code-block"><code>KRAB_API_CORS_ALLOWED_ORIGINS=https://yourproject.com,https://www.yourproject.com</code></div>
+    </div>
+
+    <div class="card">
+      <h2>Example: Tri State Coverage site</h2>
+      <p>Marketing site links to the funnel; form lives at <code>/interview</code>:</p>
+      <div class="code-block"><code>&lt;!-- On tristatecoverage.com careers page --&gt;
+&lt;p&gt;&lt;a href="https://apply.tristatetags.com/requirements"&gt;See driver requirements&lt;/a&gt;&lt;/p&gt;
+&lt;iframe src="https://apply.tristatetags.com/interview" ...&gt;&lt;/iframe&gt;</code></div>
+    </div>
+
+    <div class="card">
+      <h2>Example: Another brand / white-label project</h2>
+      <ol class="steps">
+        <li>Deploy or reuse the same <strong>krab-interviewer-bot</strong> service.</li>
+        <li>Set <code>KRAB_PUBLIC_BASE_URL</code> to that service URL.</li>
+        <li>On your site, iframe <code>{SERVICE_URL}/interview</code> only.</li>
+        <li>Add your own hero copy above the iframe; keep requirements link pointing to <code>/requirements</code>.</li>
+      </ol>
+    </div>
+
+    <p><a href="/" class="btn">Preview live funnel</a>
+       <a href="/interview" class="btn btn-secondary">Preview form</a></p>
+
+    <footer class="funnel-footer">
+      Full API reference: <code>web/README.md</code> in the krab-interviewer repo
+    </footer>
+  </div>
+  <script>
+    (function () {
+      var base = (window.KRAB_API_BASE_URL || window.location.origin).replace(/\/$/, "");
+      document.querySelectorAll("#snippet-form, #snippet-funnel").forEach(function (el) {
+        el.textContent = el.textContent.replace(/BASE_URL/g, base);
+      });
+      document.querySelectorAll(".code-block code").forEach(function (el) {
+        if (el.id) return;
+        el.innerHTML = el.innerHTML.replace(/BASE_URL/g, base);
+      });
+    })();
+  </script>
+</body>
+</html>

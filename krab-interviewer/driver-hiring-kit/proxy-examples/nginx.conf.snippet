@@ -1,0 +1,14 @@
+# Inside your server { } block — pages at /driver-hiring/, API proxied same-origin
+
+location /driver-hiring/ {
+    alias /var/www/your-site/driver-hiring-kit/;
+    try_files $uri $uri/ /driver-hiring/index.html;
+}
+
+location /api/ {
+    proxy_pass https://krab-interviewer-bot.onrender.com/api/;
+    proxy_set_header Host krab-interviewer-bot.onrender.com;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto $scheme;
+    proxy_cookie_path / /;
+}

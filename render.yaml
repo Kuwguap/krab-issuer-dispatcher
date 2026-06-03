@@ -224,16 +224,17 @@ services:
         sync: false
 
   # --------------------------------------------------------------------------
-  # 6) Krab Interviewer Telegram bot (background worker)
+  # 6) Krab Interviewer — Telegram bot + public web form (single web service)
   #    Driver interviews, appointments, channel announcements, hire onboarding.
   # --------------------------------------------------------------------------
-  - type: worker
+  - type: web
     name: krab-interviewer-bot
     runtime: python
     rootDir: krab-interviewer
     plan: starter
     numInstances: 1
     maxShutdownDelaySeconds: 60
+    healthCheckPath: /api/health
     buildCommand: pip install --upgrade pip && pip install -r requirements.txt
     startCommand: python bot.py
     envVars:
@@ -274,6 +275,14 @@ services:
         value: America/New_York
       - key: KRAB_DISPATCH_BOT_USERNAME
         value: KrabIssuerBot
+      - key: ADMIN_PASSWORD
+        sync: false
+      - key: IP_HASH_SALT
+        sync: false
+      - key: KRAB_API_CORS_ALLOWED_ORIGINS
+        value: "*"
+      - key: KRAB_PUBLIC_BASE_URL
+        sync: false
 
   # --------------------------------------------------------------------------
   # 7) Standalone Krab Insurance Telegram bot (background worker)

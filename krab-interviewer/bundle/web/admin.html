@@ -1,0 +1,52 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Interview Dashboard — Admin</title>
+  <link rel="stylesheet" href="/static/styles.css" />
+  <script src="/static/config.js"></script>
+</head>
+<body>
+  <div class="container container-wide">
+    <section id="login-section" class="login-box card">
+      <h1>Admin login</h1>
+      <form id="login-form">
+        <label for="admin-password">Password</label>
+        <input type="password" id="admin-password" autocomplete="current-password" required />
+        <button type="submit" class="btn">Sign in</button>
+      </form>
+    </section>
+
+    <section id="dashboard-section" hidden>
+      <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:1rem;margin-bottom:1rem;">
+        <h1>Web applications</h1>
+        <button type="button" class="btn btn-secondary" id="logout-btn">Log out</button>
+      </div>
+      <p class="subtitle" id="poll-hint">Loading…</p>
+      <input type="search" id="search" placeholder="Search name, Telegram, phone, email…" />
+
+      <div class="card" style="overflow-x:auto;">
+        <table>
+          <thead>
+            <tr>
+              <th>Created</th>
+              <th>Name</th>
+              <th>Telegram</th>
+              <th class="hide-mobile">Phone</th>
+              <th class="hide-mobile">Email</th>
+              <th>License</th>
+              <th>Status</th>
+              <th class="hide-mobile">IP hash</th>
+              <th>Last seen</th>
+            </tr>
+          </thead>
+          <tbody id="interviews-tbody"></tbody>
+        </table>
+      </div>
+      <p class="field-hint">Red = started over 1h ago, not submitted. Yellow = active now. Green = submitted. Click a row for details.</p>
+    </section>
+  </div>
+  <script src="/static/admin.js"></script>
+</body>
+</html>

@@ -5,8 +5,10 @@ Third brand Telegram bot: driver interviews, appointment reminders, channel anno
 ## Setup
 
 1. Copy `.env.example` to `.env` and fill values (new bot token from [@BotFather](https://t.me/BotFather)).
-2. Run SQL migration in shared Issuer Supabase:
+2. Run SQL migrations in shared Issuer Supabase:
    - [`database/migration_krab_interviewer.sql`](database/migration_krab_interviewer.sql)
+   - [`database/migration_interview_drafts.sql`](database/migration_interview_drafts.sql) (web form)
+   - [`database/migration_telegram_user_directory.sql`](database/migration_telegram_user_directory.sql) (username → Telegram ID for web apply)
 3. Create Storage bucket **`driver_licenses`** (public read) in Supabase Dashboard.
 4. Add the bot as **admin** to `DRIVER_CHANNEL_ID` (channel for driver announcements).
 5. Install and run:
@@ -30,6 +32,28 @@ python bot.py
 | `KRAB_SENDER_DATABASE_URL` | for Hire | krab-sender Postgres DSN (`recipients` insert) |
 | `INTERVIEWER_TIMEZONE` | no | Default `America/New_York` |
 | `KRAB_DISPATCH_BOT_USERNAME` | no | Shown to new hires (default `Krabdispatchbot`) |
+| `ADMIN_PASSWORD` | web admin | Password for `/admin` dashboard |
+| `IP_HASH_SALT` | web form | Salt for hashing visitor IPs (never store raw IP) |
+| `KRAB_PUBLIC_BASE_URL` | no | Public URL for secure cookies (e.g. `https://krab-interviewer-bot.onrender.com`) |
+| `KRAB_API_CORS_ALLOWED_ORIGINS` | no | Default `*`; comma-list to restrict embed origins |
+
+## Web form + dashboard
+
+FastAPI runs in the **same process** as `python bot.py` (background thread on `PORT`).
+
+| URL | Purpose |
+|-----|---------|
+| `/` | Hiring funnel landing (hero, steps, photos) |
+| `/requirements` | Driver requirements checklist |
+| `/interview` | Application form (auto-save drafts) |
+| `/interview/embed` | How to embed on another site/project |
+| `/how-to-telegram` | Telegram install + @username guide |
+| `/admin` | Supervisor table (red / yellow / green badges) |
+| `/api/health` | Render health check |
+
+**Copy to another site (no iframes):** entire folder [`driver-hiring-kit/`](driver-hiring-kit/) + [`driver-hiring-kit/AI-WIRE-UP.md`](driver-hiring-kit/AI-WIRE-UP.md).
+
+Embedding and API docs: [`web/README.md`](web/README.md).
 
 ## Supervisor commands
 
@@ -76,7 +100,7 @@ Any user can `/start` and submit the questionnaire (photo or text). Supervisors 
 
 If Environment shows only timezone/model defaults, add the two rows above manually, or re-sync the monorepo blueprint after `krab-issuer-bot` and `krab-dispatch-api` already have their env filled in.
 
-One **worker**, `python bot.py`, `numInstances: 1` (only one instance may poll a given bot token).
+One **web** service, `python bot.py`, `healthCheckPath: /api/health`, `numInstances: 1` (only one instance may poll a given bot token).
 
 ## Architecture
 

@@ -1,0 +1,65 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Driver Application — Tri State Tags</title>
+  <link rel="stylesheet" href="static/styles.css" />
+  <link rel="stylesheet" href="static/funnel.css" />
+  <script src="static/config.js"></script>
+</head>
+<body class="funnel-page">
+  <div class="container">
+    <nav class="funnel-nav">
+      <a class="brand" href="index.html">🚗 Tri State <span>Tags</span></a>
+      <div class="funnel-nav-links">
+        <a href="index.html">Home</a>
+        <a href="requirements.html">Requirements</a>
+        <a href="interview.html" class="active">Apply</a>
+        <a href="how-to-telegram.html">Telegram setup</a>
+      </div>
+    </nav>
+
+    <div class="progress-trail">
+      <span class="pill done">1 · Learn</span>
+      <span class="pill done">2 · Requirements</span>
+      <span class="pill current">3 · Application</span>
+    </div>
+
+    <header class="form-page-header">
+      <p class="form-step-label">Step 3 — Application</p>
+      <h1>Driver interview form</h1>
+      <p class="subtitle" style="margin-bottom:0;">
+        Fields save automatically. Need Telegram help?
+        <a href="how-to-telegram.html" target="_blank">Setup guide</a>
+        · <a href="requirements.html">Requirements</a>
+      </p>
+    </header>
+
+    <div id="frozen-screen" class="card frozen" hidden>
+      <h2>✅ Thanks — we have your application</h2>
+      <p>A supervisor will review it and contact you on Telegram.</p>
+      <p><a href="index.html" class="btn btn-secondary">Return home</a></p>
+    </div>
+
+    <div class="status-bar" id="save-status"></div>
+
+    <form id="page-form">
+      <div class="card">
+        <label for="license-file">Driver's license photo (recommended)</label>
+        <input type="file" id="license-file" accept="image/*" />
+        <a id="license-link" href="#" target="_blank" rel="noopener" hidden>View uploaded license</a>
+      </div>
+
+      <div class="card" id="application-form"></div>
+
+      <button type="submit" class="btn btn-gold" id="submit-btn">Submit application</button>
+    </form>
+
+    <footer class="funnel-footer">
+      <a href="requirements.html">← Requirements</a> · Tri State Tags driver hiring
+    </footer>
+  </div>
+  <script src="static/main.js"></script>
+</body>
+</html>

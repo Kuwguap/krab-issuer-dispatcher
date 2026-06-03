@@ -1,0 +1,130 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Driver Requirements — Tri State Tags</title>
+  <link rel="stylesheet" href="static/styles.css" />
+  <link rel="stylesheet" href="static/funnel.css" />
+</head>
+<body class="funnel-page">
+  <div class="container">
+    <nav class="funnel-nav">
+      <a class="brand" href="index.html">🚗 Tri State <span>Tags</span></a>
+      <div class="funnel-nav-links">
+        <a href="index.html">Home</a>
+        <a href="requirements.html" class="active">Requirements</a>
+        <a href="interview.html">Apply</a>
+        <a href="how-to-telegram.html">Telegram setup</a>
+      </div>
+    </nav>
+
+    <div class="progress-trail">
+      <span class="pill done">1 · Learn</span>
+      <span class="pill current">2 · Requirements</span>
+      <span class="pill">3 · Application</span>
+    </div>
+
+    <h1>Driver requirements</h1>
+    <p class="subtitle">
+      Please confirm you meet each item below. Supervisors review every application and follow up on Telegram.
+    </p>
+
+    <div class="card">
+      <ul class="req-list">
+        <li>
+          <span class="req-icon">🪪</span>
+          <div>
+            <strong>Valid driver’s license</strong>
+            <span>Current license in good standing; you’ll enter the number and upload a photo.</span>
+          </div>
+        </li>
+        <li>
+          <span class="req-icon">📱</span>
+          <div>
+            <strong>Reliable smartphone</strong>
+            <span>Phone and email we can use for interview scheduling and onboarding.</span>
+          </div>
+        </li>
+        <li>
+          <span class="req-icon">💬</span>
+          <div>
+            <strong>Telegram with public @username</strong>
+            <span>All hire communication runs through Telegram. <a href="how-to-telegram.html">Install &amp; set username →</a></span>
+          </div>
+        </li>
+        <li>
+          <span class="req-icon">⏳</span>
+          <div>
+            <strong>Work commitment</strong>
+            <span>Honest availability (hours per week, days, schedule) for dispatch planning.</span>
+          </div>
+        </li>
+        <li>
+          <span class="req-icon">🏠</span>
+          <div>
+            <strong>Mailing address</strong>
+            <span>Used for paperwork and shipments after you’re hired.</span>
+          </div>
+        </li>
+        <li>
+          <span class="req-icon">💰</span>
+          <div>
+            <strong>Payment method on file</strong>
+            <span>CashApp, Venmo, Zelle, or similar — listed on your application.</span>
+          </div>
+        </li>
+        <li>
+          <span class="req-icon">🚨</span>
+          <div>
+            <strong>Emergency contact</strong>
+            <span>Name and phone number of someone we can reach if needed.</span>
+          </div>
+        </li>
+        <li>
+          <span class="req-icon">✨</span>
+          <div>
+            <strong>Professional conduct</strong>
+            <span>One application per person; accurate information; duplicate Telegram usernames are rejected.</span>
+          </div>
+        </li>
+      </ul>
+    </div>
+
+    <label class="req-checkbox" for="req-confirm">
+      <input type="checkbox" id="req-confirm" />
+      <span>
+        I have read the requirements above, I have (or will set up) Telegram with an @username,
+        and I am ready to complete the driver interview application honestly.
+      </span>
+    </label>
+
+    <p style="text-align:center;margin:1rem 0;">
+      <a href="interview.html" id="apply-link" class="btn btn-gold" aria-disabled="true" style="pointer-events:none;opacity:0.45;">
+        Continue to application →
+      </a>
+    </p>
+    <p style="text-align:center;font-size:0.85rem;color:var(--muted);">
+      <a href="index.html">← Back to overview</a>
+    </p>
+
+    <footer class="funnel-footer">Step 2 of 3 · Application form saves progress automatically</footer>
+  </div>
+  <script>
+    (function () {
+      var cb = document.getElementById("req-confirm");
+      var link = document.getElementById("apply-link");
+      function sync() {
+        var on = cb && cb.checked;
+        if (link) {
+          link.style.pointerEvents = on ? "auto" : "none";
+          link.style.opacity = on ? "1" : "0.45";
+          link.setAttribute("aria-disabled", on ? "false" : "true");
+        }
+      }
+      if (cb) cb.addEventListener("change", sync);
+      sync();
+    })();
+  </script>
+</body>
+</html>
