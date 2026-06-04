@@ -240,6 +240,7 @@ def _help_guide_text() -> str:
         "Tap 🧾 Add New Receipt\n"
         "Or type /receipts\n"
         "Upload receipt for the reference ID\n\n"
+        "👮 Supervisors: same /receipts flow to upload for any assigned driver\n\n"
         "⸻\n\n"
         "💡 Helpful Tips\n\n"
         "🚘 Use a valid 17-character VIN\n"
@@ -2186,6 +2187,8 @@ def _clear_lead_conversation_user_data(context: ContextTypes.DEFAULT_TYPE) -> No
         "receipt_lead_id",
         "receipt_reference_id",
         "receipt_monday_item_id",
+        "receipt_on_behalf_driver_id",
+        "receipt_uploaded_by_supervisor",
     ):
         context.user_data.pop(key, None)
 
@@ -7254,6 +7257,70 @@ def _driver_accepted_this_lead(driver_id, lead_id: str) -> bool:
     return (st.get("status") or "").lower() == "accepted"
 
 
+def _driver_row_by_id(driver_id) -> dict | None:
+    if not driver_id:
+        return None
+    return next(
+        (d for d in _get_all_drivers_cached() if str(d.get("id")) == str(driver_id)),
+        None,
+    )
+
+
+def _receipt_upload_allowed_for_user(
+    user_id: int,
+    lead_id: str,
+    lead: dict,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> tuple[bool, str | None, dict | None]:
+    """Whether this user may upload a receipt for the lead; sets on-behalf driver in context."""
+    if (lead.get("receipt_image_url") or "").strip():
+        return False, "❌ This lead already has a receipt on file.", None
+
+    st = db.get_lead_assignment_status(lead_id)
+    if not st or (st.get("status") or "").lower() != "accepted":
+        return False, "❌ This lead has no accepted driver assignment.", None
+
+    assigned_id = str(st.get("driver_id") or "").strip()
+    if not assigned_id:
+        return False, "❌ No driver assigned on this lead.", None
+
+    if _user_is_global_supervisor(user_id):
+        target = _driver_row_by_id(assigned_id)
+        context.user_data["receipt_on_behalf_driver_id"] = assigned_id
+        context.user_data["receipt_uploaded_by_supervisor"] = True
+        return True, None, target
+
+    drv = _driver_row_for_telegram_user(user_id)
+    if not drv:
+        return (
+            False,
+            "❌ This Telegram account is not registered as a driver.\n"
+            "Ask an admin to add your Telegram user ID in the dashboard.",
+            None,
+        )
+    if str(drv["id"]) != assigned_id:
+        return False, "❌ You can only upload receipts for leads you accepted.", None
+
+    context.user_data.pop("receipt_on_behalf_driver_id", None)
+    context.user_data.pop("receipt_uploaded_by_supervisor", None)
+    return True, None, drv
+
+
+def _receipt_target_driver_row(
+    user_id: int,
+    lead_id: str,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> dict | None:
+    """Driver row receipt is credited to (from context or telegram user)."""
+    on_behalf = context.user_data.get("receipt_on_behalf_driver_id")
+    if on_behalf:
+        return _driver_row_by_id(on_behalf)
+    drv = _driver_row_for_telegram_user(user_id)
+    if drv and _driver_accepted_this_lead(drv["id"], lead_id):
+        return drv
+    return None
+
+
 def _merge_receipt_context_from_db(user_id: int, context: ContextTypes.DEFAULT_TYPE) -> None:
     row = db.get_user_state(user_id)
     if not row or not row.get("data"):
@@ -7262,9 +7329,54 @@ def _merge_receipt_context_from_db(user_id: int, context: ContextTypes.DEFAULT_T
     if st_name not in ("waiting_receipt_image", "waiting_receipt_confirm", "waiting_reference_id"):
         return
     data = row["data"]
-    for key in ("receipt_lead_id", "receipt_reference_id", "receipt_monday_item_id"):
+    for key in (
+        "receipt_lead_id",
+        "receipt_reference_id",
+        "receipt_monday_item_id",
+        "receipt_on_behalf_driver_id",
+        "receipt_uploaded_by_supervisor",
+    ):
         if data.get(key) is not None and context.user_data.get(key) is None:
             context.user_data[key] = data[key]
+
+
+async def _send_supervisor_pending_receipts_menu(
+    context: ContextTypes.DEFAULT_TYPE,
+    reply_to_message,
+) -> None:
+    """Supervisors: all drivers' owed receipts + manual reference ID entry."""
+    pending = db.get_all_pending_receipts(90)
+    rows = []
+    for p in pending:
+        ref = (p.get("reference_id") or "").strip()
+        if not ref or ref.upper() == "N/A":
+            continue
+        dname = (p.get("driver_name") or "Driver").strip()[:18]
+        rows.append(
+            [InlineKeyboardButton(f"📤 {ref} ({dname})", callback_data=f"receipt_for_{ref}")]
+        )
+    rows.append([InlineKeyboardButton("📋 Enter Reference ID", callback_data="driver_receipt")])
+    if len(rows) == 1:
+        await reply_to_message.reply_text(
+            "✅ No outstanding receipts in the system.\n\n"
+            "Tap below to upload by reference ID:",
+            reply_markup=InlineKeyboardMarkup(rows),
+        )
+        return
+    n_total = len(pending)
+    body = (
+        f"🧾 <b>Upload receipts for drivers</b>\n\n"
+        f"Showing {len(rows) - 1} of {n_total} owed receipt(s). "
+        "Tap a reference or enter one manually:"
+    )
+    receipt_kb = InlineKeyboardMarkup(rows)
+    try:
+        await reply_to_message.reply_text(body, parse_mode="HTML", reply_markup=receipt_kb)
+    except BadRequest:
+        await reply_to_message.reply_text(
+            body.replace("<b>", "").replace("</b>", ""),
+            reply_markup=receipt_kb,
+        )
 
 
 async def _send_driver_pending_receipts_menu(
@@ -7337,7 +7449,11 @@ async def handle_driver_add_receipt_callback(update: Update, context: ContextTyp
     msg = update.effective_message
     if not msg:
         return ConversationHandler.END
-    driver = _driver_row_for_telegram_user(query.from_user.id)
+    uid = query.from_user.id
+    if _user_is_global_supervisor(uid):
+        await _send_supervisor_pending_receipts_menu(context, msg)
+        return ConversationHandler.END
+    driver = _driver_row_for_telegram_user(uid)
     if not driver:
         await msg.reply_text(
             "❌ This Telegram account is not registered as a driver.\n"
@@ -7349,9 +7465,12 @@ async def handle_driver_add_receipt_callback(update: Update, context: ContextTyp
 
 
 async def handle_driver_receipts_menu_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Drivers: show every owed receipt with inline upload buttons. Commands: /receipts, /receipt, /recipts."""
+    """Drivers or supervisors: owed receipts + upload. Commands: /receipts, /receipt, /recipts."""
     user = update.effective_user
     if not user or not update.message:
+        return ConversationHandler.END
+    if _user_is_global_supervisor(user.id):
+        await _send_supervisor_pending_receipts_menu(context, update.message)
         return ConversationHandler.END
     driver = _driver_row_for_telegram_user(user.id)
     if not driver:
@@ -7373,18 +7492,23 @@ async def handle_receipt_for_ref_callback(update: Update, context: ContextTypes.
     if not lead:
         await query.message.reply_text(f"❌ Reference ID `{ref}` not found.")
         return ConversationHandler.END
-    driver = _driver_row_for_telegram_user(query.from_user.id)
-    if not driver or not _driver_accepted_this_lead(driver["id"], lead["id"]):
-        await query.message.reply_text(
-            "❌ You can only upload receipts for leads you accepted."
-        )
+    ok, err, _target_drv = _receipt_upload_allowed_for_user(
+        query.from_user.id, lead["id"], lead, context
+    )
+    if not ok:
+        await query.message.reply_text(err or "❌ Cannot upload receipt for this lead.")
         return ConversationHandler.END
     context.user_data["receipt_lead_id"] = lead["id"]
     context.user_data["receipt_reference_id"] = ref
     context.user_data["receipt_monday_item_id"] = lead.get("monday_item_id")
     delivery_safe = _sanitize_phones_for_send(lead.get("delivery_details") or "")
+    driver_line = ""
+    if context.user_data.get("receipt_uploaded_by_supervisor"):
+        drow = _driver_row_by_id(context.user_data.get("receipt_on_behalf_driver_id"))
+        dname = (drow.get("driver_name") or "Driver") if drow else "Driver"
+        driver_line = f"\n🚗 Driver: **{dname}**"
     msg = (
-        f"📋 **Reference ID:** `{ref}`\n\n"
+        f"📋 **Reference ID:** `{ref}`{driver_line}\n\n"
         f"📍 Delivery: {delivery_safe or 'N/A'}\n"
         f"🚗 Vehicle: {lead.get('vehicle_details', 'N/A')[:300]}\n\n"
         "Upload receipt for this lead:"
@@ -7412,9 +7536,15 @@ async def handle_driver_receipt_callback(update: Update, context: ContextTypes.D
     # Set state to waiting for reference ID
     db.set_user_state(user_id, "waiting_reference_id", {})
 
+    if _user_is_global_supervisor(user_id):
+        title = "📋 **Supervisor Receipt Upload**\n\n"
+        hint = "Enter the Reference ID for the driver's lead."
+    else:
+        title = "📋 **Driver Receipt Submission**\n\n"
+        hint = "Please enter the Reference ID for the lead you want to submit a receipt for."
+
     await query.message.reply_text(
-        "📋 **Driver Receipt Submission**\n\n"
-        "Please enter the Reference ID for the lead you want to submit a receipt for.",
+        title + hint,
         parse_mode="Markdown",
     )
 
@@ -7441,11 +7571,9 @@ async def handle_reference_id_input(update: Update, context: ContextTypes.DEFAUL
         )
         return STATE_WAITING_REFERENCE_ID
 
-    drv = _driver_row_for_telegram_user(user_id)
-    if not drv or not _driver_accepted_this_lead(drv["id"], lead["id"]):
-        await msg.reply_text(
-            "❌ You can only upload receipts for leads you accepted."
-        )
+    ok, err, _target_drv = _receipt_upload_allowed_for_user(user_id, lead["id"], lead, context)
+    if not ok:
+        await msg.reply_text(err or "❌ Cannot upload receipt for this lead.")
         db.clear_user_state(user_id)
         return ConversationHandler.END
 
@@ -7457,8 +7585,13 @@ async def handle_reference_id_input(update: Update, context: ContextTypes.DEFAUL
     delivery_safe = _sanitize_phones_for_send(lead.get('delivery_details') or '')
     phone_display = _driver_phone_display(lead)
     phone_label = "📞 Phone (one-time link)" if _driverblock_enabled() else "📞 Phone"
+    driver_line = ""
+    if context.user_data.get("receipt_uploaded_by_supervisor"):
+        drow = _driver_row_by_id(context.user_data.get("receipt_on_behalf_driver_id"))
+        dname = (drow.get("driver_name") or "Driver") if drow else "Driver"
+        driver_line = f"\n🚗 Driver: **{dname}**"
     confirmation_message = (
-        f"✅ **Lead Found**\n\n"
+        f"✅ **Lead Found**{driver_line}\n\n"
         f"📍 Delivery Address: {delivery_safe or 'N/A'}\n"
         f"{phone_label}: {phone_display}\n"
         f"📋 Reference ID: `{reference_id}`\n\n"
@@ -7514,6 +7647,9 @@ async def _notify_supervisory_receipt_submission(
     receipt_file_id: str | None,
     group: dict | None,
     driver_display_name: str,
+    *,
+    uploaded_by_supervisor: bool = False,
+    supervisor_display_name: str | None = None,
 ) -> None:
     """Plain receipt summary + same image as caption (no SUPERVISORY prefix); fallback text + forward."""
     gn = (group.get("group_name") or "—") if group else "—"
@@ -7528,6 +7664,8 @@ async def _notify_supervisory_receipt_submission(
         f"Client name: {client_name}\n"
         f"Lead issued by: {issuer_line}"
     )
+    if uploaded_by_supervisor and supervisor_display_name:
+        caption += f"\nUploaded by supervisor: {supervisor_display_name}"
 
     async def _send_caption_and_receipt(chat_id: int, label: str) -> None:
         msg = update.message
@@ -7654,11 +7792,15 @@ async def handle_receipt_image(update: Update, context: ContextTypes.DEFAULT_TYP
         db.clear_user_state(user_id)
         return ConversationHandler.END
 
-    dr_check = _driver_row_for_telegram_user(user_id)
-    if not dr_check or not _driver_accepted_this_lead(dr_check["id"], lead_id):
-        await update.message.reply_text("❌ You can only upload receipts for leads you accepted.")
+    dr_check = _receipt_target_driver_row(user_id, lead_id, context)
+    if not dr_check:
+        await update.message.reply_text(
+            "❌ You can only upload receipts for accepted leads assigned to the driver."
+        )
         db.clear_user_state(user_id)
         return ConversationHandler.END
+
+    uploaded_by_supervisor = bool(context.user_data.get("receipt_uploaded_by_supervisor"))
 
     mime_for_ai = "image/jpeg"
     if update.message.document:
@@ -7781,35 +7923,54 @@ async def handle_receipt_image(update: Update, context: ContextTypes.DEFAULT_TYP
     
     if success:
         ref_show = html.escape(str(reference_id or "N/A"), quote=False)
-        dq = html.escape(driver_motivation.get_random_driver_quote(), quote=False)
-        driver_confirm_html = (
-            "✅ <b>Receipt received successfully!</b>\n"
-            "📂 Your Receipt🧾 is on file.\n"
-            "🚗💨 Thank you &amp; 💪Great job — keep up the excellent work!\n\n"
-            f"Reference ID: <code>{ref_show}</code>\n\n"
-            f"💪 <i>{dq}</i>"
-        )
-        try:
-            await update.message.reply_text(
-                driver_confirm_html,
-                parse_mode="HTML",
-                reply_markup=_driver_keyboard_lead_and_receipt(),
+        if uploaded_by_supervisor:
+            dn_esc = html.escape(driver_name, quote=False)
+            supervisor_confirm_html = (
+                "✅ <b>Receipt saved for driver</b>\n"
+                f"🚗 Driver: {dn_esc}\n"
+                f"Reference ID: <code>{ref_show}</code>"
             )
-        except Exception as e:
-            logger.error("Driver receipt confirmation reply failed: %s", e)
             try:
-                dqp = driver_motivation.get_random_driver_quote()
+                await update.message.reply_text(supervisor_confirm_html, parse_mode="HTML")
+            except Exception as e:
+                logger.error("Supervisor receipt confirmation reply failed: %s", e)
                 await update.message.reply_text(
-                    f"✅ Receipt received and saved. Reference: {reference_id or 'N/A'}\n\n{dqp}",
+                    f"✅ Receipt saved for {driver_name}. Reference: {reference_id or 'N/A'}"
+                )
+        else:
+            dq = html.escape(driver_motivation.get_random_driver_quote(), quote=False)
+            driver_confirm_html = (
+                "✅ <b>Receipt received successfully!</b>\n"
+                "📂 Your Receipt🧾 is on file.\n"
+                "🚗💨 Thank you &amp; 💪Great job — keep up the excellent work!\n\n"
+                f"Reference ID: <code>{ref_show}</code>\n\n"
+                f"💪 <i>{dq}</i>"
+            )
+            try:
+                await update.message.reply_text(
+                    driver_confirm_html,
+                    parse_mode="HTML",
                     reply_markup=_driver_keyboard_lead_and_receipt(),
                 )
-            except Exception as e2:
-                logger.error("Fallback driver receipt confirm failed: %s", e2)
+            except Exception as e:
+                logger.error("Driver receipt confirmation reply failed: %s", e)
+                try:
+                    dqp = driver_motivation.get_random_driver_quote()
+                    await update.message.reply_text(
+                        f"✅ Receipt received and saved. Reference: {reference_id or 'N/A'}\n\n{dqp}",
+                        reply_markup=_driver_keyboard_lead_and_receipt(),
+                    )
+                except Exception as e2:
+                    logger.error("Fallback driver receipt confirm failed: %s", e2)
 
         # Lead adder: single summary is sent on driver accept only (not receipt).
 
         group_id = lead.get("group_id")
         group = db.get_group_by_id(group_id) if group_id else None
+        sup_name = None
+        if update.effective_user:
+            u = update.effective_user
+            sup_name = (u.full_name or u.username or str(u.id)).strip()
         try:
             await _notify_supervisory_receipt_submission(
                 context,
@@ -7819,6 +7980,8 @@ async def handle_receipt_image(update: Update, context: ContextTypes.DEFAULT_TYP
                 receipt_file_id,
                 group,
                 driver_name,
+                uploaded_by_supervisor=uploaded_by_supervisor,
+                supervisor_display_name=sup_name if uploaded_by_supervisor else None,
             )
         except Exception as e:
             logger.error("Supervisory receipt notification failed: %s", e, exc_info=True)

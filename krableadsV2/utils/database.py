@@ -1156,6 +1156,39 @@ class Database:
             logger.error("get_driver_pending_receipts: %s", e)
             return []
 
+    def get_all_pending_receipts(self, limit: int = 90) -> list:
+        """Accepted assignments missing receipts (all drivers). For supervisor /receipts menu."""
+        if not self._check_tables_exist():
+            return []
+        try:
+            r = self.client.table("lead_assignments").select(
+                "lead_id, driver_id, "
+                "driver:drivers(driver_name), "
+                "lead:leads(reference_id, receipt_image_url)"
+            ).eq("status", "accepted").execute()
+            out = []
+            for row in r.data or []:
+                lead = row.get("lead") or {}
+                if lead.get("receipt_image_url"):
+                    continue
+                ref = (lead.get("reference_id") or "").strip()
+                if not ref or ref.upper() == "N/A":
+                    continue
+                driver = row.get("driver") or {}
+                out.append({
+                    "lead_id": row.get("lead_id"),
+                    "driver_id": row.get("driver_id"),
+                    "reference_id": ref,
+                    "driver_name": driver.get("driver_name") or "Driver",
+                    "lead": lead,
+                })
+            if limit and len(out) > limit:
+                return out[:limit]
+            return out
+        except Exception as e:
+            logger.error("get_all_pending_receipts: %s", e)
+            return []
+
     def mark_receipt_reminder_sent(self, assignment_id: str) -> bool:
         """Mark that we sent the receipt reminder for this assignment."""
         if not self._check_tables_exist():
