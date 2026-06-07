@@ -1,15 +1,11 @@
 """Resolve @telegram_username to numeric Telegram user id for web interviews."""
 from __future__ import annotations
 
-import logging
 import re
 from typing import Any, Optional, Tuple
-
-import requests
+from urllib.parse import quote
 
 from config import Config
-
-logger = logging.getLogger(__name__)
 
 _USERNAME_RE = re.compile(r"^[A-Za-z0-9_]{5,32}$")
 
@@ -26,60 +22,69 @@ def normalize_telegram_username_display(raw: str) -> str:
     return f"@{un}" if un else ""
 
 
-def _get_chat_via_bot_api(username: str) -> Optional[str]:
-    token = (Config.TELEGRAM_BOT_TOKEN or "").strip()
-    if not token:
-        return None
-    chat_id = f"@{username}"
-    try:
-        r = requests.get(
-            f"https://api.telegram.org/bot{token}/getChat",
-            params={"chat_id": chat_id},
-            timeout=12,
-        )
-        data = r.json() if r.ok else {}
-        if not data.get("ok"):
-            return None
-        result = data.get("result") or {}
-        tid = result.get("id")
-        if tid is not None:
-            return str(int(tid))
-    except Exception as e:
-        logger.warning("getChat failed for %s: %s", chat_id, e)
-    return None
+def telegram_connect_url(start: str = "web") -> str:
+    bot = (getattr(Config, "KRAB_INTERVIEWER_BOT_USERNAME", None) or "krabinterviewerbot").strip().lstrip("@")
+    return f"https://t.me/{quote(bot)}?start={quote(start)}"
 
 
-def resolve_telegram_id_for_username(db: Any, username: str) -> Tuple[Optional[str], str, str]:
+def _lookup_from_db(db: Any, drafts_db: Any, username: str) -> Tuple[Optional[str], str]:
+    if db:
+        for lookup, source in (
+            (db.lookup_telegram_id_from_directory, "directory"),
+            (db.lookup_telegram_id_from_interviews, "interview"),
+            (db.lookup_telegram_id_from_drivers, "driver"),
+        ):
+            tid = lookup(username)
+            if tid:
+                return str(tid), source
+
+    if drafts_db:
+        tid = drafts_db.lookup_telegram_id_from_drafts(username)
+        if tid:
+            return str(tid), "draft"
+
+    return None, ""
+
+
+def resolve_telegram_id_for_username(
+    db: Any,
+    username: str,
+    drafts_db: Any = None,
+) -> Tuple[Optional[str], str, str]:
     """
     Returns (telegram_id, source, message).
-    source: directory | interview | driver | bot_api | none
+
+    IDs come from: bot /start directory, past interviews/drivers, or web drafts
+    linked when the user started the bot after typing their username.
     """
     un = normalize_telegram_username(username)
     if not un:
-        return None, "none", "Enter a valid Telegram username (5–32 characters, letters, numbers, underscore)."
+        return (
+            None,
+            "none",
+            "Enter a valid Telegram username (5–32 characters: letters, numbers, underscore). @ is optional.",
+        )
 
-    if db:
-        tid = db.lookup_telegram_id_from_directory(un)
-        if tid:
-            return tid, "directory", "Linked via Krab Interviewer bot."
-
-        tid = db.lookup_telegram_id_from_interviews(un)
-        if tid:
-            return tid, "interview", "Found from a previous application."
-
-        tid = db.lookup_telegram_id_from_drivers(un)
-        if tid:
-            return tid, "driver", "Found from driver records."
-
-    tid = _get_chat_via_bot_api(un)
+    tid, source = _lookup_from_db(db, drafts_db, un)
     if tid:
-        if db:
-            db.upsert_telegram_user_directory(tid, un)
-        return tid, "bot_api", "Verified with Telegram."
+        return tid, source, f"Telegram ID {tid} found for @{un}."
 
     bot = (getattr(Config, "KRAB_INTERVIEWER_BOT_USERNAME", None) or "krabinterviewerbot").strip().lstrip("@")
     return (
         None,
         "none",
-        f"Open @{bot} in Telegram, tap Start, then return here and verify your username.",
+        f'Username @{un} saved. Open @{bot} in Telegram, tap Start once, then return here - your ID will appear automatically.',
     )
+
+
+def telegram_resolve_meta(db: Any, username: str, drafts_db: Any = None) -> dict:
+    """JSON-friendly resolve result for API responses."""
+    tid, source, message = resolve_telegram_id_for_username(db, username or "", drafts_db=drafts_db)
+    return {
+        "ok": bool(tid),
+        "telegramId": tid,
+        "source": source,
+        "message": message,
+        "needsBotStart": not bool(tid),
+        "connectUrl": telegram_connect_url("web") if not tid else None,
+    }

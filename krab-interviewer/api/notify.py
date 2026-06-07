@@ -31,7 +31,7 @@ def _supervisory_chat_ids() -> List[int]:
 
 
 def notify_supervisors_new_web_interview(interview: Dict[str, Any]) -> int:
-    """Send sendMessage to each supervisor chat. Returns count sent."""
+    """Legacy: pending application awaiting supervisor /open (when auto-hire is off)."""
     token = (Config.TELEGRAM_BOT_TOKEN or "").strip()
     if not token:
         logger.warning("notify_supervisors: no TELEGRAM_BOT_TOKEN")
@@ -49,7 +49,69 @@ def notify_supervisors_new_web_interview(interview: Dict[str, Any]) -> int:
         f"📱 {phone}\n\n"
         f"Open: /open {iid}"
     )
+    return _send_supervisor_text(token, text)
 
+
+def notify_supervisors_web_auto_hired(
+    interview: Dict[str, Any],
+    db_errors: Optional[List[str]] = None,
+) -> int:
+    """Web form submitted and driver auto-hired (DB records created)."""
+    token = (Config.TELEGRAM_BOT_TOKEN or "").strip()
+    if not token:
+        logger.warning("notify_supervisors: no TELEGRAM_BOT_TOKEN")
+        return 0
+
+    iid = str(interview.get("id") or "")
+    name = (interview.get("full_name") or interview.get("first_name") or "Driver").strip()
+    tg = (interview.get("telegram_username") or "-").strip()
+    em = (interview.get("email") or "-").strip()
+    tid = (interview.get("telegram_id") or "-").strip()
+    issuer = Config.KRAB_ISSUER_BOT_USERNAME.lstrip("@")
+    dispatch = Config.KRAB_DISPATCH_BOT_USERNAME.lstrip("@")
+
+    text = (
+        "🌐 Web application — AUTO-HIRED ✅\n\n"
+        f"👤 {name}\n"
+        f"💬 {tg}\n"
+        f"📧 {em}\n"
+        f"🆔 Telegram ID: {tid}\n\n"
+        f"Added to @{issuer} + @{dispatch}.\n"
+        "Driver welcome DM, channel, papers, and training are being sent…\n\n"
+        f"Record: /open {iid}"
+    )
+    errs = [e for e in (db_errors or []) if e]
+    if errs:
+        text += "\n\n⚠️ DB warnings:\n" + "\n".join(f"• {e}" for e in errs)
+    return _send_supervisor_text(token, text)
+
+
+def notify_supervisors_hire_complete(
+    interview: Dict[str, Any],
+    hire_msg: str,
+    warnings: Optional[List[str]] = None,
+    *,
+    source: str = "web",
+) -> int:
+    """Follow-up when async hire onboarding finishes with warnings."""
+    warn = [w for w in (warnings or []) if w]
+    if not warn:
+        return 0
+    token = (Config.TELEGRAM_BOT_TOKEN or "").strip()
+    if not token:
+        return 0
+    iid = str(interview.get("id") or "")
+    text = (
+        f"⚠️ Hire onboarding warnings ({source})\n\n"
+        f"Record: /open {iid}\n\n"
+        + hire_msg
+        + "\n\n⚠️ Warnings:\n"
+        + "\n".join(f"• {w}" for w in warn)
+    )
+    return _send_supervisor_text(token, text)
+
+
+def _send_supervisor_text(token: str, text: str) -> int:
     api = f"https://api.telegram.org/bot{token}/sendMessage"
     sent = 0
     for chat_id in _supervisory_chat_ids():

@@ -1,29 +1,43 @@
 """Public interview draft API (web form)."""
 from __future__ import annotations
 
+import base64
 import logging
 from typing import Any, Dict, Optional
+from urllib.parse import quote
 
 from fastapi import APIRouter, Cookie, Depends, File, HTTPException, Request, UploadFile
-from fastapi.responses import JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
 from pydantic import BaseModel, Field
 
 from api.deps import DRAFT_COOKIE, current_ip_hash, get_db, get_drafts_db
-from api.notify import notify_supervisors_new_web_interview
+from api.notify import notify_supervisors_new_web_interview, notify_supervisors_web_auto_hired
+from api.bot_bridge import schedule_hire_side_effects
 from config import Config
 from utils.ai_vision import (
     AIVisionQuotaError,
     INTERVIEW_FIELD_KEYS,
     extract_interview_from_image,
     extract_interview_from_text,
+    filled_interview_keys,
     normalize_interview_data,
 )
 from utils.drafts_db import DraftsDatabase, new_draft_cookie
 from utils.database import Database
+from utils.hire_driver import hire_driver_records, validate_hire_ready
 from utils.telegram_resolve import (
     normalize_telegram_username_display,
     resolve_telegram_id_for_username,
+    telegram_connect_url,
+    telegram_resolve_meta,
 )
+from utils.telegram_login_host import (
+    is_allowed_return_url,
+    login_page_html,
+    telegram_bot_username,
+    widget_base_url,
+)
+from utils.telegram_widget_auth import verify_telegram_login
 
 logger = logging.getLogger(__name__)
 
@@ -36,7 +50,6 @@ REQUIRED_SUBMIT_KEYS = [
     "phone_number",
     "email",
     "mailing_address",
-    "drivers_license_id",
     "telegram_username",
     "emergency_contact",
     "payment_method",
@@ -50,6 +63,16 @@ class DraftPatchBody(BaseModel):
 
 class ResolveTelegramBody(BaseModel):
     username: str = ""
+
+
+class TelegramWidgetAuthBody(BaseModel):
+    id: int
+    auth_date: int
+    hash: str
+    first_name: Optional[str] = None
+    last_name: Optional[str] = None
+    username: Optional[str] = None
+    photo_url: Optional[str] = None
 
 
 class ParseTextBody(BaseModel):
@@ -81,7 +104,11 @@ def _merge_extracted_payload(existing: Dict[str, Any], extracted: Dict[str, str]
     return merged
 
 
-def _apply_telegram_resolution(merged: Dict[str, Any], db: Database) -> Dict[str, Any]:
+def _apply_telegram_resolution(
+    merged: Dict[str, Any],
+    db: Database,
+    drafts: Optional[DraftsDatabase] = None,
+) -> Dict[str, Any]:
     """When username is present, resolve numeric telegram_id into payload."""
     un_raw = (merged.get("telegram_username") or "").strip()
     if not un_raw:
@@ -89,10 +116,23 @@ def _apply_telegram_resolution(merged: Dict[str, Any], db: Database) -> Dict[str
     display = normalize_telegram_username_display(un_raw)
     if display:
         merged["telegram_username"] = display
-    tid, _source, _msg = resolve_telegram_id_for_username(db, un_raw)
+    tid, _source, _msg = resolve_telegram_id_for_username(db, un_raw, drafts_db=drafts)
     if tid:
-        merged["telegram_id"] = tid
+        merged["telegram_id"] = str(tid)
+    else:
+        merged.pop("telegram_id", None)
     return merged
+
+
+def _note_pending_telegram_username(
+    merged: Dict[str, Any],
+    draft_id: str,
+    drafts: DraftsDatabase,
+) -> None:
+    un_raw = (merged.get("telegram_username") or "").strip()
+    tid = str(merged.get("telegram_id") or "").strip()
+    if un_raw and (not tid or tid == "-"):
+        drafts.register_pending_telegram_username(un_raw, draft_id)
 
 
 def _cookie_response(data: dict, draft_id: str, status_code: int = 200) -> JSONResponse:
@@ -111,6 +151,38 @@ def _cookie_response(data: dict, draft_id: str, status_code: int = 200) -> JSONR
 def _empty_val(v: Any) -> bool:
     s = (str(v) if v is not None else "").strip()
     return not s or s == "-"
+
+
+def _public_api_base() -> str:
+    return (
+        Config.KRAB_PUBLIC_BASE_URL
+        or Config.TELEGRAM_LOGIN_WIDGET_BASE_URL
+        or ""
+    ).rstrip("/")
+
+
+def _license_serve_url(kind: str, record_id: str) -> str:
+    path = f"/api/interview/{kind}/{record_id}/license-file"
+    base = _public_api_base()
+    return f"{base}{path}" if base else path
+
+
+def _embed_license_fallback(payload: Dict[str, Any], data: bytes, mime: str) -> Dict[str, Any]:
+    merged = dict(payload or {})
+    merged["_license_b64"] = base64.standard_b64encode(data).decode("ascii")
+    merged["_license_mime"] = mime
+    return merged
+
+
+def _license_bytes_from_payload(payload: Dict[str, Any]) -> tuple[Optional[bytes], str]:
+    b64 = (payload or {}).get("_license_b64") or ""
+    if not b64:
+        return None, "image/jpeg"
+    mime = (payload or {}).get("_license_mime") or "image/jpeg"
+    try:
+        return base64.standard_b64decode(b64), mime
+    except Exception:
+        return None, mime
 
 
 def _verify_draft_access(
@@ -200,10 +272,13 @@ async def patch_draft(
     for k, v in (body.payload or {}).items():
         if k in INTERVIEW_FIELD_KEYS or k == "first_name":
             merged[k] = v
-    merged = _apply_telegram_resolution(merged, db)
+    merged = _apply_telegram_resolution(merged, db, drafts)
     if not drafts.update(draft_id, payload=merged):
         raise HTTPException(status_code=500, detail="Could not save draft")
-    return {"ok": True, "payload": merged}
+    _note_pending_telegram_username(merged, draft_id, drafts)
+    un = (merged.get("telegram_username") or "").strip()
+    resolve_info = telegram_resolve_meta(db, un, drafts_db=drafts) if un else None
+    return {"ok": True, "payload": merged, "telegramResolve": resolve_info}
 
 
 @router.post("/draft/{draft_id}/license")
@@ -224,17 +299,23 @@ async def upload_license(
     if not data or len(data) > 12 * 1024 * 1024:
         raise HTTPException(status_code=400, detail="Invalid or too large file")
 
-    url = db.upload_driver_license_to_storage(draft_id, data, file.filename or "license.jpg")
-    if not url:
-        raise HTTPException(status_code=500, detail="License upload failed")
-
+    mime = _mime_from_upload(file)
     merged = dict(draft.get("payload") or {})
+    url = db.upload_driver_license_to_storage(draft_id, data, file.filename or "license.jpg")
+    if url:
+        merged.pop("_license_b64", None)
+        merged.pop("_license_mime", None)
+    else:
+        merged = _embed_license_fallback(merged, data, mime)
+        url = _license_serve_url("draft", draft_id)
+        logger.warning("Supabase storage upload failed; using API-hosted license for draft %s", draft_id[:8])
+
     parsed = False
     if Config.is_ai_configured():
         try:
             extracted = extract_interview_from_image(data, _mime_from_upload(file))
             merged = _merge_extracted_payload(merged, extracted)
-            merged = _apply_telegram_resolution(merged, db)
+            merged = _apply_telegram_resolution(merged, db, drafts)
             parsed = any((merged.get(k) or "").strip() for k in INTERVIEW_FIELD_KEYS)
         except AIVisionQuotaError:
             raise HTTPException(status_code=429, detail="OpenAI quota exceeded. Try again later.")
@@ -244,6 +325,43 @@ async def upload_license(
     if not drafts.update(draft_id, drivers_license_file_url=url, payload=merged):
         raise HTTPException(status_code=500, detail="Could not save license URL")
     return {"ok": True, "driversLicenseFileUrl": url, "payload": merged, "parsed": parsed}
+
+
+@router.get("/draft/{draft_id}/license-file")
+async def serve_draft_license_file(
+    draft_id: str,
+    drafts: DraftsDatabase = Depends(get_drafts_db),
+):
+    draft = drafts.get_by_id(draft_id)
+    if not draft:
+        raise HTTPException(status_code=404, detail="Not found")
+    payload = draft.get("payload") or {}
+    raw, mime = _license_bytes_from_payload(payload)
+    if raw:
+        return Response(content=raw, media_type=mime)
+    ext_url = (draft.get("drivers_license_file_url") or "").strip()
+    if ext_url and "/license-file" not in ext_url:
+        return RedirectResponse(ext_url, status_code=302)
+    raise HTTPException(status_code=404, detail="License file not found")
+
+
+@router.get("/record/{interview_id}/license-file")
+async def serve_interview_license_file(
+    interview_id: str,
+    db: Database = Depends(get_db),
+    drafts: DraftsDatabase = Depends(get_drafts_db),
+):
+    interview = db.get_interview_by_id(interview_id)
+    if not interview:
+        raise HTTPException(status_code=404, detail="Not found")
+    ext_url = (interview.get("drivers_license_file_url") or "").strip()
+    if ext_url and "/license-file" not in ext_url:
+        return RedirectResponse(ext_url, status_code=302)
+    for draft in drafts.find_drafts_by_submitted_interview(interview_id):
+        raw, mime = _license_bytes_from_payload(draft.get("payload") or {})
+        if raw:
+            return Response(content=raw, media_type=mime)
+    raise HTTPException(status_code=404, detail="License file not found")
 
 
 @router.post("/draft/{draft_id}/parse-image")
@@ -273,13 +391,20 @@ async def parse_draft_image(
         raise HTTPException(status_code=429, detail="OpenAI quota exceeded. Try again later.")
     except Exception as e:
         logger.error("parse_draft_image: %s", e, exc_info=True)
-        raise HTTPException(status_code=422, detail="Could not read image. Try a clearer photo.")
+        raise HTTPException(status_code=422, detail="Could not read image. Try a clearer JPG or PNG photo.")
+
+    filled = filled_interview_keys(extracted)
+    if not filled:
+        raise HTTPException(
+            status_code=422,
+            detail="Could not find interview fields in that image. Try a clearer screenshot or paste text instead.",
+        )
 
     merged = _merge_extracted_payload(dict(draft.get("payload") or {}), extracted)
-    merged = _apply_telegram_resolution(merged, db)
+    merged = _apply_telegram_resolution(merged, db, drafts)
     if not drafts.update(draft_id, payload=merged):
         raise HTTPException(status_code=500, detail="Could not save parsed fields")
-    return {"ok": True, "payload": merged}
+    return {"ok": True, "payload": merged, "filledKeys": filled}
 
 
 @router.post("/draft/{draft_id}/parse-text")
@@ -311,27 +436,124 @@ async def parse_draft_text(
         logger.error("parse_draft_text: %s", e, exc_info=True)
         raise HTTPException(status_code=422, detail="Could not parse text. Try clearer formatting.")
 
+    filled = filled_interview_keys(extracted)
+    if not filled:
+        raise HTTPException(
+            status_code=422,
+            detail="Could not find interview fields in that text. Add labels like Name, Phone, Email, Telegram.",
+        )
+
     merged = _merge_extracted_payload(dict(draft.get("payload") or {}), extracted)
-    merged = _apply_telegram_resolution(merged, db)
+    merged = _apply_telegram_resolution(merged, db, drafts)
     if not drafts.update(draft_id, payload=merged):
         raise HTTPException(status_code=500, detail="Could not save parsed fields")
-    return {"ok": True, "payload": merged}
+    return {"ok": True, "payload": merged, "filledKeys": filled}
 
 
 @router.post("/resolve-telegram")
 async def resolve_telegram(
     body: ResolveTelegramBody,
     db: Database = Depends(get_db),
+    drafts: DraftsDatabase = Depends(get_drafts_db),
 ):
-    tid, source, message = resolve_telegram_id_for_username(db, body.username)
+    meta = telegram_resolve_meta(db, body.username, drafts_db=drafts)
     display = normalize_telegram_username_display(body.username)
     return {
-        "ok": bool(tid),
+        **meta,
+        "telegramUsername": display or None,
+    }
+
+
+@router.get("/telegram-login-config")
+async def telegram_login_config():
+    """Where to host Telegram Login Widget (API domain, not Vercel)."""
+    base = widget_base_url()
+    return {
+        "botUsername": telegram_bot_username(),
+        "widgetBaseUrl": base or None,
+        "hostedLoginPath": "/api/interview/telegram-login-page",
+        "inlineOnFrontend": bool(base and False),
+    }
+
+
+@router.get("/telegram-login-page", response_class=HTMLResponse)
+async def telegram_login_page(return_url: str = ""):
+    """
+    Hosted Login Widget page. BotFather /setdomain must include this host
+    (e.g. krab-interviewer-bot-j5dv.onrender.com).
+    """
+    base = widget_base_url()
+    if not base:
+        raise HTTPException(
+            status_code=503,
+            detail="TELEGRAM_LOGIN_WIDGET_BASE_URL is not configured on the API server.",
+        )
+    target = (return_url or "").strip()
+    if not target or not is_allowed_return_url(target):
+        raise HTTPException(status_code=400, detail="Invalid or missing return_url")
+    return HTMLResponse(login_page_html(target))
+
+
+@router.get("/telegram-widget-callback")
+async def telegram_widget_callback(
+    request: Request,
+    return_url: str = "",
+    db: Database = Depends(get_db),
+):
+    """Telegram redirects here after Login Widget auth (data-auth-url flow)."""
+    target = (return_url or "").strip()
+    if not target or not is_allowed_return_url(target):
+        raise HTTPException(status_code=400, detail="Invalid return_url")
+
+    params = dict(request.query_params)
+    verified = verify_telegram_login(params, Config.TELEGRAM_BOT_TOKEN or "")
+    if not verified:
+        raise HTTPException(status_code=403, detail="Telegram login verification failed")
+
+    tid = verified["telegram_id"]
+    un_display = normalize_telegram_username_display(params.get("username") or "")
+    if not un_display:
+        un_display = verified.get("telegram_username") or ""
+    if un_display and db:
+        db.upsert_telegram_user_directory(tid, un_display.lstrip("@"))
+
+    sep = "&" if "?" in target else "?"
+    redirect = (
+        f"{target}{sep}telegram_auth=1"
+        f"&id={quote(str(tid))}"
+        f"&auth_date={quote(str(params.get('auth_date') or ''))}"
+        f"&hash={quote(str(params.get('hash') or ''))}"
+    )
+    if params.get("username"):
+        redirect += f"&username={quote(str(params.get('username')))}"
+    if params.get("first_name"):
+        redirect += f"&first_name={quote(str(params.get('first_name')))}"
+    return RedirectResponse(url=redirect, status_code=302)
+
+
+@router.post("/verify-telegram-auth")
+async def verify_telegram_auth(
+    body: TelegramWidgetAuthBody,
+    db: Database = Depends(get_db),
+):
+    """Verify Telegram Login Widget callback and upsert username → id."""
+    verified = verify_telegram_login(body.model_dump(), Config.TELEGRAM_BOT_TOKEN or "")
+    if not verified:
+        raise HTTPException(status_code=403, detail="Telegram login verification failed")
+
+    tid = verified["telegram_id"]
+    un_raw = (body.username or "").strip()
+    display = normalize_telegram_username_display(un_raw) if un_raw else verified.get("telegram_username") or ""
+
+    if display and db:
+        db.upsert_telegram_user_directory(tid, display.lstrip("@"))
+
+    return {
+        "ok": True,
         "telegramId": tid,
         "telegramUsername": display or None,
-        "source": source,
-        "message": message,
-        "botUsername": (getattr(Config, "KRAB_INTERVIEWER_BOT_USERNAME", None) or "krabinterviewerbot").lstrip("@"),
+        "firstName": verified.get("first_name") or None,
+        "message": f"Telegram ID {tid} linked.",
     }
 
 
@@ -354,14 +576,15 @@ async def submit_draft(
         }
 
     payload = dict(draft.get("payload") or {})
-    payload = _apply_telegram_resolution(payload, db)
+    payload = _apply_telegram_resolution(payload, db, drafts)
     if _empty_val(payload.get("telegram_id")):
-        bot = (getattr(Config, "KRAB_INTERVIEWER_BOT_USERNAME", None) or "krabinterviewerbot").lstrip("@")
+        un = normalize_telegram_username_display(payload.get("telegram_username") or "")
+        connect = telegram_connect_url("web")
         raise HTTPException(
             status_code=400,
             detail=(
-                f"Could not verify your Telegram account. Open @{bot} in Telegram, tap Start, "
-                "then return to the form and enter your @username again."
+                f"Could not find a Telegram ID for {un or 'that username'}. "
+                f'Use "Log in with Telegram" on the form, or open {connect} and tap Start once, then try again.'
             ),
         )
     if not drafts.update(draft_id, payload=payload):
@@ -389,6 +612,12 @@ async def submit_draft(
     if lic_url:
         fields["drivers_license_file_url"] = lic_url
 
+    hire_check = {**fields, "telegram_id": payload.get("telegram_id")}
+    if Config.WEB_AUTO_HIRE_ON_SUBMIT:
+        ok_hire, hire_msg = validate_hire_ready(hire_check)
+        if not ok_hire:
+            raise HTTPException(status_code=400, detail=hire_msg)
+
     interview = db.create_interview(
         fields,
         created_by_telegram_id=WEB_CREATED_BY,
@@ -399,14 +628,36 @@ async def submit_draft(
         raise HTTPException(status_code=500, detail="Could not create interview")
 
     iid = str(interview["id"])
+    lic_url = (draft.get("drivers_license_file_url") or "").strip()
+    payload_b64, _mime = _license_bytes_from_payload(payload)
+    if payload_b64 and (not lic_url or "/license-file" in lic_url):
+        lic_url = _license_serve_url("record", iid)
     if lic_url:
         db.update_interview(iid, {"drivers_license_file_url": lic_url})
+        interview["drivers_license_file_url"] = lic_url
+
+    hired = False
+    hire_errors: list[str] = []
+    if Config.WEB_AUTO_HIRE_ON_SUBMIT:
+        interview, hire_errors = hire_driver_records(db, iid)
+        if not interview:
+            db.update_interview(iid, {"status": "cancelled"})
+            raise HTTPException(
+                status_code=500,
+                detail=hire_errors[0] if hire_errors else "Auto-hire failed",
+            )
+        hired = True
+        schedule_hire_side_effects(iid, created_by=WEB_CREATED_BY)
 
     drafts.mark_submitted(draft_id, iid)
-    notify_supervisors_new_web_interview(interview)
+    if hired:
+        notify_supervisors_web_auto_hired(interview, hire_errors)
+    else:
+        notify_supervisors_new_web_interview(interview)
 
     return {
         "ok": True,
         "alreadySubmitted": False,
         "interviewId": iid,
+        "hired": hired,
     }

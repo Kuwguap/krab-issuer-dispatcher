@@ -8,6 +8,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
 
 from config import Config
+from utils.telegram_resolve import normalize_telegram_username, normalize_telegram_username_display
 
 logger = logging.getLogger(__name__)
 
@@ -123,8 +124,138 @@ class DraftsDatabase:
             submitted_at=now,
         )
 
+    def reset_submission(self, draft_id: str) -> bool:
+        """Clear submitted state so the visitor can submit again."""
+        try:
+            self.client.table("interview_drafts").update(
+                {
+                    "status": "draft",
+                    "submitted_interview_id": None,
+                    "submitted_at": None,
+                    "last_seen_at": datetime.now(timezone.utc).isoformat(),
+                }
+            ).eq("id", draft_id).execute()
+            return True
+        except Exception as e:
+            logger.error("reset_submission failed: %s", e)
+            return False
+
+    def find_drafts_by_submitted_interview(self, interview_id: str) -> List[Dict[str, Any]]:
+        try:
+            r = (
+                self.client.table("interview_drafts")
+                .select("*")
+                .eq("submitted_interview_id", str(interview_id))
+                .execute()
+            )
+            return r.data or []
+        except Exception as e:
+            logger.error("find_drafts_by_submitted_interview failed: %s", e)
+            return []
+
     def touch(self, draft_id: str) -> bool:
         return self.update(draft_id, last_seen_at=datetime.now(timezone.utc))
+
+    def register_pending_telegram_username(self, username: str, draft_id: str) -> None:
+        """Remember username from web form until user taps /start on the bot."""
+        un = normalize_telegram_username(username)
+        if not un or not draft_id:
+            return
+        try:
+            self.client.table("telegram_username_pending").upsert(
+                {
+                    "username_lower": un,
+                    "draft_id": draft_id,
+                    "updated_at": datetime.now(timezone.utc).isoformat(),
+                }
+            ).execute()
+        except Exception as e:
+            if "telegram_username_pending" not in str(e):
+                logger.warning("register_pending_telegram_username: %s", e)
+
+    def lookup_telegram_id_from_drafts(self, username: str) -> Optional[str]:
+        """Find telegram_id already linked on a draft for this username."""
+        un = normalize_telegram_username(username)
+        if not un:
+            return None
+        try:
+            cutoff = (datetime.now(timezone.utc) - timedelta(days=14)).isoformat()
+            r = (
+                self.client.table("interview_drafts")
+                .select("payload")
+                .eq("status", "draft")
+                .gte("last_seen_at", cutoff)
+                .order("last_seen_at", desc=True)
+                .limit(300)
+                .execute()
+            )
+            for row in r.data or []:
+                payload = row.get("payload") or {}
+                if normalize_telegram_username(payload.get("telegram_username") or "") != un:
+                    continue
+                tid = str(payload.get("telegram_id") or "").strip()
+                if tid and tid != "-":
+                    return tid
+        except Exception as e:
+            logger.error("lookup_telegram_id_from_drafts: %s", e)
+        return None
+
+    def link_telegram_id_for_username(self, username: str, telegram_id: str) -> int:
+        """Set telegram_id on drafts that have this username but no ID yet."""
+        un = normalize_telegram_username(username)
+        if not un or not telegram_id:
+            return 0
+        display = normalize_telegram_username_display(un)
+        draft_ids: set[str] = set()
+
+        try:
+            r = (
+                self.client.table("telegram_username_pending")
+                .select("draft_id")
+                .eq("username_lower", un)
+                .execute()
+            )
+            for row in r.data or []:
+                if row.get("draft_id"):
+                    draft_ids.add(str(row["draft_id"]))
+            self.client.table("telegram_username_pending").delete().eq("username_lower", un).execute()
+        except Exception as e:
+            if "telegram_username_pending" not in str(e):
+                logger.warning("link_telegram_id pending table: %s", e)
+
+        try:
+            cutoff = (datetime.now(timezone.utc) - timedelta(days=14)).isoformat()
+            r = (
+                self.client.table("interview_drafts")
+                .select("id, payload")
+                .eq("status", "draft")
+                .gte("last_seen_at", cutoff)
+                .order("last_seen_at", desc=True)
+                .limit(300)
+                .execute()
+            )
+            for row in r.data or []:
+                payload = row.get("payload") or {}
+                if normalize_telegram_username(payload.get("telegram_username") or "") != un:
+                    continue
+                tid = str(payload.get("telegram_id") or "").strip()
+                if tid and tid != "-":
+                    continue
+                draft_ids.add(str(row["id"]))
+        except Exception as e:
+            logger.warning("link_telegram_id draft scan: %s", e)
+
+        linked = 0
+        for did in draft_ids:
+            draft = self.get_by_id(did)
+            if not draft or draft.get("status") != "draft":
+                continue
+            payload = dict(draft.get("payload") or {})
+            payload["telegram_username"] = display
+            payload["telegram_id"] = str(telegram_id)
+            if self.update(did, payload=payload):
+                linked += 1
+        return linked
 
     def list_for_admin(
         self,

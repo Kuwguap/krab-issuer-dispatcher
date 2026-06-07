@@ -72,6 +72,24 @@ class Database:
             logger.error("list_interviews: %s", e)
             return []
 
+    def list_interviews_by_status(self, status: str, limit: int = 50) -> List[Dict[str, Any]]:
+        st = (status or "").strip()
+        if not st:
+            return []
+        try:
+            r = (
+                self.client.table("interviews")
+                .select("*")
+                .eq("status", st)
+                .order("created_at", desc=True)
+                .limit(limit)
+                .execute()
+            )
+            return r.data or []
+        except Exception as e:
+            logger.error("list_interviews_by_status: %s", e)
+            return []
+
     def update_interview(self, interview_id: str, updates: Dict[str, Any]) -> bool:
         updates = dict(updates)
         updates["updated_at"] = datetime.now(timezone.utc).isoformat()
@@ -447,7 +465,134 @@ class Database:
             logger.error("delete_driver: %s", e)
             return False
 
+    def delete_driver_by_telegram_id(self, telegram_id: str) -> bool:
+        tid = str(telegram_id or "").strip()
+        if not tid:
+            return False
+        try:
+            self.client.table("drivers").delete().eq("driver_telegram_id", tid).execute()
+            return True
+        except Exception as e:
+            logger.error("delete_driver_by_telegram_id: %s", e)
+            return False
+
+    def find_interviews_by_full_name(self, name: str, limit: int = 20) -> List[Dict[str, Any]]:
+        needle = (name or "").strip()
+        if not needle:
+            return []
+        try:
+            r = (
+                self.client.table("interviews")
+                .select("*")
+                .ilike("full_name", f"%{needle}%")
+                .order("created_at", desc=True)
+                .limit(limit)
+                .execute()
+            )
+            return r.data or []
+        except Exception as e:
+            logger.error("find_interviews_by_full_name: %s", e)
+            return []
+
+    def cancel_interview(self, interview_id: str) -> bool:
+        return self.update_interview(interview_id, {"status": "cancelled"})
+
+    def delete_interview(self, interview_id: str) -> bool:
+        try:
+            self.client.table("interviews").delete().eq("id", interview_id).execute()
+            return True
+        except Exception as e:
+            logger.error("delete_interview: %s", e)
+            return False
+
     # --- storage ---
+
+    def _ensure_driver_license_bucket(self) -> None:
+        """Create public bucket if missing (service role key required)."""
+        base = (Config.SUPABASE_URL or "").rstrip("/")
+        key = (Config.SUPABASE_KEY or "").strip()
+        if not base or not key:
+            return
+        try:
+            buckets = self.client.storage.list_buckets() or []
+            names = set()
+            for b in buckets:
+                if isinstance(b, dict):
+                    nm = b.get("name")
+                else:
+                    nm = getattr(b, "name", None)
+                if nm:
+                    names.add(nm)
+            if "driver_licenses" in names:
+                return
+        except Exception as e:
+            logger.warning("_ensure_driver_license_bucket list: %s", e)
+
+        try:
+            self.client.storage.create_bucket(
+                "driver_licenses",
+                options={"public": True},
+            )
+            logger.info("Created Supabase storage bucket driver_licenses")
+            return
+        except Exception as e:
+            logger.warning("_ensure_driver_license_bucket create: %s", e)
+
+        try:
+            import requests
+
+            r = requests.post(
+                f"{base}/storage/v1/bucket",
+                headers={"Authorization": f"Bearer {key}", "apikey": key},
+                json={"id": "driver_licenses", "name": "driver_licenses", "public": True},
+                timeout=30,
+            )
+            if r.status_code in (200, 201):
+                logger.info("Created driver_licenses bucket via REST")
+            else:
+                logger.warning(
+                    "REST create bucket failed: %s %s",
+                    r.status_code,
+                    (r.text or "")[:300],
+                )
+        except Exception as e:
+            logger.warning("_ensure_driver_license_bucket REST: %s", e)
+
+    def _upload_license_via_rest(
+        self,
+        path: str,
+        file_bytes: bytes,
+        content_type: str,
+    ) -> Optional[str]:
+        base = (Config.SUPABASE_URL or "").rstrip("/")
+        key = (Config.SUPABASE_KEY or "").strip()
+        if not base or not key:
+            return None
+        try:
+            import requests
+
+            upload_url = f"{base}/storage/v1/object/driver_licenses/{path}"
+            r = requests.post(
+                upload_url,
+                headers={
+                    "Authorization": f"Bearer {key}",
+                    "apikey": key,
+                    "Content-Type": content_type,
+                    "x-upsert": "true",
+                },
+                data=file_bytes,
+                timeout=60,
+            )
+            if r.status_code in (200, 201):
+                return f"{base}/storage/v1/object/public/driver_licenses/{path}"
+            logger.warning(
+                "REST license upload failed: %s %s",
+                r.status_code,
+                (r.text or "")[:300],
+            )
+        except Exception as e:
+            logger.warning("_upload_license_via_rest: %s", e)
+        return None
 
     def upload_driver_license_to_storage(
         self,
@@ -471,10 +616,15 @@ class Database:
         }.get(ext, "image/jpeg")
         safe_id = re.sub(r"[^A-Za-z0-9_-]+", "_", str(interview_id))[:36]
         path = f"{safe_id}/{secrets.token_hex(4)}.{ext}"
+        self._ensure_driver_license_bucket()
         try:
             bucket = self.client.storage.from_("driver_licenses")
-            bucket.upload(path, file_bytes, file_options={"content-type": content_type})
+            bucket.upload(
+                path,
+                file_bytes,
+                file_options={"content-type": content_type, "upsert": "true"},
+            )
             return bucket.get_public_url(path)
         except Exception as e:
-            logger.warning("upload_driver_license_to_storage failed: %s", e)
-            return None
+            logger.warning("upload_driver_license_to_storage client failed: %s", e)
+        return self._upload_license_via_rest(path, file_bytes, content_type)

@@ -1,6 +1,7 @@
 """Admin dashboard API (password session)."""
 from __future__ import annotations
 
+import logging
 from typing import Optional
 
 from fastapi import APIRouter, Cookie, Depends, HTTPException
@@ -9,6 +10,7 @@ from pydantic import BaseModel
 
 from api.deps import (
     ADMIN_COOKIE,
+    get_db,
     get_drafts_db,
     require_admin,
     sign_admin_session,
@@ -16,12 +18,21 @@ from api.deps import (
 )
 from config import Config
 from utils.drafts_db import DraftsDatabase
+from utils.database import Database
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/admin", tags=["admin"])
 
 
 class LoginBody(BaseModel):
     password: str = ""
+
+
+class CleanupBody(BaseModel):
+    fullNameContains: str = "jb-test"
+    interviewId: str = ""
+    deleteRecord: bool = False
 
 
 @router.post("/login")
@@ -83,3 +94,38 @@ async def interview_detail(
         "payload": row.get("payload") or {},
         "driversLicenseFileUrl": row.get("drivers_license_file_url"),
     }
+
+
+@router.post("/maintenance/cleanup-test")
+async def cleanup_test_interviews(
+    body: CleanupBody,
+    _: None = Depends(require_admin),
+    db: Database = Depends(get_db),
+    drafts: DraftsDatabase = Depends(get_drafts_db),
+):
+    """Cancel/delete test interviews and reset linked web drafts."""
+    cleaned = []
+    if body.interviewId:
+        rows = [db.get_interview_by_id(body.interviewId.strip())]
+        rows = [r for r in rows if r]
+    else:
+        rows = db.find_interviews_by_full_name(body.fullNameContains, limit=50)
+
+    for inv in rows:
+        iid = str(inv.get("id") or "")
+        if not iid:
+            continue
+        tid = str(inv.get("telegram_id") or "").strip()
+        if body.deleteRecord:
+            db.delete_interview(iid)
+            action = "deleted"
+        else:
+            db.cancel_interview(iid)
+            action = "cancelled"
+        if tid:
+            db.delete_driver_by_telegram_id(tid)
+        for drow in drafts.find_drafts_by_submitted_interview(iid):
+            drafts.reset_submission(str(drow["id"]))
+        cleaned.append({"interviewId": iid, "action": action, "fullName": inv.get("full_name")})
+
+    return {"ok": True, "cleaned": cleaned, "count": len(cleaned)}

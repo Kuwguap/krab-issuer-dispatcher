@@ -1,53 +1,49 @@
-# Driver hiring kit (copy to any project)
+# Driver hiring site (React)
 
-**One folder — copy everything.** No iframes. Static HTML pages + API to `krab-interviewer-bot`.
+Single-folder deploy for your domain (e.g. `test.com`). **Vite + React** — light, clean UI inspired by [Whimsical](https://whimsical.com/) (soft purple accents, spacious layout, real photography).
 
-## Quick start (human)
+## 2 pages
 
-1. Copy this entire `driver-hiring-kit` folder into your project, e.g. `public/driver-hiring/`.
-2. Open `static/config.js` and set `KRAB_API_BASE_URL` (see comments).
-3. Proxy `/api` on your site to krab-interviewer-bot (see `proxy-examples/`).
-4. Link from your site: `<a href="/driver-hiring/">Apply to drive</a>`.
+| Route | Purpose |
+|-------|---------|
+| `/` | Pitch — same-day cash job, 1-2-3 steps, what you need |
+| `/apply` | Form with **real photo examples** beside every field → submits to Telegram bot |
 
-**For AI / developers:** read **[AI-WIRE-UP.md](./AI-WIRE-UP.md)** — step-by-step checklist and placement table.
+## Local dev
 
-## Pages
-
-| File | URL on your site (example) |
-|------|----------------------------|
-| `index.html` | `/driver-hiring/` |
-| `requirements.html` | `/driver-hiring/requirements.html` |
-| `interview.html` | `/driver-hiring/interview.html` |
-| `how-to-telegram.html` | `/driver-hiring/how-to-telegram.html` |
-
-## Contents
-
-```
-driver-hiring-kit/
-  README.md              ← you are here
-  AI-WIRE-UP.md          ← give this to AI when integrating
-  index.html
-  requirements.html
-  interview.html
-  how-to-telegram.html
-  static/
-    config.js            ← EDIT: API URL
-    config.example.js
-    main.js
-    styles.css
-    funnel.css
-  proxy-examples/
-    nginx.conf.snippet
-    vercel.json.snippet
-    next.config.snippet.js
+```bash
+cd driver-hiring-kit
+npm install
+npm run dev
 ```
 
-## Sync from krab-interviewer
+Vite proxies `/api` → `krab-interviewer-bot.onrender.com` (see `vite.config.js`).
 
-If you change `web/` in the repo, re-copy CSS/HTML or run from repo root:
+## Deploy (Vercel → test.com)
 
-```powershell
-.\scripts\sync-driver-hiring-kit.ps1
+1. Connect repo; set **Root Directory** to `krab-interviewer/driver-hiring-kit`.
+2. Add env var **`KRAB_INTERVIEWER_URL`** = `https://krab-interviewer-bot-j5dv.onrender.com` (Vercel → Settings → Environment Variables).
+3. Deploy — `api/interview/[...path].js` proxies all `/api/interview/*` requests (fixes 404 on draft / verify).
+4. Optional: hit `https://your-domain.com/api/health` — should return `{"ok":true}`.
+
+**Why 404 happened:** the SPA rewrite was sending `/api/*` to `index.html`. Fixed by excluding `/api/` from that rewrite and using Vercel serverless proxy.
+
+## Env
+
+| Variable | Default | Notes |
+|----------|---------|-------|
+| `VITE_KRAB_API_BASE_URL` | *(empty)* | Same-origin `/api` proxy (recommended) |
+| `VITE_BRAND_NAME` | Driver Interview Call | Nav branding |
+
+## Custom images
+
+Edit `src/images.js` — Unsplash URLs today. Replace with your own URLs or add files under `public/images/` and reference `/images/your-file.jpg`.
+
+## API flow
+
+```
+/apply → POST /api/interview/draft → PATCH auto-save → POST /api/interview/submit
+→ supervisor Telegram alert → /open {id} → Hire → bot adds group, channel, driver bot
 ```
 
-(Script copies assets from `web/` into this kit.)
+See **AI-WIRE-UP.md** for CORS / nginx alternatives.

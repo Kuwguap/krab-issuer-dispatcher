@@ -1,0 +1,15 @@
+{
+  "buildCommand": "npm run build",
+  "outputDirectory": "dist",
+  "framework": null,
+  "rewrites": [
+    {
+      "source": "/api/interview/:path*",
+      "destination": "/api/interview-proxy?path=:path*"
+    },
+    {
+      "source": "/((?!api/|assets/|images/).*)",
+      "destination": "/index.html"
+    }
+  ]
+}

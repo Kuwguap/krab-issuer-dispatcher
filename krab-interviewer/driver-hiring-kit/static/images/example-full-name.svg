@@ -1,0 +1,7 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="280" height="100" viewBox="0 0 280 100" role="img" aria-label="Example full name">
+  <rect width="280" height="100" rx="10" fill="#1e293b" stroke="#475569" stroke-width="2"/>
+  <rect x="12" y="12" width="256" height="76" rx="6" fill="#0f172a"/>
+  <text x="20" y="34" fill="#94a3b8" font-size="9" font-weight="600">EXAMPLE</text>
+  <rect x="20" y="44" width="240" height="32" rx="6" fill="#1a2332" stroke="#334155"/>
+  <text x="32" y="64" fill="#f8fafc" font-family="system-ui,sans-serif" font-size="12">Eddie Goldman</text>
+</svg>

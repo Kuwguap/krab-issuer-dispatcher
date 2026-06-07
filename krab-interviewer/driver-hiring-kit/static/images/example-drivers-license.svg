@@ -1,0 +1,15 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="280" height="175" viewBox="0 0 280 175" role="img" aria-label="Example driver license photo">
+  <rect width="280" height="175" rx="10" fill="#1e293b" stroke="#475569" stroke-width="2"/>
+  <rect x="12" y="12" width="256" height="151" rx="6" fill="#0f172a"/>
+  <text x="20" y="32" fill="#94a3b8" font-family="system-ui,sans-serif" font-size="9" font-weight="600">EXAMPLE — front of license (clear photo)</text>
+  <rect x="20" y="42" width="72" height="88" rx="4" fill="#334155"/>
+  <circle cx="56" cy="78" r="22" fill="#64748b"/>
+  <text x="56" y="82" text-anchor="middle" fill="#cbd5e1" font-size="8">PHOTO</text>
+  <text x="104" y="58" fill="#e2e8f0" font-family="system-ui,sans-serif" font-size="11" font-weight="700">NEW JERSEY</text>
+  <text x="104" y="74" fill="#94a3b8" font-family="system-ui,sans-serif" font-size="9">DRIVER LICENSE</text>
+  <text x="104" y="96" fill="#f8fafc" font-family="system-ui,sans-serif" font-size="10">DOE, JANE M</text>
+  <text x="104" y="112" fill="#cbd5e1" font-family="monospace" font-size="10">DL# D12345678901234</text>
+  <text x="104" y="128" fill="#94a3b8" font-family="system-ui,sans-serif" font-size="8">EXP 08/15/2028</text>
+  <rect x="20" y="138" width="240" height="18" rx="3" fill="#14532d"/>
+  <text x="140" y="150" text-anchor="middle" fill="#86efac" font-family="system-ui,sans-serif" font-size="8">✓ Good: flat, well-lit, all corners visible</text>
+</svg>

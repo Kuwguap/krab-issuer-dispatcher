@@ -12,9 +12,9 @@ class Config:
     TELEGRAM_BOT_TOKEN = (os.getenv("TELEGRAM_BOT_TOKEN") or "").strip() or None
     SUPERVISORY_TELEGRAM_ID = os.getenv("SUPERVISORY_TELEGRAM_ID")
     SUPABASE_URL = (os.getenv("SUPABASE_URL") or "").strip() or None
-    # Prefer SUPABASE_KEY; fall back to SUPABASE_SERVICE_ROLE_KEY (name used on krab-dispatch).
+    # Prefer service role for server-side DB + storage; fall back to SUPABASE_KEY.
     SUPABASE_KEY = (
-        (os.getenv("SUPABASE_KEY") or os.getenv("SUPABASE_SERVICE_ROLE_KEY") or "").strip() or None
+        (os.getenv("SUPABASE_SERVICE_ROLE_KEY") or os.getenv("SUPABASE_KEY") or "").strip() or None
     )
     OPENAI_API_KEY = (os.getenv("OPENAI_API_KEY") or "").strip() or None
     OPENAI_VISION_MODEL = (os.getenv("OPENAI_VISION_MODEL") or "gpt-4o").strip() or "gpt-4o"
@@ -46,6 +46,19 @@ class Config:
     IP_HASH_SALT = (os.getenv("IP_HASH_SALT") or "krab-interviewer").strip()
     KRAB_API_CORS_ALLOWED_ORIGINS = (os.getenv("KRAB_API_CORS_ALLOWED_ORIGINS") or "*").strip()
     KRAB_PUBLIC_BASE_URL = (os.getenv("KRAB_PUBLIC_BASE_URL") or "").strip() or None
+    # Host Login Widget here (BotFather /setdomain must match this hostname).
+    TELEGRAM_LOGIN_WIDGET_BASE_URL = (
+        os.getenv("TELEGRAM_LOGIN_WIDGET_BASE_URL") or os.getenv("KRAB_PUBLIC_BASE_URL") or ""
+    ).strip() or None
+    # Comma-separated site origins allowed after Telegram auth redirect (e.g. Vercel frontend).
+    TELEGRAM_LOGIN_RETURN_ORIGINS = (os.getenv("TELEGRAM_LOGIN_RETURN_ORIGINS") or "").strip() or None
+    # When true (default), web form submit auto-hires: issuer + dispatch + onboarding.
+    WEB_AUTO_HIRE_ON_SUBMIT = (os.getenv("WEB_AUTO_HIRE_ON_SUBMIT") or "true").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
 
     @classmethod
     def is_ai_configured(cls) -> bool:
