@@ -14,6 +14,7 @@ import uuid as _uuid_mod
 import calendar as _calendar_mod
 from datetime import date as _date, datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
+from urllib.parse import urlparse
 
 import pytz
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, InputFile, Update
@@ -596,7 +597,7 @@ async def _send_license_attachment(
             logger.warning("send_document license bytes failed: %s", e)
 
     lic = (license_url or "").strip()
-    if not lic:
+    if not lic or not _license_url_fetchable(lic):
         return
     try:
         await message.reply_photo(photo=lic, caption=caption)
@@ -609,6 +610,29 @@ async def _send_license_attachment(
     except Exception as e:
         logger.warning("send_document license url failed: %s", e)
     await message.reply_text(f"🪪 License file:\n{lic}")
+
+
+def _license_url_fetchable(url: str) -> bool:
+    """False for local/test hostnames (e.g. FastAPI TestClient ``testserver``)."""
+    u = (url or "").strip()
+    if not u:
+        return False
+    try:
+        host = (urlparse(u).hostname or "").lower()
+    except Exception:
+        return True
+    if not host:
+        return u.startswith("http")
+    blocked = {"testserver", "localhost", "127.0.0.1", "0.0.0.0", "::1"}
+    return host not in blocked and not host.endswith(".local")
+
+
+def _public_license_url(interview_id: str, fallback: str = "") -> str:
+    api = _record_license_api_url(interview_id)
+    if api:
+        return api
+    fb = (fallback or "").strip()
+    return fb if _license_url_fetchable(fb) else ""
 
 
 def _record_license_api_url(interview_id: str) -> str:
@@ -657,24 +681,26 @@ async def _resolve_license_for_interview(interview_id: str) -> tuple[Optional[by
 
     drafts = DraftsDatabase(db.client)
     linked = drafts.find_drafts_by_submitted_interview(interview_id)
-    urls: List[str] = []
-
     inv_url = (interview.get("drivers_license_file_url") or "").strip()
-    if inv_url:
-        urls.append(inv_url)
 
     for draft in linked:
-        payload = draft.get("payload") or {}
-        raw, mime = _decode_license_payload(payload)
+        raw, mime = _decode_license_payload(draft.get("payload") or {})
         if raw:
-            return raw, mime, inv_url or (draft.get("drivers_license_file_url") or "")
-        draft_url = (draft.get("drivers_license_file_url") or "").strip()
-        if draft_url and draft_url not in urls:
-            urls.append(draft_url)
+            good_url = _public_license_url(
+                interview_id,
+                inv_url or (draft.get("drivers_license_file_url") or ""),
+            )
+            return raw, mime, good_url
 
+    urls: List[str] = []
     api_url = _record_license_api_url(interview_id)
-    if api_url and api_url not in urls:
+    if api_url:
         urls.append(api_url)
+    for candidate in [inv_url] + [
+        (d.get("drivers_license_file_url") or "").strip() for d in linked
+    ]:
+        if candidate and candidate not in urls and _license_url_fetchable(candidate):
+            urls.append(candidate)
 
     loop = asyncio.get_running_loop()
     for url in urls:
@@ -682,7 +708,7 @@ async def _resolve_license_for_interview(interview_id: str) -> tuple[Optional[by
         if raw:
             return raw, mime, url
 
-    return None, "image/jpeg", inv_url
+    return None, "image/jpeg", _public_license_url(interview_id, inv_url)
 
 
 def _format_interview_understanding(interview: dict) -> str:
