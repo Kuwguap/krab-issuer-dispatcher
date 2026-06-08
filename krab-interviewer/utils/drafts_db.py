@@ -128,6 +128,7 @@ class DraftsDatabase:
         *,
         payload: Optional[Dict[str, Any]] = None,
         drivers_license_file_url: Optional[str] = None,
+        ip_hash: Optional[str] = None,
         status: Optional[str] = None,
         submitted_interview_id: Optional[str] = None,
         submitted_at: Optional[str] = None,
@@ -140,6 +141,8 @@ class DraftsDatabase:
             updates["payload"] = payload
         if drivers_license_file_url is not None:
             updates["drivers_license_file_url"] = drivers_license_file_url
+        if ip_hash is not None:
+            updates["ip_hash"] = ip_hash
         if status is not None:
             updates["status"] = status
         if submitted_interview_id is not None:
