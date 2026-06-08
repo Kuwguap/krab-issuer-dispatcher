@@ -6,7 +6,7 @@ import logging
 from typing import Any, Dict, Optional
 from urllib.parse import quote
 
-from fastapi import APIRouter, BackgroundTasks, Cookie, Depends, File, HTTPException, Request, UploadFile
+from fastapi import APIRouter, BackgroundTasks, Cookie, Depends, File, HTTPException, Query, Request, UploadFile
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
 from pydantic import BaseModel, Field
 
@@ -199,9 +199,12 @@ def _verify_draft_access(
     return draft
 
 
-def _client_draft_payload(raw: Optional[dict]) -> dict:
+def _client_draft_payload(raw: Any) -> dict:
     """Form fields only — never return internal license blobs to the browser."""
-    payload = dict(raw or {})
+    if isinstance(raw, dict):
+        payload = dict(raw)
+    else:
+        payload = {}
     payload.pop("_license_b64", None)
     payload.pop("_license_mime", None)
     return payload
@@ -210,10 +213,28 @@ def _client_draft_payload(raw: Optional[dict]) -> dict:
 @router.post("/draft")
 async def create_or_resume_draft(
     request: Request,
-    fresh: bool = False,
+    fresh: bool = Query(False),
     ip_hash: str = Depends(current_ip_hash),
     krab_draft_id: Optional[str] = Cookie(default=None),
     drafts: DraftsDatabase = Depends(get_drafts_db),
+):
+    try:
+        return _create_or_resume_draft_impl(
+            request, fresh, ip_hash, krab_draft_id, drafts
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception("create_or_resume_draft failed")
+        raise HTTPException(status_code=500, detail=f"Could not create draft: {e}")
+
+
+def _create_or_resume_draft_impl(
+    request: Request,
+    fresh: bool,
+    ip_hash: str,
+    krab_draft_id: Optional[str],
+    drafts: DraftsDatabase,
 ):
     ua = (request.headers.get("user-agent") or "")[:500]
     forwarded = _forwarded_for(request)

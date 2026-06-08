@@ -22,6 +22,9 @@ def _client_ip(forwarded_for: Optional[str], remote_addr: Optional[str]) -> str:
 
 
 def request_ip_is_reliable(forwarded_for: Optional[str], remote_addr: Optional[str]) -> bool:
+    """Only trust IP when an upstream proxy explicitly forwarded the client address."""
+    if not (forwarded_for or "").strip():
+        return False
     ip = _client_ip(forwarded_for, remote_addr)
     if not ip or ip.startswith("sess-"):
         return False
