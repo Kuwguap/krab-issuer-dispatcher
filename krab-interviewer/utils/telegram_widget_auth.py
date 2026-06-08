@@ -12,6 +12,15 @@ _TELEGRAM_LOGIN_DATA_FIELDS = frozenset(
 )
 
 
+def telegram_login_return_query_params(data: Dict[str, Any]) -> Dict[str, str]:
+    """All signed Telegram fields + hash for redirect back to the frontend."""
+    out = extract_telegram_login_data(data)
+    received_hash = str(data.get("hash") or "").strip()
+    if received_hash:
+        out["hash"] = received_hash
+    return out
+
+
 def extract_telegram_login_data(data: Dict[str, Any]) -> Dict[str, str]:
     """Strip app-specific query params (e.g. return_url) before hash verification."""
     out: Dict[str, str] = {}

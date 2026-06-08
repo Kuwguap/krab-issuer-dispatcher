@@ -12,6 +12,8 @@ export function parseTelegramAuthFromSearch(search = window.location.search) {
     hash,
     username: p.get("username") || undefined,
     first_name: p.get("first_name") || undefined,
+    last_name: p.get("last_name") || undefined,
+    photo_url: p.get("photo_url") || undefined,
   };
 }
 

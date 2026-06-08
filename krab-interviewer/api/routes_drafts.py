@@ -37,7 +37,7 @@ from utils.telegram_login_host import (
     telegram_bot_username,
     widget_base_url,
 )
-from utils.telegram_widget_auth import verify_telegram_login
+from utils.telegram_widget_auth import telegram_login_return_query_params, verify_telegram_login
 
 logger = logging.getLogger(__name__)
 
@@ -570,16 +570,11 @@ async def telegram_widget_callback(
         db.upsert_telegram_user_directory(tid, un_display.lstrip("@"))
 
     sep = "&" if "?" in target else "?"
-    redirect = (
-        f"{target}{sep}telegram_auth=1"
-        f"&id={quote(str(tid))}"
-        f"&auth_date={quote(str(params.get('auth_date') or ''))}"
-        f"&hash={quote(str(params.get('hash') or ''))}"
-    )
-    if params.get("username"):
-        redirect += f"&username={quote(str(params.get('username')))}"
-    if params.get("first_name"):
-        redirect += f"&first_name={quote(str(params.get('first_name')))}"
+    auth_params = telegram_login_return_query_params(params)
+    query_parts = ["telegram_auth=1"]
+    for key in sorted(auth_params.keys()):
+        query_parts.append(f"{key}={quote(str(auth_params[key]))}")
+    redirect = f"{target}{sep}{'&'.join(query_parts)}"
     return RedirectResponse(url=redirect, status_code=302)
 
 
