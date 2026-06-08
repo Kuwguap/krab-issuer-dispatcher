@@ -6,6 +6,26 @@ import hmac
 import time
 from typing import Any, Dict, Optional
 
+# Fields Telegram signs for Login Widget (https://core.telegram.org/widgets/login).
+_TELEGRAM_LOGIN_DATA_FIELDS = frozenset(
+    {"id", "first_name", "last_name", "username", "photo_url", "auth_date"}
+)
+
+
+def extract_telegram_login_data(data: Dict[str, Any]) -> Dict[str, str]:
+    """Strip app-specific query params (e.g. return_url) before hash verification."""
+    out: Dict[str, str] = {}
+    for key in _TELEGRAM_LOGIN_DATA_FIELDS:
+        if key not in data:
+            continue
+        value = data[key]
+        if value is None:
+            continue
+        text = str(value).strip()
+        if text:
+            out[key] = text
+    return out
+
 
 def verify_telegram_login(data: Dict[str, Any], bot_token: str, max_age_sec: int = 86400) -> Optional[Dict[str, str]]:
     """
@@ -15,7 +35,7 @@ def verify_telegram_login(data: Dict[str, Any], bot_token: str, max_age_sec: int
     if not token or not data:
         return None
 
-    payload = {k: v for k, v in data.items() if v is not None and k != "hash"}
+    payload = extract_telegram_login_data(data)
     received_hash = str(data.get("hash") or "").strip()
     if not received_hash:
         return None

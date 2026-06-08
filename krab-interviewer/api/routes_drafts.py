@@ -119,7 +119,7 @@ def _apply_telegram_resolution(
     tid, _source, _msg = resolve_telegram_id_for_username(db, un_raw, drafts_db=drafts)
     if tid:
         merged["telegram_id"] = str(tid)
-    else:
+    elif _empty_val(merged.get("telegram_id")):
         merged.pop("telegram_id", None)
     return merged
 
