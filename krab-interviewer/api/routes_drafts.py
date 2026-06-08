@@ -199,40 +199,55 @@ def _verify_draft_access(
     return draft
 
 
+def _client_draft_payload(raw: Optional[dict]) -> dict:
+    """Form fields only — never return internal license blobs to the browser."""
+    payload = dict(raw or {})
+    payload.pop("_license_b64", None)
+    payload.pop("_license_mime", None)
+    return payload
+
+
 @router.post("/draft")
 async def create_or_resume_draft(
     request: Request,
+    fresh: bool = False,
     ip_hash: str = Depends(current_ip_hash),
     krab_draft_id: Optional[str] = Cookie(default=None),
     drafts: DraftsDatabase = Depends(get_drafts_db),
 ):
     ua = (request.headers.get("user-agent") or "")[:500]
-    existing = drafts.get_by_ip_hash(ip_hash)
+    if fresh:
+        drafts.archive_visitor_drafts(ip_hash, krab_draft_id)
 
-    if not existing and krab_draft_id:
+    existing = None
+    if krab_draft_id and not fresh:
         by_cookie = drafts.get_by_id(krab_draft_id)
-        if by_cookie and by_cookie.get("ip_hash") == ip_hash:
-            existing = by_cookie
+        if by_cookie:
+            cookie_ip = (by_cookie.get("ip_hash") or "").strip()
+            if cookie_ip == ip_hash or by_cookie.get("status") == "submitted":
+                existing = by_cookie
+
+    if existing is None and not fresh:
+        existing = drafts.get_by_ip_hash(ip_hash)
 
     if existing:
         drafts.touch(str(existing["id"]))
         if existing.get("status") == "submitted":
-            payload = existing.get("payload") or {}
             inv_id = existing.get("submitted_interview_id")
             return _cookie_response(
                 {
                     "draftId": str(existing["id"]),
-                    "payload": payload,
+                    "payload": {},
                     "alreadySubmitted": True,
                     "submittedInterviewId": str(inv_id) if inv_id else None,
-                    "driversLicenseFileUrl": existing.get("drivers_license_file_url"),
+                    "driversLicenseFileUrl": None,
                 },
                 str(existing["id"]),
             )
         return _cookie_response(
             {
                 "draftId": str(existing["id"]),
-                "payload": existing.get("payload") or {},
+                "payload": _client_draft_payload(existing.get("payload")),
                 "alreadySubmitted": False,
                 "driversLicenseFileUrl": existing.get("drivers_license_file_url"),
             },

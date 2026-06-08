@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { Link } from "react-router-dom";
+import { Link, useNavigate, useSearchParams } from "react-router-dom";
 import { api } from "../api";
 import { FIELDS, FORM_FIELD_KEYS } from "../fields";
 import FormField from "../components/FormField";
@@ -8,6 +8,7 @@ import { registerDraftFlush, unregisterDraftFlush } from "../draftFlush";
 import { displayTelegramUsername, normalizeTelegramUsername, userFacingTelegramMessage } from "../telegram";
 import { useTelegramAuthReturn } from "../components/TelegramLoginButton";
 const TELEGRAM_BOT = (import.meta.env.VITE_TELEGRAM_BOT_USERNAME || "krabinterviewerbot").replace(/^@+/, "");
+const SUBMITTED_KEY = "krab_interview_submitted";
 
 function emptyPayload() {
   const p = { telegram_id: "" };
@@ -18,9 +19,13 @@ function emptyPayload() {
 }
 
 export default function ApplyPage() {
+  const [searchParams] = useSearchParams();
+  const navigate = useNavigate();
+  const freshStart = searchParams.get("fresh") === "1";
   const [draftId, setDraftId] = useState(null);
   const [payload, setPayload] = useState(emptyPayload);
-  const [frozen, setFrozen] = useState(false);
+  const [frozen, setFrozen] = useState(() => sessionStorage.getItem(SUBMITTED_KEY) === "1");
+  const [loadingDraft, setLoadingDraft] = useState(true);
   const [licenseUrl, setLicenseUrl] = useState("");
   const [licenseParseNote, setLicenseParseNote] = useState("");
   const [telegramStatus, setTelegramStatus] = useState(null);
@@ -190,11 +195,22 @@ export default function ApplyPage() {
   useEffect(() => {
     let cancelled = false;
     (async () => {
+      if (sessionStorage.getItem(SUBMITTED_KEY) === "1") {
+        setFrozen(true);
+        setLoadingDraft(false);
+        return;
+      }
       try {
-        const data = await api("/api/interview/draft", { method: "POST" });
+        const qs = freshStart ? "?fresh=1" : "";
+        const data = await api(`/api/interview/draft${qs}`, { method: "POST" });
         if (cancelled) return;
+        if (freshStart) {
+          sessionStorage.removeItem(SUBMITTED_KEY);
+          navigate("/apply", { replace: true });
+        }
         setDraftId(data.draftId);
         if (data.alreadySubmitted) {
+          sessionStorage.setItem(SUBMITTED_KEY, "1");
           setFrozen(true);
           return;
         }
@@ -204,12 +220,14 @@ export default function ApplyPage() {
         if (un) lookupTelegram(un);
       } catch (e) {
         if (!cancelled) console.error(e);
+      } finally {
+        if (!cancelled) setLoadingDraft(false);
       }
     })();
     return () => {
       cancelled = true;
     };
-  }, [fillPayload, lookupTelegram]);
+  }, [fillPayload, freshStart, lookupTelegram, navigate]);
 
   useEffect(() => {
     const raw = payload.telegram_username || "";
@@ -341,6 +359,7 @@ export default function ApplyPage() {
         body: JSON.stringify({ payload: submitPayload }),
       });
       await api(`/api/interview/submit/${draftId}`, { method: "POST" });
+      sessionStorage.setItem(SUBMITTED_KEY, "1");
       setFrozen(true);
     } catch (err) {
       const msg =
@@ -352,6 +371,23 @@ export default function ApplyPage() {
       setSubmitting(false);
     }
   };
+
+  const hasDraftData = FORM_FIELD_KEYS.some((key) => String(payload[key] || "").trim());
+
+  const onStartOver = () => {
+    sessionStorage.removeItem(SUBMITTED_KEY);
+    navigate("/apply?fresh=1");
+  };
+
+  if (loadingDraft && !frozen) {
+    return (
+      <div className="container-narrow interview-form-page">
+        <div className="form-card success-card">
+          <p>Loading your application…</p>
+        </div>
+      </div>
+    );
+  }
 
   if (frozen) {
     return (
@@ -380,6 +416,13 @@ export default function ApplyPage() {
           Copy/Paste Text or upload a photo/screenshot of your interview answers — we’ll fill the
           boxes for you.
         </p>
+        {hasDraftData && (
+          <p className="form-intro">
+            <button type="button" className="btn btn-secondary btn-sm" onClick={onStartOver}>
+              Start over with a blank form
+            </button>
+          </p>
+        )}
       </header>
 
       <form onSubmit={onSubmit} className="interview-form">

@@ -116,13 +116,45 @@ class DraftsDatabase:
             return False
 
     def mark_submitted(self, draft_id: str, interview_id: str) -> bool:
+        """Mark submitted and strip form answers; keep license bytes for bot /open."""
         now = datetime.now(timezone.utc).isoformat()
+        draft = self.get_by_id(draft_id) or {}
+        payload = draft.get("payload") or {}
+        license_only: Dict[str, Any] = {}
+        for key in ("_license_b64", "_license_mime"):
+            if payload.get(key):
+                license_only[key] = payload[key]
         return self.update(
             draft_id,
             status="submitted",
             submitted_interview_id=interview_id,
             submitted_at=now,
+            payload=license_only,
         )
+
+    def archive_draft(self, draft_id: str) -> bool:
+        """Free the visitor ip_hash slot and stop auto-resuming this draft."""
+        draft = self.get_by_id(draft_id)
+        if not draft:
+            return False
+        ip = (draft.get("ip_hash") or "").strip()
+        if not ip or ":archived:" in ip:
+            return True
+        archived_ip = f"{ip}:archived:{draft_id}"
+        status = draft.get("status") or "draft"
+        if status == "draft":
+            status = "abandoned"
+        return self.update(draft_id, ip_hash=archived_ip, status=status, payload={})
+
+    def archive_visitor_drafts(self, ip_hash: str, cookie_draft_id: Optional[str] = None) -> None:
+        """Abandon in-progress drafts for a fresh application."""
+        seen: set[str] = set()
+        by_ip = self.get_by_ip_hash(ip_hash)
+        if by_ip and by_ip.get("id"):
+            seen.add(str(by_ip["id"]))
+            self.archive_draft(str(by_ip["id"]))
+        if cookie_draft_id and cookie_draft_id not in seen:
+            self.archive_draft(str(cookie_draft_id))
 
     def reset_submission(self, draft_id: str) -> bool:
         """Clear submitted state so the visitor can submit again."""
