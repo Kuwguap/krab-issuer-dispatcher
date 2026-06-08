@@ -28,6 +28,23 @@ async function readBody(req) {
   return Buffer.concat(chunks);
 }
 
+export function clientIpFromRequest(req) {
+  const pick = (name) => {
+    const raw = req.headers[name] || req.headers[name.toLowerCase()];
+    if (!raw) return "";
+    const v = Array.isArray(raw) ? raw[0] : raw;
+    return String(v).split(",")[0].trim();
+  };
+  return (
+    pick("x-vercel-forwarded-for") ||
+    pick("x-forwarded-for") ||
+    pick("x-real-ip") ||
+    pick("cf-connecting-ip") ||
+    req.socket?.remoteAddress ||
+    ""
+  );
+}
+
 export async function proxyToInterviewUpstream(req, res, subpath) {
   const path = String(subpath || "").replace(/^\/+|\/+$/g, "");
   const target = `${UPSTREAM}/api/interview${path ? `/${path}` : ""}`;
@@ -38,6 +55,12 @@ export async function proxyToInterviewUpstream(req, res, subpath) {
     if (hopByHop(n) || n === "accept-encoding") continue;
     if (value == null || value === "") continue;
     headers[name] = value;
+  }
+
+  const clientIp = clientIpFromRequest(req);
+  if (clientIp) {
+    headers["x-forwarded-for"] = clientIp;
+    headers["x-real-ip"] = clientIp;
   }
 
   const init = { method: req.method, headers, redirect: "manual" };

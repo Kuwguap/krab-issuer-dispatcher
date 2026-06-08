@@ -59,10 +59,17 @@ def verify_admin_session(token: Optional[str]) -> bool:
         return False
 
 
+def _forwarded_for(request: Request) -> Optional[str]:
+    return (
+        request.headers.get("x-forwarded-for")
+        or request.headers.get("x-vercel-forwarded-for")
+        or request.headers.get("x-real-ip")
+    )
+
+
 async def current_ip_hash(request: Request) -> str:
-    forwarded = request.headers.get("x-forwarded-for")
     remote = request.client.host if request.client else None
-    return ip_hash_from_request(forwarded, remote)
+    return ip_hash_from_request(_forwarded_for(request), remote)
 
 
 async def require_admin(

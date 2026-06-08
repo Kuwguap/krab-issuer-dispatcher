@@ -6,7 +6,7 @@ import FormField from "../components/FormField";
 import AiFillPanel from "../components/AiFillPanel";
 import { registerDraftFlush, unregisterDraftFlush } from "../draftFlush";
 import { displayTelegramUsername, normalizeTelegramUsername, userFacingTelegramMessage } from "../telegram";
-import { useTelegramAuthReturn } from "../components/TelegramLoginButton";
+import TelegramLoginButton, { useTelegramAuthReturn } from "../components/TelegramLoginButton";
 const TELEGRAM_BOT = (import.meta.env.VITE_TELEGRAM_BOT_USERNAME || "krabinterviewerbot").replace(/^@+/, "");
 
 function emptyPayload() {
@@ -29,6 +29,7 @@ export default function ApplyPage() {
   const [licenseParseNote, setLicenseParseNote] = useState("");
   const [telegramStatus, setTelegramStatus] = useState(null);
   const [submitting, setSubmitting] = useState(false);
+  const [draftError, setDraftError] = useState(null);
   const saveTimer = useRef(null);
   const payloadRef = useRef(payload);
   const telegramTimer = useRef(null);
@@ -198,6 +199,7 @@ export default function ApplyPage() {
         const qs = freshStart ? "?fresh=1" : "";
         const data = await api(`/api/interview/draft${qs}`, { method: "POST" });
         if (cancelled) return;
+        setDraftError(null);
         if (freshStart) {
           navigate("/apply", { replace: true });
         }
@@ -207,7 +209,13 @@ export default function ApplyPage() {
         const un = data.payload?.telegram_username;
         if (un) lookupTelegram(un);
       } catch (e) {
-        if (!cancelled) console.error(e);
+        if (!cancelled) {
+          console.error(e);
+          setDraftError(
+            e.message ||
+              "Could not connect to the application server. Try again in a moment."
+          );
+        }
       } finally {
         if (!cancelled) setLoadingDraft(false);
       }
@@ -416,6 +424,21 @@ export default function ApplyPage() {
         )}
       </header>
 
+      {draftError && (
+        <div className="form-card verify-msg bad" role="alert">
+          <p>{draftError}</p>
+          <button type="button" className="btn btn-secondary btn-sm" onClick={() => window.location.reload()}>
+            Retry
+          </button>
+        </div>
+      )}
+
+      {!draftId && !draftError && (
+        <div className="form-card">
+          <p className="verify-msg">Starting your application session…</p>
+        </div>
+      )}
+
       <form onSubmit={onSubmit} className="interview-form">
         <AiFillPanel draftId={draftId} onFilled={onAiFilled} disabled={!draftId} />
 
@@ -445,6 +468,11 @@ export default function ApplyPage() {
 
         {FIELDS.map((field, index) => (
           <div key={field.key}>
+            {field.autoResolveTelegram && (
+              <div className="form-card telegram-login-card">
+                <TelegramLoginButton onAuth={onTelegramWidgetAuth} disabled={!draftId} />
+              </div>
+            )}
             <FormField
               field={field}
               number={index + 2}

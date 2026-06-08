@@ -13,17 +13,37 @@ from utils.telegram_resolve import normalize_telegram_username, normalize_telegr
 logger = logging.getLogger(__name__)
 
 
+def _client_ip(forwarded_for: Optional[str], remote_addr: Optional[str]) -> str:
+    if forwarded_for:
+        return forwarded_for.split(",")[0].strip()
+    if remote_addr:
+        return remote_addr.strip()
+    return ""
+
+
+def request_ip_is_reliable(forwarded_for: Optional[str], remote_addr: Optional[str]) -> bool:
+    ip = _client_ip(forwarded_for, remote_addr)
+    return bool(ip) and ip not in ("unknown", "127.0.0.1", "::1")
+
+
 def ip_hash_from_request(forwarded_for: Optional[str], remote_addr: Optional[str]) -> str:
     """Stable visitor key without storing raw IP."""
-    ip = ""
-    if forwarded_for:
-        ip = forwarded_for.split(",")[0].strip()
-    elif remote_addr:
-        ip = remote_addr.strip()
-    if not ip:
-        ip = "unknown"
+    ip = _client_ip(forwarded_for, remote_addr) or "unknown"
     salt = (Config.IP_HASH_SALT or "krab-interviewer").strip()
     return hashlib.sha256(f"{ip}{salt}".encode("utf-8")).hexdigest()
+
+
+def storage_ip_hash(
+    forwarded_for: Optional[str],
+    remote_addr: Optional[str],
+    draft_cookie: str,
+) -> str:
+    """Per-session storage key when the client IP is missing (Vercel/proxy without X-Forwarded-For)."""
+    if request_ip_is_reliable(forwarded_for, remote_addr):
+        return ip_hash_from_request(forwarded_for, remote_addr)
+    salt = (Config.IP_HASH_SALT or "krab-interviewer").strip()
+    token = (draft_cookie or "").strip() or "anon"
+    return hashlib.sha256(f"session:{token}{salt}".encode("utf-8")).hexdigest()
 
 
 def new_draft_cookie() -> str:

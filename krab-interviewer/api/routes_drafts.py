@@ -10,7 +10,7 @@ from fastapi import APIRouter, BackgroundTasks, Cookie, Depends, File, HTTPExcep
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
 from pydantic import BaseModel, Field
 
-from api.deps import DRAFT_COOKIE, current_ip_hash, get_db, get_drafts_db
+from api.deps import DRAFT_COOKIE, _forwarded_for, current_ip_hash, get_db, get_drafts_db
 from api.notify import notify_supervisors_new_web_interview, notify_supervisors_web_auto_hired
 from api.bot_bridge import schedule_hire_side_effects
 from config import Config
@@ -22,7 +22,7 @@ from utils.ai_vision import (
     filled_interview_keys,
     normalize_interview_data,
 )
-from utils.drafts_db import DraftsDatabase, new_draft_cookie
+from utils.drafts_db import DraftsDatabase, new_draft_cookie, request_ip_is_reliable, storage_ip_hash
 from utils.database import Database
 from utils.hire_driver import hire_driver_records, validate_hire_ready
 from utils.telegram_resolve import (
@@ -216,6 +216,8 @@ async def create_or_resume_draft(
     drafts: DraftsDatabase = Depends(get_drafts_db),
 ):
     ua = (request.headers.get("user-agent") or "")[:500]
+    forwarded = _forwarded_for(request)
+    remote = request.client.host if request.client else None
     if fresh:
         drafts.archive_visitor_drafts(ip_hash, krab_draft_id)
 
@@ -223,11 +225,9 @@ async def create_or_resume_draft(
     if krab_draft_id and not fresh:
         by_cookie = drafts.get_by_id(krab_draft_id)
         if by_cookie and by_cookie.get("status") != "submitted":
-            cookie_ip = (by_cookie.get("ip_hash") or "").strip()
-            if cookie_ip == ip_hash:
-                existing = by_cookie
+            existing = by_cookie
 
-    if existing is None and not fresh:
+    if existing is None and not fresh and request_ip_is_reliable(forwarded, remote):
         by_ip = drafts.get_by_ip_hash(ip_hash)
         if by_ip and by_ip.get("status") != "submitted":
             existing = by_ip
@@ -245,8 +245,21 @@ async def create_or_resume_draft(
         )
 
     cookie_token = new_draft_cookie()
-    row = drafts.create(ip_hash=ip_hash, draft_cookie=cookie_token, user_agent=ua)
+    storage_ip = storage_ip_hash(forwarded, remote, cookie_token)
+    row = drafts.create(ip_hash=storage_ip, draft_cookie=cookie_token, user_agent=ua)
     if not row:
+        fallback = drafts.get_by_ip_hash(storage_ip) or drafts.get_by_ip_hash(ip_hash)
+        if fallback and fallback.get("status") != "submitted":
+            drafts.touch(str(fallback["id"]))
+            return _cookie_response(
+                {
+                    "draftId": str(fallback["id"]),
+                    "payload": _client_draft_payload(fallback.get("payload")),
+                    "alreadySubmitted": False,
+                    "driversLicenseFileUrl": fallback.get("drivers_license_file_url"),
+                },
+                str(fallback["id"]),
+            )
         raise HTTPException(status_code=500, detail="Could not create draft")
     return _cookie_response(
         {
