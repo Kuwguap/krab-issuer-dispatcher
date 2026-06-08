@@ -30,7 +30,7 @@ def add_recipient(name: str, email: str) -> tuple[bool, Optional[str]]:
     try:
         import psycopg
 
-        with psycopg.connect(dsn) as conn:
+        with psycopg.connect(dsn, connect_timeout=5) as conn:
             with conn.cursor() as cur:
                 cur.execute(
                     """

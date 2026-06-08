@@ -6,7 +6,7 @@ import logging
 from typing import Any, Dict, Optional
 from urllib.parse import quote
 
-from fastapi import APIRouter, Cookie, Depends, File, HTTPException, Request, UploadFile
+from fastapi import APIRouter, BackgroundTasks, Cookie, Depends, File, HTTPException, Request, UploadFile
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
 from pydantic import BaseModel, Field
 
@@ -222,28 +222,18 @@ async def create_or_resume_draft(
     existing = None
     if krab_draft_id and not fresh:
         by_cookie = drafts.get_by_id(krab_draft_id)
-        if by_cookie:
+        if by_cookie and by_cookie.get("status") != "submitted":
             cookie_ip = (by_cookie.get("ip_hash") or "").strip()
-            if cookie_ip == ip_hash or by_cookie.get("status") == "submitted":
+            if cookie_ip == ip_hash:
                 existing = by_cookie
 
     if existing is None and not fresh:
-        existing = drafts.get_by_ip_hash(ip_hash)
+        by_ip = drafts.get_by_ip_hash(ip_hash)
+        if by_ip and by_ip.get("status") != "submitted":
+            existing = by_ip
 
     if existing:
         drafts.touch(str(existing["id"]))
-        if existing.get("status") == "submitted":
-            inv_id = existing.get("submitted_interview_id")
-            return _cookie_response(
-                {
-                    "draftId": str(existing["id"]),
-                    "payload": {},
-                    "alreadySubmitted": True,
-                    "submittedInterviewId": str(inv_id) if inv_id else None,
-                    "driversLicenseFileUrl": None,
-                },
-                str(existing["id"]),
-            )
         return _cookie_response(
             {
                 "draftId": str(existing["id"]),
@@ -575,6 +565,7 @@ async def verify_telegram_auth(
 @router.post("/submit/{draft_id}")
 async def submit_draft(
     draft_id: str,
+    background_tasks: BackgroundTasks,
     ip_hash: str = Depends(current_ip_hash),
     krab_draft_id: Optional[str] = Cookie(default=None),
     drafts: DraftsDatabase = Depends(get_drafts_db),
@@ -665,10 +656,14 @@ async def submit_draft(
         schedule_hire_side_effects(iid, created_by=WEB_CREATED_BY)
 
     drafts.mark_submitted(draft_id, iid)
+    interview_snapshot = dict(interview)
+    errors_snapshot = list(hire_errors)
     if hired:
-        notify_supervisors_web_auto_hired(interview, hire_errors)
+        background_tasks.add_task(
+            notify_supervisors_web_auto_hired, interview_snapshot, errors_snapshot
+        )
     else:
-        notify_supervisors_new_web_interview(interview)
+        background_tasks.add_task(notify_supervisors_new_web_interview, interview_snapshot)
 
     return {
         "ok": True,

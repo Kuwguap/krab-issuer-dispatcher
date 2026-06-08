@@ -8,7 +8,6 @@ import { registerDraftFlush, unregisterDraftFlush } from "../draftFlush";
 import { displayTelegramUsername, normalizeTelegramUsername, userFacingTelegramMessage } from "../telegram";
 import { useTelegramAuthReturn } from "../components/TelegramLoginButton";
 const TELEGRAM_BOT = (import.meta.env.VITE_TELEGRAM_BOT_USERNAME || "krabinterviewerbot").replace(/^@+/, "");
-const SUBMITTED_KEY = "krab_interview_submitted";
 
 function emptyPayload() {
   const p = { telegram_id: "" };
@@ -24,7 +23,7 @@ export default function ApplyPage() {
   const freshStart = searchParams.get("fresh") === "1";
   const [draftId, setDraftId] = useState(null);
   const [payload, setPayload] = useState(emptyPayload);
-  const [frozen, setFrozen] = useState(() => sessionStorage.getItem(SUBMITTED_KEY) === "1");
+  const [frozen, setFrozen] = useState(false);
   const [loadingDraft, setLoadingDraft] = useState(true);
   const [licenseUrl, setLicenseUrl] = useState("");
   const [licenseParseNote, setLicenseParseNote] = useState("");
@@ -195,25 +194,14 @@ export default function ApplyPage() {
   useEffect(() => {
     let cancelled = false;
     (async () => {
-      if (sessionStorage.getItem(SUBMITTED_KEY) === "1") {
-        setFrozen(true);
-        setLoadingDraft(false);
-        return;
-      }
       try {
         const qs = freshStart ? "?fresh=1" : "";
         const data = await api(`/api/interview/draft${qs}`, { method: "POST" });
         if (cancelled) return;
         if (freshStart) {
-          sessionStorage.removeItem(SUBMITTED_KEY);
           navigate("/apply", { replace: true });
         }
         setDraftId(data.draftId);
-        if (data.alreadySubmitted) {
-          sessionStorage.setItem(SUBMITTED_KEY, "1");
-          setFrozen(true);
-          return;
-        }
         fillPayload(data.payload || {});
         if (data.driversLicenseFileUrl) setLicenseUrl(data.driversLicenseFileUrl);
         const un = data.payload?.telegram_username;
@@ -340,7 +328,7 @@ export default function ApplyPage() {
     try {
       let submitPayload = { ...payload };
       const un = normalizeTelegramUsername(payload.telegram_username);
-      if (un) {
+      if (un && !String(payload.telegram_id || "").trim()) {
         const res = await api("/api/interview/resolve-telegram", {
           method: "POST",
           body: JSON.stringify({ username: un }),
@@ -359,7 +347,6 @@ export default function ApplyPage() {
         body: JSON.stringify({ payload: submitPayload }),
       });
       await api(`/api/interview/submit/${draftId}`, { method: "POST" });
-      sessionStorage.setItem(SUBMITTED_KEY, "1");
       setFrozen(true);
     } catch (err) {
       const msg =
@@ -375,7 +362,6 @@ export default function ApplyPage() {
   const hasDraftData = FORM_FIELD_KEYS.some((key) => String(payload[key] || "").trim());
 
   const onStartOver = () => {
-    sessionStorage.removeItem(SUBMITTED_KEY);
     navigate("/apply?fresh=1");
   };
 
@@ -398,9 +384,14 @@ export default function ApplyPage() {
             Your interview is complete and you're officially on the team. Check Telegram for a
             welcome message from @krabinterviewerbot — then start receiving leads at @Krabdispatchbot.
           </p>
-          <Link to="/" className="btn btn-secondary">
-            Return home
-          </Link>
+          <div className="success-actions">
+            <Link to="/" className="btn btn-secondary">
+              Return home
+            </Link>
+            <Link to="/apply?fresh=1" className="btn btn-primary">
+              Submit another application
+            </Link>
+          </div>
         </div>
       </div>
     );

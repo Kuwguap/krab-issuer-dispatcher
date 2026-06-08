@@ -1089,6 +1089,14 @@ a.progress-pill-link:hover {
   margin: 0 auto 0.75rem;
 }
 
+.success-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.75rem;
+  justify-content: center;
+  margin-top: 1.25rem;
+}
+
 .site-footer {
   border-top: 1px solid var(--border);
   padding: 2rem 0;

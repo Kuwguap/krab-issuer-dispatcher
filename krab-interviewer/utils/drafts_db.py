@@ -115,8 +115,18 @@ class DraftsDatabase:
             logger.error("update draft failed: %s", e)
             return False
 
+    def release_ip_hash(self, draft_id: str) -> bool:
+        """Free the unique ip_hash slot so the visitor can start a new application."""
+        draft = self.get_by_id(draft_id)
+        if not draft:
+            return False
+        ip = (draft.get("ip_hash") or "").strip()
+        if not ip or ":archived:" in ip:
+            return True
+        return self.update(draft_id, ip_hash=f"{ip}:archived:{draft_id}")
+
     def mark_submitted(self, draft_id: str, interview_id: str) -> bool:
-        """Mark submitted and strip form answers; keep license bytes for bot /open."""
+        """Mark submitted, strip form answers (keep license bytes), release ip_hash."""
         now = datetime.now(timezone.utc).isoformat()
         draft = self.get_by_id(draft_id) or {}
         payload = draft.get("payload") or {}
@@ -124,13 +134,16 @@ class DraftsDatabase:
         for key in ("_license_b64", "_license_mime"):
             if payload.get(key):
                 license_only[key] = payload[key]
-        return self.update(
+        ok = self.update(
             draft_id,
             status="submitted",
             submitted_interview_id=interview_id,
             submitted_at=now,
             payload=license_only,
         )
+        if ok:
+            self.release_ip_hash(draft_id)
+        return ok
 
     def archive_draft(self, draft_id: str) -> bool:
         """Free the visitor ip_hash slot and stop auto-resuming this draft."""
