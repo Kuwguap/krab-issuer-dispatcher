@@ -6,15 +6,13 @@ export function parseTelegramAuthFromSearch(search = window.location.search) {
   const auth_date = Number(p.get("auth_date"));
   const hash = p.get("hash");
   if (!id || !auth_date || !hash) return null;
-  return {
-    id,
-    auth_date,
-    hash,
-    username: p.get("username") || undefined,
-    first_name: p.get("first_name") || undefined,
-    last_name: p.get("last_name") || undefined,
-    photo_url: p.get("photo_url") || undefined,
-  };
+
+  const user = { id, auth_date, hash };
+  for (const [key, value] of p.entries()) {
+    if (key === "telegram_auth" || key === "id" || key === "auth_date") continue;
+    if (value) user[key] = value;
+  }
+  return user;
 }
 
 export function stripTelegramAuthFromUrl() {
@@ -29,6 +27,7 @@ export function stripTelegramAuthFromUrl() {
     "first_name",
     "last_name",
     "photo_url",
+    "login_handoff",
   ].forEach((k) => url.searchParams.delete(k));
   const next = url.pathname + (url.searchParams.toString() ? `?${url.searchParams}` : "") + url.hash;
   window.history.replaceState({}, "", next);

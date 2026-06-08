@@ -37,7 +37,14 @@ from utils.telegram_login_host import (
     telegram_bot_username,
     widget_base_url,
 )
-from utils.telegram_widget_auth import telegram_login_return_query_params, verify_telegram_login
+from utils.telegram_widget_auth import (
+    create_telegram_login_handoff,
+    lookup_verified_telegram_login,
+    remember_verified_telegram_login,
+    telegram_login_return_query_params,
+    verify_telegram_login,
+    verify_telegram_login_handoff,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -73,6 +80,7 @@ class TelegramWidgetAuthBody(BaseModel):
     last_name: Optional[str] = None
     username: Optional[str] = None
     photo_url: Optional[str] = None
+    login_handoff: Optional[str] = None
 
 
 class ParseTextBody(BaseModel):
@@ -561,6 +569,7 @@ async def telegram_widget_callback(
     verified = verify_telegram_login(params, Config.TELEGRAM_BOT_TOKEN or "")
     if not verified:
         raise HTTPException(status_code=403, detail="Telegram login verification failed")
+    remember_verified_telegram_login(params, verified)
 
     tid = verified["telegram_id"]
     un_display = normalize_telegram_username_display(params.get("username") or "")
@@ -571,7 +580,10 @@ async def telegram_widget_callback(
 
     sep = "&" if "?" in target else "?"
     auth_params = telegram_login_return_query_params(params)
+    handoff = create_telegram_login_handoff(params, Config.TELEGRAM_BOT_TOKEN or "")
     query_parts = ["telegram_auth=1"]
+    if handoff:
+        query_parts.append(f"login_handoff={quote(handoff, safe='')}")
     for key in sorted(auth_params.keys()):
         query_parts.append(f"{key}={quote(str(auth_params[key]))}")
     redirect = f"{target}{sep}{'&'.join(query_parts)}"
@@ -584,7 +596,13 @@ async def verify_telegram_auth(
     db: Database = Depends(get_db),
 ):
     """Verify Telegram Login Widget callback and upsert username → id."""
-    verified = verify_telegram_login(body.model_dump(), Config.TELEGRAM_BOT_TOKEN or "")
+    auth_payload = body.model_dump()
+    bot_token = Config.TELEGRAM_BOT_TOKEN or ""
+    verified = verify_telegram_login(auth_payload, bot_token)
+    if not verified:
+        verified = lookup_verified_telegram_login(auth_payload)
+    if not verified:
+        verified = verify_telegram_login_handoff(auth_payload, bot_token)
     if not verified:
         raise HTTPException(status_code=403, detail="Telegram login verification failed")
 
