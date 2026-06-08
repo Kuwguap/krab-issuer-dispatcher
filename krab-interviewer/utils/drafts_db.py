@@ -23,7 +23,9 @@ def _client_ip(forwarded_for: Optional[str], remote_addr: Optional[str]) -> str:
 
 def request_ip_is_reliable(forwarded_for: Optional[str], remote_addr: Optional[str]) -> bool:
     ip = _client_ip(forwarded_for, remote_addr)
-    return bool(ip) and ip not in ("unknown", "127.0.0.1", "::1")
+    if not ip or ip.startswith("sess-"):
+        return False
+    return ip not in ("unknown", "127.0.0.1", "::1")
 
 
 def ip_hash_from_request(forwarded_for: Optional[str], remote_addr: Optional[str]) -> str:
@@ -101,6 +103,19 @@ class DraftsDatabase:
             r = self.client.table("interview_drafts").insert(row).execute()
             return r.data[0] if r.data else None
         except Exception as e:
+            err = str(e).lower()
+            if "duplicate" in err or "unique" in err:
+                existing = self.get_by_ip_hash(ip_hash)
+                if existing:
+                    if existing.get("status") == "submitted":
+                        self.release_ip_hash(str(existing["id"]))
+                        try:
+                            r = self.client.table("interview_drafts").insert(row).execute()
+                            return r.data[0] if r.data else None
+                        except Exception as retry_err:
+                            logger.error("create draft retry failed: %s", retry_err)
+                    elif existing.get("status") != "submitted":
+                        return existing
             logger.error("create draft failed: %s", e)
             return None
 

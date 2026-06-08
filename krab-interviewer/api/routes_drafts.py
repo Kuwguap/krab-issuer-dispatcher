@@ -229,8 +229,11 @@ async def create_or_resume_draft(
 
     if existing is None and not fresh and request_ip_is_reliable(forwarded, remote):
         by_ip = drafts.get_by_ip_hash(ip_hash)
-        if by_ip and by_ip.get("status") != "submitted":
-            existing = by_ip
+        if by_ip:
+            if by_ip.get("status") == "submitted":
+                drafts.release_ip_hash(str(by_ip["id"]))
+            else:
+                existing = by_ip
 
     if existing:
         drafts.touch(str(existing["id"]))
@@ -249,7 +252,10 @@ async def create_or_resume_draft(
     row = drafts.create(ip_hash=storage_ip, draft_cookie=cookie_token, user_agent=ua)
     if not row:
         fallback = drafts.get_by_ip_hash(storage_ip) or drafts.get_by_ip_hash(ip_hash)
-        if fallback and fallback.get("status") != "submitted":
+        if fallback and fallback.get("status") == "submitted":
+            drafts.release_ip_hash(str(fallback["id"]))
+            row = drafts.create(ip_hash=storage_ip, draft_cookie=cookie_token, user_agent=ua)
+        elif fallback and fallback.get("status") != "submitted":
             drafts.touch(str(fallback["id"]))
             return _cookie_response(
                 {
@@ -260,7 +266,14 @@ async def create_or_resume_draft(
                 },
                 str(fallback["id"]),
             )
-        raise HTTPException(status_code=500, detail="Could not create draft")
+    if not row:
+        raise HTTPException(
+            status_code=500,
+            detail=(
+                "Could not create draft. Run migration_interview_drafts.sql in Supabase, "
+                "then redeploy krab-interviewer-bot on Render."
+            ),
+        )
     return _cookie_response(
         {
             "draftId": str(row["id"]),

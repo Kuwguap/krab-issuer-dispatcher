@@ -1,4 +1,5 @@
 /** Shared proxy to krab-interviewer-bot for /api/interview/* routes. */
+import { randomUUID } from "node:crypto";
 export const UPSTREAM = (
   process.env.KRAB_INTERVIEWER_URL || "https://krab-interviewer-bot-j5dv.onrender.com"
 ).replace(/\/+$/, "");
@@ -57,11 +58,12 @@ export async function proxyToInterviewUpstream(req, res, subpath) {
     headers[name] = value;
   }
 
-  const clientIp = clientIpFromRequest(req);
-  if (clientIp) {
-    headers["x-forwarded-for"] = clientIp;
-    headers["x-real-ip"] = clientIp;
+  let clientIp = clientIpFromRequest(req);
+  if (!clientIp) {
+    clientIp = `sess-${randomUUID()}`;
   }
+  headers["x-forwarded-for"] = clientIp;
+  headers["x-real-ip"] = clientIp;
 
   const init = { method: req.method, headers, redirect: "manual" };
   if (req.method !== "GET" && req.method !== "HEAD") {
