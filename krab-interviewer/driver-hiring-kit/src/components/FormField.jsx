@@ -1,3 +1,5 @@
+import { telegramConnectUrl } from "../telegram";
+
 export default function FormField({
   field,
   value,
@@ -63,25 +65,24 @@ export default function FormField({
         />
       )}
 
-      {field.autoResolveTelegram && telegramStatus && (
-        <>
-          <p className={`verify-msg ${telegramStatus.type}`}>{telegramStatus.text}</p>
-          {telegramStatus.connectUrl && telegramStatus.type === "bad" && (
-            <p className="verify-row">
-              <a
-                className="btn btn-secondary telegram-connect-btn"
-                href={telegramStatus.connectUrl}
-                target="_blank"
-                rel="noopener noreferrer"
-              >
-                Open @{telegramBotUsername.replace(/^@+/, "")} → tap Start
-              </a>
-              {telegramStatus.polling && (
-                <span className="verify-msg">Waiting for link… checking every few seconds.</span>
-              )}
-            </p>
+      {field.autoResolveTelegram && (
+        <p className="verify-row">
+          <a
+            className="btn btn-secondary telegram-connect-btn"
+            href={telegramStatus?.connectUrl || telegramConnectUrl()}
+            target="_blank"
+            rel="noopener noreferrer"
+          >
+            Open @{telegramBotUsername.replace(/^@+/, "")} → tap Start
+          </a>
+          {telegramStatus?.polling && (
+            <span className="verify-msg">Waiting for link… checking every few seconds.</span>
           )}
-        </>
+        </p>
+      )}
+
+      {field.autoResolveTelegram && telegramStatus?.text && (
+        <p className={`verify-msg ${telegramStatus.type || ""}`}>{telegramStatus.text}</p>
       )}
     </div>
   );

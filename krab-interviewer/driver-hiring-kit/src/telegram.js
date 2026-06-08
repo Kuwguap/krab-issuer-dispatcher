@@ -14,6 +14,11 @@ export function displayTelegramUsername(raw) {
   return un ? `@${un}` : "";
 }
 
+export function telegramConnectUrl(start = "web") {
+  const bot = (import.meta.env.VITE_TELEGRAM_BOT_USERNAME || "krabinterviewerbot").replace(/^@+/, "");
+  return `https://t.me/${encodeURIComponent(bot)}?start=${encodeURIComponent(start)}`;
+}
+
 /** Hide legacy /start copy from older API builds. */
 export function userFacingTelegramMessage(msg) {
   if (!msg || /tap Start|verify your username|Open @|Log in with Telegram below/i.test(msg)) {

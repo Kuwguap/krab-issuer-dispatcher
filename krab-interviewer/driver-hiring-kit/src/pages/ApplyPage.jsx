@@ -5,7 +5,7 @@ import { FIELDS, FORM_FIELD_KEYS } from "../fields";
 import FormField from "../components/FormField";
 import AiFillPanel from "../components/AiFillPanel";
 import { registerDraftFlush, unregisterDraftFlush } from "../draftFlush";
-import { displayTelegramUsername, normalizeTelegramUsername, userFacingTelegramMessage } from "../telegram";
+import { displayTelegramUsername, normalizeTelegramUsername, telegramConnectUrl, userFacingTelegramMessage } from "../telegram";
 import TelegramLoginButton, { useTelegramAuthReturn } from "../components/TelegramLoginButton";
 const TELEGRAM_BOT = (import.meta.env.VITE_TELEGRAM_BOT_USERNAME || "krabinterviewerbot").replace(/^@+/, "");
 
@@ -184,6 +184,7 @@ export default function ApplyPage() {
         setTelegramStatus({
           type: "bad",
           text: err.message || "Telegram login failed. Try the bot link below.",
+          connectUrl: telegramConnectUrl(),
         });
       }
     },

@@ -213,6 +213,15 @@ def _paper_girl_usernames_tag() -> str:
     return " ".join(handles) + " "
 
 
+def _paper_girl_follow_up_tag() -> str:
+    handles: List[str] = []
+    for part in _raw_supervisory_tokens(Config.PAPER_GIRL_USERNAME):
+        h = part.strip().lstrip("@")
+        if h:
+            handles.append(f"@{h}")
+    return " & ".join(handles)
+
+
 def _user_is_paper_girl(user_id) -> bool:
     target = _norm_chat_id(user_id)
     if target is None:
@@ -1035,33 +1044,34 @@ async def _create_and_notify_paper_girl(
 
 
 def _build_hire_announcement_message(interview: dict, driver_name: str) -> str:
-    em = (interview.get("email") or "").strip()
-    tid = (interview.get("telegram_id") or "").strip()
-    username_display = (interview.get("telegram_username") or "").strip()
-    if username_display and not username_display.startswith("@"):
-        username_display = "@" + username_display
-    if not username_display:
-        username_display = driver_name if driver_name != "Driver" else "-"
+    welcome_first, _ = ai_vision.split_full_name(driver_name)
+    if not welcome_first:
+        welcome_first = (interview.get("first_name") or "").strip() or driver_name.split()[0] or "Driver"
 
-    issuer_bot = Config.KRAB_ISSUER_BOT_USERNAME.lstrip("@")
+    interviewer_bot = Config.KRAB_INTERVIEWER_BOT_USERNAME.lstrip("@")
     dispatch_bot = Config.KRAB_DISPATCH_BOT_USERNAME.lstrip("@")
-    channel_link = (Config.DRIVER_CHANNEL_LINK or "").strip() or "https://t.me/TriStateTags"
-    pg_tag = _paper_girl_usernames_tag()
     qty = Config.DEFAULT_PAPER_QTY
 
     return (
-        "🎉 DRIVER HIRED SUCCESSFULLY ✅\n\n"
-        f"👤 USERNAME: {username_display}\n"
-        f"📧 EMAIL: {em}\n"
-        f"ℹ️CHATID:{tid}\n\n"
-        "🚀 Added to:\n"
-        f"• @{issuer_bot}\n"
-        f"• @{dispatch_bot}\n"
-        f"• {channel_link}\n\n"
-        f"📦 {qty} papers are now being prepared & shipped by papergirl "
-        f"{pg_tag}please push & follow up\n\n"
-        "📬 Tracking number coming shortly…\n"
-        "⚡ Driver is now officially ACTIVE & ready to receive leads!"
+        "🎉 DRIVER HIRED ✅\n\n"
+        f"Welcome to the team, {welcome_first}!\n\n"
+        "📲 Start these bots now:\n"
+        f"@{interviewer_bot}\n"
+        f"@{dispatch_bot}\n\n"
+        f"📦 Your {qty} temp tag papers are being prepared and shipped.\n"
+        "📬 Tracking number coming soon.\n\n"
+        "🖨️ Please have a LaserJet printer ready to print temp tags. 1 click Purchase here:\n"
+        "https://shorturl.at/gvOrb\n\n"
+        "⚡ You are now ACTIVE and ready to receive deliveries.\n\n"
+        "Important:\n"
+        "• All clients belong to the dealership.\n"
+        "• Every client phone number must be recorded.\n"
+        "• No off-platform deals or private servicing of clients.\n\n"
+        "💰 Every successful delivery pays $50.\n"
+        "🔄 Many clients renew monthly, creating repeat opportunities.\n\n"
+        "📢 Want more deliveries?\n"
+        "Stay active, keep notifications ON, and bring in new clients whenever possible.\n\n"
+        "🚀 Welcome aboard. Let's get to work!"
     )
 
 
@@ -1103,11 +1113,46 @@ async def _run_hire_side_effects(
         else f"@{welcome_first}"
     )
     dispatch_bot = Config.KRAB_DISPATCH_BOT_USERNAME.lstrip("@")
+    interviewer_bot = Config.KRAB_INTERVIEWER_BOT_USERNAME.lstrip("@")
+    pg_follow = _paper_girl_follow_up_tag()
+    qty = Config.DEFAULT_PAPER_QTY
+    pg_line = (
+        f"📦 {qty} papers are now being prepared & shipped by papergirl "
+        f"please push & follow up {pg_follow}\n\n"
+        if pg_follow
+        else f"📦 {qty} papers are now being prepared & shipped by papergirl please push & follow up\n\n"
+    )
     driver_dm = (
         f"🎉 Welcome to the Team, {welcome_handle}! 🚗🔥\n\n"
+        "🎉 DRIVER HIRED SUCCESSFULLY ✅\n\n"
+        f"Welcome to the Family {welcome_first} !\n\n"
+        f"Please start this 2 bots —-> @{interviewer_bot} & @{dispatch_bot}\n"
+        f"{pg_line}"
+        "Get laserjet printer ready to print & drop off temp tags !\n\n"
+        "📬 Tracking number coming shortly !\n"
+        "⚡️ Driver is now officially ACTIVE & ready to receive leads!\n"
+        "🖨️ Laserjet Printer purchase anywhere or Amazon https://shorturl.at/gvOrb\n\n"
         "You're officially hired and now part of the family 💪\n"
         "Let's get money, move fast, and serve clients together!\n\n"
-        f"📲 Start receiving leads now at @{dispatch_bot}\n"
+        "1.\n"
+        "1st thing first, all clients belong to our car dealership; clients that we train you to retain all belong to our car dealership. "
+        "We are in the business of building clientele, hence every single client cellphone number must be accounted for and recorded. "
+        "Therefore we strictly DO NOT ALLOW ❌ any partners to serve clients behind our backs nor withhold any information from our clients.\n\n"
+        "2.\n"
+        "Here comes the 😊 Good news 🗞️ ! All clients are monthly renewals ! So when you make 1 delivery, expect to be receiving $50/month every month !\n\n"
+        "3. More Good News !📰\n"
+        "We have a government product, license titles, insurance and registration, it is necessary for everyone's daily life "
+        "and sums up to hundreds of millions of dollars every year ! You are now in on the action!\n\n"
+        "4.\n"
+        "Remember the location of dealership is for cars only. DMV Services department is remote and online work. "
+        "Therefore no trips to the dealership are necessary everything is remote, welcome to your future ✨.\n\n"
+        "5. Push dispatchers @uDominica\n"
+        "@highkage0_0\n"
+        "@sensei_vi daily for new deliveries\n\n"
+        "6. Sitting duck. 🦆 instead of sitting waiting for deliveries:\n"
+        "Go the extra mile\n"
+        "Post ads find clients close some deals, everyone needs temp tags 🏷️ go out there and bring some clients !\n\n"
+        f"📲 Start receiving leads now at @{dispatch_bot}\n\n"
         "🔔 Keep notifications ON so you never miss a lead.\n\n"
         "🚀 Welcome aboard — let's get to work!"
     )
@@ -1141,8 +1186,8 @@ async def _run_hire_side_effects(
             await context.bot.send_message(
                 chat_id=driver_chat_id,
                 text=(
-                    "🎬 Training time! Watch these to learn the workflow.\n"
-                    "You can replay them anytime with /training."
+                    "🎬 Training time! 🫪Watch these quick training videos to learn how temp tag deliveries work from start to finish.\n"
+                    "Replay & Access them anytime by typing /training."
                 ),
             )
         except Exception as e:
