@@ -32,6 +32,8 @@ from utils.telegram_resolve import (
     telegram_resolve_meta,
 )
 from utils.telegram_login_host import (
+    auth_return_bridge_html,
+    is_allowed_callback_return_url,
     is_allowed_return_url,
     login_page_html,
     telegram_bot_username,
@@ -554,6 +556,18 @@ async def telegram_login_page(return_url: str = ""):
     return HTMLResponse(login_page_html(target))
 
 
+@router.get("/telegram-auth-return", response_class=HTMLResponse)
+async def telegram_auth_return(target: str = ""):
+    """
+    Bridge after widget callback: postMessage full auth payload to the form (popup flow),
+    or redirect to the frontend with all signed query params (full-page fallback).
+    """
+    final = (target or "").strip()
+    if not final or not is_allowed_return_url(final):
+        raise HTTPException(status_code=400, detail="Invalid target")
+    return HTMLResponse(auth_return_bridge_html())
+
+
 @router.get("/telegram-widget-callback")
 async def telegram_widget_callback(
     request: Request,
@@ -562,7 +576,7 @@ async def telegram_widget_callback(
 ):
     """Telegram redirects here after Login Widget auth (data-auth-url flow)."""
     target = (return_url or "").strip()
-    if not target or not is_allowed_return_url(target):
+    if not target or not is_allowed_callback_return_url(target):
         raise HTTPException(status_code=400, detail="Invalid return_url")
 
     params = dict(request.query_params)

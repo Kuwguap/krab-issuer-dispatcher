@@ -52,10 +52,114 @@ def is_allowed_return_url(url: str) -> bool:
     return origin in allowed
 
 
+def auth_return_bridge_path() -> str:
+    return "/api/interview/telegram-auth-return"
+
+
+def auth_return_bridge_url(final_return_url: str) -> str:
+    """Intermediate page on the API host that forwards full auth data to the frontend."""
+    base = widget_base_url()
+    path = auth_return_bridge_path()
+    return f"{base}{path}?target={quote(final_return_url, safe='')}"
+
+
+def is_api_auth_bridge_url(url: str) -> bool:
+    """True when url is our hosted auth-return bridge (same host as Login Widget)."""
+    base = widget_base_url()
+    if not base:
+        return False
+    parsed = urlparse((url or "").strip())
+    expected = urlparse(f"{base}{auth_return_bridge_path()}")
+    return (
+        parsed.scheme == expected.scheme
+        and parsed.netloc == expected.netloc
+        and parsed.path.rstrip("/") == expected.path.rstrip("/")
+        and bool(parsed.query)
+    )
+
+
+def is_allowed_callback_return_url(url: str) -> bool:
+    """Callback may redirect to the API bridge or an allowed frontend origin."""
+    if is_api_auth_bridge_url(url):
+        return True
+    return is_allowed_return_url(url)
+
+
+def auth_return_bridge_html() -> str:
+    """Parse full Telegram auth query on the API domain and postMessage to the form."""
+    return """<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Telegram login</title>
+  <style>
+    body {
+      font-family: system-ui, sans-serif;
+      margin: 0;
+      min-height: 100vh;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      background: #f8f7fc;
+      color: #1c1633;
+      padding: 1.5rem;
+      text-align: center;
+    }
+  </style>
+</head>
+<body>
+  <p>Finishing Telegram login…</p>
+  <script>
+    (function () {
+      var params = new URLSearchParams(window.location.search);
+      var target = params.get("target");
+      if (!target) {
+        document.body.textContent = "Missing return URL.";
+        return;
+      }
+      params.delete("target");
+      if (params.get("telegram_auth") !== "1") {
+        window.location.replace(target);
+        return;
+      }
+      var id = Number(params.get("id"));
+      var authDate = Number(params.get("auth_date"));
+      var hash = params.get("hash");
+      if (!id || !authDate || !hash) {
+        window.location.replace(target);
+        return;
+      }
+      var user = { id: id, auth_date: authDate, hash: hash };
+      params.forEach(function (value, key) {
+        if (key === "telegram_auth" || key === "id" || key === "auth_date") return;
+        if (value) user[key] = value;
+      });
+      var origin;
+      try {
+        origin = new URL(target).origin;
+      } catch (e) {
+        document.body.textContent = "Invalid return URL.";
+        return;
+      }
+      if (window.opener && !window.opener.closed) {
+        window.opener.postMessage({ type: "krab-telegram-auth", user: user }, origin);
+        window.close();
+        return;
+      }
+      var sep = target.indexOf("?") >= 0 ? "&" : "?";
+      window.location.replace(target + sep + params.toString());
+    })();
+  </script>
+</body>
+</html>"""
+
+
 def login_page_html(return_url: str) -> str:
     base = widget_base_url()
     bot = telegram_bot_username()
-    callback = f"{base}/api/interview/telegram-widget-callback?return_url={quote(return_url, safe='')}"
+    bridge = auth_return_bridge_url(return_url)
+    callback = f"{base}/api/interview/telegram-widget-callback?return_url={quote(bridge, safe='')}"
     return f"""<!DOCTYPE html>
 <html lang="en">
 <head>
