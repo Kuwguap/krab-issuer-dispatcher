@@ -532,7 +532,8 @@ export default function ApplyPage() {
             Driver’s License <span className="field-req">*</span>
           </label>
           <p className="field-sublabel">
-            A valid driver’s license is required to drive. Please Upload a clear photo/picture below.
+            A valid driver’s license is required to drive. Upload a clear photo below — it is saved
+            on your application and supervisors can view it in the bot.
           </p>
           <input
             key={`license-file-${formSessionKey}`}

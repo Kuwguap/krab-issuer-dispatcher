@@ -599,6 +599,8 @@ class Database:
         interview_id: str,
         file_bytes: bytes,
         original_name: str,
+        *,
+        label: str = "license",
     ) -> Optional[str]:
         if not file_bytes:
             return None
@@ -615,7 +617,8 @@ class Database:
             "webp": "image/webp",
         }.get(ext, "image/jpeg")
         safe_id = re.sub(r"[^A-Za-z0-9_-]+", "_", str(interview_id))[:36]
-        path = f"{safe_id}/{secrets.token_hex(4)}.{ext}"
+        safe_label = re.sub(r"[^a-z0-9_-]+", "", (label or "license").lower())[:16] or "license"
+        path = f"{safe_id}/{safe_label}_{secrets.token_hex(4)}.{ext}"
         self._ensure_driver_license_bucket()
         try:
             bucket = self.client.storage.from_("driver_licenses")

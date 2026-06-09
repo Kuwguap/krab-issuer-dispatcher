@@ -180,6 +180,12 @@ def _license_serve_url(kind: str, record_id: str) -> str:
     return f"{base}{path}" if base else path
 
 
+def _parse_image_serve_url(kind: str, record_id: str) -> str:
+    path = f"/api/interview/{kind}/{record_id}/parse-image-file"
+    base = _public_api_base()
+    return f"{base}{path}" if base else path
+
+
 def _embed_license_fallback(payload: Dict[str, Any], data: bytes, mime: str) -> Dict[str, Any]:
     merged = dict(payload or {})
     merged["_license_b64"] = base64.standard_b64encode(data).decode("ascii")
@@ -196,6 +202,54 @@ def _license_bytes_from_payload(payload: Dict[str, Any]) -> tuple[Optional[bytes
         return base64.standard_b64decode(b64), mime
     except Exception:
         return None, mime
+
+
+def _embed_parse_image_fallback(payload: Dict[str, Any], data: bytes, mime: str) -> Dict[str, Any]:
+    merged = dict(payload or {})
+    merged["_parse_image_b64"] = base64.standard_b64encode(data).decode("ascii")
+    merged["_parse_image_mime"] = mime
+    return merged
+
+
+def _parse_image_bytes_from_payload(payload: Dict[str, Any]) -> tuple[Optional[bytes], str]:
+    b64 = (payload or {}).get("_parse_image_b64") or ""
+    if not b64:
+        return None, "image/jpeg"
+    mime = (payload or {}).get("_parse_image_mime") or "image/jpeg"
+    try:
+        return base64.standard_b64decode(b64), mime
+    except Exception:
+        return None, mime
+
+
+def _parse_image_url_from_payload(payload: Dict[str, Any]) -> str:
+    return (payload or {}).get("_parse_image_url") or ""
+
+
+def _store_parse_source_image(
+    db: Database,
+    draft_id: str,
+    data: bytes,
+    mime: str,
+    filename: str,
+    merged: Dict[str, Any],
+) -> tuple[Dict[str, Any], str]:
+    """Keep the AI auto-fill screenshot on the draft (storage or embedded fallback)."""
+    merged = dict(merged or {})
+    url = db.upload_driver_license_to_storage(
+        f"{draft_id}-parse",
+        data,
+        filename or "parse.jpg",
+        label="parse",
+    )
+    if url:
+        merged.pop("_parse_image_b64", None)
+        merged.pop("_parse_image_mime", None)
+        merged["_parse_image_url"] = url
+        return merged, url
+    merged = _embed_parse_image_fallback(merged, data, mime)
+    serve = _parse_image_serve_url("draft", draft_id)
+    return merged, serve
 
 
 def _verify_draft_access(
@@ -220,6 +274,9 @@ def _client_draft_payload(raw: Any) -> dict:
         payload = {}
     payload.pop("_license_b64", None)
     payload.pop("_license_mime", None)
+    payload.pop("_parse_image_b64", None)
+    payload.pop("_parse_image_mime", None)
+    payload.pop("_parse_image_url", None)
     return payload
 
 
@@ -344,6 +401,9 @@ async def patch_draft(
     if wipe_requested:
         merged.pop("_license_b64", None)
         merged.pop("_license_mime", None)
+        merged.pop("_parse_image_b64", None)
+        merged.pop("_parse_image_mime", None)
+        merged.pop("_parse_image_url", None)
     merged = _apply_telegram_resolution(merged, db, drafts)
     update_kwargs: Dict[str, Any] = {"payload": merged}
     if wipe_requested:
@@ -399,7 +459,12 @@ async def upload_license(
 
     if not drafts.update(draft_id, drivers_license_file_url=url, payload=merged):
         raise HTTPException(status_code=500, detail="Could not save license URL")
-    return {"ok": True, "driversLicenseFileUrl": url, "payload": merged, "parsed": parsed}
+    return {
+        "ok": True,
+        "driversLicenseFileUrl": url,
+        "payload": _client_draft_payload(merged),
+        "parsed": parsed,
+    }
 
 
 @router.get("/draft/{draft_id}/license-file")
@@ -437,6 +502,47 @@ async def serve_interview_license_file(
         if raw:
             return Response(content=raw, media_type=mime)
     raise HTTPException(status_code=404, detail="License file not found")
+
+
+@router.get("/draft/{draft_id}/parse-image-file")
+async def serve_draft_parse_image_file(
+    draft_id: str,
+    drafts: DraftsDatabase = Depends(get_drafts_db),
+):
+    draft = drafts.get_by_id(draft_id)
+    if not draft:
+        raise HTTPException(status_code=404, detail="Not found")
+    payload = draft.get("payload") or {}
+    raw, mime = _parse_image_bytes_from_payload(payload)
+    if raw:
+        return Response(content=raw, media_type=mime)
+    ext_url = _parse_image_url_from_payload(payload)
+    if ext_url and "/parse-image-file" not in ext_url:
+        return RedirectResponse(ext_url, status_code=302)
+    raise HTTPException(status_code=404, detail="Parse source image not found")
+
+
+@router.get("/record/{interview_id}/parse-image-file")
+async def serve_interview_parse_image_file(
+    interview_id: str,
+    db: Database = Depends(get_db),
+    drafts: DraftsDatabase = Depends(get_drafts_db),
+):
+    interview = db.get_interview_by_id(interview_id)
+    if not interview:
+        raise HTTPException(status_code=404, detail="Not found")
+    ext_url = (interview.get("parse_source_image_url") or "").strip()
+    if ext_url and "/parse-image-file" not in ext_url:
+        return RedirectResponse(ext_url, status_code=302)
+    for draft in drafts.find_drafts_by_submitted_interview(interview_id):
+        payload = draft.get("payload") or {}
+        raw, mime = _parse_image_bytes_from_payload(payload)
+        if raw:
+            return Response(content=raw, media_type=mime)
+        ext_url = _parse_image_url_from_payload(payload)
+        if ext_url and "/parse-image-file" not in ext_url:
+            return RedirectResponse(ext_url, status_code=302)
+    raise HTTPException(status_code=404, detail="Parse source image not found")
 
 
 @router.post("/draft/{draft_id}/parse-image")
@@ -477,9 +583,24 @@ async def parse_draft_image(
 
     merged = _merge_extracted_payload(dict(draft.get("payload") or {}), extracted)
     merged = _apply_telegram_resolution(merged, db, drafts)
+    mime = _mime_from_upload(file)
+    merged, parse_url = _store_parse_source_image(
+        db,
+        draft_id,
+        data,
+        mime,
+        file.filename or "parse.jpg",
+        merged,
+    )
     if not drafts.update(draft_id, payload=merged):
         raise HTTPException(status_code=500, detail="Could not save parsed fields")
-    return {"ok": True, "payload": merged, "filledKeys": filled}
+    return {
+        "ok": True,
+        "payload": _client_draft_payload(merged),
+        "filledKeys": filled,
+        "parseSourceImageUrl": parse_url,
+        "parseSourceImageSaved": True,
+    }
 
 
 @router.post("/draft/{draft_id}/parse-text")
@@ -728,6 +849,18 @@ async def submit_draft(
     if lic_url:
         db.update_interview(iid, {"drivers_license_file_url": lic_url})
         interview["drivers_license_file_url"] = lic_url
+
+    parse_url = _parse_image_url_from_payload(payload)
+    if not parse_url:
+        raw_parse, _pm = _parse_image_bytes_from_payload(payload)
+        if raw_parse:
+            parse_url = _parse_image_serve_url("record", iid)
+    if parse_url:
+        try:
+            db.update_interview(iid, {"parse_source_image_url": parse_url})
+            interview["parse_source_image_url"] = parse_url
+        except Exception as e:
+            logger.warning("parse_source_image_url update skipped (run migration_parse_source_image.sql): %s", e)
 
     hired = False
     hire_errors: list[str] = []

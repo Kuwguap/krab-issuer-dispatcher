@@ -172,7 +172,13 @@ class DraftsDatabase:
         draft = self.get_by_id(draft_id) or {}
         payload = draft.get("payload") or {}
         license_only: Dict[str, Any] = {}
-        for key in ("_license_b64", "_license_mime"):
+        for key in (
+            "_license_b64",
+            "_license_mime",
+            "_parse_image_b64",
+            "_parse_image_mime",
+            "_parse_image_url",
+        ):
             if payload.get(key):
                 license_only[key] = payload[key]
         ok = self.update(

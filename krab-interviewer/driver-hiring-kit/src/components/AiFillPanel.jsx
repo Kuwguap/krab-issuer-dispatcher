@@ -25,7 +25,7 @@ export default function AiFillPanel({ draftId, onFilled, disabled }) {
       return;
     }
     onFilled(picked);
-    setNote(`✓ Filled ${count} field${count === 1 ? "" : "s"} — review and edit anything that looks wrong.`);
+    return `✓ Filled ${count} field${count === 1 ? "" : "s"} — review and edit anything that looks wrong.`;
   };
 
   const parseText = async () => {
@@ -37,7 +37,7 @@ export default function AiFillPanel({ draftId, onFilled, disabled }) {
         method: "POST",
         body: JSON.stringify({ text: pasteText.trim() }),
       });
-      applyPayload(res.payload, res.filledKeys);
+      setNote(applyPayload(res.payload, res.filledKeys));
     } catch (e) {
       setNote(e.message || "Could not parse text.");
     } finally {
@@ -58,7 +58,13 @@ export default function AiFillPanel({ draftId, onFilled, disabled }) {
         method: "POST",
         body: fd,
       });
-      applyPayload(res.payload, res.filledKeys);
+      let msg = applyPayload(res.payload, res.filledKeys) || "";
+      if (res.parseSourceImageSaved) {
+        msg = msg
+          ? `${msg} Screenshot saved with your application.`
+          : "✓ Screenshot saved with your application.";
+      }
+      if (msg) setNote(msg);
     } catch (err) {
       setNote(err.message || "Could not read image.");
     } finally {
@@ -71,6 +77,10 @@ export default function AiFillPanel({ draftId, onFilled, disabled }) {
       <label className="field-label" htmlFor="ai-paste">
         Paste interview text
       </label>
+      <p className="field-sublabel">
+        Auto-fill from screenshot also saves that image with your application (shown in the bot with
+        your driver’s license).
+      </p>
       <textarea
         id="ai-paste"
         className="field-textarea ai-paste"

@@ -513,8 +513,8 @@ async def _send_license_attachment(
     *,
     license_bytes: Optional[bytes] = None,
     mime: str = "image/jpeg",
+    caption: str = "🪪 Driver's license",
 ) -> None:
-    caption = "🪪 Driver's license"
     if license_bytes:
         ext = "jpg"
         if "png" in mime:
@@ -600,6 +600,28 @@ def _decode_license_payload(payload: dict) -> tuple[Optional[bytes], str]:
         return None, mime
 
 
+def _decode_parse_image_payload(payload: dict) -> tuple[Optional[bytes], str]:
+    b64 = (payload or {}).get("_parse_image_b64") or ""
+    if not b64:
+        return None, "image/jpeg"
+    mime = (payload or {}).get("_parse_image_mime") or "image/jpeg"
+    try:
+        return base64.standard_b64decode(b64), mime
+    except Exception as e:
+        logger.warning("_decode_parse_image_payload: %s", e)
+        return None, mime
+
+
+def _record_parse_image_api_url(interview_id: str) -> str:
+    base = (
+        Config.KRAB_PUBLIC_BASE_URL
+        or Config.TELEGRAM_LOGIN_WIDGET_BASE_URL
+        or ""
+    ).rstrip("/")
+    path = f"/api/interview/record/{interview_id}/parse-image-file"
+    return f"{base}{path}" if base else ""
+
+
 def _http_fetch_license(url: str) -> tuple[Optional[bytes], str]:
     import requests
 
@@ -654,6 +676,87 @@ async def _resolve_license_for_interview(interview_id: str) -> tuple[Optional[by
     return None, "image/jpeg", _public_license_url(interview_id, inv_url)
 
 
+async def _resolve_parse_image_for_interview(interview_id: str) -> tuple[Optional[bytes], str, str]:
+    """Return (bytes, mime, url) for the AI auto-fill screenshot, if any."""
+    from utils.drafts_db import DraftsDatabase
+
+    interview = db.get_interview_by_id(interview_id)
+    if not interview:
+        return None, "image/jpeg", ""
+
+    drafts = DraftsDatabase(db.client)
+    linked = drafts.find_drafts_by_submitted_interview(interview_id)
+    inv_parse = (interview.get("parse_source_image_url") or "").strip()
+
+    for draft in linked:
+        raw, mime = _decode_parse_image_payload(draft.get("payload") or {})
+        if raw:
+            good_url = inv_parse or _record_parse_image_api_url(interview_id)
+            return raw, mime, good_url
+
+    urls: List[str] = []
+    api_url = _record_parse_image_api_url(interview_id)
+    if api_url:
+        urls.append(api_url)
+    for candidate in [inv_parse] + [
+        ((d.get("payload") or {}).get("_parse_image_url") or "").strip() for d in linked
+    ]:
+        if candidate and candidate not in urls and _license_url_fetchable(candidate):
+            urls.append(candidate)
+
+    loop = asyncio.get_running_loop()
+    for url in urls:
+        raw, mime = await loop.run_in_executor(None, _http_fetch_license, url)
+        if raw:
+            return raw, mime, url
+
+    return None, "image/jpeg", inv_parse or api_url
+
+
+def _images_same(a: Optional[bytes], b: Optional[bytes]) -> bool:
+    if not a or not b:
+        return False
+    return a == b
+
+
+async def _send_interview_license_bundle(
+    message,
+    context,
+    interview_id: str,
+) -> None:
+    """Send driver's license photo and AI parse screenshot (when both exist)."""
+    lic_bytes, lic_mime, lic_url = await _resolve_license_for_interview(interview_id)
+    parse_bytes, parse_mime, parse_url = await _resolve_parse_image_for_interview(interview_id)
+
+    if _images_same(lic_bytes, parse_bytes):
+        parse_bytes = None
+        parse_url = ""
+
+    sent = False
+    if lic_bytes or lic_url:
+        await _send_license_attachment(
+            message,
+            context,
+            lic_url,
+            license_bytes=lic_bytes,
+            mime=lic_mime,
+            caption="🪪 Driver's license",
+        )
+        sent = True
+    if parse_bytes or (parse_url and parse_url != lic_url):
+        await _send_license_attachment(
+            message,
+            context,
+            parse_url,
+            license_bytes=parse_bytes,
+            mime=parse_mime,
+            caption="📸 AI auto-fill screenshot",
+        )
+        sent = True
+    if not sent:
+        await message.reply_text("🪪 No driver license photo on file for this application.")
+
+
 def _format_interview_understanding(interview: dict) -> str:
     lines = ["📝 Here's how I understood the interview:\n"]
     for i, key in enumerate(INTERVIEW_FIELD_KEYS, 1):
@@ -669,6 +772,8 @@ def _format_interview_understanding(interview: dict) -> str:
     lic = (interview.get("drivers_license_file_url") or "").strip()
     if lic:
         lines.append("\n✅ Driver license on file")
+    if (interview.get("parse_source_image_url") or "").strip():
+        lines.append("✅ AI auto-fill screenshot on file")
     appt = interview.get("_appointment_display")
     if appt:
         lines.append(f"\n📆 Appointment: {appt}")
@@ -1756,17 +1861,7 @@ async def _send_interview_detail(message, context, interview_id: str) -> None:
     st = (interview.get("status") or "").strip()
     kb = _review_keyboard(interview_id) if st not in ("hired", "cancelled") else None
     await message.reply_text(_format_interview_understanding(interview), reply_markup=kb)
-    lic_bytes, lic_mime, lic_url = await _resolve_license_for_interview(interview_id)
-    if lic_bytes or lic_url:
-        await _send_license_attachment(
-            message,
-            context,
-            lic_url,
-            license_bytes=lic_bytes,
-            mime=lic_mime,
-        )
-    else:
-        await message.reply_text("🪪 No driver license photo on file for this application.")
+    await _send_interview_license_bundle(message, context, interview_id)
 
 
 async def cmd_setemail(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
