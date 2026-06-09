@@ -8,6 +8,7 @@ import { registerDraftFlush, unregisterDraftFlush } from "../draftFlush";
 import { displayTelegramUsername, normalizeTelegramUsername, telegramConnectUrl, userFacingTelegramMessage } from "../telegram";
 import { stripTelegramAuthFromUrl } from "../telegramAuth";
 import TelegramLoginButton, { useTelegramAuthReturn } from "../components/TelegramLoginButton";
+import TelegramBotStartButtons from "../components/TelegramBotStartButtons";
 
 function emptyPayload() {
   const p = { telegram_id: "" };
@@ -594,6 +595,7 @@ export default function ApplyPage() {
               Set your <strong>@username</strong> in Telegram → Settings → Edit → @Username
             </li>
           </ol>
+          <TelegramBotStartButtons className="preflight-bot-links" />
         </div>
 
         <button type="submit" className="btn btn-primary btn-lg btn-block" disabled={submitting || !draftId}>

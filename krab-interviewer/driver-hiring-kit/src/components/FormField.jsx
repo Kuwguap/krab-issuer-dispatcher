@@ -1,9 +1,5 @@
-import {
-  dispatchBotUsername,
-  interviewerBotUsername,
-  telegramConnectUrl,
-  telegramDispatchConnectUrl,
-} from "../telegram";
+import { telegramConnectUrl } from "../telegram";
+import TelegramBotStartButtons from "./TelegramBotStartButtons";
 
 export default function FormField({
   field,
@@ -77,26 +73,7 @@ export default function FormField({
 
       {field.autoResolveTelegram && (
         <div className="telegram-bot-links">
-          <p className="verify-row">
-            <a
-              className="btn btn-secondary telegram-connect-btn"
-              href={telegramStatus?.connectUrl || telegramConnectUrl()}
-              target="_blank"
-              rel="noopener noreferrer"
-            >
-              Open @{interviewerBotUsername()} → tap Start
-            </a>
-          </p>
-          <p className="verify-row">
-            <a
-              className="btn btn-secondary telegram-connect-btn"
-              href={telegramDispatchConnectUrl()}
-              target="_blank"
-              rel="noopener noreferrer"
-            >
-              Open @{dispatchBotUsername()} → tap Start
-            </a>
-          </p>
+          <TelegramBotStartButtons connectUrl={telegramStatus?.connectUrl || telegramConnectUrl()} />
           <p className="field-sublabel telegram-bots-note">
             We use AI 🤖 to automate our Dealership system operation — please start these 2 bots to
             receive daily client delivery alerts 🔔

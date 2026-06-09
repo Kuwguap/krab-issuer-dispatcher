@@ -1092,6 +1092,21 @@ a.progress-pill-link:hover {
   font-size: 0.92rem;
 }
 
+.preflight-card .preflight-bot-links {
+  margin-top: 1rem;
+  align-items: stretch;
+}
+
+.preflight-card .preflight-bot-links .verify-row {
+  justify-content: center;
+}
+
+.preflight-card .preflight-bot-links .telegram-connect-btn {
+  width: 100%;
+  max-width: 22rem;
+  text-align: center;
+}
+
 .success-card {
   text-align: center;
   padding: 2.5rem;
