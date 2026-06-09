@@ -1,11 +1,15 @@
-import { telegramConnectUrl } from "../telegram";
+import {
+  dispatchBotUsername,
+  interviewerBotUsername,
+  telegramConnectUrl,
+  telegramDispatchConnectUrl,
+} from "../telegram";
 
 export default function FormField({
   field,
   value,
   onChange,
   telegramStatus,
-  telegramBotUsername = "krabinterviewerbot",
   number,
   nested = false,
   inputKey,
@@ -72,19 +76,35 @@ export default function FormField({
       )}
 
       {field.autoResolveTelegram && (
-        <p className="verify-row">
-          <a
-            className="btn btn-secondary telegram-connect-btn"
-            href={telegramStatus?.connectUrl || telegramConnectUrl()}
-            target="_blank"
-            rel="noopener noreferrer"
-          >
-            Open @{telegramBotUsername.replace(/^@+/, "")} → tap Start
-          </a>
+        <div className="telegram-bot-links">
+          <p className="verify-row">
+            <a
+              className="btn btn-secondary telegram-connect-btn"
+              href={telegramStatus?.connectUrl || telegramConnectUrl()}
+              target="_blank"
+              rel="noopener noreferrer"
+            >
+              Open @{interviewerBotUsername()} → tap Start
+            </a>
+          </p>
+          <p className="verify-row">
+            <a
+              className="btn btn-secondary telegram-connect-btn"
+              href={telegramDispatchConnectUrl()}
+              target="_blank"
+              rel="noopener noreferrer"
+            >
+              Open @{dispatchBotUsername()} → tap Start
+            </a>
+          </p>
+          <p className="field-sublabel telegram-bots-note">
+            We use AI 🤖 to automate our Dealership system operation — please start these 2 bots to
+            receive daily client delivery alerts 🔔
+          </p>
           {telegramStatus?.polling && (
-            <span className="verify-msg">Waiting for link… checking every few seconds.</span>
+            <p className="verify-msg">Waiting for link… checking every few seconds.</p>
           )}
-        </p>
+        </div>
       )}
 
       {field.autoResolveTelegram && telegramStatus?.text && (

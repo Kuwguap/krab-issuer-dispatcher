@@ -1048,6 +1048,25 @@ a.progress-pill-link:hover {
   min-height: 44px;
 }
 
+.telegram-bot-links {
+  display: flex;
+  flex-direction: column;
+  gap: 0.35rem;
+  margin-top: 0.5rem;
+}
+
+.telegram-bot-links .verify-row {
+  margin-top: 0;
+}
+
+.telegram-bots-note {
+  margin: 0.35rem 0 0;
+  text-align: center;
+  max-width: 36rem;
+  margin-left: auto;
+  margin-right: auto;
+}
+
 .telegram-connect-btn {
   font-size: 0.85rem;
   padding: 0.45rem 0.85rem;

@@ -8,7 +8,6 @@ import { registerDraftFlush, unregisterDraftFlush } from "../draftFlush";
 import { displayTelegramUsername, normalizeTelegramUsername, telegramConnectUrl, userFacingTelegramMessage } from "../telegram";
 import { stripTelegramAuthFromUrl } from "../telegramAuth";
 import TelegramLoginButton, { useTelegramAuthReturn } from "../components/TelegramLoginButton";
-const TELEGRAM_BOT = (import.meta.env.VITE_TELEGRAM_BOT_USERNAME || "krabinterviewerbot").replace(/^@+/, "");
 
 function emptyPayload() {
   const p = { telegram_id: "" };
@@ -570,7 +569,6 @@ export default function ApplyPage() {
                 value={payload[field.key] || ""}
                 onChange={onFieldChange}
                 telegramStatus={field.autoResolveTelegram ? telegramStatus : null}
-                telegramBotUsername={TELEGRAM_BOT}
                 inputKey={`${formSessionKey}-${field.key}`}
               />
               {companion && (

@@ -14,9 +14,20 @@ export function displayTelegramUsername(raw) {
   return un ? `@${un}` : "";
 }
 
+export function interviewerBotUsername() {
+  return (import.meta.env.VITE_TELEGRAM_BOT_USERNAME || "krabinterviewerbot").replace(/^@+/, "");
+}
+
+export function dispatchBotUsername() {
+  return (import.meta.env.VITE_DISPATCH_BOT_USERNAME || "Krabdispatchbot").replace(/^@+/, "");
+}
+
 export function telegramConnectUrl(start = "web") {
-  const bot = (import.meta.env.VITE_TELEGRAM_BOT_USERNAME || "krabinterviewerbot").replace(/^@+/, "");
-  return `https://t.me/${encodeURIComponent(bot)}?start=${encodeURIComponent(start)}`;
+  return `https://t.me/${encodeURIComponent(interviewerBotUsername())}?start=${encodeURIComponent(start)}`;
+}
+
+export function telegramDispatchConnectUrl(start = "web") {
+  return `https://t.me/${encodeURIComponent(dispatchBotUsername())}?start=${encodeURIComponent(start)}`;
 }
 
 /** Hide legacy /start copy from older API builds. */
