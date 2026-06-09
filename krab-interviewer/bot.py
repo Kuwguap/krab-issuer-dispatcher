@@ -299,23 +299,70 @@ def _parse_city_zip_from_address(address: str) -> tuple[str, str]:
 _EMPTY_INLINE_KB = InlineKeyboardMarkup([])
 
 
+def _shipping_address_line(name: str, address: str) -> str:
+    """Drop a leading driver name duplicate from the mailing address."""
+    raw = (address or "").strip()
+    if not raw:
+        return "—"
+    nm = (name or "").strip()
+    if nm and raw.lower().startswith(nm.lower()):
+        rest = raw[len(nm) :].strip().lstrip(",.- ")
+        if rest:
+            return rest
+    return raw
+
+
+_PAPER_SHIP_FOOTER = (
+    "⚡️🏷️📬 Priority Order — Ship ASAP, preferably first thing in the morning.\n\n"
+    "⏳ All paper orders should be shipped within 24 hours.\n\n"
+    "🏁Automated🏎️Automotive💨"
+)
+
+
+def _format_paper_ship_message(
+    *,
+    qty: int,
+    name: str,
+    address: str,
+    phone: str,
+    ship_intro: str,
+    receipt_line: str,
+) -> str:
+    addr = _shipping_address_line(name, address)
+    return (
+        "➕🚗 New Driver Hired ✅🎉\n\n"
+        f"{ship_intro}\n\n"
+        f"👤 {name}\n"
+        f"📍 {addr}\n"
+        f"📞 {phone}\n\n"
+        f"{receipt_line}\n\n"
+        f"{_PAPER_SHIP_FOOTER}"
+    )
+
+
 def _format_paper_girl_ship_request(shipment: dict) -> str:
     qty = int(shipment.get("quantity") or Config.DEFAULT_PAPER_QTY)
     name = (shipment.get("driver_name") or "Driver").strip()
-    addr = (shipment.get("driver_address") or "-").strip()
-    phone = (shipment.get("driver_phone") or "-").strip()
-    city = (shipment.get("driver_city") or "").strip()
-    zip_code = (shipment.get("driver_zip") or "").strip()
-    loc = ", ".join(p for p in [city, zip_code] if p) or "—"
-    return (
-        "📦 **Ship this order**\n\n"
-        f"Please ship **{qty}** papers today to:\n\n"
-        f"👤 {name}\n"
-        f"🏙 {loc}\n"
-        f"📍 {addr}\n"
-        f"📞 {phone}\n\n"
-        "🧾 Upload receipt after shipping\n"
-        "⚡ Send ASAP — first thing in the morning latest!"
+    return _format_paper_ship_message(
+        qty=qty,
+        name=name,
+        address=(shipment.get("driver_address") or "").strip(),
+        phone=(shipment.get("driver_phone") or "-").strip(),
+        ship_intro=f"📦 Please ship {qty} temp tag papers today to:",
+        receipt_line="🧾 Please upload the tracking number shipping receipt once sent.",
+    )
+
+
+def _format_driver_paper_ship_notice(interview: dict) -> str:
+    qty = Config.DEFAULT_PAPER_QTY
+    name = _driver_display_name(interview)
+    return _format_paper_ship_message(
+        qty=qty,
+        name=name,
+        address=(interview.get("mailing_address") or "").strip(),
+        phone=(interview.get("phone_number") or "-").strip(),
+        ship_intro=f"📦 Your {qty} temp tag papers are being prepared & shipped today to:",
+        receipt_line="🧾 Tracking number & shipping receipt coming once sent.",
     )
 
 
@@ -1057,66 +1104,26 @@ async def _create_and_notify_paper_girl(
     return shipment, None
 
 
-def _build_hire_announcement_message(interview: dict, driver_name: str) -> str:
-    welcome_first, _ = ai_vision.split_full_name(driver_name)
-    if not welcome_first:
-        welcome_first = (interview.get("first_name") or "").strip() or driver_name.split()[0] or "Driver"
-
-    interviewer_bot = Config.KRAB_INTERVIEWER_BOT_USERNAME.lstrip("@")
-    dispatch_bot = Config.KRAB_DISPATCH_BOT_USERNAME.lstrip("@")
-    qty = Config.DEFAULT_PAPER_QTY
-
-    return (
-        "🎉 DRIVER HIRED ✅\n\n"
-        f"Welcome to the team, {welcome_first}!\n\n"
-        "📲 Start these bots now:\n"
-        f"@{interviewer_bot}\n"
-        f"@{dispatch_bot}\n\n"
-        f"📦 Your {qty} temp tag papers are being prepared and shipped.\n"
-        "📬 Tracking number coming soon.\n\n"
-        "🖨️ Please have a LaserJet printer ready to print temp tags. 1 click Purchase here:\n"
-        "https://shorturl.at/gvOrb\n\n"
-        "⚡ You are now ACTIVE and ready to receive deliveries.\n\n"
-        "Important:\n"
-        "• All clients belong to the dealership.\n"
-        "• Every client phone number must be recorded.\n"
-        "• No off-platform deals or private servicing of clients.\n\n"
-        "💰 Every successful delivery pays $50.\n"
-        "🔄 Many clients renew monthly, creating repeat opportunities.\n\n"
-        "📢 Want more deliveries?\n"
-        "Stay active, keep notifications ON, and bring in new clients whenever possible.\n\n"
-        "🚀 Welcome aboard. Let's get to work!"
-    )
+def _driver_channel_join_keyboard(
+    channel_invite: Optional[str],
+) -> Optional[InlineKeyboardMarkup]:
+    if not channel_invite:
+        return None
+    channel_btn_label = "🔗 Join @TriStateTags"
+    link = (Config.DRIVER_CHANNEL_LINK or "").strip()
+    if link and "t.me/" in link:
+        handle = link.rstrip("/").split("/")[-1]
+        if handle:
+            channel_btn_label = f"🔗 Join @{handle.lstrip('@')}"
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton(channel_btn_label, url=channel_invite)],
+    ])
 
 
-async def _run_hire_side_effects(
-    context: ContextTypes.DEFAULT_TYPE,
-    interview: dict,
-    *,
-    created_by_telegram_id: str,
-    prior_errors: Optional[List[str]] = None,
-) -> tuple[str, List[str]]:
-    """Channel post, driver DM, paper shipment, training. Returns (hire_msg, warnings)."""
-    driver_name = _driver_display_name(interview)
+def _build_driver_welcome_dm(interview: dict, driver_name: str) -> str:
     welcome_first, _ = ai_vision.split_full_name(driver_name)
     if not welcome_first:
         welcome_first = (interview.get("first_name") or "").strip() or driver_name.split()[0]
-
-    channel_invite = await _create_driver_channel_invite(context, driver_name)
-    tid = (interview.get("telegram_id") or "").strip()
-    try:
-        await _add_driver_to_channel(context, tid)
-    except Exception as e:
-        logger.warning("Could not auto-add driver %s to channel: %s", tid, e)
-
-    ship, ship_warn = await _create_and_notify_paper_girl(
-        context,
-        interview,
-        created_by_telegram_id=created_by_telegram_id,
-    )
-
-    hire_msg = _build_hire_announcement_message(interview, driver_name)
-    await _post_to_driver_channel(context, kind="text", body=hire_msg, media_file_id=None)
 
     username_display = (interview.get("telegram_username") or "").strip()
     if username_display and not username_display.startswith("@"):
@@ -1136,7 +1143,7 @@ async def _run_hire_side_effects(
         if pg_follow
         else f"📦 {qty} papers are now being prepared & shipped by papergirl please push & follow up\n\n"
     )
-    driver_dm = (
+    return (
         f"🎉 Welcome to the Team, {welcome_handle}! 🚗🔥\n\n"
         "🎉 DRIVER HIRED SUCCESSFULLY ✅\n\n"
         f"Welcome to the Family {welcome_first} !\n\n"
@@ -1170,51 +1177,180 @@ async def _run_hire_side_effects(
         "🔔 Keep notifications ON so you never miss a lead.\n\n"
         "🚀 Welcome aboard — let's get to work!"
     )
-    join_kb = None
-    if channel_invite:
-        channel_btn_label = "🔗 Join @TriStateTags"
-        link = (Config.DRIVER_CHANNEL_LINK or "").strip()
-        if link and "t.me/" in link:
-            handle = link.rstrip("/").split("/")[-1]
-            if handle:
-                channel_btn_label = f"🔗 Join @{handle.lstrip('@')}"
-        join_kb = InlineKeyboardMarkup([
-            [InlineKeyboardButton(channel_btn_label, url=channel_invite)],
-        ])
-    try:
-        await context.bot.send_message(
-            chat_id=int(tid),
-            text=driver_dm,
-            reply_markup=join_kb,
-        )
-    except Exception as e:
-        logger.warning("Driver welcome DM failed: %s", e)
 
-    training_warn: Optional[str] = None
+
+def _build_driver_onboarding_steps_message() -> str:
+    dispatch_bot = Config.KRAB_DISPATCH_BOT_USERNAME.lstrip("@")
+    return (
+        "🚗 Welcome to the Team – Driver Onboarding Steps 🚗\n\n"
+        "👋 Step 1: Introduce Yourself\n"
+        "Please introduce yourself to the entire team, including dispatchers, supervisors, and fellow drivers. "
+        "Take a few minutes to get acquainted with everyone and build good communication from day one.\n\n"
+        "📲 Step 2: Turn On Notifications\n"
+        f"Enable notifications for @{dispatch_bot} so you receive delivery assignments immediately.\n\n"
+        "✅ Step 3: Accept Deliveries\n"
+        "When a new delivery appears, click Accept and wait for the delivery email to arrive.\n\n"
+        "🖨️ Step 4: Print the Temporary Plate\n"
+        "A temporary plate will be emailed to you. Print it using your LaserJet printer before contacting the client.\n\n"
+        "📞 Step 5: Call the Client\n"
+        "Contact the client and confirm:\n"
+        "• Delivery date and time\n"
+        "• Pickup/drop-off location\n"
+        "• Client's full name\n"
+        "• Address\n"
+        "• Phone number\n"
+        "• Delivery price\n\n"
+        "🔍 Step 6: Verify All Information\n"
+        "Carefully review the temporary tag and ensure all details are correct:\n"
+        "• Client name\n"
+        "• Address\n"
+        "• Vehicle color\n"
+        "• VIN number\n"
+        "• Any other vehicle information\n\n"
+        "⚠️ Double-check everything to prevent mistakes, delays, and unnecessary return trips.\n\n"
+        "💳 Step 7: Payment Instructions\n"
+        "Clients should pay the dealership directly through electronic payment whenever possible.\n\n"
+        "💵 If the Client Pays Cash\n"
+        "If the client insists on paying cash, you may accept it. Once received, forward the payment to us "
+        "electronically using your approved payment method.\n\n"
+        "💰 Driver Compensation\n"
+        "We will send you $50+ per delivery plus any applicable toll reimbursements.\n\n"
+        "📱 If you have any questions or encounter any issues during a delivery, contact dispatch immediately.\n\n"
+        "Thank you and drive safely! 🚘"
+    )
+
+
+_DRIVER_TRAINING_INTRO = (
+    "🎬 Training time! 🫪Watch these quick training videos to learn how temp tag deliveries work from start to finish.\n"
+    "Replay & Access them anytime by typing /training."
+)
+
+
+async def _send_driver_onboarding_messages(
+    context: ContextTypes.DEFAULT_TYPE,
+    interview: dict,
+    *,
+    channel_invite: Optional[str] = None,
+) -> List[str]:
+    """All Telegram messages a newly hired driver receives."""
+    warnings: List[str] = []
+    tid = (interview.get("telegram_id") or "").strip()
     try:
         driver_chat_id = int(tid)
     except Exception:
-        driver_chat_id = None
-    if driver_chat_id:
-        try:
-            await context.bot.send_message(
-                chat_id=driver_chat_id,
-                text=(
-                    "🎬 Training time! 🫪Watch these quick training videos to learn how temp tag deliveries work from start to finish.\n"
-                    "Replay & Access them anytime by typing /training."
-                ),
-            )
-        except Exception as e:
-            logger.warning("Training intro DM failed: %s", e)
-        sent_any = await _send_training_video_to_chat(context, driver_chat_id)
-        if not sent_any:
-            training_warn = "No training videos configured (supervisor: run /training)."
+        return ["Driver telegram_id missing or invalid"]
+
+    driver_name = _driver_display_name(interview)
+    join_kb = _driver_channel_join_keyboard(channel_invite)
+
+    try:
+        await context.bot.send_message(
+            chat_id=driver_chat_id,
+            text=_build_driver_welcome_dm(interview, driver_name),
+            reply_markup=join_kb,
+        )
+    except Exception as e:
+        warnings.append(f"Welcome DM: {e}")
+
+    try:
+        await context.bot.send_message(
+            chat_id=driver_chat_id,
+            text=_build_driver_onboarding_steps_message(),
+        )
+    except Exception as e:
+        warnings.append(f"Onboarding steps: {e}")
+
+    try:
+        await context.bot.send_message(
+            chat_id=driver_chat_id,
+            text=_format_driver_paper_ship_notice(interview),
+        )
+    except Exception as e:
+        warnings.append(f"Paper ship notice: {e}")
+
+    try:
+        await context.bot.send_message(
+            chat_id=driver_chat_id,
+            text=_DRIVER_TRAINING_INTRO,
+        )
+    except Exception as e:
+        warnings.append(f"Training intro: {e}")
+
+    if not await _send_training_video_to_chat(context, driver_chat_id):
+        warnings.append("No training videos configured (supervisor: run /training).")
+
+    return warnings
+
+
+def _build_hire_announcement_message(interview: dict, driver_name: str) -> str:
+    welcome_first, _ = ai_vision.split_full_name(driver_name)
+    if not welcome_first:
+        welcome_first = (interview.get("first_name") or "").strip() or driver_name.split()[0] or "Driver"
+
+    interviewer_bot = Config.KRAB_INTERVIEWER_BOT_USERNAME.lstrip("@")
+    dispatch_bot = Config.KRAB_DISPATCH_BOT_USERNAME.lstrip("@")
+
+    return (
+        "🎉 DRIVER HIRED ✅\n\n"
+        f"Welcome to the team, {welcome_first}!\n\n"
+        "📲 Start these bots now:\n"
+        f"@{interviewer_bot}\n"
+        f"@{dispatch_bot}\n\n"
+        "🖨️ Please have a LaserJet printer ready to print temp tags. 1 click Purchase here:\n"
+        "https://shorturl.at/gvOrb\n\n"
+        "⚡ You are now ACTIVE and ready to receive deliveries.\n\n"
+        "Important:\n"
+        "• All clients belong to the dealership.\n"
+        "• Every client phone number must be recorded.\n"
+        "• No off-platform deals or private servicing of clients.\n\n"
+        "💰 Every successful delivery pays $50.\n"
+        "🔄 Many clients renew monthly, creating repeat opportunities.\n\n"
+        "📢 Want more deliveries?\n"
+        "Stay active, keep notifications ON, and bring in new clients whenever possible.\n\n"
+        "🚀 Welcome aboard. Let's get to work!\n\n"
+        "━━━━━━━━━━━━━━━\n\n"
+        + _format_driver_paper_ship_notice(interview)
+        + "\n\n━━━━━━━━━━━━━━━\n\n"
+        + _DRIVER_TRAINING_INTRO
+    )
+
+
+async def _run_hire_side_effects(
+    context: ContextTypes.DEFAULT_TYPE,
+    interview: dict,
+    *,
+    created_by_telegram_id: str,
+    prior_errors: Optional[List[str]] = None,
+) -> tuple[str, List[str]]:
+    """Channel post, driver DM, paper shipment, training. Returns (hire_msg, warnings)."""
+    driver_name = _driver_display_name(interview)
+
+    channel_invite = await _create_driver_channel_invite(context, driver_name)
+    tid = (interview.get("telegram_id") or "").strip()
+    try:
+        await _add_driver_to_channel(context, tid)
+    except Exception as e:
+        logger.warning("Could not auto-add driver %s to channel: %s", tid, e)
+
+    ship, ship_warn = await _create_and_notify_paper_girl(
+        context,
+        interview,
+        created_by_telegram_id=created_by_telegram_id,
+    )
+
+    hire_msg = _build_hire_announcement_message(interview, driver_name)
+    await _post_to_driver_channel(context, kind="text", body=hire_msg, media_file_id=None)
+
+    dm_warnings = await _send_driver_onboarding_messages(
+        context,
+        interview,
+        channel_invite=channel_invite,
+    )
 
     warnings: List[str] = list(prior_errors or [])
     if ship_warn:
         warnings.append(ship_warn)
-    if training_warn:
-        warnings.append(training_warn)
+    warnings.extend(dm_warnings)
     if not channel_invite:
         warnings.append("Channel invite link not created (check DRIVER_CHANNEL_ID + bot admin rights).")
 
@@ -3146,6 +3282,26 @@ async def handle_chat_join_request(update: Update, context: ContextTypes.DEFAULT
         logger.info("Auto-approved join request from %s in %s", req.from_user.id, req.chat.id)
     except Exception as e:
         logger.warning("approve_chat_join_request failed: %s", e)
+        return
+
+    tid = str(req.from_user.id)
+    interview = db.get_latest_interview_for_telegram_id(tid)
+    if not interview or (interview.get("status") or "") != "hired":
+        return
+    channel_invite = await _create_driver_channel_invite(
+        context, _driver_display_name(interview)
+    )
+    dm_warnings = await _send_driver_onboarding_messages(
+        context,
+        interview,
+        channel_invite=channel_invite,
+    )
+    if dm_warnings:
+        logger.warning(
+            "Driver onboarding on channel join (%s): %s",
+            tid,
+            "; ".join(dm_warnings),
+        )
 
 
 async def cancel_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
