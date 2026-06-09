@@ -208,6 +208,24 @@ class Database:
             logger.error("get_latest_interview_for_telegram_id: %s", e)
             return None
 
+    def list_interviews_for_telegram_id(self, telegram_id: str, limit: int = 20) -> List[Dict[str, Any]]:
+        tid = str(telegram_id or "").strip()
+        if not tid:
+            return []
+        try:
+            r = (
+                self.client.table("interviews")
+                .select("*")
+                .eq("telegram_id", tid)
+                .order("created_at", desc=True)
+                .limit(max(1, min(limit, 50)))
+                .execute()
+            )
+            return r.data or []
+        except Exception as e:
+            logger.error("list_interviews_for_telegram_id: %s", e)
+            return []
+
     # --- appointments ---
 
     def create_appointment(

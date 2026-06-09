@@ -74,3 +74,53 @@ def hire_driver_records(
     updated = db.get_interview_by_id(interview_id) or interview
     updated["status"] = "hired"
     return updated, errors
+
+
+def purge_driver_everywhere(
+    db: Database,
+    driver: dict,
+    *,
+    drafts_db=None,
+) -> tuple[bool, list[str]]:
+    """Remove driver from Issuer, Dispatch, and interview records. Returns (ok, errors)."""
+    errors: list[str] = []
+    did = str(driver.get("id") or "").strip()
+    tid = str(driver.get("driver_telegram_id") or "").strip()
+    driver_name = (driver.get("driver_name") or "").strip()
+
+    interview = db.get_latest_interview_for_telegram_id(tid) if tid else None
+    email = (interview.get("email") or "").strip() if interview else ""
+
+    if tid:
+        for inv in db.list_interviews_for_telegram_id(tid):
+            iid = str(inv.get("id") or "")
+            if not iid:
+                continue
+            if drafts_db:
+                try:
+                    for drow in drafts_db.find_drafts_by_submitted_interview(iid):
+                        drafts_db.reset_submission(str(drow["id"]))
+                except Exception as e:
+                    errors.append(f"Draft reset: {e}")
+            if not db.delete_interview(iid):
+                errors.append(f"Interview {iid[:8]}… not deleted")
+
+    issuer_ok = False
+    if did:
+        issuer_ok = db.delete_driver(did)
+    elif tid:
+        issuer_ok = db.delete_driver_by_telegram_id(tid)
+
+    dispatch_ok = False
+    if email:
+        dispatch_ok, err = recipients_db.delete_recipient_by_email(email)
+        if not dispatch_ok and err:
+            errors.append(f"Dispatch: {err}")
+    elif driver_name:
+        dispatch_ok, err = recipients_db.delete_recipient_by_name(driver_name)
+        if not dispatch_ok and err:
+            errors.append(f"Dispatch: {err}")
+
+    if not issuer_ok and not dispatch_ok and not tid:
+        errors.append("Nothing was removed")
+    return issuer_ok or dispatch_ok, errors

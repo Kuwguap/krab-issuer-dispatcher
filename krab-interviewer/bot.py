@@ -395,7 +395,7 @@ async def _notify_paper_girl_chats(
 
 
 from utils.hire_driver import driver_display_name as _driver_display_name
-from utils.hire_driver import hire_driver_records
+from utils.hire_driver import hire_driver_records, purge_driver_everywhere
 
 
 def _format_shipments_list(rows: List[dict]) -> str:
@@ -1797,6 +1797,32 @@ async def cmd_drivers(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     )
 
 
+async def cmd_delete(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not _user_is_global_supervisor(update.effective_user.id):
+        return
+    drivers = db.get_all_drivers()
+    if not drivers:
+        await update.effective_message.reply_text("No drivers to delete.")
+        return
+    buttons = []
+    for d in drivers[:25]:
+        did = str(d.get("id", ""))
+        sid = _short_uuid(did) if len(did) == 36 else did[:22]
+        name = (d.get("driver_name") or "?")[:20]
+        phone = (d.get("phone_number") or "-")[:12]
+        buttons.append([
+            InlineKeyboardButton(
+                f"🗑 {name} | {phone}", callback_data=f"drv_dell_{sid}"
+            ),
+        ])
+    await update.effective_message.reply_text(
+        "🗑 <b>Delete driver</b> — tap a name, then confirm.\n\n"
+        "Removes Issuer driver, Dispatch recipient, and interview records.",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(buttons),
+    )
+
+
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     msg = update.effective_message
     if not msg:
@@ -1808,11 +1834,12 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "2. ❌ /cancel — cancel the current flow\n"
         "3. 🎤 /interviews — driver applications (tap a first name to open)\n"
         "4. 🚗 /drivers — list Issuer drivers (tap for profile)\n"
-        "5. 📂 /open — hired drivers (tap a name) or /open &lt;id&gt; — open by id\n"
-        "6. 📢 /announce — post next message to drivers channel now\n"
-        "7. 🗓️📢 /announce_schedule — schedule a channel post\n"
-        "8. 🎥📚 /training — view training videos (supervisors: add or remove)\n"
-        "9. ❓ /help — show this command list"
+        "5. 🗑 /delete — remove a driver (Issuer + Dispatch + interviews)\n"
+        "6. 📂 /open — hired drivers (tap a name) or /open &lt;id&gt; — open by id\n"
+        "7. 📢 /announce — post next message to drivers channel now\n"
+        "8. 🗓️📢 /announce_schedule — schedule a channel post\n"
+        "9. 🎥📚 /training — view training videos (supervisors: add or remove)\n"
+        "10. ❓ /help — show this command list"
     )
 
     try:
@@ -2717,15 +2744,34 @@ def _driver_edit_menu_keyboard(driver_short: str) -> InlineKeyboardMarkup:
     ])
 
 
-def _driver_delete_confirm_keyboard(driver_short: str) -> InlineKeyboardMarkup:
+def _driver_delete_confirm_keyboard(
+    driver_short: str, *, back_to_profile: bool = True
+) -> InlineKeyboardMarkup:
+    cancel_cb = (
+        f"drv_back_{driver_short}"
+        if back_to_profile
+        else f"drv_delx_{driver_short}"
+    )
     return InlineKeyboardMarkup([
         [
             InlineKeyboardButton(
                 "✅ Yes, delete", callback_data=f"drv_delc_{driver_short}"
             ),
-            InlineKeyboardButton("⬅️ Cancel", callback_data=f"drv_back_{driver_short}"),
+            InlineKeyboardButton("❌ No, cancel", callback_data=cancel_cb),
         ],
     ])
+
+
+def _driver_delete_confirm_text(driver: dict) -> str:
+    nm = driver.get("driver_name") or "this driver"
+    return (
+        f"🗑 Delete <b>{nm}</b>?\n\n"
+        "This removes:\n"
+        "• Issuer driver record\n"
+        "• Dispatch email recipient\n"
+        "• Interview records in this bot\n\n"
+        + "\n".join(_driver_profile_lines(driver))
+    )
 
 
 async def handle_driver_callbacks(
@@ -2804,25 +2850,6 @@ async def handle_driver_callbacks(
         _track_pending_prompt(context, sent.message_id)
         return STATE_DRV_EDIT_VALUE
 
-    if data.startswith("drv_del_"):
-        short = data[len("drv_del_"):]
-        driver = _resolve_driver_by_short(short)
-        if not driver:
-            try:
-                await q.edit_message_text("Driver not found.")
-            except Exception:
-                pass
-            return STATE_INTERVIEW_INPUT
-        nm = driver.get("driver_name") or "this driver"
-        try:
-            await q.edit_message_text(
-                f"🗑 Delete {nm}?\n\n" + "\n".join(_driver_profile_lines(driver)),
-                reply_markup=_driver_delete_confirm_keyboard(short),
-            )
-        except Exception:
-            pass
-        return STATE_INTERVIEW_INPUT
-
     if data.startswith("drv_delc_"):
         short = data[len("drv_delc_"):]
         driver = _resolve_driver_by_short(short)
@@ -2832,19 +2859,78 @@ async def handle_driver_callbacks(
             except Exception:
                 pass
             return STATE_INTERVIEW_INPUT
-        ok = db.delete_driver(str(driver["id"]))
+        from utils.drafts_db import DraftsDatabase
+
+        drafts = DraftsDatabase(db.client)
+        ok, purge_errors = purge_driver_everywhere(db, driver, drafts_db=drafts)
+        nm = driver.get("driver_name") or "(unnamed)"
         if ok:
+            lines = [
+                f"🗑 Deleted: <b>{nm}</b>",
+                "",
+                "Removed from Issuer, Dispatch, and interview records.",
+            ]
+            if purge_errors:
+                lines.append("")
+                lines.append("Notes:")
+                lines.extend(f"• {e}" for e in purge_errors[:5])
             try:
                 await q.edit_message_text(
-                    f"🗑 Deleted: {driver.get('driver_name') or '(unnamed)'}",
-                    reply_markup=None,
+                    "\n".join(lines), parse_mode="HTML", reply_markup=None
                 )
             except Exception:
-                await msg.reply_text(
-                    f"🗑 Deleted: {driver.get('driver_name') or '(unnamed)'}"
-                )
+                await msg.reply_text(f"🗑 Deleted: {nm}")
         else:
-            await msg.reply_text("❌ Could not delete driver.")
+            err = purge_errors[0] if purge_errors else "Could not delete driver."
+            await msg.reply_text(f"❌ {err}")
+        return STATE_INTERVIEW_INPUT
+
+    if data.startswith("drv_delx_"):
+        short = data[len("drv_delx_"):]
+        try:
+            await q.edit_message_text("Delete cancelled.", reply_markup=None)
+        except Exception:
+            pass
+        return STATE_INTERVIEW_INPUT
+
+    if data.startswith("drv_dell_"):
+        short = data[len("drv_dell_"):]
+        driver = _resolve_driver_by_short(short)
+        if not driver:
+            try:
+                await q.edit_message_text("Driver not found.")
+            except Exception:
+                pass
+            return STATE_INTERVIEW_INPUT
+        try:
+            await q.edit_message_text(
+                _driver_delete_confirm_text(driver),
+                parse_mode="HTML",
+                reply_markup=_driver_delete_confirm_keyboard(
+                    short, back_to_profile=False
+                ),
+            )
+        except Exception:
+            pass
+        return STATE_INTERVIEW_INPUT
+
+    if data.startswith("drv_del_"):
+        short = data[len("drv_del_"):]
+        driver = _resolve_driver_by_short(short)
+        if not driver:
+            try:
+                await q.edit_message_text("Driver not found.")
+            except Exception:
+                pass
+            return STATE_INTERVIEW_INPUT
+        try:
+            await q.edit_message_text(
+                _driver_delete_confirm_text(driver),
+                parse_mode="HTML",
+                reply_markup=_driver_delete_confirm_keyboard(short),
+            )
+        except Exception:
+            pass
         return STATE_INTERVIEW_INPUT
 
     return STATE_INTERVIEW_INPUT
@@ -3218,6 +3304,7 @@ def main() -> None:
     application.add_handler(CommandHandler("applications", cmd_interviews))
     application.add_handler(CommandHandler("shipments", cmd_shipments))
     application.add_handler(CommandHandler("drivers", cmd_drivers))
+    application.add_handler(CommandHandler("delete", cmd_delete))
     application.add_handler(CommandHandler("open", cmd_open))
     application.add_handler(
         CallbackQueryHandler(handle_interview_callbacks, pattern=r"^(int_|int_ef_|int_open_|int_drv_)"),
