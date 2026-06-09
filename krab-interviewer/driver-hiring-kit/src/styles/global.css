@@ -1141,22 +1141,26 @@ a.progress-pill-link:hover {
 
 .field-setup-video {
   margin: 0.65rem 0 0;
+  max-width: 11rem;
 }
 
 .field-setup-video-caption {
-  margin: 0 0 0.5rem;
-  font-size: 0.88rem;
+  margin: 0 0 0.4rem;
+  font-size: 0.82rem;
   font-weight: 600;
   color: var(--text-primary);
+  line-height: 1.35;
 }
 
 .field-setup-video-player {
   display: block;
   width: 100%;
-  max-width: 22rem;
-  border-radius: 10px;
+  max-width: 11rem;
+  max-height: 14.5rem;
+  border-radius: 8px;
   border: 1px solid var(--border, #ddd);
   background: #000;
+  object-fit: contain;
 }
 
 .success-card {
