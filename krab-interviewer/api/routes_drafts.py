@@ -123,6 +123,8 @@ def _apply_telegram_resolution(
     """When username is present, resolve numeric telegram_id into payload."""
     un_raw = (merged.get("telegram_username") or "").strip()
     if not un_raw:
+        merged["telegram_username"] = ""
+        merged["telegram_id"] = ""
         return merged
     display = normalize_telegram_username_display(un_raw)
     if display:
@@ -335,8 +337,18 @@ async def patch_draft(
     for k, v in (body.payload or {}).items():
         if k in INTERVIEW_FIELD_KEYS or k == "first_name":
             merged[k] = v
+    wipe_requested = body.payload is not None and all(
+        _empty_val(body.payload.get(k))
+        for k in INTERVIEW_FIELD_KEYS
+    )
+    if wipe_requested:
+        merged.pop("_license_b64", None)
+        merged.pop("_license_mime", None)
     merged = _apply_telegram_resolution(merged, db, drafts)
-    if not drafts.update(draft_id, payload=merged):
+    update_kwargs: Dict[str, Any] = {"payload": merged}
+    if wipe_requested:
+        update_kwargs["drivers_license_file_url"] = ""
+    if not drafts.update(draft_id, **update_kwargs):
         raise HTTPException(status_code=500, detail="Could not save draft")
     _note_pending_telegram_username(merged, draft_id, drafts)
     un = (merged.get("telegram_username") or "").strip()

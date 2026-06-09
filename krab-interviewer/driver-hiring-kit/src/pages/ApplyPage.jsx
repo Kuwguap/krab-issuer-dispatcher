@@ -6,6 +6,7 @@ import FormField from "../components/FormField";
 import AiFillPanel from "../components/AiFillPanel";
 import { registerDraftFlush, unregisterDraftFlush } from "../draftFlush";
 import { displayTelegramUsername, normalizeTelegramUsername, telegramConnectUrl, userFacingTelegramMessage } from "../telegram";
+import { stripTelegramAuthFromUrl } from "../telegramAuth";
 import TelegramLoginButton, { useTelegramAuthReturn } from "../components/TelegramLoginButton";
 const TELEGRAM_BOT = (import.meta.env.VITE_TELEGRAM_BOT_USERNAME || "krabinterviewerbot").replace(/^@+/, "");
 
@@ -54,9 +55,12 @@ export default function ApplyPage() {
   const [draftError, setDraftError] = useState(null);
   const saveTimer = useRef(null);
   const payloadRef = useRef(payload);
+  const draftIdRef = useRef(null);
+  const saveGenerationRef = useRef(0);
   const telegramTimer = useRef(null);
   const telegramPoll = useRef(null);
   const telegramReq = useRef(0);
+  const [formSessionKey, setFormSessionKey] = useState(0);
 
   const fillPayload = useCallback((data) => {
     if (!data) return;
@@ -72,41 +76,55 @@ export default function ApplyPage() {
     clearInterval(telegramPoll.current);
     telegramPoll.current = null;
     telegramReq.current += 1;
-    setPayload(emptyPayload());
+    saveGenerationRef.current += 1;
+    const blank = emptyPayload();
+    payloadRef.current = blank;
+    setPayload(blank);
     setLicenseUrl("");
     setLicenseParseNote("");
     setTelegramStatus(null);
+    setFormSessionKey((k) => k + 1);
+    stripTelegramAuthFromUrl();
   }, []);
 
   useEffect(() => {
     payloadRef.current = payload;
   }, [payload]);
 
+  useEffect(() => {
+    draftIdRef.current = draftId;
+  }, [draftId]);
+
   const flushSave = useCallback(async () => {
     clearTimeout(saveTimer.current);
-    if (frozen || !draftId) return;
+    if (frozen || !draftIdRef.current) return;
+    const gen = saveGenerationRef.current;
     const nextPayload = payloadRef.current;
     try {
-      const res = await api(`/api/interview/draft/${draftId}`, {
+      const res = await api(`/api/interview/draft/${draftIdRef.current}`, {
         method: "PATCH",
         body: JSON.stringify({ payload: nextPayload }),
       });
+      if (gen !== saveGenerationRef.current) return;
       if (res.payload) applyPayloadFromServer(res.payload);
     } catch (e) {
       console.error("flushSave failed", e);
     }
-  }, [draftId, frozen, applyPayloadFromServer]);
+  }, [frozen, applyPayloadFromServer]);
 
   const queueSave = useCallback(
     (nextPayload) => {
-      if (frozen || !draftId) return;
+      if (frozen || !draftIdRef.current) return;
+      const gen = saveGenerationRef.current;
       clearTimeout(saveTimer.current);
       saveTimer.current = setTimeout(async () => {
+        if (gen !== saveGenerationRef.current || !draftIdRef.current || frozen) return;
         try {
-          const res = await api(`/api/interview/draft/${draftId}`, {
+          const res = await api(`/api/interview/draft/${draftIdRef.current}`, {
             method: "PATCH",
             body: JSON.stringify({ payload: nextPayload }),
           });
+          if (gen !== saveGenerationRef.current) return;
           if (res.payload) applyPayloadFromServer(res.payload);
           const tr = res.telegramResolve;
           if (tr?.telegramId) {
@@ -129,7 +147,7 @@ export default function ApplyPage() {
         }
       }, 800);
     },
-    [draftId, frozen, applyPayloadFromServer]
+    [frozen, applyPayloadFromServer]
   );
 
   const lookupTelegram = useCallback(
@@ -248,7 +266,7 @@ export default function ApplyPage() {
         setDraftId(data.draftId);
         applyPayloadFromServer(data.payload || {});
         setLicenseUrl(data.driversLicenseFileUrl || "");
-        const un = data.payload?.telegram_username;
+        const un = String(data.payload?.telegram_username || "").trim();
         if (un) lookupTelegram(un);
       } catch (e) {
         if (!cancelled) {
@@ -313,6 +331,9 @@ export default function ApplyPage() {
   const onFieldChange = (key, value) => {
     setPayload((prev) => {
       const next = { ...prev, [key]: value };
+      if (key === "telegram_username" && !String(value || "").trim()) {
+        next.telegram_id = "";
+      }
       queueSave(next);
       return next;
     });
@@ -416,11 +437,20 @@ export default function ApplyPage() {
     setDraftError(null);
     setLoadingDraft(true);
     setDraftId(null);
+    draftIdRef.current = null;
     try {
       const data = await api("/api/interview/draft?fresh=1", { method: "POST" });
+      const blank = emptyPayload();
+      const gen = saveGenerationRef.current;
       setDraftId(data.draftId);
-      applyPayloadFromServer(data.payload || {});
-      setLicenseUrl(data.driversLicenseFileUrl || "");
+      draftIdRef.current = data.draftId;
+      const wipe = await api(`/api/interview/draft/${data.draftId}`, {
+        method: "PATCH",
+        body: JSON.stringify({ payload: blank }),
+      });
+      if (gen !== saveGenerationRef.current) return;
+      applyPayloadFromServer(wipe.payload || blank);
+      setLicenseUrl("");
     } catch (e) {
       setDraftError(e.message || "Could not reset the form. Try again.");
     } finally {
@@ -494,11 +524,11 @@ export default function ApplyPage() {
         </div>
       )}
 
-      <form onSubmit={onSubmit} className="interview-form">
+      <form key={formSessionKey} onSubmit={onSubmit} className="interview-form">
         <AiFillPanel draftId={draftId} onFilled={onAiFilled} disabled={!draftId} />
 
         <div className="form-card form-field-single">
-          <label className="field-label" htmlFor="license-file">
+          <label className="field-label" htmlFor={`license-file-${formSessionKey}`}>
             <span className="field-num">1.</span>
             Driver’s License <span className="field-req">*</span>
           </label>
@@ -506,7 +536,8 @@ export default function ApplyPage() {
             A valid driver’s license is required to drive. Please Upload a clear photo/picture below.
           </p>
           <input
-            id="license-file"
+            key={`license-file-${formSessionKey}`}
+            id={`license-file-${formSessionKey}`}
             type="file"
             accept="image/*"
             capture="environment"
@@ -540,6 +571,7 @@ export default function ApplyPage() {
                 onChange={onFieldChange}
                 telegramStatus={field.autoResolveTelegram ? telegramStatus : null}
                 telegramBotUsername={TELEGRAM_BOT}
+                inputKey={`${formSessionKey}-${field.key}`}
               />
               {companion && (
                 <FormField
@@ -547,6 +579,7 @@ export default function ApplyPage() {
                   nested
                   value={payload[companion.key] || ""}
                   onChange={onFieldChange}
+                  inputKey={`${formSessionKey}-${companion.key}`}
                 />
               )}
             </div>

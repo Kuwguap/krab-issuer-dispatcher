@@ -99,10 +99,16 @@ export default function TelegramLoginButton({ onAuth, disabled }) {
 
 /** Call on interview page mount — handles redirect return + popup postMessage bridge. */
 export function useTelegramAuthReturn(onAuth) {
+  const onAuthRef = useRef(onAuth);
+  const processedSearchRef = useRef("");
+  onAuthRef.current = onAuth;
+
   useEffect(() => {
-    if (!onAuth) return;
-    const user = parseTelegramAuthFromSearch();
+    const search = window.location.search;
+    if (!search || search === processedSearchRef.current) return;
+    const user = parseTelegramAuthFromSearch(search);
     if (!user) return;
+    processedSearchRef.current = search;
 
     if (window.opener && !window.opener.closed) {
       window.opener.postMessage({ type: "krab-telegram-auth", user }, window.location.origin);
@@ -111,7 +117,8 @@ export function useTelegramAuthReturn(onAuth) {
       return;
     }
 
-    onAuth?.(user);
+    if (!onAuthRef.current) return;
+    onAuthRef.current(user);
     stripTelegramAuthFromUrl();
   }, [onAuth]);
 }

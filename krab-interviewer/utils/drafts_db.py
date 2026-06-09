@@ -198,7 +198,13 @@ class DraftsDatabase:
         status = draft.get("status") or "draft"
         if status == "draft":
             status = "abandoned"
-        return self.update(draft_id, ip_hash=archived_ip, status=status, payload={})
+        return self.update(
+            draft_id,
+            ip_hash=archived_ip,
+            status=status,
+            payload={},
+            drivers_license_file_url="",
+        )
 
     def archive_visitor_drafts(self, ip_hash: str, cookie_draft_id: Optional[str] = None) -> None:
         """Abandon in-progress drafts for a fresh application."""

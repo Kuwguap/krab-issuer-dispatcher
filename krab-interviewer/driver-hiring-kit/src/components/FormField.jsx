@@ -8,15 +8,19 @@ export default function FormField({
   telegramBotUsername = "krabinterviewerbot",
   number,
   nested = false,
+  inputKey,
 }) {
   const InputTag = field.textarea ? "textarea" : "input";
+  const controlId = inputKey || field.key;
+  const autoComplete =
+    field.key === "telegram_username" ? "off" : field.type === "email" ? "email" : undefined;
 
   return (
     <div
       className={`form-card form-field-single${field.highlight ? " form-card-highlight" : ""}${nested ? " form-field-nested" : ""}`}
       id={field.key}
     >
-      <label className="field-label" htmlFor={field.choices ? undefined : field.key}>
+      <label className="field-label" htmlFor={field.choices ? undefined : controlId}>
         {number != null && <span className="field-num">{number}.</span>}
         {field.label}
         {field.required && <span className="field-req"> *</span>}
@@ -54,15 +58,16 @@ export default function FormField({
         </>
       ) : (
         <InputTag
-          id={field.key}
-          name={field.key}
+          key={controlId}
+          id={controlId}
+          name={controlId}
           className={field.textarea ? "field-textarea" : "field-input"}
           type={field.textarea ? undefined : field.type || "text"}
           placeholder={field.placeholder}
           value={value}
           onChange={(e) => onChange(field.key, e.target.value)}
           required={field.required}
-          autoComplete={field.key === "telegram_username" ? "off" : undefined}
+          autoComplete={autoComplete}
         />
       )}
 
