@@ -30,7 +30,7 @@ def create_shipment(
     driver_telegram_id: Optional[str],
     quantity: int,
     created_by_telegram_id: str,
-    status: str = "pending_accept",
+    status: str = "awaiting_tracking",
     driver_city: Optional[str] = None,
     driver_zip: Optional[str] = None,
     offer_messages: Optional[List[Dict[str, Any]]] = None,

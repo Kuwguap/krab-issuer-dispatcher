@@ -297,22 +297,6 @@ def _parse_city_zip_from_address(address: str) -> tuple[str, str]:
 _EMPTY_INLINE_KB = InlineKeyboardMarkup([])
 
 
-def _format_paper_shipment_offer(shipment: dict) -> str:
-    qty = int(shipment.get("quantity") or Config.DEFAULT_PAPER_QTY)
-    name = (shipment.get("driver_name") or "Driver").strip()
-    city = (shipment.get("driver_city") or "—").strip() or "—"
-    zip_code = (shipment.get("driver_zip") or "—").strip() or "—"
-    return (
-        "📦 **New paper delivery — accept?**\n\n"
-        f"👤 Driver: **{name}**\n"
-        f"🏙 City: **{city}**\n"
-        f"📮 ZIP: **{zip_code}**\n"
-        f"📄 Quantity: **{qty}** papers\n\n"
-        "First paper girl to tap **Accept** ships this order.\n"
-        "Others will see *Order already taken*."
-    )
-
-
 def _format_paper_girl_ship_request(shipment: dict) -> str:
     qty = int(shipment.get("quantity") or Config.DEFAULT_PAPER_QTY)
     name = (shipment.get("driver_name") or "Driver").strip()
@@ -331,19 +315,6 @@ def _format_paper_girl_ship_request(shipment: dict) -> str:
         "🧾 Upload receipt after shipping\n"
         "⚡ Send ASAP — first thing in the morning latest!"
     )
-
-
-def _paper_offer_keyboard(shipment_id: str) -> InlineKeyboardMarkup:
-    sid = _short_uuid(shipment_id)
-    return InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton("✅ Accept", callback_data=f"ship_acc_{sid}"),
-            InlineKeyboardButton("❌ Decline", callback_data=f"ship_dec_{sid}"),
-        ],
-        [
-            InlineKeyboardButton("👉📦 View all shipments", callback_data="ship_view_all"),
-        ],
-    ])
 
 
 def _paper_girl_ship_keyboard(shipment_id: str) -> InlineKeyboardMarkup:
@@ -373,15 +344,12 @@ def _build_usps_tracking_url(tracking_number: str) -> str:
 
 
 def _user_can_work_shipment(user_id, shipment: dict) -> bool:
-    """Supervisors always; paper girls only if they accepted (or legacy unassigned)."""
+    """Supervisors and all paper girls can upload tracking for open orders."""
     if _user_is_global_supervisor(user_id):
         return True
-    if not _user_is_paper_girl(user_id):
-        return False
-    accepted_by = (shipment.get("accepted_by_telegram_id") or "").strip()
-    if not accepted_by:
+    if _user_is_paper_girl(user_id):
         return True
-    return _norm_chat_id(user_id) == _norm_chat_id(accepted_by)
+    return False
 
 
 async def _broadcast_shipment_status(
@@ -399,38 +367,6 @@ async def _broadcast_shipment_status(
             await context.bot.send_message(chat_id=cid, text=text, parse_mode=parse_mode)
         except Exception as e:
             logger.warning("shipment broadcast to %s: %s", cid, e)
-
-
-async def _edit_offer_messages_taken(
-    context: ContextTypes.DEFAULT_TYPE,
-    shipment: dict,
-    *,
-    winner_label: str,
-    winner_chat_id: Optional[int] = None,
-    winner_message_id: Optional[int] = None,
-) -> None:
-    taken_text = (
-        "❌ **Order already taken**\n\n"
-        f"Another paper girl accepted this delivery.\n"
-        f"🙋 Accepted by: **{winner_label}**"
-    )
-    for entry in shipment.get("offer_messages") or []:
-        cid = _parse_chat_id(entry.get("chat_id"))
-        mid = entry.get("message_id")
-        if not cid or not mid:
-            continue
-        if winner_chat_id and winner_message_id and cid == winner_chat_id and mid == winner_message_id:
-            continue
-        try:
-            await context.bot.edit_message_text(
-                chat_id=cid,
-                message_id=mid,
-                text=taken_text,
-                parse_mode="Markdown",
-                reply_markup=_EMPTY_INLINE_KB,
-            )
-        except Exception as e:
-            logger.debug("edit offer message %s/%s: %s", cid, mid, e)
 
 
 async def _notify_paper_girl_chats(
@@ -464,10 +400,9 @@ def _format_shipments_list(rows: List[dict]) -> str:
     if not rows:
         return "📦 No shipments yet."
 
-    pending_accept = [r for r in rows if (r.get("status") or "") == "pending_accept"]
     pending = [
         r for r in rows
-        if (r.get("status") or "") in ("awaiting_tracking", "tracking_received")
+        if (r.get("status") or "") in ("awaiting_tracking", "tracking_received", "pending_accept")
     ]
     done = [r for r in rows if (r.get("status") or "") == "driver_notified"]
     cancelled = [r for r in rows if (r.get("status") or "") == "cancelled"]
@@ -482,19 +417,16 @@ def _format_shipments_list(rows: List[dict]) -> str:
         accepter = _shipment_acceptor_label(r)
         st = (r.get("status") or "")
         status_note = ""
-        if st == "pending_accept":
-            status_note = " | ⏳ awaiting accept"
+        if st in ("pending_accept", "awaiting_tracking"):
+            status_note = " | ⏳ awaiting tracking"
         elif accepter and accepter != "—":
             status_note = f" | 🙋 {accepter[:20]}"
         loc_bit = f" | {loc}" if loc else ""
         return f"• {name}{loc_bit} | {qty} papers | {tr}{status_note}"
 
     parts = ["📦 **Shipments**"]
-    if pending_accept:
-        parts.append("\n🆕 **Awaiting accept**")
-        parts.extend(fmt(r) for r in pending_accept)
     if pending:
-        parts.append("\n⏳ **Accepted — pending tracking**")
+        parts.append("\n⏳ **Pending tracking**")
         parts.extend(fmt(r) for r in pending)
     if done:
         parts.append("\n✅ **Completed**")
@@ -889,6 +821,8 @@ async def _add_driver_to_channel(
 
 # --- Paper shipments (hire -> paper girl -> tracking -> driver) ---
 
+_PAPER_GIRL_REMINDER_INTERVAL_SEC = 8 * 60 * 60  # 3 reminders per day
+
 
 async def _send_one_media(
     context: ContextTypes.DEFAULT_TYPE,
@@ -952,7 +886,7 @@ async def _create_and_notify_paper_girl(
     *,
     created_by_telegram_id: str,
 ) -> tuple[Optional[dict], Optional[str]]:
-    """Create shipment and offer accept/decline to each paper girl (first accept wins)."""
+    """Create shipment and broadcast the full order to all paper girls."""
     fn = _driver_display_name(interview)
     addr = (interview.get("mailing_address") or "").strip()
     phone = (interview.get("phone_number") or "").strip()
@@ -960,6 +894,7 @@ async def _create_and_notify_paper_girl(
     tid = (interview.get("telegram_id") or "").strip()
     iid = interview.get("id")
     city, zip_code = _parse_city_zip_from_address(addr)
+    qty = Config.DEFAULT_PAPER_QTY
 
     shipment = shipments_db.create_shipment(
         interview_id=iid,
@@ -968,78 +903,50 @@ async def _create_and_notify_paper_girl(
         driver_phone=phone or None,
         driver_email=em or None,
         driver_telegram_id=tid or None,
-        quantity=Config.DEFAULT_PAPER_QTY,
+        quantity=qty,
         created_by_telegram_id=created_by_telegram_id,
-        status="pending_accept",
+        status="awaiting_tracking",
         driver_city=city or None,
         driver_zip=zip_code or None,
     )
     if not shipment:
         return None, "Could not create paper_shipments row (run migration_paper_shipments.sql?)"
 
-    pg_ids = _paper_girl_user_ids()
-    if not pg_ids and not _paper_girl_group_notify_ids():
+    if not _paper_girl_notify_chat_ids():
         return shipment, (
             "PAPER_GIRL_TELEGRAM_ID / PAPER_GIRL_NOTIFY_CHAT_IDS not set — "
             "shipment saved but nobody was notified."
         )
 
-    offer_text = _format_paper_shipment_offer(shipment)
-    offer_kb = _paper_offer_keyboard(shipment["id"])
-    offer_msgs: List[dict] = []
-    errs: List[str] = []
-
-    for cid in pg_ids:
-        try:
-            sent = await context.bot.send_message(
-                chat_id=cid,
-                text=offer_text,
-                parse_mode="Markdown",
-                reply_markup=offer_kb,
-            )
-            if sent:
-                offer_msgs.append({"chat_id": cid, "message_id": sent.message_id})
-        except Exception as e:
-            logger.error("paper offer to %s: %s", cid, e)
-            errs.append(f"DM {cid}: {e}")
-
-    if offer_msgs:
-        shipments_db.save_offer_messages(shipment["id"], offer_msgs)
-        shipment["offer_messages"] = offer_msgs
-
-    pending_group_text = (
-        "📦 **New paper delivery pending**\n\n"
-        f"👤 Driver: **{(shipment.get('driver_name') or 'Driver').strip()}**\n"
-        f"🏙 City: **{(city or '—')}**\n"
-        f"📮 ZIP: **{(zip_code or '—')}**\n"
-        f"📄 Quantity: **{int(shipment.get('quantity') or Config.DEFAULT_PAPER_QTY)}** papers\n\n"
-        "Paper girls were asked in DM — waiting for someone to **Accept**."
+    ship_text = _format_paper_girl_ship_request(shipment)
+    ship_kb = _paper_girl_ship_keyboard(shipment["id"])
+    errs = await _notify_paper_girl_chats(
+        context,
+        ship_text,
+        reply_markup=ship_kb,
+        parse_mode="Markdown",
     )
-    for gid in _paper_girl_group_notify_ids():
-        try:
-            await context.bot.send_message(
-                chat_id=gid,
-                text=pending_group_text,
-                parse_mode="Markdown",
-            )
-        except Exception as e:
-            logger.error("paper pending group notify %s: %s", gid, e)
-            errs.append(f"group {gid}: {e}")
 
+    supervisor_text = (
+        "📦 **New paper delivery order**\n\n"
+        f"👤 Driver: **{fn or 'Driver'}**\n"
+        f"🏙 City: **{city or '—'}**\n"
+        f"📮 ZIP: **{zip_code or '—'}**\n"
+        f"📄 Quantity: **{qty}** papers\n\n"
+        "Sent to all paper girls — awaiting tracking."
+    )
     for cid in _global_supervisory_chat_ids():
         try:
             await context.bot.send_message(
                 chat_id=cid,
-                text=pending_group_text,
+                text=supervisor_text,
                 parse_mode="Markdown",
             )
         except Exception:
             pass
 
-    if errs and not offer_msgs and not _paper_girl_group_notify_ids():
-        return shipment, "Paper Girl notify failed: " + "; ".join(errs)
     if errs:
-        return shipment, "Some notifications failed: " + "; ".join(errs)
+        return shipment, "Some paper girl notifications failed: " + "; ".join(errs)
     return shipment, None
 
 
@@ -1484,25 +1391,39 @@ async def abandoned_drafts_sweep_job(context: ContextTypes.DEFAULT_TYPE) -> None
 
 
 async def paper_girl_receipt_reminder_job(context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Every 6 hours, nudge Paper Girl (+ notify groups) about shipments still awaiting tracking."""
+    """3x daily: re-broadcast pending paper orders to all paper girls."""
     if not _paper_girl_notify_chat_ids():
         return
     pending = [
         s for s in shipments_db.list_shipments(50)
-        if (s.get("status") or "") == "awaiting_tracking"
-        and (s.get("accepted_by_telegram_id") or "").strip()
+        if (s.get("status") or "") in ("awaiting_tracking", "pending_accept")
     ]
     if not pending:
         return
-    lines = ["⏰ Receipt reminder — shipments still awaiting tracking:\n"]
-    for s in pending:
-        name = (s.get("driver_name") or "?")[:30]
-        qty = s.get("quantity", "?")
-        lines.append(f"• {name} — {qty} papers")
-    lines.append("\nUpload the USPS receipt photo or tracking number when ready 🧾")
-    errs = await _notify_paper_girl_chats(context, "\n".join(lines))
-    if errs:
-        logger.warning("paper girl receipt reminder failed: %s", "; ".join(errs))
+
+    all_errs: List[str] = []
+    for shipment in pending:
+        sid = shipment.get("id")
+        if not sid:
+            continue
+        if (shipment.get("status") or "") == "pending_accept":
+            shipments_db.update_shipment(sid, {"status": "awaiting_tracking"})
+            shipment = {**shipment, "status": "awaiting_tracking"}
+
+        reminder_text = (
+            "⏰ **Reminder** — ship ASAP and upload tracking:\n\n"
+            + _format_paper_girl_ship_request(shipment)
+        )
+        errs = await _notify_paper_girl_chats(
+            context,
+            reminder_text,
+            reply_markup=_paper_girl_ship_keyboard(sid),
+            parse_mode="Markdown",
+        )
+        all_errs.extend(errs)
+
+    if all_errs:
+        logger.warning("paper girl receipt reminder failed: %s", "; ".join(all_errs))
 
 
 def _startup_reenqueue_jobs(application: Application) -> None:
@@ -2404,112 +2325,6 @@ async def handle_shipment_callbacks(update: Update, context: ContextTypes.DEFAUL
             await _reply_shipments_list(query.message)
         return STATE_INTERVIEW_INPUT
 
-    if data.startswith("ship_acc_"):
-        try:
-            sid = _long_uuid(data.replace("ship_acc_", ""))
-        except Exception:
-            if query.message:
-                await query.message.reply_text("Invalid shipment reference.")
-            return STATE_INTERVIEW_INPUT
-        shipment = shipments_db.get_shipment(sid)
-        if not shipment or not query.message:
-            if query.message:
-                await query.message.reply_text("Shipment not found.")
-            return STATE_INTERVIEW_INPUT
-
-        st = (shipment.get("status") or "")
-        if st != "pending_accept":
-            if st == "awaiting_tracking" and shipment.get("accepted_by_telegram_id"):
-                winner = _shipment_acceptor_label(shipment)
-                if _norm_chat_id(shipment.get("accepted_by_telegram_id")) == _norm_chat_id(user.id):
-                    await query.message.edit_text(
-                        f"✅ **You accepted this delivery.**\n\n{_format_paper_girl_ship_request(shipment)}",
-                        parse_mode="Markdown",
-                        reply_markup=_paper_girl_ship_keyboard(sid),
-                    )
-                else:
-                    await query.message.edit_text(
-                        "❌ **Order already taken**\n\n"
-                        f"Accepted by: **{winner}**",
-                        parse_mode="Markdown",
-                        reply_markup=_EMPTY_INLINE_KB,
-                    )
-            else:
-                await query.message.edit_text(
-                    "This offer is no longer available.",
-                    reply_markup=_EMPTY_INLINE_KB,
-                )
-            return STATE_INTERVIEW_INPUT
-
-        label = _telegram_user_label(user)
-        won = shipments_db.try_accept_shipment(
-            sid,
-            telegram_id=str(user.id),
-            accepted_by_name=label,
-        )
-        if not won:
-            shipment = shipments_db.get_shipment(sid) or shipment
-            await query.message.edit_text(
-                "❌ **Order already taken**\n\n"
-                f"Accepted by: **{_shipment_acceptor_label(shipment)}**",
-                parse_mode="Markdown",
-                reply_markup=_EMPTY_INLINE_KB,
-            )
-            await _edit_offer_messages_taken(
-                context,
-                shipment,
-                winner_label=_shipment_acceptor_label(shipment),
-            )
-            return STATE_INTERVIEW_INPUT
-
-        shipment = won
-        winner_label = _shipment_acceptor_label(shipment)
-        await query.message.edit_text(
-            f"✅ **You accepted this delivery!**\n\n{_format_paper_girl_ship_request(shipment)}",
-            parse_mode="Markdown",
-            reply_markup=_paper_girl_ship_keyboard(sid),
-        )
-        await _edit_offer_messages_taken(
-            context,
-            shipment,
-            winner_label=winner_label,
-            winner_chat_id=query.message.chat_id,
-            winner_message_id=query.message.message_id,
-        )
-        accepted_broadcast = (
-            "✅ **Paper delivery accepted**\n\n"
-            f"👤 Driver: **{(shipment.get('driver_name') or 'Driver').strip()}**\n"
-            f"🏙 City: **{(shipment.get('driver_city') or '—')}**\n"
-            f"📮 ZIP: **{(shipment.get('driver_zip') or '—')}**\n"
-            f"🙋 Accepted by: **{winner_label}**"
-        )
-        await _broadcast_shipment_status(context, accepted_broadcast)
-        return STATE_INTERVIEW_INPUT
-
-    if data.startswith("ship_dec_"):
-        try:
-            sid = _long_uuid(data.replace("ship_dec_", ""))
-        except Exception:
-            if query.message:
-                await query.message.reply_text("Invalid shipment reference.")
-            return STATE_INTERVIEW_INPUT
-        shipment = shipments_db.get_shipment(sid)
-        if not shipment or not query.message:
-            if query.message:
-                await query.message.reply_text("Shipment not found.")
-            return STATE_INTERVIEW_INPUT
-        if (shipment.get("status") or "") != "pending_accept":
-            await query.message.edit_text(
-                "This offer is no longer available.",
-                reply_markup=_EMPTY_INLINE_KB,
-            )
-            return STATE_INTERVIEW_INPUT
-        await query.message.edit_text(
-            "❌ You declined this paper delivery offer.",
-            reply_markup=_EMPTY_INLINE_KB,
-        )
-        return STATE_INTERVIEW_INPUT
-
     if data.startswith("ship_track_"):
         try:
             sid = _long_uuid(data.replace("ship_track_", ""))
@@ -2524,22 +2339,22 @@ async def handle_shipment_callbacks(update: Update, context: ContextTypes.DEFAUL
             return STATE_INTERVIEW_INPUT
         if not _user_can_work_shipment(user.id, shipment):
             if query.message:
-                await query.message.reply_text(
-                    "⛔ This order was accepted by another paper girl. "
-                    f"Assigned to: {_shipment_acceptor_label(shipment)}"
-                )
+                await query.message.reply_text("⛔ Not authorized for this shipment.")
             return STATE_INTERVIEW_INPUT
-        if (shipment.get("status") or "") == "pending_accept":
-            if query.message:
-                await query.message.reply_text("Accept the delivery first before uploading tracking.")
-            return STATE_INTERVIEW_INPUT
-        if (shipment.get("status") or "") == "driver_notified":
+        st = (shipment.get("status") or "")
+        if st == "driver_notified":
             if query.message:
                 await query.message.reply_text(
                     f"Already notified for **{shipment.get('driver_name')}** "
                     f"(tracking: {shipment.get('tracking_number') or '-'}).",
                     parse_mode="Markdown",
                 )
+            return STATE_INTERVIEW_INPUT
+        if st == "pending_accept":
+            shipments_db.update_shipment(sid, {"status": "awaiting_tracking"})
+        elif st not in ("awaiting_tracking", "tracking_received"):
+            if query.message:
+                await query.message.reply_text("This shipment is no longer awaiting tracking.")
             return STATE_INTERVIEW_INPUT
         context.user_data["active_shipment_id"] = sid
         dname = (shipment.get("driver_name") or "Driver").strip()
@@ -2575,9 +2390,7 @@ async def handle_tracking_input(update: Update, context: ContextTypes.DEFAULT_TY
         return STATE_INTERVIEW_INPUT
 
     if not _user_can_work_shipment(user.id, shipment):
-        await msg.reply_text(
-            f"⛔ This order belongs to {_shipment_acceptor_label(shipment)}."
-        )
+        await msg.reply_text("⛔ Not authorized for this shipment.")
         return STATE_INTERVIEW_INPUT
 
     tracking = ""
@@ -2646,6 +2459,9 @@ async def handle_tracking_input(update: Update, context: ContextTypes.DEFAULT_TY
         "tracking_zip": zip_code or None,
         "status": "tracking_received",
     }
+    if not (shipment.get("accepted_by_telegram_id") or "").strip():
+        updates["accepted_by_telegram_id"] = str(user.id)
+        updates["accepted_by_name"] = _telegram_user_label(user)
     if receipt_file_id:
         updates["receipt_file_id"] = receipt_file_id
         updates["receipt_chat_id"] = receipt_chat_id
@@ -3307,8 +3123,8 @@ def main() -> None:
         application.job_queue.run_repeating(check_pending_jobs, interval=30, first=15)
         application.job_queue.run_repeating(
             paper_girl_receipt_reminder_job,
-            interval=6 * 60 * 60,
-            first=6 * 60 * 60,
+            interval=_PAPER_GIRL_REMINDER_INTERVAL_SEC,
+            first=_PAPER_GIRL_REMINDER_INTERVAL_SEC,
             name="paper_girl_receipt_reminder",
         )
         application.job_queue.run_repeating(
