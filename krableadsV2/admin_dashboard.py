@@ -323,8 +323,10 @@ class AdminDatabase:
         if not self._check_tables_exist():
             return out
         try:
-            r = self.client.table("leads").select("id").execute()
-            out["total_leads"] = len(r.data or [])
+            r = self.client.table("leads").select("id, exclude_from_count").execute()
+            out["total_leads"] = len([
+                x for x in (r.data or []) if not x.get("exclude_from_count")
+            ])
         except Exception:
             pass
         try:
@@ -332,14 +334,22 @@ class AdminDatabase:
             assignments = self.client.table("lead_assignments").select("driver_id, lead_id").eq("status", "accepted").execute()
             lead_ids_with_receipt = set()
             try:
-                leads = self.client.table("leads").select("id, receipt_image_url").execute()
-                lead_ids_with_receipt = {l["id"] for l in (leads.data or []) if l.get("receipt_image_url")}
+                leads = self.client.table("leads").select("id, receipt_image_url, exclude_from_count").execute()
+                lead_ids_with_receipt = {
+                    l["id"] for l in (leads.data or [])
+                    if l.get("receipt_image_url") and not l.get("exclude_from_count")
+                }
+                excluded_lead_ids = {
+                    l["id"] for l in (leads.data or []) if l.get("exclude_from_count")
+                }
             except Exception:
                 pass
             by_driver = {}
             for a in (assignments.data or []):
                 did = a.get("driver_id")
                 lid = a.get("lead_id")
+                if lid and lid in excluded_lead_ids:
+                    continue
                 if did not in by_driver:
                     by_driver[did] = {"accepted": 0, "receipts": 0}
                 by_driver[did]["accepted"] += 1
@@ -521,7 +531,7 @@ class AdminDatabase:
         cap = max(1, min(int(limit or 100), 500))
         try:
             r = self.client.table("leads").select(
-                "id, reference_id, receipt_image_url, updated_at, group_id"
+                "id, reference_id, receipt_image_url, updated_at, group_id, appeal_status, exclude_from_count"
             ).order("updated_at", desc=True).limit(cap * 3).execute()
             out = []
             for lead in (r.data or []):
@@ -552,6 +562,8 @@ class AdminDatabase:
                     "driver_name": driver_name,
                     "group_name": gname,
                     "updated_at": lead.get("updated_at"),
+                    "appeal_status": lead.get("appeal_status"),
+                    "exclude_from_count": bool(lead.get("exclude_from_count")),
                 })
                 if len(out) >= cap:
                     break

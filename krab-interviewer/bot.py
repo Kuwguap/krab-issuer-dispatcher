@@ -1615,10 +1615,24 @@ async def cmd_shipments(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
 
 def _driver_profile_lines(driver: dict) -> List[str]:
+    tid = str(driver.get("driver_telegram_id") or "").strip()
+    username = "-"
+    email = "-"
+    if db and tid:
+        interview = db.get_latest_interview_for_telegram_id(tid)
+        if interview:
+            un_raw = (interview.get("telegram_username") or "").strip().lstrip("@")
+            if un_raw:
+                username = f"@{un_raw}"
+            em = (interview.get("email") or "").strip()
+            if em:
+                email = em
     return [
         f"🚗 {driver.get('driver_name', '?')}",
         f"📱 {driver.get('phone_number') or '-'}",
-        f"💬 Telegram ID: {driver.get('driver_telegram_id') or '-'}",
+        f"💬 {username}",
+        f"💬 Telegram ID: {tid or '-'}",
+        f"📧 {email}",
     ]
 
 

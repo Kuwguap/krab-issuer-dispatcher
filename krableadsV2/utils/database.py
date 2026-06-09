@@ -1139,12 +1139,14 @@ class Database:
             return []
         try:
             r = self.client.table("lead_assignments").select(
-                "lead_id, lead:leads(reference_id, receipt_image_url, vehicle_details, delivery_details, extra_info, special_request_note, special_request_issuers, special_request_drivers)"
+                "lead_id, lead:leads(reference_id, receipt_image_url, exclude_from_count, appeal_status, vehicle_details, delivery_details, extra_info, special_request_note, special_request_issuers, special_request_drivers)"
             ).eq("driver_id", driver_id).eq("status", "accepted").execute()
             out = []
             for row in r.data or []:
                 lead = row.get("lead") or {}
                 if lead.get("receipt_image_url"):
+                    continue
+                if lead.get("exclude_from_count"):
                     continue
                 out.append({
                     "lead_id": row.get("lead_id"),
@@ -1164,12 +1166,14 @@ class Database:
             r = self.client.table("lead_assignments").select(
                 "lead_id, driver_id, "
                 "driver:drivers(driver_name), "
-                "lead:leads(reference_id, receipt_image_url)"
+                "lead:leads(reference_id, receipt_image_url, exclude_from_count)"
             ).eq("status", "accepted").execute()
             out = []
             for row in r.data or []:
                 lead = row.get("lead") or {}
                 if lead.get("receipt_image_url"):
+                    continue
+                if lead.get("exclude_from_count"):
                     continue
                 ref = (lead.get("reference_id") or "").strip()
                 if not ref or ref.upper() == "N/A":
@@ -1293,9 +1297,11 @@ class Database:
             import pytz
             now_eastern = datetime.now(pytz.timezone("America/New_York"))
             cutoff_7d = (now_eastern - timedelta(days=7)).astimezone(pytz.UTC).strftime("%Y-%m-%dT%H:%M:%S") + "Z"
-            r = self.client.table("leads").select("user_id, created_at").order("created_at", desc=True).execute()
+            r = self.client.table("leads").select("user_id, created_at, exclude_from_count").order("created_at", desc=True).execute()
             by_user = {}
             for row in (r.data or []):
+                if row.get("exclude_from_count"):
+                    continue
                 uid = row.get("user_id")
                 if uid is None:
                     continue
@@ -1319,9 +1325,11 @@ class Database:
             now_eastern = datetime.now(pytz.timezone("America/New_York"))
             cutoff_7d = (now_eastern - timedelta(days=7)).astimezone(pytz.UTC).strftime("%Y-%m-%dT%H:%M:%S") + "Z"
             cutoff_24h = (now_eastern - timedelta(hours=24)).astimezone(pytz.UTC).strftime("%Y-%m-%dT%H:%M:%S") + "Z"
-            r = self.client.table("leads").select("user_id, created_at").execute()
+            r = self.client.table("leads").select("user_id, created_at, exclude_from_count").execute()
             by_user = {}
             for row in (r.data or []):
+                if row.get("exclude_from_count"):
+                    continue
                 uid = row.get("user_id")
                 if uid is None:
                     continue
@@ -1481,3 +1489,155 @@ class Database:
         except Exception as e:
             logger.error(f"Error checking active renewal: {e}")
             return None
+
+    # ── Lead appeals ───────────────────────────────────────────────────
+
+    def upload_appeal_proof_to_storage(
+        self,
+        lead_id: str,
+        reference_id: str,
+        file_bytes: bytes,
+        original_name: str,
+    ) -> Optional[str]:
+        """Upload appeal proof image to Storage bucket `receipts` under appeals/. Returns public URL."""
+        if not file_bytes or not Config.SUPABASE_URL or not Config.SUPABASE_KEY:
+            return None
+        lower = (original_name or "").lower()
+        ext = "jpg"
+        if lower.endswith(".png"):
+            ext = "png"
+        elif lower.endswith(".webp"):
+            ext = "webp"
+        elif lower.endswith(".gif"):
+            ext = "gif"
+        content_type = {
+            "jpg": "image/jpeg",
+            "jpeg": "image/jpeg",
+            "png": "image/png",
+            "webp": "image/webp",
+            "gif": "image/gif",
+        }.get(ext, "image/jpeg")
+        safe_ref = re.sub(r"[^A-Za-z0-9_-]+", "_", str(reference_id))[:36]
+        path = f"appeals/{lead_id}/{safe_ref}_{secrets.token_hex(4)}.{ext}"
+        try:
+            bucket = self.client.storage.from_("receipts")
+            bucket.upload(
+                path,
+                file_bytes,
+                file_options={"content-type": content_type},
+            )
+            return bucket.get_public_url(path)
+        except Exception as e:
+            logger.warning("upload_appeal_proof_to_storage failed: %s", e)
+            return None
+
+    def get_pending_appeal_for_lead(self, lead_id: str) -> Optional[Dict[str, Any]]:
+        if not self._check_tables_exist():
+            return None
+        try:
+            r = (
+                self.client.table("lead_appeals")
+                .select("*")
+                .eq("lead_id", lead_id)
+                .eq("status", "pending")
+                .limit(1)
+                .execute()
+            )
+            return r.data[0] if r.data else None
+        except Exception as e:
+            logger.error("get_pending_appeal_for_lead: %s", e)
+            return None
+
+    def get_appeal_by_id(self, appeal_id: str) -> Optional[Dict[str, Any]]:
+        if not self._check_tables_exist():
+            return None
+        try:
+            r = self.client.table("lead_appeals").select("*").eq("id", appeal_id).limit(1).execute()
+            return r.data[0] if r.data else None
+        except Exception as e:
+            logger.error("get_appeal_by_id: %s", e)
+            return None
+
+    def create_lead_appeal(
+        self,
+        *,
+        lead_id: str,
+        reference_id: str,
+        proof_image_url: str | None,
+        proof_file_id: str | None,
+        submitted_by_telegram_id: int,
+        submitted_by_username: str | None,
+        submitted_by_display_name: str | None,
+        lead_client_name: str | None,
+    ) -> Optional[Dict[str, Any]]:
+        if not self._check_tables_exist():
+            return None
+        try:
+            row = {
+                "lead_id": lead_id,
+                "reference_id": reference_id,
+                "status": "pending",
+                "proof_image_url": proof_image_url,
+                "proof_file_id": proof_file_id,
+                "submitted_by_telegram_id": submitted_by_telegram_id,
+                "submitted_by_username": submitted_by_username,
+                "submitted_by_display_name": submitted_by_display_name,
+                "lead_client_name": lead_client_name,
+            }
+            r = self.client.table("lead_appeals").insert(row).execute()
+            if not r.data:
+                return None
+            self.update_lead(lead_id, {"appeal_status": "pending"})
+            return r.data[0]
+        except Exception as e:
+            logger.error("create_lead_appeal: %s", e)
+            return None
+
+    def resolve_lead_appeal(
+        self,
+        appeal_id: str,
+        *,
+        status: str,
+        reviewed_by_telegram_id: int,
+        reviewed_by_display_name: str | None,
+    ) -> Optional[Dict[str, Any]]:
+        """Accept or decline appeal. On accept, marks lead exclude_from_count."""
+        if status not in ("accepted", "declined"):
+            return None
+        if not self._check_tables_exist():
+            return None
+        try:
+            from datetime import datetime
+            import pytz
+            now = datetime.now(pytz.UTC).isoformat()
+            appeal = self.get_appeal_by_id(appeal_id)
+            if not appeal or (appeal.get("status") or "") != "pending":
+                return None
+            r = (
+                self.client.table("lead_appeals")
+                .update({
+                    "status": status,
+                    "reviewed_by_telegram_id": reviewed_by_telegram_id,
+                    "reviewed_by_display_name": reviewed_by_display_name,
+                    "reviewed_at": now,
+                    "updated_at": now,
+                })
+                .eq("id", appeal_id)
+                .eq("status", "pending")
+                .execute()
+            )
+            if not r.data:
+                return None
+            lead_id = appeal.get("lead_id")
+            if lead_id:
+                lead_updates: Dict[str, Any] = {"appeal_status": status}
+                if status == "accepted":
+                    lead_updates["exclude_from_count"] = True
+                self.update_lead(str(lead_id), lead_updates)
+            return r.data[0]
+        except Exception as e:
+            logger.error("resolve_lead_appeal: %s", e)
+            return None
+
+    def _lead_excluded_from_count(self, lead: dict) -> bool:
+        return bool(lead.get("exclude_from_count"))

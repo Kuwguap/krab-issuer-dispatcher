@@ -46,9 +46,28 @@ export function clientIpFromRequest(req) {
   );
 }
 
+function queryStringFromRequest(req) {
+  const rawUrl = req.url || "";
+  const fromUrl = rawUrl.includes("?") ? rawUrl.slice(rawUrl.indexOf("?")) : "";
+  if (fromUrl) return fromUrl;
+  const params = new URLSearchParams();
+  for (const [key, value] of Object.entries(req.query || {})) {
+    if (key === "path") continue;
+    if (value == null || value === "") continue;
+    if (Array.isArray(value)) {
+      value.forEach((v) => params.append(key, String(v)));
+    } else {
+      params.append(key, String(value));
+    }
+  }
+  const built = params.toString();
+  return built ? `?${built}` : "";
+}
+
 export async function proxyToInterviewUpstream(req, res, subpath) {
   const path = String(subpath || "").replace(/^\/+|\/+$/g, "");
-  const target = `${UPSTREAM}/api/interview${path ? `/${path}` : ""}`;
+  const qs = queryStringFromRequest(req);
+  const target = `${UPSTREAM}/api/interview${path ? `/${path}` : ""}${qs}`;
 
   const headers = { "accept-encoding": "identity" };
   for (const [name, value] of Object.entries(req.headers)) {

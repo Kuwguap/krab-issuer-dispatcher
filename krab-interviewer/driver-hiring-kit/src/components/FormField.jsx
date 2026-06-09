@@ -7,12 +7,13 @@ export default function FormField({
   telegramStatus,
   telegramBotUsername = "krabinterviewerbot",
   number,
+  nested = false,
 }) {
   const InputTag = field.textarea ? "textarea" : "input";
 
   return (
     <div
-      className={`form-card form-field-single${field.highlight ? " form-card-highlight" : ""}`}
+      className={`form-card form-field-single${field.highlight ? " form-card-highlight" : ""}${nested ? " form-field-nested" : ""}`}
       id={field.key}
     >
       <label className="field-label" htmlFor={field.choices ? undefined : field.key}>

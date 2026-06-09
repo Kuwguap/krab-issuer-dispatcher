@@ -78,13 +78,15 @@ export const FIELDS = [
     sublabel: "How do you want to get paid for deliveries?",
     required: true,
     choices: ["Zelle", "Cashapp", "Venmo", "PayPal"],
+    companionKey: "payment_id",
   },
   {
     key: "payment_id",
-    label: "Payment ID / handle",
+    label: "Payment method ID",
     sublabel:
-      "Where we send your $50/delivery — Zelle phone or email, CashApp $tag, Venmo @username, or PayPal email.",
+      "Your Zelle phone/email, CashApp $tag, Venmo @username, or PayPal email — where we send $50 per delivery.",
     required: true,
+    nested: true,
     placeholder: "e.g. 732-241-8338 or $YourCashTag or @YourVenmo",
   },
   {

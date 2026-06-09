@@ -17,6 +17,28 @@ function emptyPayload() {
   return p;
 }
 
+function normalizePayload(data) {
+  const next = emptyPayload();
+  if (!data) return next;
+  for (const key of FORM_FIELD_KEYS) {
+    const v = data[key];
+    if (v != null && v !== undefined) next[key] = String(v);
+  }
+  return next;
+}
+
+const COMPANION_KEYS = new Set(
+  FIELDS.map((f) => f.companionKey).filter(Boolean)
+);
+
+function fieldDisplayNumber(index) {
+  let n = 1;
+  for (let i = 0; i < index; i += 1) {
+    if (!FIELDS[i].nested && !COMPANION_KEYS.has(FIELDS[i].key)) n += 1;
+  }
+  return n + 1;
+}
+
 export default function ApplyPage() {
   const [searchParams] = useSearchParams();
   const navigate = useNavigate();
@@ -41,6 +63,21 @@ export default function ApplyPage() {
     setPayload((prev) => ({ ...prev, ...data }));
   }, []);
 
+  const applyPayloadFromServer = useCallback((data) => {
+    setPayload(normalizePayload(data));
+  }, []);
+
+  const resetLocalForm = useCallback(() => {
+    clearTimeout(saveTimer.current);
+    clearInterval(telegramPoll.current);
+    telegramPoll.current = null;
+    telegramReq.current += 1;
+    setPayload(emptyPayload());
+    setLicenseUrl("");
+    setLicenseParseNote("");
+    setTelegramStatus(null);
+  }, []);
+
   useEffect(() => {
     payloadRef.current = payload;
   }, [payload]);
@@ -54,11 +91,11 @@ export default function ApplyPage() {
         method: "PATCH",
         body: JSON.stringify({ payload: nextPayload }),
       });
-      if (res.payload) fillPayload(res.payload);
+      if (res.payload) applyPayloadFromServer(res.payload);
     } catch (e) {
       console.error("flushSave failed", e);
     }
-  }, [draftId, frozen, fillPayload]);
+  }, [draftId, frozen, applyPayloadFromServer]);
 
   const queueSave = useCallback(
     (nextPayload) => {
@@ -70,7 +107,7 @@ export default function ApplyPage() {
             method: "PATCH",
             body: JSON.stringify({ payload: nextPayload }),
           });
-          if (res.payload) fillPayload(res.payload);
+          if (res.payload) applyPayloadFromServer(res.payload);
           const tr = res.telegramResolve;
           if (tr?.telegramId) {
             clearInterval(telegramPoll.current);
@@ -92,7 +129,7 @@ export default function ApplyPage() {
         }
       }, 800);
     },
-    [draftId, frozen, fillPayload]
+    [draftId, frozen, applyPayloadFromServer]
   );
 
   const lookupTelegram = useCallback(
@@ -196,6 +233,10 @@ export default function ApplyPage() {
   useEffect(() => {
     let cancelled = false;
     (async () => {
+      if (freshStart) {
+        resetLocalForm();
+      }
+      setLoadingDraft(true);
       try {
         const qs = freshStart ? "?fresh=1" : "";
         const data = await api(`/api/interview/draft${qs}`, { method: "POST" });
@@ -205,8 +246,8 @@ export default function ApplyPage() {
           navigate("/apply", { replace: true });
         }
         setDraftId(data.draftId);
-        fillPayload(data.payload || {});
-        if (data.driversLicenseFileUrl) setLicenseUrl(data.driversLicenseFileUrl);
+        applyPayloadFromServer(data.payload || {});
+        setLicenseUrl(data.driversLicenseFileUrl || "");
         const un = data.payload?.telegram_username;
         if (un) lookupTelegram(un);
       } catch (e) {
@@ -224,7 +265,7 @@ export default function ApplyPage() {
     return () => {
       cancelled = true;
     };
-  }, [fillPayload, freshStart, lookupTelegram, navigate]);
+  }, [applyPayloadFromServer, freshStart, lookupTelegram, navigate, resetLocalForm]);
 
   useEffect(() => {
     const raw = payload.telegram_username || "";
@@ -370,8 +411,21 @@ export default function ApplyPage() {
 
   const hasDraftData = FORM_FIELD_KEYS.some((key) => String(payload[key] || "").trim());
 
-  const onStartOver = () => {
-    navigate("/apply?fresh=1");
+  const onStartOver = async () => {
+    resetLocalForm();
+    setDraftError(null);
+    setLoadingDraft(true);
+    setDraftId(null);
+    try {
+      const data = await api("/api/interview/draft?fresh=1", { method: "POST" });
+      setDraftId(data.draftId);
+      applyPayloadFromServer(data.payload || {});
+      setLicenseUrl(data.driversLicenseFileUrl || "");
+    } catch (e) {
+      setDraftError(e.message || "Could not reset the form. Try again.");
+    } finally {
+      setLoadingDraft(false);
+    }
   };
 
   if (loadingDraft && !frozen) {
@@ -467,23 +521,37 @@ export default function ApplyPage() {
           {licenseParseNote && <p className="verify-msg ok">{licenseParseNote}</p>}
         </div>
 
-        {FIELDS.map((field, index) => (
-          <div key={field.key}>
-            {field.autoResolveTelegram && (
-              <div className="form-card telegram-login-card">
-                <TelegramLoginButton onAuth={onTelegramWidgetAuth} disabled={!draftId} />
-              </div>
-            )}
-            <FormField
-              field={field}
-              number={index + 2}
-              value={payload[field.key] || ""}
-              onChange={onFieldChange}
-              telegramStatus={field.autoResolveTelegram ? telegramStatus : null}
-              telegramBotUsername={TELEGRAM_BOT}
-            />
-          </div>
-        ))}
+        {FIELDS.map((field, index) => {
+          if (COMPANION_KEYS.has(field.key)) return null;
+          const companion = field.companionKey
+            ? FIELDS.find((f) => f.key === field.companionKey)
+            : null;
+          return (
+            <div key={field.key}>
+              {field.autoResolveTelegram && (
+                <div className="form-card telegram-login-card">
+                  <TelegramLoginButton onAuth={onTelegramWidgetAuth} disabled={!draftId} />
+                </div>
+              )}
+              <FormField
+                field={field}
+                number={fieldDisplayNumber(index)}
+                value={payload[field.key] || ""}
+                onChange={onFieldChange}
+                telegramStatus={field.autoResolveTelegram ? telegramStatus : null}
+                telegramBotUsername={TELEGRAM_BOT}
+              />
+              {companion && (
+                <FormField
+                  field={companion}
+                  nested
+                  value={payload[companion.key] || ""}
+                  onChange={onFieldChange}
+                />
+              )}
+            </div>
+          );
+        })}
 
         <div className="form-card preflight-card">
           <h3>Before you Finish:</h3>

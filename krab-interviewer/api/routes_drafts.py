@@ -341,7 +341,7 @@ async def patch_draft(
     _note_pending_telegram_username(merged, draft_id, drafts)
     un = (merged.get("telegram_username") or "").strip()
     resolve_info = telegram_resolve_meta(db, un, drafts_db=drafts) if un else None
-    return {"ok": True, "payload": merged, "telegramResolve": resolve_info}
+    return {"ok": True, "payload": _client_draft_payload(merged), "telegramResolve": resolve_info}
 
 
 @router.post("/draft/{draft_id}/license")

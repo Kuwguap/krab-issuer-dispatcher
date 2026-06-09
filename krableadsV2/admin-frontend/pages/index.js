@@ -757,8 +757,24 @@ export default function AdminPanel() {
                   <tr><td colSpan={5} style={{ textAlign: 'center', color: '#888' }}>No submitted receipts yet</td></tr>
                 ) : (
                   (submittedReceipts || []).map((row) => (
-                    <tr key={row.lead_id}>
-                      <td><code>{row.reference_id}</code></td>
+                    <tr
+                      key={row.lead_id}
+                      style={
+                        row.exclude_from_count || row.appeal_status === 'accepted'
+                          ? { backgroundColor: '#fde8e8' }
+                          : row.appeal_status === 'declined'
+                            ? { backgroundColor: '#fff3e0' }
+                            : undefined
+                      }
+                    >
+                      <td>
+                        <code>{row.reference_id}</code>
+                        {row.appeal_status ? (
+                          <span style={{ marginLeft: 8, fontSize: 11, color: row.exclude_from_count ? '#c62828' : '#e65100' }}>
+                            ({row.appeal_status})
+                          </span>
+                        ) : null}
+                      </td>
                       <td>{row.driver_name}</td>
                       <td>{row.group_name}</td>
                       <td>

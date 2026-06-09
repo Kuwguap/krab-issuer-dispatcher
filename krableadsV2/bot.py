@@ -213,6 +213,7 @@ def _help_guide_text() -> str:
         "▶️ /start — Open the bot\n"
         "➕ /lead or /client — Add a new client/lead\n"
         "🧾 /receipts — Upload receipts\n"
+        "📋 /appeal — Appeal / cancel a delivery (with proof)\n"
         "❌ /cancel — Cancel and restart\n"
         "❓ /help — Show this guide\n\n"
         "⸻\n\n"
@@ -241,6 +242,11 @@ def _help_guide_text() -> str:
         "Or type /receipts\n"
         "Upload receipt for the reference ID\n\n"
         "👮 Supervisors: same /receipts flow to upload for any assigned driver\n\n"
+        "⸻\n\n"
+        "📋 Delivery appeals\n\n"
+        "Type /appeal when a delivery has complications.\n"
+        "Enter the reference ID, confirm the client name, upload image proof.\n"
+        "Supervisors review and accept or decline; you are notified of the outcome.\n\n"
         "⸻\n\n"
         "💡 Helpful Tips\n\n"
         "🚘 Use a valid 17-character VIN\n"
@@ -8679,6 +8685,29 @@ def main():
     )
 
     application.add_handler(receipt_handler)
+
+    from appeal_flow import register_appeal_handlers
+
+    register_appeal_handlers(
+        application,
+        {
+            "db": db,
+            "empty_inline_kb": _EMPTY_INLINE_KB,
+            "user_is_global_supervisor": _user_is_global_supervisor,
+            "global_supervisory_chat_ids": _global_supervisory_chat_ids,
+            "driver_row_for_telegram_user": _driver_row_for_telegram_user,
+            "driver_accepted_this_lead": _driver_accepted_this_lead,
+            "client_display_name_from_lead": _client_display_name_from_lead,
+            "short_uuid": _short_uuid,
+            "long_uuid": _long_uuid,
+            "telegram_download_url_from_file_path": _telegram_download_url_from_file_path,
+            "clear_lead_conversation_user_data": _clear_lead_conversation_user_data,
+            "restart_bot_from_top": _restart_bot_from_top,
+            "sanitize_phones_for_send": _sanitize_phones_for_send,
+            "start_handler": start,
+        },
+    )
+
     application.add_handler(conv_handler)
 
     # /help + inline ❓ Help — outside ConversationHandler so they work during any flow.

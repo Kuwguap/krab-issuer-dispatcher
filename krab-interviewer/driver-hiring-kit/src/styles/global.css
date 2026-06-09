@@ -1114,6 +1114,23 @@ a.progress-pill-link:hover {
   margin-bottom: 0;
 }
 
+.form-field-nested {
+  margin-top: -0.75rem;
+  padding-top: 0;
+  border-top: none;
+  box-shadow: none;
+  background: transparent;
+}
+
+.form-field-nested .field-label {
+  font-size: 0.95rem;
+  font-weight: 600;
+}
+
+.form-field-nested .field-sublabel {
+  margin-bottom: 0.5rem;
+}
+
 .ai-fill-panel h3 {
   margin: 0 0 0.5rem;
   font-size: 1.05rem;
