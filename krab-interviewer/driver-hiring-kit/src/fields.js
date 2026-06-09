@@ -41,16 +41,34 @@ export const FIELDS = [
   {
     key: "telegram_username",
     label: "Telegram Username (@username)",
-    sublabel:
-      "Download Telegram, create a username in Settings, and enter your @username below.",
-    appLinks: [
+    setupGuide: [
       {
-        label: "📱 iPhone:",
-        href: "https://apps.apple.com/app/telegram-messenger/id686449807",
+        title: "1. Download the Telegram Messenger app:",
+        appLinks: [
+          {
+            label: "📱 iPhone:",
+            href: "https://apps.apple.com/app/telegram-messenger/id686449807",
+          },
+          {
+            label: "🤖 Android:",
+            href: "https://play.google.com/store/apps/details?id=org.telegram.messenger",
+          },
+        ],
       },
       {
-        label: "🤖 Android:",
-        href: "https://play.google.com/store/apps/details?id=org.telegram.messenger",
+        text: "2. Open Telegram and create an account.",
+      },
+      {
+        title: "3. Set your username:",
+        lines: [
+          "Go to Settings",
+          "Tap Edit Profile",
+          "Tap Username",
+          "Create a username that starts with @ (example: @johnsmith)",
+        ],
+      },
+      {
+        text: "4. Enter your Telegram username (@username) in the field below.",
       },
     ],
     required: true,

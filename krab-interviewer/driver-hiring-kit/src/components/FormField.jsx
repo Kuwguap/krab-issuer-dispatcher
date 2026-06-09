@@ -26,7 +26,36 @@ export default function FormField({
         {field.required && <span className="field-req"> *</span>}
       </label>
       {field.sublabel && <p className="field-sublabel">{field.sublabel}</p>}
-      {field.appLinks?.length > 0 && (
+      {field.setupGuide?.length > 0 && (
+        <div className="field-setup-guide">
+          {field.setupGuide.map((step, i) => (
+            <div key={i} className="field-setup-step">
+              {step.title && <p className="field-setup-step-title">{step.title}</p>}
+              {step.text && <p className="field-setup-step-text">{step.text}</p>}
+              {step.lines?.length > 0 && (
+                <ul className="field-setup-lines">
+                  {step.lines.map((line) => (
+                    <li key={line}>{line}</li>
+                  ))}
+                </ul>
+              )}
+              {step.appLinks?.length > 0 && (
+                <div className="field-app-links">
+                  {step.appLinks.map((link) => (
+                    <p key={link.href}>
+                      {link.label}{" "}
+                      <a href={link.href} target="_blank" rel="noopener noreferrer">
+                        {link.href}
+                      </a>
+                    </p>
+                  ))}
+                </div>
+              )}
+            </div>
+          ))}
+        </div>
+      )}
+      {!field.setupGuide?.length && field.appLinks?.length > 0 && (
         <div className="field-app-links">
           {field.appLinks.map((link) => (
             <p key={link.href}>
