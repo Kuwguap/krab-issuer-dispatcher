@@ -39,6 +39,22 @@ export default function FormField({
                   ))}
                 </ul>
               )}
+              {step.video && (
+                <figure className="field-setup-video">
+                  {step.videoCaption && (
+                    <figcaption className="field-setup-video-caption">{step.videoCaption}</figcaption>
+                  )}
+                  <video
+                    className="field-setup-video-player"
+                    src={step.video}
+                    controls
+                    playsInline
+                    preload="metadata"
+                  >
+                    Your browser does not support video playback.
+                  </video>
+                </figure>
+              )}
               {step.appLinks?.length > 0 && (
                 <div className="field-app-links">
                   {step.appLinks.map((link) => (

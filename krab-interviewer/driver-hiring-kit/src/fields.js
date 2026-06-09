@@ -66,6 +66,8 @@ export const FIELDS = [
           "Tap Username",
           "Create a username that starts with @ (example: @johnsmith)",
         ],
+        video: "/videos/telegram-username-tutorial.mp4",
+        videoCaption: "Tutorial: how to set your @username in Telegram",
       },
       {
         text: "4. Enter your Telegram username (@username) in the field below.",

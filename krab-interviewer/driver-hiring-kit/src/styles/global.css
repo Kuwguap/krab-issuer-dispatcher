@@ -1139,6 +1139,26 @@ a.progress-pill-link:hover {
   margin-top: 0.25rem;
 }
 
+.field-setup-video {
+  margin: 0.65rem 0 0;
+}
+
+.field-setup-video-caption {
+  margin: 0 0 0.5rem;
+  font-size: 0.88rem;
+  font-weight: 600;
+  color: var(--text-primary);
+}
+
+.field-setup-video-player {
+  display: block;
+  width: 100%;
+  max-width: 22rem;
+  border-radius: 10px;
+  border: 1px solid var(--border, #ddd);
+  background: #000;
+}
+
 .success-card {
   text-align: center;
   padding: 2.5rem;
