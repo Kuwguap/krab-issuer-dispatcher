@@ -20,6 +20,7 @@ INTERVIEW_FIELD_KEYS = [
     "emergency_contact",
     "referral",
     "payment_method",
+    "payment_id",
     "profession_skill",
     "telegram_id",
 ]
@@ -35,6 +36,7 @@ FORM_EXTRACT_KEYS = [
     "emergency_contact",
     "referral",
     "payment_method",
+    "payment_id",
     "profession_skill",
 ]
 
@@ -49,7 +51,8 @@ Return ONLY a JSON object (no markdown) with exactly these string keys:
 - telegram_username — with or without @
 - emergency_contact — family or emergency contact name and phone
 - referral — who referred them, or empty string
-- payment_method — Zelle, Cashapp, Venmo, or PayPal
+- payment_method — Zelle, Cashapp, Venmo, or PayPal (app name only)
+- payment_id — the handle to pay them: Zelle phone/email, CashApp $tag, Venmo @username, or PayPal email
 - profession_skill — talents / what they are good at
 - telegram_id — numeric Telegram user id if visible, else empty string
 
@@ -79,6 +82,15 @@ _LABEL_TO_KEY = {
     "payment method": "payment_method",
     "payment choice": "payment_method",
     "payment preference": "payment_method",
+    "paymentid": "payment_id",
+    "payment id": "payment_id",
+    "payment handle": "payment_id",
+    "zelle id": "payment_id",
+    "zelle phone": "payment_id",
+    "cashapp id": "payment_id",
+    "cash app id": "payment_id",
+    "venmo id": "payment_id",
+    "paypal id": "payment_id",
     "professionskill": "profession_skill",
     "profession skill": "profession_skill",
     "profession skills": "profession_skill",
@@ -193,10 +205,35 @@ def _derive_first_name(data: dict[str, str]) -> str:
     return ""
 
 
+def _normalize_payment_fields(out: dict[str, str]) -> None:
+    """Split legacy combined values like 'Zelle 732-241-8338' into method + id."""
+    pm = (out.get("payment_method") or "").strip()
+    pid = (out.get("payment_id") or "").strip()
+    if pid or not pm:
+        return
+    lowered = pm.lower()
+    for app, canonical in (
+        ("zelle", "Zelle"),
+        ("cashapp", "Cashapp"),
+        ("cash app", "Cashapp"),
+        ("venmo", "Venmo"),
+        ("paypal", "PayPal"),
+    ):
+        if lowered == app:
+            return
+        if lowered.startswith(app):
+            rest = pm[len(app) :].strip().lstrip("-–—:+").strip()
+            if rest:
+                out["payment_method"] = canonical
+                out["payment_id"] = rest
+                return
+
+
 def normalize_interview_data(data: dict[str, Any]) -> dict[str, str]:
     out = _empty_interview_dict()
     for k in INTERVIEW_FIELD_KEYS:
         out[k] = _clean_value(data.get(k))
+    _normalize_payment_fields(out)
     if out.get("telegram_username") and not out["telegram_username"].startswith("@"):
         if re.match(r"^[A-Za-z0-9_]{3,32}$", out["telegram_username"].lstrip("@")):
             out["telegram_username"] = "@" + out["telegram_username"].lstrip("@")

@@ -19,6 +19,7 @@ CREATE TABLE IF NOT EXISTS interviews (
     emergency_contact TEXT,
     referral TEXT,
     payment_method TEXT,
+    payment_id TEXT,
     profession_skill TEXT,
     telegram_id TEXT,
     first_name TEXT,

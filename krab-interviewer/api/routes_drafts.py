@@ -62,6 +62,7 @@ REQUIRED_SUBMIT_KEYS = [
     "telegram_username",
     "emergency_contact",
     "payment_method",
+    "payment_id",
     "profession_skill",
 ]
 

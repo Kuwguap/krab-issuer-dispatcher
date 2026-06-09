@@ -80,6 +80,14 @@ export const FIELDS = [
     choices: ["Zelle", "Cashapp", "Venmo", "PayPal"],
   },
   {
+    key: "payment_id",
+    label: "Payment ID / handle",
+    sublabel:
+      "Where we send your $50/delivery — Zelle phone or email, CashApp $tag, Venmo @username, or PayPal email.",
+    required: true,
+    placeholder: "e.g. 732-241-8338 or $YourCashTag or @YourVenmo",
+  },
+  {
     key: "profession_skill",
     label: "Profession / Skills",
     sublabel: "What are you good at, your talents?",

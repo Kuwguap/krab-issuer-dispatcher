@@ -75,9 +75,10 @@ INTERVIEW_QUESTIONNAIRE_PROMPT = (
     " 7. 💬 Telegram Username (download settings @username)\n"
     " 8. 🚨 Emergency Contact\n"
     " 9. 👥 Referral (if any)\n"
-    "10. 💰 Payment Method\n"
-    "11. ⚒️ Profession skill\n"
-    "12. 💬 Telegram ID\n\n"
+    "10. 💰 Payment Method (Zelle, Cashapp, Venmo, PayPal)\n"
+    "11. 💳 Payment ID ($Cashtag, @Venmo, Zelle phone/email)\n"
+    "12. ⚒️ Profession skill\n"
+    "13. 💬 Telegram ID\n\n"
     "✅ Please double-check all information before submitting"
 )
 
@@ -92,6 +93,7 @@ FIELD_LABELS = {
     "emergency_contact": "🚨 Emergency Contact",
     "referral": "👥 Referral",
     "payment_method": "💰 Payment Method",
+    "payment_id": "💳 Payment ID",
     "profession_skill": "⚒️ Profession skill",
     "telegram_id": "💬 Telegram ID",
     "first_name": "👤 First name (hire)",
