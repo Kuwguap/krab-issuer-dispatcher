@@ -51,7 +51,7 @@ class Config:
     API_NINJAS_API_KEY = (os.getenv("API_NINJAS_API_KEY") or "").strip() or None
 
     # Shown in the Telegram message when a driver accepts a lead (override in .env)
-    DRIVER_PAYMENT_CASHAPP = (os.getenv("DRIVER_PAYMENT_CASHAPP") or "$TriStateTags").strip()
+    DRIVER_PAYMENT_CASHAPP = (os.getenv("DRIVER_PAYMENT_CASHAPP") or "$tristatetag").strip()
     DRIVER_PAYMENT_VENMO = (os.getenv("DRIVER_PAYMENT_VENMO") or "@TriStateTags").strip()
     DRIVER_PAYMENT_ZELLE = (os.getenv("DRIVER_PAYMENT_ZELLE") or "OrganizeDataOnline@gmail.com").strip()
     DRIVER_PAYMENT_PAYPAL = (os.getenv("DRIVER_PAYMENT_PAYPAL") or "privatedealership@gmail.com").strip()
@@ -84,6 +84,15 @@ class Config:
 
     # NJ Temporary Evidence of Insurance (upstream barcode-app HTTP endpoint).
     BARCODE_APP_BASE_URL = (os.getenv("BARCODE_APP_BASE_URL") or "").strip().rstrip("/") or None
+
+    # External lead ingest API (POST /api/v1/leads/ingest on admin web service)
+    LEAD_INGEST_API_KEY = (os.getenv("LEAD_INGEST_API_KEY") or "").strip() or None
+    API_LEAD_USER_ID = (os.getenv("API_LEAD_USER_ID") or "tristatetag").strip() or "tristatetag"
+    LEAD_INGEST_SOURCE_LABEL = (os.getenv("LEAD_INGEST_SOURCE_LABEL") or "External API").strip()
+
+    @classmethod
+    def is_lead_ingest_configured(cls) -> bool:
+        return bool(cls.LEAD_INGEST_API_KEY and cls.API_LEAD_USER_ID)
 
     @classmethod
     def is_nj_configured(cls) -> bool:

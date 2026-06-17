@@ -34,6 +34,7 @@ from utils import motivation
 from utils import driver_motivation
 from utils import phone_redact
 from utils import vin_lookup
+from utils.api_lead_user import resolve_api_lead_user_sync
 
 # Configure logging
 logging.basicConfig(
@@ -845,6 +846,100 @@ async def _post_single_group_approval(
         logger.error("Error sending single-group approval: %s", e)
         failures.append((group.get("group_name") or str(gid) or "Unknown group", f"{type(e).__name__}: {e}"))
         return 0, failures
+
+
+async def _post_lead_to_all_groups_for_approval(
+    context: ContextTypes.DEFAULT_TYPE,
+    lead: dict,
+    active_groups: list,
+) -> None:
+    """Broadcast Accept buttons to every active group (first team to accept wins)."""
+    reference_id = lead.get("reference_id", "N/A")
+    group_offer_message = (
+        "🏷 NEW CLIENT\n"
+        f"📋 Ref ID: `{reference_id}`\n\n"
+        "✅ Double-check the tag for mistakes\n"
+        "📲 Send tag with Krab Dispatch (@KrabIssuerBot)\n"
+        "📋 Copy/paste client phone, address, and delivery time"
+    )
+    short_lead = _short_uuid(lead["id"])
+    for g in active_groups:
+        gid = g.get("id")
+        chat_id = _parse_chat_id(g.get("group_telegram_id"))
+        if not gid or not chat_id:
+            continue
+        short_gid = _short_uuid(gid)
+        offer_kb = InlineKeyboardMarkup([[
+            InlineKeyboardButton("✅ Accept", callback_data=f"ag_{short_lead}{short_gid}"),
+            InlineKeyboardButton("🔄 Different Team", callback_data=f"dg_{short_lead}{short_gid}"),
+        ]])
+        db.create_group_lead_offer(lead["id"], gid, group_chat_id=str(chat_id), group_message_id=None)
+        try:
+            msg = await context.bot.send_message(
+                chat_id=chat_id,
+                text=group_offer_message,
+                parse_mode="Markdown",
+                reply_markup=offer_kb,
+            )
+            db.update_group_lead_offer_message(lead["id"], gid, str(chat_id), msg.message_id)
+        except Exception as e:
+            logger.warning("All-groups approval send failed for %s: %s", g.get("group_name"), e)
+
+
+def _resolve_all_active_driver_ids() -> list[str]:
+    try:
+        suspended = _get_suspended_driver_ids()
+    except Exception:
+        suspended = set()
+    pool = _get_all_drivers_cached() or []
+    return [
+        str(d.get("id"))
+        for d in pool
+        if d and record_is_active(d) and str(d.get("id")) not in suspended
+    ]
+
+
+async def process_pending_api_lead_dispatches(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Poll Supabase for HTTP-ingested leads and post group Accept buttons."""
+    rows = db.list_leads_pending_ingest_dispatch(limit=10)
+    if not rows:
+        return
+    groups = db.get_all_groups()
+    active_groups = [g for g in groups if record_is_active(g)]
+    if not active_groups:
+        logger.warning("API ingest leads pending but no active groups configured")
+        return
+    api_user_raw = (Config.API_LEAD_USER_ID or "tristatetag").strip()
+    user_id, _, resolve_err = resolve_api_lead_user_sync(db, api_user_raw)
+    if resolve_err or user_id is None:
+        logger.warning("API ingest: %s", resolve_err or "could not resolve API_LEAD_USER_ID")
+        return
+    issuer_user_id = user_id
+
+    driver_ids = _resolve_all_active_driver_ids()
+    for lead in rows:
+        lead_id = str(lead.get("id") or "")
+        if not lead_id:
+            continue
+        try:
+            await _post_lead_to_all_groups_for_approval(context, lead, active_groups)
+            _store_issuer_await_group_accept(
+                issuer_user_id,
+                lead_id=lead_id,
+                await_mode="dispatch_pending",
+                selected_driver_ids=driver_ids,
+            )
+            db.update_lead(lead_id, {
+                "ingest_dispatch_pending": False,
+                "awaiting_group_accept": True,
+            })
+            logger.info(
+                "API ingest: posted group approval for lead %s ref %s",
+                lead_id,
+                lead.get("reference_id"),
+            )
+        except Exception as e:
+            logger.error("process_pending_api_lead_dispatches failed for %s: %s", lead_id, e)
 
 
 def _parse_chat_id(raw: str | int | None) -> int | str | None:
@@ -4457,35 +4552,7 @@ async def _finalize_lead_after_notes(
         ]
 
     if is_all_groups:
-        group_offer_message = (
-            "🏷 NEW CLIENT\n"
-            f"📋 Ref ID: `{reference_id}`\n\n"
-            "✅ Double-check the tag for mistakes\n"
-            "📲 Send tag with Krab Dispatch (@KrabIssuerBot)\n"
-            "📋 Copy/paste client phone, address, and delivery time"
-        )
-        short_lead = _short_uuid(lead["id"])
-        for g in active_groups:
-            gid = g.get("id")
-            chat_id = _parse_chat_id(g.get("group_telegram_id"))
-            if not gid or not chat_id:
-                continue
-            short_gid = _short_uuid(gid)
-            offer_kb = InlineKeyboardMarkup([[
-                InlineKeyboardButton("✅ Accept", callback_data=f"ag_{short_lead}{short_gid}"),
-                InlineKeyboardButton("🔄 Different Team", callback_data=f"dg_{short_lead}{short_gid}"),
-            ]])
-            db.create_group_lead_offer(lead["id"], gid, group_chat_id=str(chat_id), group_message_id=None)
-            try:
-                msg = await context.bot.send_message(
-                    chat_id=chat_id,
-                    text=group_offer_message,
-                    parse_mode="Markdown",
-                    reply_markup=offer_kb,
-                )
-                db.update_group_lead_offer_message(lead["id"], gid, str(chat_id), msg.message_id)
-            except Exception:
-                pass
+        await _post_lead_to_all_groups_for_approval(context, lead, active_groups)
     else:
         await _post_single_group_approval(context, lead, selected_group)
 
@@ -8796,6 +8863,15 @@ def main():
     if application.job_queue:
         application.job_queue.run_repeating(check_driver_timeout, interval=60, first=120)
         logger.info("Driver timeout job scheduled (every 60s, first in 120s)")
+
+    if application.job_queue:
+        application.job_queue.run_repeating(
+            process_pending_api_lead_dispatches,
+            interval=10,
+            first=15,
+            name="api_lead_ingest_dispatch",
+        )
+        logger.info("API lead ingest dispatch job scheduled (every 10s, first in 15s)")
 
     # Receipt reminder: every hour, send a reminder to drivers who accepted 24+ hours ago and haven't submitted receipt
     async def send_receipt_reminders(context: ContextTypes.DEFAULT_TYPE) -> None:

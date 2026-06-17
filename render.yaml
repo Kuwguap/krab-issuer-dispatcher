@@ -125,10 +125,29 @@ services:
     dockerContext: .
     dockerCommand: python admin_dashboard.py
     plan: starter
+    healthCheckPath: /api/health
     envVars:
       - key: SUPABASE_URL
         sync: false
       - key: SUPABASE_KEY
+        sync: false
+      - key: LEAD_INGEST_API_KEY
+        sync: false
+      - key: API_LEAD_USER_ID
+        value: tristatetag
+      - key: LEAD_INGEST_SOURCE_LABEL
+        value: External API
+      - key: ONETIMESECRET_USERNAME
+        sync: false
+      - key: ONETIMESECRET_API_KEY
+        sync: false
+      - key: ONETIMESECRET_URL
+        sync: false
+      - key: ONETIMESECRET_LINK_BASE
+        sync: false
+      - key: ONETIMESECRET_PASSPHRASE
+        sync: false
+      - key: TELEGRAM_BOT_TOKEN
         sync: false
       # Allow the new unified admin page to embed the Flask admin in an iframe.
       - key: ADMIN_FRAME_ANCESTORS
@@ -170,6 +189,8 @@ services:
         sync: false
       - key: SUPABASE_KEY
         sync: false
+      - key: API_LEAD_USER_ID
+        value: tristatetag
       - key: DRIVER_TELEGRAM_ID
         sync: false
       - key: GROUP_TELEGRAM_ID

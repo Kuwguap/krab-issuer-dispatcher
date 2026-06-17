@@ -46,6 +46,18 @@ def add_cors_headers(response):
     return response
 
 
+@app.route("/api/health", methods=["GET"])
+def api_health():
+    """Health check for Render / monitoring."""
+    from config import Config
+
+    return jsonify({
+        "ok": True,
+        "service": "krab-issuer-admin",
+        "lead_ingest_configured": Config.is_lead_ingest_configured(),
+    })
+
+
 @app.route("/api/<path:path>", methods=["OPTIONS"])
 def api_options(path):
     """Handle CORS preflight for all /api/* so browser always gets CORS headers."""
@@ -1568,6 +1580,66 @@ def api_upcoming_renewals():
     except Exception as e:
         logger.error("Error fetching upcoming renewals: %s", e)
         return jsonify({"error": str(e)}), 500
+
+
+def _require_lead_ingest_auth() -> tuple[bool, tuple]:
+    """Validate Bearer token for external lead ingest."""
+    from config import Config
+
+    expected = (Config.LEAD_INGEST_API_KEY or "").strip()
+    if not expected:
+        return False, (jsonify({"ok": False, "error": "Lead ingest API is not configured"}), 503)
+    auth = (request.headers.get("Authorization") or "").strip()
+    if not auth.lower().startswith("bearer "):
+        return False, (jsonify({"ok": False, "error": "Missing Authorization: Bearer token"}), 401)
+    token = auth[7:].strip()
+    if token != expected:
+        return False, (jsonify({"ok": False, "error": "Invalid API key"}), 401)
+    return True, ()
+
+
+@app.route("/api/v1/leads/ingest", methods=["POST"])
+def api_v1_leads_ingest():
+    """
+    Accept external 'New Lead' messages and create krableadsV2 leads.
+    Authorization: Bearer <LEAD_INGEST_API_KEY>
+    Body: text/plain message or JSON { "message": "..." } or { "fields": { ... } }
+    """
+    ok, err_resp = _require_lead_ingest_auth()
+    if not ok:
+        return err_resp
+
+    from utils.database import Database
+    from utils.lead_ingest import ingest_external_lead
+
+    ingest_db = Database()
+    content_type = (request.content_type or "").lower()
+    message = None
+    fields = None
+
+    if "application/json" in content_type:
+        body = request.get_json(silent=True) or {}
+        if isinstance(body, dict):
+            if body.get("message"):
+                message = str(body["message"])
+            elif body.get("fields") and isinstance(body["fields"], dict):
+                fields = body["fields"]
+            else:
+                return jsonify({"ok": False, "errors": ["JSON body needs message or fields"]}), 422
+        else:
+            return jsonify({"ok": False, "errors": ["Invalid JSON body"]}), 422
+    else:
+        message = request.get_data(as_text=True) or ""
+        if not message.strip():
+            return jsonify({"ok": False, "errors": ["Empty message body"]}), 422
+
+    result, errors = ingest_external_lead(ingest_db, message=message, fields=fields)
+    if errors:
+        return jsonify({"ok": False, "errors": errors}), 422
+    if not result:
+        return jsonify({"ok": False, "errors": ["Ingest failed"]}), 500
+
+    return jsonify({"ok": True, **result}), 201
 
 
 if __name__ == '__main__':

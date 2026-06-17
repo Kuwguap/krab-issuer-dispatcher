@@ -22,6 +22,8 @@ _OPTIONAL_LEADS_WRITE_KEYS = frozenset({
     "insurance_card_error",
     "portal_email",
     "portal_password",
+    "ingest_dispatch_pending",
+    "external_order_id",
 })
 
 
@@ -218,6 +220,69 @@ class Database:
                 logger.error(f"Error getting lead by ID: {e}")
             return None
     
+    def list_leads_pending_ingest_dispatch(self, limit: int = 10) -> list:
+        """Leads created via HTTP ingest awaiting bot worker group broadcast."""
+        if not self._check_tables_exist():
+            return []
+        try:
+            response = (
+                self.client.table("leads")
+                .select("*")
+                .eq("ingest_dispatch_pending", True)
+                .order("created_at")
+                .limit(max(1, min(limit, 25)))
+                .execute()
+            )
+            return response.data or []
+        except Exception as e:
+            msg = str(e).lower()
+            if "ingest_dispatch_pending" in msg or "pgrst204" in msg:
+                logger.warning(
+                    "list_leads_pending_ingest_dispatch: column missing — run migration_lead_api_ingest.sql"
+                )
+                return []
+            logger.error("list_leads_pending_ingest_dispatch: %s", e)
+            return []
+
+    def lookup_telegram_id_by_username(self, username: str) -> Optional[int]:
+        """Best-effort: resolve @username to Telegram user id from bot_usage / past leads."""
+        un = (username or "").strip().lstrip("@").lower()
+        if not un:
+            return None
+        try:
+            r = (
+                self.client.table("bot_usage")
+                .select("user_telegram_id, telegram_username")
+                .order("created_at", desc=True)
+                .limit(500)
+                .execute()
+            )
+            for row in r.data or []:
+                row_un = (row.get("telegram_username") or "").strip().lstrip("@").lower()
+                if row_un == un:
+                    uid = row.get("user_telegram_id")
+                    if uid is not None:
+                        return int(uid)
+        except Exception as e:
+            logger.error("lookup_telegram_id_by_username bot_usage: %s", e)
+        try:
+            r = (
+                self.client.table("leads")
+                .select("user_id, telegram_username")
+                .order("created_at", desc=True)
+                .limit(500)
+                .execute()
+            )
+            for row in r.data or []:
+                row_un = (row.get("telegram_username") or "").strip().lstrip("@").lower()
+                if row_un == un:
+                    uid = row.get("user_id")
+                    if uid is not None:
+                        return int(uid)
+        except Exception as e:
+            logger.error("lookup_telegram_id_by_username leads: %s", e)
+        return None
+
     def get_lead_by_monday_id(self, monday_item_id: int) -> Optional[Dict[str, Any]]:
         """Get a lead by Monday.com item ID."""
         if not self._check_tables_exist():
