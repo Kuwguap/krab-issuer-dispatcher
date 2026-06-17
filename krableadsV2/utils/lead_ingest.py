@@ -33,7 +33,7 @@ def ingest_external_lead(
     fields: Optional[Dict[str, Any]] = None,
 ) -> Tuple[Optional[Dict[str, Any]], List[str]]:
     """
-    Parse, validate, encrypt phone, and create a lead with ingest_dispatch_pending=true.
+    Parse, validate, optionally encrypt phone, and create a lead with ingest_dispatch_pending=true.
     Returns ({lead_id, reference_id, external_order_id}, []) or (None, errors).
     """
     if fields:
@@ -64,11 +64,20 @@ def ingest_external_lead(
     if not active_groups:
         return None, ["No active dispatch groups configured"]
 
+    phone_str = str(phone)
     ots = OneTimeSecret()
-    encrypted = ots.encrypt_phone(str(phone))
-    if not encrypted:
-        err = (ots.last_error or "Phone encryption failed").strip()
-        return None, [err]
+    encrypted = ots.encrypt_phone(phone_str)
+    if encrypted:
+        ots_token = encrypted.get("secret_key")
+        ots_meta = encrypted.get("metadata_key")
+        ots_link = encrypted.get("link")
+    else:
+        # OTS optional for API ingest — store raw phone and still dispatch Accept buttons.
+        err = (ots.last_error or "Phone encryption skipped").strip()
+        logger.warning("Lead ingest: skipping phone encryption — %s", err)
+        ots_token = None
+        ots_meta = None
+        ots_link = phone_str  # copy-paste block shows number when no secret link
 
     reference_id = generate_reference_id()
     vehicle_details = build_vehicle_details_11(state)
@@ -80,11 +89,11 @@ def ingest_external_lead(
         "telegram_username": issuer_username,
         "vehicle_details": vehicle_details,
         "delivery_details": delivery_details,
-        "phone_number": str(phone),
+        "phone_number": phone_str,
         "price": str(price),
-        "onetimesecret_token": encrypted.get("secret_key"),
-        "onetimesecret_secret_key": encrypted.get("metadata_key"),
-        "encrypted_link": encrypted.get("link"),
+        "onetimesecret_token": ots_token,
+        "onetimesecret_secret_key": ots_meta,
+        "encrypted_link": ots_link,
         "reference_id": reference_id,
         "group_id": active_groups[0]["id"],
         "extra_info": state.get("extra_info", "") or "",

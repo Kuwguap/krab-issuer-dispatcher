@@ -6,13 +6,18 @@ All routes require X-Admin-Password (same as Dispatch admin).
 from __future__ import annotations
 
 import logging
+import os
+import re
 from typing import Optional
 
-from fastapi import APIRouter, Depends, HTTPException
+import httpx
+from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi.responses import RedirectResponse, StreamingResponse
 from pydantic import BaseModel
 
 from .config import ApiConfig
 from .issuer_admin_db import IssuerAdminDatabase
+from .issuer_supabase import fetch_lead_meta_by_references
 
 logger = logging.getLogger(__name__)
 
@@ -235,6 +240,74 @@ def issuer_receipt_debts_del_assignment(assignment_id: str, db: IssuerAdminDatab
 @router.get("/receipts/submitted")
 def issuer_receipts_submitted(limit: int = 100, db: IssuerAdminDatabase = Depends(get_issuer_db)):
     return db.get_submitted_receipts_recent(limit=limit)
+
+
+_TELEGRAM_FILE_PREFIX = "https://api.telegram.org/file/bot"
+
+
+def _telegram_bot_token() -> str:
+    return (
+        os.getenv("TELEGRAM_BOT_TOKEN")
+        or os.getenv("ISSUER_TELEGRAM_BOT_TOKEN")
+        or os.getenv("KRAB_ISSUER_BOT_TOKEN")
+        or ""
+    ).strip()
+
+
+def _resolve_receipt_fetch_url(stored: str, bot_token: str) -> Optional[str]:
+    u = (stored or "").strip()
+    if not u:
+        return None
+    if u.startswith("http://") or u.startswith("https://"):
+        if _TELEGRAM_FILE_PREFIX in u and bot_token:
+            m = re.search(r"/file/bot[^/]+/(.+)$", u)
+            if m:
+                return f"{_TELEGRAM_FILE_PREFIX}{bot_token}/{m.group(1)}"
+        return u
+    if bot_token:
+        return f"{_TELEGRAM_FILE_PREFIX}{bot_token}/{u.lstrip('/')}"
+    return None
+
+
+@router.get("/receipts/view")
+def issuer_receipt_view(
+    ref: str = Query(..., min_length=1),
+    config: ApiConfig = Depends(_api_config),
+):
+    """Stream receipt image for a lead reference (re-signs Telegram file URLs server-side)."""
+    ref_key = ref.strip()
+    if not config.supabase_configured():
+        raise HTTPException(status_code=503, detail="Supabase not configured")
+    meta = fetch_lead_meta_by_references(
+        config.supabase_url,
+        config.supabase_service_role_key,
+        [ref_key],
+    )
+    row = meta.get(ref_key) or {}
+    stored = (row.get("receipt_image_url") or "").strip()
+    if not stored:
+        raise HTTPException(status_code=404, detail="Receipt not found for this reference")
+    bot_token = _telegram_bot_token()
+    fetch_url = _resolve_receipt_fetch_url(stored, bot_token)
+    if not fetch_url:
+        raise HTTPException(status_code=502, detail="Cannot resolve receipt URL")
+    if _TELEGRAM_FILE_PREFIX not in fetch_url:
+        return RedirectResponse(url=fetch_url, status_code=302)
+    try:
+        with httpx.Client(timeout=30.0, follow_redirects=True) as client:
+            resp = client.get(fetch_url)
+        if resp.status_code != 200:
+            raise HTTPException(
+                status_code=502,
+                detail=f"Telegram file fetch failed ({resp.status_code})",
+            )
+        media = resp.headers.get("content-type") or "image/jpeg"
+        return StreamingResponse(iter([resp.content]), media_type=media)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.warning("receipt view %s: %s", ref_key, exc)
+        raise HTTPException(status_code=502, detail="Failed to fetch receipt image") from exc
 
 
 @router.get("/renewals/upcoming")

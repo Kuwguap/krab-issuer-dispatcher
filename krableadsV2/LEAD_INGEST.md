@@ -26,7 +26,7 @@ Integrate another website with krableadsV2 so orders are submitted over **HTTP**
    | `LEAD_INGEST_API_KEY` | Secret Bearer token (generate a long random string) |
    | `API_LEAD_USER_ID` | Virtual issuer for API leads — default `tristatetag` (@username). Resolved to Telegram numeric id via past bot activity or optional `TELEGRAM_BOT_TOKEN` + getChat |
    | `LEAD_INGEST_SOURCE_LABEL` | Optional; default `External API` |
-   | `ONETIMESECRET_*` | Same as bot — required to encrypt client phone |
+   | `ONETIMESECRET_*` | Optional for ingest — if unset, API leads store the raw phone and still dispatch |
    | `TELEGRAM_BOT_TOKEN` | Optional on admin — helps resolve `@tristatetag` to numeric id on ingest |
 
 3. Set on **krab-issuer-bot** worker:

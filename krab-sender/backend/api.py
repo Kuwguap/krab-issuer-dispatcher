@@ -146,6 +146,7 @@ def require_admin(
 # unlocking the dashboard. Only the POST is exempt - read endpoints stay locked.
 _PUBLIC_ISSUER_PATHS = {
     ("POST", "/issuer-admin/drivers"),
+    ("GET", "/issuer-admin/receipts/view"),
 }
 
 
