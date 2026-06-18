@@ -12,7 +12,7 @@ from typing import Optional
 
 import httpx
 from fastapi import APIRouter, Depends, HTTPException, Query
-from fastapi.responses import RedirectResponse, StreamingResponse
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
 from .config import ApiConfig
@@ -245,6 +245,68 @@ def issuer_receipts_submitted(limit: int = 100, db: IssuerAdminDatabase = Depend
 _TELEGRAM_FILE_PREFIX = "https://api.telegram.org/file/bot"
 
 
+def _sniff_image_media_type(
+    data: bytes,
+    header_ct: Optional[str] = None,
+    url_hint: str = "",
+) -> str:
+    """Telegram often returns application/octet-stream — detect real image type from bytes."""
+    if len(data) >= 12 and data[0:4] == b"RIFF" and data[8:12] == b"WEBP":
+        return "image/webp"
+    if len(data) >= 8 and data[0:8] == b"\x89PNG\r\n\x1a\n":
+        return "image/png"
+    if len(data) >= 6 and data[0:6] in (b"GIF87a", b"GIF89a"):
+        return "image/gif"
+    if len(data) >= 3 and data[0:3] == b"\xff\xd8\xff":
+        return "image/jpeg"
+    if len(data) >= 2 and data[0:2] == b"\xff\xd8":
+        return "image/jpeg"
+    ct = (header_ct or "").split(";")[0].strip().lower()
+    if ct.startswith("image/"):
+        return ct
+    path = (url_hint or "").split("?")[0].lower()
+    for ext, mt in (
+        (".png", "image/png"),
+        (".jpg", "image/jpeg"),
+        (".jpeg", "image/jpeg"),
+        (".gif", "image/gif"),
+        (".webp", "image/webp"),
+    ):
+        if path.endswith(ext):
+            return mt
+    return "image/jpeg"
+
+
+def _receipt_inline_headers(media_type: str, ref: str) -> dict[str, str]:
+    ext = "jpg"
+    if "png" in media_type:
+        ext = "png"
+    elif "gif" in media_type:
+        ext = "gif"
+    elif "webp" in media_type:
+        ext = "webp"
+    safe_ref = re.sub(r"[^\w\-]+", "_", ref.strip())[:40] or "receipt"
+    return {
+        "Content-Disposition": f'inline; filename="{safe_ref}.{ext}"',
+        "Cache-Control": "private, max-age=3600",
+        "X-Content-Type-Options": "nosniff",
+    }
+
+
+def _stream_receipt_image(
+    content: bytes,
+    header_ct: Optional[str],
+    url_hint: str,
+    ref: str,
+) -> StreamingResponse:
+    media = _sniff_image_media_type(content, header_ct, url_hint)
+    return StreamingResponse(
+        iter([content]),
+        media_type=media,
+        headers=_receipt_inline_headers(media, ref),
+    )
+
+
 def _telegram_bot_token() -> str:
     return (
         os.getenv("TELEGRAM_BOT_TOKEN")
@@ -291,18 +353,20 @@ def issuer_receipt_view(
     fetch_url = _resolve_receipt_fetch_url(stored, bot_token)
     if not fetch_url:
         raise HTTPException(status_code=502, detail="Cannot resolve receipt URL")
-    if _TELEGRAM_FILE_PREFIX not in fetch_url:
-        return RedirectResponse(url=fetch_url, status_code=302)
     try:
         with httpx.Client(timeout=30.0, follow_redirects=True) as client:
             resp = client.get(fetch_url)
         if resp.status_code != 200:
             raise HTTPException(
                 status_code=502,
-                detail=f"Telegram file fetch failed ({resp.status_code})",
+                detail=f"Receipt file fetch failed ({resp.status_code})",
             )
-        media = resp.headers.get("content-type") or "image/jpeg"
-        return StreamingResponse(iter([resp.content]), media_type=media)
+        return _stream_receipt_image(
+            resp.content,
+            resp.headers.get("content-type"),
+            fetch_url,
+            ref_key,
+        )
     except HTTPException:
         raise
     except Exception as exc:
