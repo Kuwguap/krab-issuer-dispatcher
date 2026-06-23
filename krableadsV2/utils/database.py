@@ -1198,20 +1198,26 @@ class Database:
             logger.error("mark_driver_timeout_notified: %s", e)
             return False
 
+    def _lead_excluded_from_receipt_count(self, lead: dict) -> bool:
+        """True when appeals migration marked the lead excluded (column may be absent)."""
+        return bool((lead or {}).get("exclude_from_count"))
+
     def get_driver_pending_receipts(self, driver_id: str) -> list:
         """Accepted assignments for this driver where lead has no receipt. Returns list of {reference_id, lead_id, lead}."""
         if not self._check_tables_exist():
             return []
         try:
+            # Do not select appeal_status / exclude_from_count here — production DBs that
+            # have not run migration_lead_appeals.sql will 42703 and return [] for all drivers.
             r = self.client.table("lead_assignments").select(
-                "lead_id, lead:leads(reference_id, receipt_image_url, exclude_from_count, appeal_status, vehicle_details, delivery_details, extra_info, special_request_note, special_request_issuers, special_request_drivers)"
+                "lead_id, lead:leads(reference_id, receipt_image_url, vehicle_details, delivery_details, extra_info, special_request_note, special_request_issuers, special_request_drivers)"
             ).eq("driver_id", driver_id).eq("status", "accepted").execute()
             out = []
             for row in r.data or []:
                 lead = row.get("lead") or {}
                 if lead.get("receipt_image_url"):
                     continue
-                if lead.get("exclude_from_count"):
+                if self._lead_excluded_from_receipt_count(lead):
                     continue
                 out.append({
                     "lead_id": row.get("lead_id"),
@@ -1269,7 +1275,7 @@ class Database:
             leads_by_id = self._fetch_rows_by_id(
                 "leads",
                 lead_ids,
-                "id, reference_id, receipt_image_url, exclude_from_count",
+                "id, reference_id, receipt_image_url",
             )
             drivers_by_id = self._fetch_rows_by_id(
                 "drivers",
@@ -1286,7 +1292,7 @@ class Database:
                 lead = leads_by_id.get(lid) or {}
                 if lead.get("receipt_image_url"):
                     continue
-                if lead.get("exclude_from_count"):
+                if self._lead_excluded_from_receipt_count(lead):
                     continue
                 ref = (lead.get("reference_id") or "").strip()
                 if not ref or ref.upper() == "N/A":
