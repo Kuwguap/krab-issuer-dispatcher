@@ -7413,43 +7413,206 @@ def _merge_receipt_context_from_db(user_id: int, context: ContextTypes.DEFAULT_T
             context.user_data[key] = data[key]
 
 
+# ── Supervisor receipt navigation: drill-down callback prefixes ──────────────
+# ``recsup_dri_<short_uuid>`` (10 + 22 chars) → show that driver's pending refs.
+# ``recsup_back``                              → return to the drivers list.
+RECSUP_DRI_PREFIX = "recsup_dri_"
+RECSUP_BACK = "recsup_back"
+
+
+def _group_pending_receipts_by_driver(pending: list) -> list[tuple[str, str, list]]:
+    """Group ``get_all_pending_receipts`` output by driver.
+
+    Returns a list of ``(driver_id, driver_name, [{ref, lead_id, ...}, ...])``
+    sorted by descending receipt count, then by driver name.
+    """
+    buckets: dict[str, dict] = {}
+    for row in pending or []:
+        did = str(row.get("driver_id") or "").strip()
+        if not did:
+            continue
+        dname = (row.get("driver_name") or "Driver").strip() or "Driver"
+        buckets.setdefault(did, {"id": did, "name": dname, "rows": []})
+        buckets[did]["rows"].append(row)
+    out = [(b["id"], b["name"], b["rows"]) for b in buckets.values()]
+    out.sort(key=lambda t: (-len(t[2]), t[1].lower()))
+    return out
+
+
+def _supervisor_drivers_keyboard(grouped: list[tuple[str, str, list]]) -> InlineKeyboardMarkup:
+    """Drivers list keyboard: one button per driver with their pending count."""
+    rows: list[list[InlineKeyboardButton]] = []
+    for driver_id, driver_name, items in grouped:
+        n = len(items)
+        try:
+            short = _short_uuid(driver_id)
+        except Exception:
+            # If the driver_id isn't a UUID, fall back to a plain receipt menu.
+            continue
+        label = f"🚗 {driver_name[:24]} — {n} owed"
+        rows.append([InlineKeyboardButton(label, callback_data=f"{RECSUP_DRI_PREFIX}{short}")])
+    rows.append([InlineKeyboardButton("📋 Enter Reference ID", callback_data="driver_receipt")])
+    return InlineKeyboardMarkup(rows)
+
+
+def _supervisor_driver_refs_keyboard(rows_for_driver: list) -> InlineKeyboardMarkup:
+    """Per-driver refs keyboard with a Back button."""
+    rows: list[list[InlineKeyboardButton]] = []
+    for r in rows_for_driver:
+        ref = (r.get("reference_id") or "").strip()
+        if not ref or ref.upper() == "N/A":
+            continue
+        rows.append([InlineKeyboardButton(f"📤 Upload {ref}", callback_data=f"receipt_for_{ref}")])
+    rows.append([InlineKeyboardButton("⬅️ Back to drivers", callback_data=RECSUP_BACK)])
+    return InlineKeyboardMarkup(rows)
+
+
 async def _send_supervisor_pending_receipts_menu(
     context: ContextTypes.DEFAULT_TYPE,
     reply_to_message,
 ) -> None:
-    """Supervisors: all drivers' owed receipts + manual reference ID entry."""
-    pending = db.get_all_pending_receipts(90)
-    rows = []
-    for p in pending:
-        ref = (p.get("reference_id") or "").strip()
-        if not ref or ref.upper() == "N/A":
-            continue
-        dname = (p.get("driver_name") or "Driver").strip()[:18]
-        rows.append(
-            [InlineKeyboardButton(f"📤 {ref} ({dname})", callback_data=f"receipt_for_{ref}")]
-        )
-    rows.append([InlineKeyboardButton("📋 Enter Reference ID", callback_data="driver_receipt")])
-    if len(rows) == 1:
+    """Supervisors: drivers-with-owed-receipts list → tap a driver to see refs.
+
+    Per the user request ("see each driver then each reference for easy
+    upload"), this two-tier menu replaces the older flat list.
+    """
+    pending = db.get_all_pending_receipts(500)
+    grouped = _group_pending_receipts_by_driver(pending)
+
+    if not grouped:
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton("📋 Enter Reference ID", callback_data="driver_receipt")],
+        ])
         await reply_to_message.reply_text(
             "✅ No outstanding receipts in the system.\n\n"
             "Tap below to upload by reference ID:",
-            reply_markup=InlineKeyboardMarkup(rows),
+            reply_markup=kb,
         )
         return
-    n_total = len(pending)
+
+    total_refs = sum(len(items) for _, _, items in grouped)
+    n_drivers = len(grouped)
     body = (
-        f"🧾 <b>Upload receipts for drivers</b>\n\n"
-        f"Showing {len(rows) - 1} of {n_total} owed receipt(s). "
-        "Tap a reference or enter one manually:"
+        "🧾 <b>Upload receipts for drivers</b>\n\n"
+        f"<b>{total_refs}</b> owed receipt(s) across <b>{n_drivers}</b> driver(s).\n"
+        "Tap a driver to see their pending references."
     )
-    receipt_kb = InlineKeyboardMarkup(rows)
+    kb = _supervisor_drivers_keyboard(grouped)
     try:
-        await reply_to_message.reply_text(body, parse_mode="HTML", reply_markup=receipt_kb)
+        await reply_to_message.reply_text(body, parse_mode="HTML", reply_markup=kb)
     except BadRequest:
         await reply_to_message.reply_text(
             body.replace("<b>", "").replace("</b>", ""),
-            reply_markup=receipt_kb,
+            reply_markup=kb,
         )
+
+
+def _supervisor_driver_refs_body(driver_name: str, n: int) -> str:
+    return (
+        f"🚗 <b>{html.escape(driver_name, quote=False)}</b>\n"
+        f"{n} pending receipt(s).\n\n"
+        "Tap a reference to upload its receipt:"
+    )
+
+
+async def handle_supervisor_receipts_nav(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Top-level handler for supervisor receipts drill-down navigation.
+
+    Pattern: ``recsup_dri_<short_uuid>`` (show driver's refs) or
+    ``recsup_back`` (back to drivers list). Runs OUTSIDE the receipt
+    ConversationHandler so navigation always works regardless of state.
+    """
+    query = update.callback_query
+    if not query:
+        return
+    try:
+        await query.answer()
+    except Exception:
+        pass
+
+    user_id = query.from_user.id
+    if not _user_is_global_supervisor(user_id):
+        try:
+            await query.message.reply_text("❌ Only supervisors can use this menu.")
+        except Exception:
+            pass
+        return
+
+    data = query.data or ""
+
+    # Back to drivers list — re-fetch + re-render the top-level menu in place.
+    if data == RECSUP_BACK:
+        pending = db.get_all_pending_receipts(500)
+        grouped = _group_pending_receipts_by_driver(pending)
+        if not grouped:
+            try:
+                await query.edit_message_text(
+                    "✅ No outstanding receipts in the system.",
+                    reply_markup=InlineKeyboardMarkup([
+                        [InlineKeyboardButton("📋 Enter Reference ID", callback_data="driver_receipt")],
+                    ]),
+                )
+            except Exception:
+                pass
+            return
+        total_refs = sum(len(items) for _, _, items in grouped)
+        n_drivers = len(grouped)
+        body = (
+            "🧾 <b>Upload receipts for drivers</b>\n\n"
+            f"<b>{total_refs}</b> owed receipt(s) across <b>{n_drivers}</b> driver(s).\n"
+            "Tap a driver to see their pending references."
+        )
+        try:
+            await query.edit_message_text(
+                body, parse_mode="HTML",
+                reply_markup=_supervisor_drivers_keyboard(grouped),
+            )
+        except Exception:
+            pass
+        return
+
+    # Drill into one driver
+    if data.startswith(RECSUP_DRI_PREFIX):
+        token = data[len(RECSUP_DRI_PREFIX):]
+        try:
+            driver_id = _long_uuid(token)
+        except Exception:
+            try:
+                await query.message.reply_text("❌ Invalid driver link.")
+            except Exception:
+                pass
+            return
+        driver_row = _driver_row_by_id(driver_id)
+        driver_name = (driver_row.get("driver_name") or "Driver") if driver_row else "Driver"
+        rows_for_driver = db.get_driver_pending_receipts(driver_id) or []
+        if not rows_for_driver:
+            try:
+                await query.edit_message_text(
+                    f"✅ {html.escape(driver_name, quote=False)} has no outstanding receipts.",
+                    parse_mode="HTML",
+                    reply_markup=InlineKeyboardMarkup([
+                        [InlineKeyboardButton("⬅️ Back to drivers", callback_data=RECSUP_BACK)],
+                    ]),
+                )
+            except Exception:
+                pass
+            return
+        try:
+            await query.edit_message_text(
+                _supervisor_driver_refs_body(driver_name, len(rows_for_driver)),
+                parse_mode="HTML",
+                reply_markup=_supervisor_driver_refs_keyboard(rows_for_driver),
+            )
+        except Exception:
+            # Fallback: send a fresh message if the original can't be edited.
+            try:
+                await query.message.reply_text(
+                    _supervisor_driver_refs_body(driver_name, len(rows_for_driver)),
+                    parse_mode="HTML",
+                    reply_markup=_supervisor_driver_refs_keyboard(rows_for_driver),
+                )
+            except Exception:
+                pass
 
 
 async def _send_driver_pending_receipts_menu(
@@ -7689,26 +7852,41 @@ async def handle_reference_id_input(update: Update, context: ContextTypes.DEFAUL
 async def handle_receipt_confirm_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """Handle receipt confirmation callback."""
     query = update.callback_query
-    
+
     if query.data == "cancel_receipt":
         await query.answer("Cancelled")
         user_id = query.from_user.id
         db.clear_user_state(user_id)
         await query.message.reply_text("❌ Receipt submission cancelled.")
         return ConversationHandler.END
-    
+
     await query.answer()
-    
-    # Set state to waiting for image
+
     user_id = query.from_user.id
+
+    # Restore receipt context from DB in case the bot restarted between
+    # showing the Confirm button and the user tapping it. Without this the
+    # in-memory ``context.user_data`` is empty after a redeploy, gets
+    # persisted back as empty, and the photo upload later fails with
+    # "Lead information not found."
+    _merge_receipt_context_from_db(user_id, context)
+
+    if not context.user_data.get("receipt_lead_id"):
+        await query.message.reply_text(
+            "⚠️ This receipt session has expired (the bot may have restarted).\n\n"
+            "Type /receipts to see your pending receipts again."
+        )
+        db.clear_user_state(user_id)
+        return ConversationHandler.END
+
     db.set_user_state(user_id, "waiting_receipt_image", context.user_data)
-    
+
     await query.message.reply_text(
         "📸 **Upload Receipt**\n\n"
         "Please upload the receipt image now🧾.\n\n",
         parse_mode="Markdown",
     )
-    
+
     return STATE_WAITING_RECEIPT_IMAGE
 
 
@@ -8797,6 +8975,13 @@ def main():
     # Post-dispatch insurance-card prompt (NY FS-20 PDF + Resend email).
     application.add_handler(
         CallbackQueryHandler(handle_insurance_card_decision, pattern=r"^ins_card_(yes|no)_")
+    )
+
+    # Supervisor receipts navigation (drivers list <-> driver's refs).
+    # Top-level so the back/forward buttons work even while inside another
+    # conversation; the actual upload flow still goes through receipt_handler.
+    application.add_handler(
+        CallbackQueryHandler(handle_supervisor_receipts_nav, pattern=r"^recsup_(dri_|back$)")
     )
 
     # Renewal accept / reassign handlers
