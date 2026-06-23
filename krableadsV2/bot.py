@@ -7723,6 +7723,7 @@ async def handle_receipt_for_ref_callback(update: Update, context: ContextTypes.
     """When driver clicks ref in strike message – show lead details and Upload button."""
     query = update.callback_query
     await query.answer()
+    _merge_receipt_context_from_db(query.from_user.id, context)
     ref = query.data.partition("receipt_for_")[2].strip()
     lead = db.get_lead_by_reference_id(ref)
     if not lead:
@@ -8926,6 +8927,8 @@ def main():
             CommandHandler("start", start),
             CommandHandler(["receipt", "receipts", "recipts"], handle_driver_receipts_menu_command),
             CallbackQueryHandler(handle_driver_add_receipt_callback, pattern="^driver_add_receipt$"),
+            # Supervisor drill-down: pick a different ref while confirm/upload is active.
+            CallbackQueryHandler(handle_receipt_for_ref_callback, pattern="^receipt_for_"),
         ],
     )
 
@@ -8981,7 +8984,7 @@ def main():
     # Top-level so the back/forward buttons work even while inside another
     # conversation; the actual upload flow still goes through receipt_handler.
     application.add_handler(
-        CallbackQueryHandler(handle_supervisor_receipts_nav, pattern=r"^recsup_(dri_|back$)")
+        CallbackQueryHandler(handle_supervisor_receipts_nav, pattern=r"^recsup_(dri_.+|back)$")
     )
 
     # Renewal accept / reassign handlers
