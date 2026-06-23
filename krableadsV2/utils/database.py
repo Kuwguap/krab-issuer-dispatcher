@@ -1223,19 +1223,67 @@ class Database:
             logger.error("get_driver_pending_receipts: %s", e)
             return []
 
+    def _fetch_rows_by_id(
+        self,
+        table: str,
+        ids: list,
+        columns: str,
+        *,
+        chunk_size: int = 100,
+    ) -> dict[str, dict]:
+        """Batch-fetch rows by primary key ``id`` (chunks for PostgREST ``in_`` limits)."""
+        out: dict[str, dict] = {}
+        clean = [str(x).strip() for x in (ids or []) if x]
+        if not clean:
+            return out
+        for i in range(0, len(clean), chunk_size):
+            chunk = clean[i : i + chunk_size]
+            try:
+                r = self.client.table(table).select(columns).in_("id", chunk).execute()
+            except Exception as e:
+                logger.error("_fetch_rows_by_id(%s): %s", table, e)
+                continue
+            for row in r.data or []:
+                rid = row.get("id")
+                if rid:
+                    out[str(rid)] = row
+        return out
+
     def get_all_pending_receipts(self, limit: int = 90) -> list:
         """Accepted assignments missing receipts (all drivers). For supervisor /receipts menu."""
         if not self._check_tables_exist():
             return []
         try:
+            # Flat queries — nested ``lead:leads(...)`` embeds can come back empty on bulk
+            # selects (PostgREST/RLS), which made the supervisor /receipts menu show
+            # "No outstanding receipts" even while per-driver pending counts were > 0.
             r = self.client.table("lead_assignments").select(
-                "lead_id, driver_id, "
-                "driver:drivers(driver_name), "
-                "lead:leads(reference_id, receipt_image_url, exclude_from_count)"
+                "lead_id, driver_id"
             ).eq("status", "accepted").execute()
+            rows = r.data or []
+            if not rows:
+                return []
+
+            lead_ids = [row.get("lead_id") for row in rows if row.get("lead_id")]
+            driver_ids = [row.get("driver_id") for row in rows if row.get("driver_id")]
+            leads_by_id = self._fetch_rows_by_id(
+                "leads",
+                lead_ids,
+                "id, reference_id, receipt_image_url, exclude_from_count",
+            )
+            drivers_by_id = self._fetch_rows_by_id(
+                "drivers",
+                driver_ids,
+                "id, driver_name",
+            )
+
             out = []
-            for row in r.data or []:
-                lead = row.get("lead") or {}
+            for row in rows:
+                lid = str(row.get("lead_id") or "").strip()
+                did = str(row.get("driver_id") or "").strip()
+                if not lid or not did:
+                    continue
+                lead = leads_by_id.get(lid) or {}
                 if lead.get("receipt_image_url"):
                     continue
                 if lead.get("exclude_from_count"):
@@ -1243,20 +1291,50 @@ class Database:
                 ref = (lead.get("reference_id") or "").strip()
                 if not ref or ref.upper() == "N/A":
                     continue
-                driver = row.get("driver") or {}
+                driver = drivers_by_id.get(did) or {}
                 out.append({
-                    "lead_id": row.get("lead_id"),
-                    "driver_id": row.get("driver_id"),
+                    "lead_id": lid,
+                    "driver_id": did,
                     "reference_id": ref,
-                    "driver_name": driver.get("driver_name") or "Driver",
+                    "driver_name": (driver.get("driver_name") or "Driver").strip() or "Driver",
                     "lead": lead,
                 })
+            if not out and rows:
+                logger.warning(
+                    "get_all_pending_receipts: %d accepted assignment(s) but flat join found "
+                    "0 pending — falling back to per-driver scan",
+                    len(rows),
+                )
+                out = self._get_all_pending_receipts_per_driver(limit=0)
             if limit and len(out) > limit:
                 return out[:limit]
             return out
         except Exception as e:
             logger.error("get_all_pending_receipts: %s", e)
-            return []
+            return self._get_all_pending_receipts_per_driver(limit)
+
+    def _get_all_pending_receipts_per_driver(self, limit: int = 90) -> list:
+        """Fallback: aggregate ``get_driver_pending_receipts`` across all drivers."""
+        out: list = []
+        for drv in self.get_all_drivers():
+            did = drv.get("id")
+            if not did:
+                continue
+            dname = (drv.get("driver_name") or "Driver").strip() or "Driver"
+            for row in self.get_driver_pending_receipts(str(did)):
+                ref = (row.get("reference_id") or "").strip()
+                if not ref or ref.upper() == "N/A":
+                    continue
+                out.append({
+                    "lead_id": row.get("lead_id"),
+                    "driver_id": str(did),
+                    "reference_id": ref,
+                    "driver_name": dname,
+                    "lead": row.get("lead") or {},
+                })
+        if limit and len(out) > limit:
+            return out[:limit]
+        return out
 
     def mark_receipt_reminder_sent(self, assignment_id: str) -> bool:
         """Mark that we sent the receipt reminder for this assignment."""
