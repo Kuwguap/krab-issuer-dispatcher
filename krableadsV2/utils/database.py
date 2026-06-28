@@ -1499,11 +1499,41 @@ class Database:
 
     # ── Renewal helpers ──────────────────────────────────────────────────
 
+    def resolve_renewal_group_id(self, lead_id: str, lead: dict | None = None) -> Optional[str]:
+        """Best-effort issuing group for renewal routing (lead row → assignment → group offer)."""
+        if not self._check_tables_exist():
+            return None
+        lead = lead or self.get_lead_by_id(lead_id) or {}
+        gid = lead.get("group_id")
+        if gid:
+            return str(gid)
+        st = self.get_lead_assignment_status(lead_id)
+        if st and st.get("group_id"):
+            return str(st["group_id"])
+        acc = self.get_accepted_group_for_lead(lead_id)
+        if acc and acc.get("group_id"):
+            return str(acc["group_id"])
+        return None
+
+    def ensure_renewal_original_group(self, renewal: dict) -> dict:
+        """Backfill ``original_group_id`` on older renewal rows when missing."""
+        if not renewal or renewal.get("original_group_id"):
+            return renewal or {}
+        lead_id = renewal.get("lead_id")
+        gid = self.resolve_renewal_group_id(lead_id, renewal.get("lead"))
+        if gid and renewal.get("id"):
+            self.update_renewal(str(renewal["id"]), {"original_group_id": gid})
+            renewal = dict(renewal)
+            renewal["original_group_id"] = gid
+        return renewal
+
     def schedule_renewal(self, lead_id: str, group_id: str | None, driver_id: str | None, renewal_due_at: str) -> Optional[Dict[str, Any]]:
         """Create a pending renewal record for a lead (28-day cycle)."""
         if not self._check_tables_exist():
             return None
         try:
+            if not group_id:
+                group_id = self.resolve_renewal_group_id(lead_id)
             row = {
                 "lead_id": lead_id,
                 "renewal_due_at": renewal_due_at,
@@ -1520,6 +1550,29 @@ class Database:
         except Exception as e:
             logger.error(f"Error scheduling renewal: {e}")
             return None
+
+    def claim_renewal_for_group_dispatch(self, renewal_id: str) -> bool:
+        """Atomically pending → group_phase. Only one worker should get True."""
+        if not self._check_tables_exist():
+            return False
+        try:
+            from datetime import datetime, timezone
+            now_iso = datetime.now(timezone.utc).isoformat()
+            r = (
+                self.client.table("lead_renewals")
+                .update({
+                    "status": "group_phase",
+                    "group_status": "sent",
+                    "group_sent_at": now_iso,
+                })
+                .eq("id", renewal_id)
+                .eq("status", "pending")
+                .execute()
+            )
+            return bool(r.data)
+        except Exception as e:
+            logger.error("claim_renewal_for_group_dispatch: %s", e)
+            return False
 
     def get_due_renewals(self) -> list:
         """Return renewals whose due date has passed and are still 'pending'."""
@@ -1571,55 +1624,88 @@ class Database:
             logger.error(f"Error updating renewal: {e}")
             return False
 
-    def accept_renewal_group(self, renewal_id: str, group_id: str) -> bool:
-        """First-come-first-served group accept for a renewal. Returns False if already accepted."""
+    def accept_renewal_group(self, renewal_id: str, group_id: str) -> str:
+        """Team-level renewal accept.
+
+        Returns one of: ``ok``, ``already_accepted``, ``wrong_team``, ``not_found``, ``error``.
+
+        Before escalation (``group_status`` pending/sent) only the original issuing group
+        may accept. After escalation any team that received the offer may accept (FCFS).
+        """
         if not self._check_tables_exist():
-            return False
+            return "error"
         try:
-            existing = (
+            existing = self.get_renewal_by_id(renewal_id)
+            if not existing:
+                return "not_found"
+            gs = (existing.get("group_status") or "").strip().lower()
+            if gs == "accepted":
+                return "already_accepted"
+            existing = self.ensure_renewal_original_group(existing)
+            orig_gid = existing.get("original_group_id")
+            if gs in ("pending", "sent") and orig_gid and str(group_id) != str(orig_gid):
+                return "wrong_team"
+            r = (
                 self.client.table("lead_renewals")
-                .select("group_status")
+                .update({
+                    "group_status": "accepted",
+                    "group_accepted_by_id": group_id,
+                    "status": "driver_phase",
+                })
                 .eq("id", renewal_id)
-                .limit(1)
+                .neq("group_status", "accepted")
                 .execute()
             )
-            if existing.data and existing.data[0].get("group_status") == "accepted":
-                return False
-            self.client.table("lead_renewals").update({
-                "group_status": "accepted",
-                "group_accepted_by_id": group_id,
-                "status": "driver_phase",
-            }).eq("id", renewal_id).execute()
-            return True
+            if not r.data:
+                return "already_accepted"
+            return "ok"
         except Exception as e:
             logger.error(f"Error accepting renewal group: {e}")
-            return False
+            return "error"
 
-    def accept_renewal_driver(self, renewal_id: str, driver_id: str) -> bool:
-        """First-come-first-served driver accept for a renewal. Returns False if already accepted."""
+    def accept_renewal_driver(self, renewal_id: str, driver_id: str) -> str:
+        """Driver-level renewal accept (FCFS among drivers in the accepted group).
+
+        Returns one of: ``ok``, ``already_accepted``, ``wrong_driver``, ``not_found``, ``error``.
+        """
         if not self._check_tables_exist():
-            return False
+            return "error"
         try:
-            existing = (
+            existing = self.get_renewal_by_id(renewal_id)
+            if not existing:
+                return "not_found"
+            if (existing.get("driver_status") or "").strip().lower() == "accepted":
+                return "already_accepted"
+            if (existing.get("group_status") or "").strip().lower() != "accepted":
+                return "error"
+            group_id = existing.get("group_accepted_by_id") or existing.get("original_group_id")
+            if group_id:
+                allowed = {
+                    str(d.get("id"))
+                    for d in (self.get_active_drivers_for_group(str(group_id)) or [])
+                    if d.get("id")
+                }
+                if allowed and str(driver_id) not in allowed:
+                    return "wrong_driver"
+            from datetime import datetime, timezone
+            r = (
                 self.client.table("lead_renewals")
-                .select("driver_status")
+                .update({
+                    "driver_status": "accepted",
+                    "driver_accepted_by_id": driver_id,
+                    "status": "completed",
+                    "completed_at": datetime.now(timezone.utc).isoformat(),
+                })
                 .eq("id", renewal_id)
-                .limit(1)
+                .neq("driver_status", "accepted")
                 .execute()
             )
-            if existing.data and existing.data[0].get("driver_status") == "accepted":
-                return False
-            from datetime import datetime, timezone
-            self.client.table("lead_renewals").update({
-                "driver_status": "accepted",
-                "driver_accepted_by_id": driver_id,
-                "status": "completed",
-                "completed_at": datetime.now(timezone.utc).isoformat(),
-            }).eq("id", renewal_id).execute()
-            return True
+            if not r.data:
+                return "already_accepted"
+            return "ok"
         except Exception as e:
             logger.error(f"Error accepting renewal driver: {e}")
-            return False
+            return "error"
 
     def get_active_renewal_for_lead(self, lead_id: str) -> Optional[Dict[str, Any]]:
         """Check if a non-completed renewal already exists for this lead."""

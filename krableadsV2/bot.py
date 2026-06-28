@@ -6974,9 +6974,10 @@ async def handle_accept_lead(update: Update, context: ContextTypes.DEFAULT_TYPE)
         renewal_due = datetime.now(_tz.utc) + timedelta(days=Config.RENEWAL_DAYS)
         existing_renewal = db.get_active_renewal_for_lead(lead_id)
         if not existing_renewal:
+            renewal_group_id = group_id or db.resolve_renewal_group_id(lead_id, lead)
             db.schedule_renewal(
                 lead_id=lead_id,
-                group_id=group_id if group_id else None,
+                group_id=renewal_group_id,
                 driver_id=driver["id"],
                 renewal_due_at=renewal_due.isoformat(),
             )
@@ -8433,11 +8434,44 @@ async def _send_renewal_to_driver(context: ContextTypes.DEFAULT_TYPE, renewal: d
         return False
 
 
+async def _offer_renewal_to_group_drivers(
+    context: ContextTypes.DEFAULT_TYPE,
+    renewal_id: str,
+    renewal: dict,
+    group_id: str | None,
+    *,
+    exclude_driver_id: str | None = None,
+) -> bool:
+    """Offer a renewal delivery to active drivers in the accepting group."""
+    if not group_id:
+        return False
+    drivers = db.get_active_drivers_for_group(group_id) or []
+    suspended = _get_suspended_driver_ids()
+    refreshed = db.get_renewal_by_id(renewal_id) or renewal
+    db.update_renewal(renewal_id, {
+        "driver_status": "sent",
+        "driver_sent_at": datetime.utcnow().isoformat(),
+    })
+    sent_any = False
+    for d in drivers:
+        did = str(d.get("id") or "")
+        if not did:
+            continue
+        if exclude_driver_id and did == str(exclude_driver_id):
+            continue
+        if did in suspended:
+            continue
+        if await _send_renewal_to_driver(context, refreshed, d):
+            sent_any = True
+    return sent_any
+
+
 async def _escalate_renewal_group(context: ContextTypes.DEFAULT_TYPE, renewal_id: str) -> None:
     """Timer callback: original group didn't accept within the escalation window — broadcast to all."""
     renewal = db.get_renewal_by_id(renewal_id)
     if not renewal:
         return
+    renewal = db.ensure_renewal_original_group(renewal)
     if renewal.get("group_status") == "accepted":
         return  # already handled
     logger.info("Renewal %s: group escalation triggered", renewal_id)
@@ -8455,8 +8489,13 @@ async def _escalate_renewal_group(context: ContextTypes.DEFAULT_TYPE, renewal_id
         await _send_renewal_to_group(context, refreshed, g)
 
 
-async def _escalate_renewal_driver(context: ContextTypes.DEFAULT_TYPE, renewal_id: str) -> None:
-    """Timer callback: original driver didn't accept — send to all drivers in the accepted group."""
+async def _escalate_renewal_driver(
+    context: ContextTypes.DEFAULT_TYPE,
+    renewal_id: str,
+    *,
+    exclude_driver_id: str | None = None,
+) -> None:
+    """Timer / reassign callback: offer renewal to other drivers in the accepted group."""
     renewal = db.get_renewal_by_id(renewal_id)
     if not renewal:
         return
@@ -8468,16 +8507,13 @@ async def _escalate_renewal_driver(context: ContextTypes.DEFAULT_TYPE, renewal_i
         "driver_escalated_at": datetime.utcnow().isoformat(),
     })
     group_id = renewal.get("group_accepted_by_id") or renewal.get("original_group_id")
-    drivers = db.get_active_drivers_for_group(group_id) if group_id else []
-    suspended = _get_suspended_driver_ids()
-    original_did = renewal.get("original_driver_id")
-    refreshed = db.get_renewal_by_id(renewal_id) or renewal
-    for d in (drivers or []):
-        if str(d.get("id")) == str(original_did):
-            continue
-        if str(d.get("id")) in suspended:
-            continue
-        await _send_renewal_to_driver(context, refreshed, d)
+    await _offer_renewal_to_group_drivers(
+        context,
+        renewal_id,
+        renewal,
+        group_id,
+        exclude_driver_id=exclude_driver_id,
+    )
 
 
 async def handle_renewal_group_accept(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -8497,18 +8533,40 @@ async def handle_renewal_group_accept(update: Update, context: ContextTypes.DEFA
         return
 
     renewal = db.get_renewal_by_id(renewal_id)
+    if not renewal:
+        try:
+            await query.message.edit_text("❌ Renewal not found or expired.")
+        except Exception:
+            pass
+        return
+    renewal = db.ensure_renewal_original_group(renewal)
     group = db.get_group_by_id(group_id)
-    if not renewal or not group:
+    if not group:
         try:
             await query.message.edit_text("❌ Renewal not found or expired.")
         except Exception:
             pass
         return
 
-    accepted = db.accept_renewal_group(renewal_id, group_id)
-    if not accepted:
+    result = db.accept_renewal_group(renewal_id, group_id)
+    if result == "wrong_team":
         try:
-            await query.message.edit_text("❌ This renewal was already accepted by another team.")
+            await query.message.edit_text(
+                "❌ This renewal is reserved for the team that originally issued this client.\n\n"
+                "Wait for them to accept, or use **Reassign** on their renewal message to send it to other teams.",
+                parse_mode="Markdown",
+            )
+        except Exception:
+            pass
+        return
+    if result != "ok":
+        err_msg = {
+            "already_accepted": "❌ This renewal was already accepted by another team.",
+            "not_found": "❌ Renewal not found or expired.",
+            "error": "❌ Could not accept this renewal. Please try again or contact support.",
+        }.get(result, "❌ Could not accept this renewal.")
+        try:
+            await query.message.edit_text(err_msg)
         except Exception:
             pass
         return
@@ -8519,18 +8577,13 @@ async def handle_renewal_group_accept(update: Update, context: ContextTypes.DEFA
         await query.message.edit_text(
             f"✅ **Renewal accepted by {gname}**\n\n"
             f"Reference ID: `{ref}`\n\n"
-            "Now sending to driver…",
+            "Now sending to your drivers…",
             parse_mode="Markdown",
         )
     except Exception:
         pass
 
     refreshed = db.get_renewal_by_id(renewal_id) or renewal
-    original_did = renewal.get("original_driver_id")
-    original_driver = None
-    if original_did:
-        all_drivers = _get_all_drivers_cached()
-        original_driver = next((d for d in all_drivers if str(d.get("id")) == str(original_did)), None)
 
     # Re-send the lead to the accepting group with a RENEWAL header (not NEW CLIENT).
     try:
@@ -8545,28 +8598,11 @@ async def handle_renewal_group_accept(update: Update, context: ContextTypes.DEFA
     except Exception as e:
         logger.warning("Could not re-send renewal lead to accepting group: %s", e)
 
-    # Phase 2: send to original driver first
-    sent_to_driver = False
-    if original_driver and record_is_active(original_driver):
-        db.update_renewal(renewal_id, {
-            "driver_status": "sent",
-            "driver_sent_at": datetime.utcnow().isoformat(),
-        })
-        sent_to_driver = await _send_renewal_to_driver(context, refreshed, original_driver)
-
-    if sent_to_driver:
-        esc_seconds = Config.RENEWAL_ESCALATION_MINUTES * 60
-        if context.application.job_queue:
-            async def _driver_esc_job(ctx, _rid=renewal_id):
-                await _escalate_renewal_driver(ctx, _rid)
-            context.application.job_queue.run_once(
-                _driver_esc_job,
-                when=esc_seconds,
-                name=f"renewal_driver_esc_{renewal_id}",
-            )
-    else:
-        # No original driver available — immediately escalate to all drivers in group
-        await _escalate_renewal_driver(context, renewal_id)
+    # Phase 2: all active drivers in this group choose whether they can take it.
+    accepting_gid = str(group_id)
+    await _offer_renewal_to_group_drivers(
+        context, renewal_id, refreshed, accepting_gid
+    )
 
 
 async def handle_renewal_group_reassign(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -8630,10 +8666,23 @@ async def handle_renewal_driver_accept(update: Update, context: ContextTypes.DEF
             pass
         return
 
-    accepted = db.accept_renewal_driver(renewal_id, driver_id)
-    if not accepted:
+    result = db.accept_renewal_driver(renewal_id, driver_id)
+    if result == "wrong_driver":
         try:
-            await query.message.edit_text("❌ This renewal delivery was already accepted by another driver.")
+            await query.message.edit_text(
+                "❌ This renewal is only for drivers on the team that accepted it."
+            )
+        except Exception:
+            pass
+        return
+    if result != "ok":
+        err_msg = {
+            "already_accepted": "❌ This renewal delivery was already accepted by another driver.",
+            "not_found": "❌ Renewal not found or expired.",
+            "error": "❌ Could not accept this renewal. Please try again.",
+        }.get(result, "❌ Could not accept this renewal.")
+        try:
+            await query.message.edit_text(err_msg)
         except Exception:
             pass
         return
@@ -8747,7 +8796,7 @@ async def handle_renewal_driver_reassign(update: Update, context: ContextTypes.D
         )
     except Exception:
         pass
-    await _escalate_renewal_driver(context, renewal_id)
+    await _escalate_renewal_driver(context, renewal_id, exclude_driver_id=driver_id)
 
 
 def main():
@@ -9104,13 +9153,13 @@ def main():
                 renewal_id = renewal.get("id")
                 if not renewal_id:
                     continue
+                renewal = db.ensure_renewal_original_group(renewal)
                 original_gid = renewal.get("original_group_id")
                 original_group = db.get_group_by_id(original_gid) if original_gid else None
-                db.update_renewal(renewal_id, {
-                    "status": "group_phase",
-                    "group_status": "sent",
-                    "group_sent_at": datetime.utcnow().isoformat(),
-                })
+
+                if not await asyncio.to_thread(db.claim_renewal_for_group_dispatch, renewal_id):
+                    continue
+
                 sent = False
                 if original_group and record_is_active(original_group):
                     sent = await _send_renewal_to_group(context, renewal, original_group)
@@ -9131,8 +9180,18 @@ def main():
                         "Renewal %s (ref %s) sent to original group, escalation in %d min",
                         renewal_id, ref, Config.RENEWAL_ESCALATION_MINUTES,
                     )
-                else:
+                elif not original_gid:
+                    # No issuing team on record — broadcast to all teams immediately.
                     await _escalate_renewal_group(context, renewal_id)
+                else:
+                    logger.warning(
+                        "Renewal %s: could not DM original group %s — will retry on next cycle",
+                        renewal_id, original_gid,
+                    )
+                    db.update_renewal(renewal_id, {
+                        "status": "pending",
+                        "group_status": "pending",
+                    })
         except Exception as e:
             logger.error("Renewal checker job failed: %s", e)
 
