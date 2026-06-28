@@ -27,7 +27,7 @@ Fort Lee New Jersey 07024`;
 /** Alt text for requirement cards */
 export const NEED_IMAGE_ALT = {
   driversLicense: "Driver's license — valid license to drive",
-  laserPrinter: "Laserjet printer — print temp tags for clients",
+  laserPrinter: "Laserjet printer — print papers for clients",
   smartphone: "Smartphone — call clients and receive deliveries from dispatchers",
 };
 

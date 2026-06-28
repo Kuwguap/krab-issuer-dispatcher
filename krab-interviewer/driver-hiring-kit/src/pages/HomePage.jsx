@@ -12,7 +12,7 @@ const STEPS = [
   {
     num: 2,
     title: "Get the papers, get the papers",
-    text: "Receive your temp tag paper with tracking.",
+    text: "Receive your paper with tracking.",
     image: IMAGES.stepsPackage,
     alt: STEP_IMAGE_ALT.tracking,
   },
@@ -40,7 +40,7 @@ const NEEDS = [
   },
   {
     title: "Laserjet Printer",
-    text: "To print temp tags for clients",
+    text: "To print papers for clients",
     image: IMAGES.laserPrinter,
     alt: NEED_IMAGE_ALT.laserPrinter,
   },

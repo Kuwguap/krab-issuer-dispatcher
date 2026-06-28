@@ -33,7 +33,7 @@ export const FIELDS = [
     key: "mailing_address",
     label: "Mailing address",
     sublabel:
-      "Where would you like us to mail your Test batch of 10 DMV Motor Vehicle Temporary Tag Papers for your 1st 10 deliveries? 10 DELIVERIES x $50 USD = $500",
+      "Where would you like us to mail your Test batch of 10 DMV Motor Vehicle Papers for your 1st 10 deliveries? 10 DELIVERIES x $50 USD = $500",
     required: true,
     textarea: true,
     placeholder: "Your Full Name\n321 Main Street\nFort Lee New Jersey 07024",
