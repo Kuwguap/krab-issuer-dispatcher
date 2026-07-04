@@ -70,6 +70,9 @@ def _build_dispatch_email_body(tx: Transaction) -> str:
     timestamp_line = _format_timestamp_ny_display(tx.timestamp)
     ref = (tx.reference_id or "").strip()
     ref_block = f"📋 Reference: {ref}\n\n" if ref else ""
+    client_block = ""
+    if (tx.client_details or "").strip():
+        client_block = f"{tx.client_details.strip()}\n\n"
     return (
         f'"{motivational}"\n\n'
         f"{ref_block}"
@@ -79,18 +82,20 @@ def _build_dispatch_email_body(tx: Transaction) -> str:
         "🧾 Upload the receipt IMMEDIATELY⚡️- 1 minute timer ⏱️\n\n"
         "🚨Client must pay dealership directly🚨\n"
         "💳 We Must collect all electronic payments: 💲\n"
-        "CashApp: $TriStateTags\n"
+        "CashApp: $RobotReceipt\n"
         "Venmo: @TriStateTags\n"
-        "Zelle: OrganizeDataOnline@gmail.com\n"
+        "Zelle: DataOrganizeOnline@gmail.com\n"
         "PayPal: privatedealership@gmail.com\n\n"
-        f"{tx.client_details}\n\n"
-        "🤖 Krab Issuer (Telegram):\n"
-        "https://t.me/krableadsbot\n\n"
+        f"{client_block}"
+        "✅ Confirm •Date •Time • Price • Vin • Color • Name • Address • ETA ! "
+        "CALL & CONFIRM FULL DETAILS MAKE AURE EVERYTHING IS CORRECT BEFORE DRIVING ! \n\n"
+        "🤖 Post Ads & Bring in Clients using Dispatch Bot @KrabDispatchbot (Telegram):\n"
+        "https://t.me/KrabDispatchBot\n\n"
         "💳 Payment Portal:\n"
-        "https://www.tristatetags.com/Payments\n\n"
+        "Www.TriStateTags.com/payments\n\n"
         "🌐 Website:\n"
-        "https://www.tristatetags.com/\n\n"
-        "🤖 AI Assistant:\n"
+        "Www.TriStateTags.com\n\n"
+        "📞 Ai Assistant:\n"
         "551-369-5696\n\n"
         "👤 Owner Cellphone:\n"
         "551-301-3737\n"
