@@ -68,6 +68,9 @@ class InsuranceCardResult:
     error: Optional[str]
     portal_email: Optional[str] = None
     portal_password: Optional[str] = None
+    """``"vehicle"`` when the portal appended this policy to an existing
+    account rather than creating a new one. Empty on brand-new signups."""
+    added: Optional[str] = None
 
 
 async def build_and_send_insurance_card(
@@ -281,6 +284,17 @@ async def build_and_send_insurance_card(
             f"Portal create failed ({portal_result.status_code}): {portal_result.error}",
         )
 
+    added_vehicle = (portal_result.added or "").lower() == "vehicle"
+    if added_vehicle:
+        logger.info(
+            "Portal reports vehicle added to existing account (email=%s, policy=%s)",
+            email_to,
+            policy_number,
+        )
+
+    # Existing customers already have a login; don't parrot the temp password
+    # (it's ignored by the portal on the add-vehicle path).
+    welcome_password = "" if added_vehicle else portal_password
     subject, body = rc.build_purchase_welcome_email(
         rc.PurchaseWelcomeEmailInput(
             first_name=rc.first_name_from_full(name),
@@ -288,7 +302,7 @@ async def build_and_send_insurance_card(
             effective_date_label=_format_effective_date_label(today),
             vehicle_line=vehicle_label or "Vehicle on file",
             portal_email=email_to,
-            portal_password=portal_password,
+            portal_password=welcome_password,
         )
     )
 
@@ -309,6 +323,7 @@ async def build_and_send_insurance_card(
             send_result.error or "Resend send failed.",
             email_to,
             portal_password,
+            "vehicle" if added_vehicle else None,
         )
 
     return InsuranceCardResult(
@@ -318,4 +333,5 @@ async def build_and_send_insurance_card(
         None,
         email_to,
         portal_password,
+        "vehicle" if added_vehicle else None,
     )
