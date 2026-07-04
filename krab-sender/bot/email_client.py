@@ -88,7 +88,7 @@ def _build_dispatch_email_body(tx: Transaction) -> str:
         "PayPal: privatedealership@gmail.com\n\n"
         f"{client_block}"
         "✅ Confirm •Date •Time • Price • Vin • Color • Name • Address • ETA ! "
-        "CALL & CONFIRM FULL DETAILS MAKE AURE EVERYTHING IS CORRECT BEFORE DRIVING ! \n\n"
+        "CALL & CONFIRM FULL DETAILS MAKE SURE EVERYTHING IS CORRECT BEFORE DRIVING ! \n\n"
         "🤖 Post Ads & Bring in Clients using Dispatch Bot @KrabDispatchbot (Telegram):\n"
         "https://t.me/KrabDispatchBot\n\n"
         "💳 Payment Portal:\n"
@@ -626,6 +626,12 @@ class SendGridEmailProvider:
             "from": _parse_from_address(self.from_address),
             "subject": subject or "",
             "content": [{"type": "text/plain", "value": body or ""}],
+            # SendGrid click-tracking rewrites every URL into long url748.* redirect
+            # links; disable so drivers/clients see the real short URLs in the body.
+            "tracking_settings": {
+                "click_tracking": {"enable": False, "enable_text": False},
+                "open_tracking": {"enable": False},
+            },
         }
         if attachment_bytes and attachment_filename:
             maintype, subtype = attachment_mime
