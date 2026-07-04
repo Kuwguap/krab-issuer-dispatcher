@@ -43,6 +43,23 @@ export interface NjInsuranceTeiInput {
   includeInfoPanel?: boolean
 }
 
+export const DEFAULT_CLAIMS_ADDRESS_LINES = [
+  'National Specialty Insurance Company',
+  'PO Box 6400',
+  'Providence, RI 02940-620',
+] as const
+
+function resolveClaimsAddressLines (d: NjInsuranceTeiInput): string[] {
+  if (d.claimsAddress?.trim()) {
+    const lines = d.claimsAddress
+      .split(/\n+/)
+      .map(s => s.trim())
+      .filter(Boolean)
+    if (lines.length) return lines
+  }
+  return [...DEFAULT_CLAIMS_ADDRESS_LINES]
+}
+
 const PAGE_W = 612
 const PAGE_H = 792
 
@@ -121,7 +138,15 @@ const CARD_TEXT_ITEMS: TxItem[] = [
   { x: 288.4, y: 575.6, size: 7.5, bold: true, text: 'ADDRESS FOR NOTIFICATION OF COMMENCEMENT OF MEDICAL TREATMENT:' },
   {
     x: 288.4, y: 564.8, size: 7.5, bold: true,
-    text: d => d.claimsAddress ?? 'Progressive Claims, P.O. Box 512926 Los Angeles, CA 90051-0926',
+    text: d => resolveClaimsAddressLines(d)[0] ?? '',
+  },
+  {
+    x: 288.4, y: 554.8, size: 7.5, bold: true,
+    text: d => resolveClaimsAddressLines(d)[1] ?? '',
+  },
+  {
+    x: 288.4, y: 544.8, size: 7.5, bold: true,
+    text: d => resolveClaimsAddressLines(d)[2] ?? '',
   },
 
   /* Form revision line (bottom-left of card). */

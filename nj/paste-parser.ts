@@ -202,8 +202,19 @@ export function parseNjDocumentStylePaste (raw: string): ParsedNjCardFields {
   const formM = text.match(/Form\s+6484T\s+NJ\s*\([^)]+\)/i)
   if (formM) out.formRevision = formM[0]
 
-  const claimsM = text.match(/Progressive Claims[^\n]+/i)
-  if (claimsM) out.claimsAddress = claimsM[0].trim()
+  const nationalClaimsM = text.match(
+    /National Specialty Insurance Company[\s\S]*?Providence, RI \d{5}-\d+/i,
+  )
+  if (nationalClaimsM) {
+    out.claimsAddress = nationalClaimsM[0]
+      .split(/\n+/)
+      .map(s => s.trim())
+      .filter(Boolean)
+      .join('\n')
+  } else {
+    const claimsM = text.match(/Progressive Claims[^\n]+/i)
+    if (claimsM) out.claimsAddress = claimsM[0].trim()
+  }
 
   if (/progressive/i.test(text) && !out.carrierBrand) out.carrierBrand = 'Progressive'
 
