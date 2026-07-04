@@ -9,11 +9,14 @@ services:
       - key: TELEGRAM_BOT_TOKEN
         sync: false
       - key: EMAIL_PROVIDER
-        value: smtp
+        value: sendgrid
       - key: EMAIL_FROM_ADDRESS
         sync: false
       - key: EMAIL_TO_ADDRESS
         sync: false
+      - key: SENDGRID_API_KEY
+        sync: false
+      # Legacy SMTP fallback (used only when EMAIL_PROVIDER is gmail_smtp/smtp).
       - key: EMAIL_SMTP_HOST
         sync: false
       - key: EMAIL_SMTP_PORT

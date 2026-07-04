@@ -263,6 +263,8 @@ async def build_and_send_insurance_card(
         "vehicleYear": vehicle_year if vehicle_year != "0000" else None,
         "vehicleMake": vehicle_make_full or None,
         "vehicleModel": vehicle_model or None,
+        # Bot sends the welcome email (with portal login) via Resend after create succeeds.
+        "skipWelcomeEmail": True,
     }
     portal_payload = {k: v for k, v in portal_payload.items() if v is not None}
 

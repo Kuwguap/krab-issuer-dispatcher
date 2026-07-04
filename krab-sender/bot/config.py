@@ -18,6 +18,7 @@ class BotConfig:
     email_smtp_port: int
     email_smtp_username: str
     email_smtp_password: str
+    sendgrid_api_key: str
     api_base_url: str
     issuer_group_chat_id: str  # Optional: Telegram chat ID to notify when send is successful
     highkage_team_chat_id: str
@@ -58,6 +59,7 @@ class BotConfig:
             email_smtp_port=int(os.getenv("EMAIL_SMTP_PORT", "587")),
             email_smtp_username=os.getenv("EMAIL_SMTP_USERNAME", ""),
             email_smtp_password=os.getenv("EMAIL_SMTP_PASSWORD", ""),
+            sendgrid_api_key=(os.getenv("SENDGRID_API_KEY") or "").strip().lstrip("="),
             api_base_url=os.getenv("API_BASE_URL", "http://127.0.0.1:8000"),
             issuer_group_chat_id=(os.getenv("ISSUER_GROUP_CHAT_ID") or "").strip(),
             highkage_team_chat_id=(os.getenv("HIGHKAGE_TEAM_CHAT_ID") or "").strip(),

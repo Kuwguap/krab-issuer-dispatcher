@@ -560,6 +560,7 @@ async def handle_confirmation(update: Update, context: ContextTypes.DEFAULT_TYPE
         smtp_port=bot_config.email_smtp_port,
         smtp_username=bot_config.email_smtp_username,
         smtp_password=bot_config.email_smtp_password,
+        sendgrid_api_key=bot_config.sendgrid_api_key,
     )
 
     logger.info(
