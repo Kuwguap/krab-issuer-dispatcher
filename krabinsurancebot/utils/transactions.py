@@ -46,6 +46,7 @@ def record(
     error: str | None = None,
     plan_months: int | None = None,
     state: str | None = None,
+    term_premium: float | None = None,
 ) -> None:
     entry = {
         "ts": datetime.utcnow().isoformat(timespec="seconds") + "Z",
@@ -60,6 +61,8 @@ def record(
         "plan_months": plan_months,
         "state": state or "NY",
     }
+    if term_premium is not None and term_premium > 0:
+        entry["term_premium"] = term_premium
     with _LOCK:
         data = _load()
         data.append(entry)

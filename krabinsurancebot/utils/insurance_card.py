@@ -541,7 +541,7 @@ class CardIssuer:
     as aliases so existing callers don't break.
     """
 
-    carrier_name: str = "169 National Specialty Insurance Company"
+    carrier_name: str = "707 National Specialty"
     agency_phone: str = ""
     agency_name: str = "Serviced by AIPSO-SAIP"
     agency_address_lines: list[str] = field(default_factory=lambda: [

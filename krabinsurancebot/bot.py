@@ -46,12 +46,12 @@ PHASE1_VISION_DONE_CB = "p1_done"
 
 PLAN_OPTIONS = (
     (1, "1 month"),
-    (3, "3 months"),
     (6, "6 months"),
     (12, "12 months"),
 )
 DEFAULT_PLAN_MONTHS = 1
 PLAN_MONTH_VALUES = tuple(m for m, _ in PLAN_OPTIONS)
+PLAN_TERM_PREMIUMS = {1: 100.0, 6: 500.0, 12: 900.0}
 CARD_STATE_OPTIONS = ("NY", "NJ")
 DEFAULT_CARD_STATE = "NY"
 
@@ -66,6 +66,19 @@ def _next_plan_months(current: int) -> int:
 
 def _plan_label(months: int) -> str:
     return next((label for m, label in PLAN_OPTIONS if m == months), f"{months} months")
+
+
+def plan_term_premium(months: int) -> float:
+    """Total term premium sent to the portal as ``annualPremium``."""
+    return PLAN_TERM_PREMIUMS.get(months, PLAN_TERM_PREMIUMS[DEFAULT_PLAN_MONTHS])
+
+
+def format_plan_price(months: int, *, state: str = "NY") -> str:
+    m = 1 if state == "NJ" else months
+    premium = plan_term_premium(m)
+    if premium == int(premium):
+        return f"${int(premium)}"
+    return f"${premium:.2f}"
 
 EDITABLE_FIELDS = {
     "name": "Name",
@@ -349,6 +362,7 @@ def _format_review(
         f"🔠 {html.escape(vin)}",
         f"🪪 {html.escape(dl_id)}",
         f"📅{html.escape(duration)}",
+        f"💰 {html.escape(format_plan_price(1 if selected_state == 'NJ' else selected_months, state=selected_state))}",
         state_label,
     ]
     if email:
@@ -447,6 +461,7 @@ async def _build_card_pdf(
         address_lines = ["UNKNOWN ADDRESS"]
 
     phone_raw = (lead.get("phone_number") or "").strip()
+    term_premium = plan_term_premium(plan_months)
 
     if state == "NJ":
         if not Config.is_nj_configured():
@@ -465,7 +480,7 @@ async def _build_card_pdf(
             email=email,
             first_name=rc.first_name_from_full(name),
             phone=phone_raw or None,
-            annual_premium=_parse_annual_premium(lead) or None,
+            annual_premium=term_premium,
         )
         pdf_result = await asyncio.to_thread(nj.fetch_nj_pdf_preview, nj_payload)
         if not pdf_result.ok or not pdf_result.pdf_bytes:
@@ -528,7 +543,7 @@ async def _build_card_pdf(
         "dl_id": (lead.get("driver_license_id") or "").strip() or None,
         "email": email,
         "phone": phone_raw or None,
-        "annual_premium": _parse_annual_premium(lead),
+        "annual_premium": term_premium,
         "today_iso": today.isoformat(),
         "today_ymd_slash": today.strftime("%Y/%m/%d"),
         "effective_label": effective_label,
@@ -581,6 +596,7 @@ def _format_info_card(c: dict) -> str:
         f"🪪 {html.escape(dl_id)}",
         f"📆 Issue Date {html.escape(issue_mdy)}",
         f"📅{html.escape(duration)}",
+        f"💰 {html.escape(format_plan_price(plan_months, state=state))}",
         f"🛡️ Policy Number <code>{html.escape(c['policy_number'])}</code>",
         state_label,
     ])
@@ -678,7 +694,7 @@ async def _email_with_portal(card: dict) -> tuple[bool, Optional[str], Optional[
         "policyNumber": card["policy_number"],
         "policyEffectiveDate": card["today_iso"],
         "policyExpirationDate": card["expiration_iso"],
-        "annualPremium": card.get("annual_premium") or 0.0,
+        "annualPremium": card.get("annual_premium") or plan_term_premium(int(card.get("plan_months") or 1)),
         "vehicleColor": card.get("color") if card.get("color") and card["color"] != "-" else None,
         "vehicleYear": card["vehicle_year"] or None,
         "vehicleMake": card.get("vehicle_make_full") or None,
@@ -831,11 +847,15 @@ async def cmd_transactions(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         else:
             plan_label = "—"
         card_state = (e.get("state") or "NY").upper()
+        premium_raw = e.get("term_premium")
+        premium_line = ""
+        if isinstance(premium_raw, (int, float)) and premium_raw > 0:
+            premium_line = f"\n💰 ${int(premium_raw) if float(premium_raw) == int(premium_raw) else premium_raw}"
         block = (
             f"{status} <b>{html.escape(ts_display)}</b>\n"
             f"📋 Policy: <code>{html.escape(policy)}</code>\n"
             f"📅 Duration: {html.escape(plan_label)}\n"
-            f"🗺 State: {html.escape(card_state)}\n"
+            f"🗺 State: {html.escape(card_state)}{premium_line}\n"
             f"👤 {html.escape(name)}\n"
             f"🚗 {html.escape(vehicle)}\n"
             f"📧 {html.escape(email_to)}"
@@ -1196,6 +1216,7 @@ async def handle_delivery_callbacks(update: Update, context: ContextTypes.DEFAUL
                 error=error,
                 plan_months=int(card.get("plan_months") or 1),
                 state=card.get("card_state"),
+                term_premium=float(card.get("annual_premium") or 0) or None,
             )
         except Exception:
             logger.exception("Failed to record transaction")
