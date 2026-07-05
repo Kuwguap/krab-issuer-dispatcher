@@ -74,18 +74,12 @@ services:
       - key: TELEGRAM_BOT_TOKEN
         sync: false
       - key: EMAIL_PROVIDER
-        value: gmail_smtp
+        value: sendgrid
       - key: EMAIL_FROM_ADDRESS
         sync: false
       - key: EMAIL_TO_ADDRESS
         sync: false
-      - key: EMAIL_SMTP_HOST
-        value: smtp.gmail.com
-      - key: EMAIL_SMTP_PORT
-        value: "587"
-      - key: EMAIL_SMTP_USERNAME
-        sync: false
-      - key: EMAIL_SMTP_PASSWORD
+      - key: SENDGRID_API_KEY
         sync: false
       - key: ADMIN_PASSWORD
         sync: false

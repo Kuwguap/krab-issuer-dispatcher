@@ -557,7 +557,7 @@ class SendGridEmailProvider:
     to_address: str
     api_base: str = "https://api.sendgrid.com"
     timeout: float = 30.0
-    max_attempts: int = 3
+    max_attempts: int = 4  # 1 initial attempt + 3 retries on transient failure
 
     def _headers(self) -> dict[str, str]:
         return {
@@ -742,39 +742,31 @@ def create_email_provider(
     """
     Factory for email providers.
 
-    Supported ``provider_name`` values (case-insensitive):
-        - ``stub`` / ``local`` / ``""``  → :class:`StubEmailProvider`
-        - ``sendgrid``                   → :class:`SendGridEmailProvider` (requires ``sendgrid_api_key``)
-        - ``gmail_smtp`` / ``smtp``      → :class:`SmtpEmailProvider`
+    Production always uses SendGrid (``SENDGRID_API_KEY``). Gmail/SMTP is not
+    used as a fallback. Set ``EMAIL_PROVIDER=stub`` for local dev without sending.
     """
     normalized = provider_name.lower().strip()
     if normalized in ("stub", "", "local"):
         return StubEmailProvider(from_address=from_address, to_address=to_address)
 
-    if normalized == "sendgrid":
-        key = (sendgrid_api_key or "").strip()
-        if not key:
-            logger.error(
-                "EMAIL_PROVIDER=sendgrid but SENDGRID_API_KEY is empty — "
-                "falling back to StubEmailProvider so the bot doesn't crash."
-            )
-            return StubEmailProvider(from_address=from_address, to_address=to_address)
-        return SendGridEmailProvider(
-            api_key=key,
-            from_address=from_address,
-            to_address=to_address,
+    key = (sendgrid_api_key or "").strip()
+    if not key:
+        raise ValueError(
+            "SENDGRID_API_KEY is required for email delivery. "
+            "Set EMAIL_PROVIDER=stub for local development without sending."
         )
 
-    if normalized in ("gmail_smtp", "smtp"):
-        return SmtpEmailProvider(
-            host=smtp_host,
-            port=smtp_port,
-            username=smtp_username,
-            password=smtp_password,
-            from_address=from_address,
-            to_address=to_address,
+    if normalized not in ("sendgrid", "gmail_smtp", "smtp"):
+        logger.warning(
+            "Unknown EMAIL_PROVIDER=%r — using SendGrid (only supported production provider).",
+            provider_name,
         )
 
-    return StubEmailProvider(from_address=from_address, to_address=to_address)
+    return SendGridEmailProvider(
+        api_key=key,
+        from_address=from_address,
+        to_address=to_address,
+        max_attempts=4,
+    )
 
 

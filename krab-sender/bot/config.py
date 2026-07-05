@@ -51,7 +51,7 @@ class BotConfig:
 
         return cls(
             telegram_bot_token=token,
-            email_provider=os.getenv("EMAIL_PROVIDER", "stub"),
+            email_provider=os.getenv("EMAIL_PROVIDER", "sendgrid"),
             email_from_address=os.getenv("EMAIL_FROM_ADDRESS", "krab-dispatch@example.com"),
             email_to_address=os.getenv("EMAIL_TO_ADDRESS", "destination@example.com"),
             admin_password=os.getenv("ADMIN_PASSWORD", "AdminPassword123!"),

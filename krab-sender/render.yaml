@@ -16,7 +16,7 @@ services:
         sync: false
       - key: SENDGRID_API_KEY
         sync: false
-      # Legacy SMTP fallback (used only when EMAIL_PROVIDER is gmail_smtp/smtp).
+      # SMTP vars unused — email is SendGrid-only. Kept for backwards compat in dashboard.
       - key: EMAIL_SMTP_HOST
         sync: false
       - key: EMAIL_SMTP_PORT
