@@ -485,16 +485,9 @@ def format_suggested_vehicle_name(model_year: str, make: str, model: str) -> str
 
 
 def format_insured_fs20_name(insured_name_upper: str) -> str:
-    """Compact card name: ``LAST F`` (last name + first initial, space-separated).
-
-    The full legal name still goes into the AAMVA payload (DCS/DAC). The printed
-    card never uses a comma here — see the FS-20 layout, which keeps the printed
-    text comma-free per request.
-    """
-    parts = split_insured_name(insured_name_upper)
-    last = parts["dcs"]
-    first_initial = parts["dac"][0] if parts["dac"] else ""
-    return f"{last} {first_initial}" if first_initial else last
+    """Printed FS-20 insured name: full legal name, comma-free."""
+    name = re.sub(r"\s+", " ", (insured_name_upper or "").strip())
+    return re.sub(r"\s*,\s*", " ", name).strip().upper()
 
 
 # ─── Page + card geometry (port of lib/pdf/ny-insurance-id-card.ts) ──────────
@@ -569,7 +562,7 @@ class InsuranceCardInput:
     vehicle_make_short: str          # up to 5 chars uppercase
     vin: str
     insured_name_upper: str          # full legal name, for AAMVA payload
-    insured_fs20_name: str           # compact "LAST,F" for printed card
+    insured_fs20_name: str           # full name printed on the card (comma-free)
     insured_address_lines: list[str]
     daq: Optional[str] = None
     issuer: CardIssuer = field(default_factory=CardIssuer)

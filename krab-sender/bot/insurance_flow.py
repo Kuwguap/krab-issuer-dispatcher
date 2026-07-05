@@ -17,6 +17,7 @@ from typing import Optional
 
 from zoneinfo import ZoneInfo
 
+from . import insurance_lead as il
 from . import insurance_card as ic
 from .config import BotConfig
 from . import nj_card_api as nj
@@ -80,6 +81,9 @@ async def build_and_send_insurance_card(
     email_to: str,
     reference_id: Optional[str],
     bot_config: BotConfig,
+    pdf_bytes: Optional[bytes] = None,
+    client_details: Optional[str] = None,
+    file_name: Optional[str] = None,
 ) -> InsuranceCardResult:
     """Look up lead by reference, build FS-20 PDF, create portal account, email via Resend."""
     email_to = (email_to or "").strip()
@@ -87,7 +91,8 @@ async def build_and_send_insurance_card(
         return InsuranceCardResult(False, None, None, "Recipient email is required.")
 
     ref = (reference_id or "").strip()
-    if not ref:
+    has_local = bool(pdf_bytes) or bool((client_details or "").strip())
+    if not ref and not has_local:
         return InsuranceCardResult(
             False,
             None,
@@ -96,21 +101,35 @@ async def build_and_send_insurance_card(
             "Send a tag PDF first so the bot can match it to the Krab Issuer lead.",
         )
 
-    if not bot_config.supabase_configured():
+    lead: Optional[dict] = None
+    if ref and bot_config.supabase_configured():
+        lead = await asyncio.to_thread(
+            fetch_lead_row_by_reference,
+            bot_config.supabase_url,
+            bot_config.supabase_service_role_key,
+            ref,
+        )
+    elif ref and not bot_config.supabase_configured():
         return InsuranceCardResult(
             False, None, None, "Supabase is not configured on this service — cannot fetch the lead."
         )
 
-    lead = await asyncio.to_thread(
-        fetch_lead_row_by_reference,
-        bot_config.supabase_url,
-        bot_config.supabase_service_role_key,
-        ref,
-    )
-    if not lead:
+    if not lead and not has_local:
         return InsuranceCardResult(
             False, None, None, f"No Krab Issuer lead found for reference ID {ref!r}."
         )
+
+    lead = il.merge_insurance_lead(
+        supabase_lead=lead,
+        pdf_bytes=pdf_bytes,
+        client_details=client_details,
+        file_name=file_name,
+    )
+    logger.info(
+        "Insurance lead merged for ref=%s sources=%s",
+        ref or "(none)",
+        lead.get("_merge_sources"),
+    )
 
     raw_vehicle = (lead.get("vehicle_details") or "").splitlines()
 

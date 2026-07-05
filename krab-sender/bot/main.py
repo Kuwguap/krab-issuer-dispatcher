@@ -657,6 +657,9 @@ async def handle_confirmation(update: Update, context: ContextTypes.DEFAULT_TYPE
         context.user_data["insurance_pending"] = {
             "recipient_name": recipient_name,
             "reference_id": ref_for_msg,
+            "pdf_bytes": bytes(file_bytes),
+            "client_details": client_details_text,
+            "file_name": pending_doc["file_name"],
         }
         context.user_data["insurance_received"] = False
 
@@ -857,6 +860,9 @@ async def handle_insurance_credentials(update: Update, context: ContextTypes.DEF
         email_to=email_to,
         reference_id=ref,
         bot_config=bot_config,
+        pdf_bytes=pending.get("pdf_bytes"),
+        client_details=pending.get("client_details"),
+        file_name=pending.get("file_name"),
     )
 
     if result.ok:
