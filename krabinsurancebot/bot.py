@@ -1052,9 +1052,9 @@ async def handle_edit_pick(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     await q.answer()
     data = q.data or ""
     chat_id = q.message.chat.id
+    lead = context.user_data.get("lead") or {}
 
     if data == "ef_back":
-        lead = context.user_data.get("lead") or {}
         months = _current_plan_months(context)
         card_state = _current_card_state(context, lead)
         await _send_clean(
