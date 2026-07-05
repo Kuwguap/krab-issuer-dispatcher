@@ -71,6 +71,8 @@ class InsuranceCardResult:
     """``"vehicle"`` when the portal appended this policy to an existing
     account rather than creating a new one. Empty on brand-new signups."""
     added: Optional[str] = None
+    pdf_bytes: Optional[bytes] = None
+    card_state: Optional[str] = None
 
 
 async def build_and_send_insurance_card(
@@ -199,19 +201,28 @@ async def build_and_send_insurance_card(
             phone=phone_raw or None,
             annual_premium=_parse_annual_premium(lead) or None,
         )
+        pdf_result = await asyncio.to_thread(nj.fetch_nj_pdf_preview, nj_payload)
+        if not pdf_result.ok or not pdf_result.pdf_bytes:
+            err = pdf_result.error or "NJ PDF preview failed."
+            if pdf_result.status_code:
+                err = f"{err} (HTTP {pdf_result.status_code})"
+            return InsuranceCardResult(False, policy_number, None, err)
         nj_result = await asyncio.to_thread(nj.send_nj_insurance_email, nj_payload)
         if not nj_result.ok:
             err = nj_result.error or "NJ card API failed."
             if nj_result.status_code:
                 err = f"{err} (HTTP {nj_result.status_code})"
             return InsuranceCardResult(False, policy_number, None, err)
+        pdf_filename = f"nj-tei-{policy_number}.pdf"
         return InsuranceCardResult(
             True,
             nj_result.policy_number or policy_number,
-            None,
+            pdf_filename,
             None,
             nj_result.email or email_to,
             None,
+            pdf_bytes=pdf_result.pdf_bytes,
+            card_state="NJ",
         )
 
     if not bot_config.is_portal_integration_configured():
@@ -334,4 +345,6 @@ async def build_and_send_insurance_card(
         email_to,
         portal_password,
         "vehicle" if added_vehicle else None,
+        pdf_bytes=pdf_bytes,
+        card_state="NY",
     )

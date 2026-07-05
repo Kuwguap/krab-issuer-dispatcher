@@ -123,6 +123,68 @@ def build_nj_email_payload(
     return payload
 
 
+@dataclass
+class NJPdfResult:
+    ok: bool
+    status_code: int
+    pdf_bytes: Optional[bytes] = None
+    error: Optional[str] = None
+
+
+def fetch_nj_pdf_preview(payload: Dict[str, Any]) -> NJPdfResult:
+    """POST JSON to ``/api/insurance-card-nj`` for raw PDF bytes (no email)."""
+    try:
+        from .config import Config
+    except Exception:
+        return NJPdfResult(False, 503, error="Config not available.")
+
+    base = (getattr(Config, "BARCODE_APP_BASE_URL", None) or "").strip().rstrip("/")
+    if not base:
+        return NJPdfResult(
+            False,
+            503,
+            error="BARCODE_APP_BASE_URL is not configured on the bot.",
+        )
+
+    body = {k: v for k, v in payload.items() if k != "email"}
+    body["asBase64"] = True
+
+    url = f"{base}/api/insurance-card-nj"
+    headers = {"Content-Type": "application/json"}
+
+    resp: requests.Response | None = None
+    backoff = _5XX_BACKOFF_START_S
+    for attempt in range(_5XX_RETRY_MAX + 1):
+        try:
+            resp = requests.post(url, json=body, headers=headers, timeout=120)
+        except requests.RequestException as exc:
+            logger.exception("NJ PDF preview request failed")
+            return NJPdfResult(False, 0, error=str(exc))
+        if resp.status_code < 500:
+            break
+        if attempt < _5XX_RETRY_MAX:
+            time.sleep(backoff)
+            backoff *= 2
+
+    assert resp is not None
+    if resp.status_code != 200:
+        return NJPdfResult(False, resp.status_code, error=_parse_error(resp))
+    try:
+        data = resp.json()
+    except Exception:
+        return NJPdfResult(False, 200, error="Invalid JSON in PDF response.")
+    if not isinstance(data, dict) or not data.get("ok"):
+        return NJPdfResult(False, resp.status_code, error=_parse_error(resp))
+    b64 = data.get("base64") or ""
+    try:
+        import base64 as _b64
+
+        pdf_bytes = _b64.b64decode(b64)
+    except Exception as exc:
+        return NJPdfResult(False, 200, error=f"Failed to decode PDF: {exc}")
+    return NJPdfResult(True, 200, pdf_bytes=pdf_bytes)
+
+
 def send_nj_insurance_email(payload: Dict[str, Any]) -> NJCardResult:
     """POST JSON to ``/api/insurance-card-nj/email`` with 5xx-only retry."""
     try:

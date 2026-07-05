@@ -7,6 +7,7 @@ import os
 import uuid
 from datetime import datetime, timedelta, timezone
 from enum import IntEnum, auto
+from io import BytesIO
 from pathlib import Path
 from typing import List, Dict
 
@@ -805,6 +806,28 @@ async def _insurance_timeout_job(ctx: ContextTypes.DEFAULT_TYPE) -> None:
         pass
 
 
+async def _send_insurance_card_document(
+    update: Update,
+    *,
+    pdf_bytes: bytes,
+    policy_number: str,
+    card_state: str | None,
+) -> None:
+    """Attach the insurance card PDF to the Telegram chat."""
+    if not update.effective_chat or not pdf_bytes:
+        return
+    prefix = "nj-tei" if card_state == "NJ" else "ny-fs20"
+    policy = (policy_number or "card").strip() or "card"
+    fname = f"{prefix}-{policy}.pdf"
+    bio = BytesIO(pdf_bytes)
+    bio.name = fname
+    await update.get_bot().send_document(
+        chat_id=update.effective_chat.id,
+        document=bio,
+        filename=fname,
+    )
+
+
 async def handle_insurance_credentials(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """Accept insurance email (1 line) and forward via email."""
     pending = context.user_data.get("insurance_pending")
@@ -826,7 +849,7 @@ async def handle_insurance_credentials(update: Update, context: ContextTypes.DEF
     from .insurance_flow import build_and_send_insurance_card
 
     await update.message.reply_text(
-        f"⏳ Building NY FS-20 insurance card and emailing {email_to}…",
+        f"⏳ Building insurance card and emailing {email_to}…",
         parse_mode=None,
     )
 
@@ -844,6 +867,16 @@ async def handle_insurance_credentials(update: Update, context: ContextTypes.DEF
                 job.schedule_removal()
         except Exception:
             pass
+        if result.pdf_bytes:
+            try:
+                await _send_insurance_card_document(
+                    update,
+                    pdf_bytes=result.pdf_bytes,
+                    policy_number=result.policy_number or "card",
+                    card_state=result.card_state,
+                )
+            except Exception:
+                logger.exception("Failed to send insurance card PDF to chat")
         quote = _get_bot_motivational()
         policy_line = (
             f"📋 Policy: {result.policy_number}\n"
@@ -858,6 +891,7 @@ async def handle_insurance_credentials(update: Update, context: ContextTypes.DEF
             )
         await update.message.reply_text(
             f"✅ Insurance card sent\n\n"
+            f"📎 Insurance card PDF attached above\n"
             f"🛡️ Insurance card emailed to: {email_to}\n"
             f"{policy_line}"
             f"📧 Delivered to {email_to}"
