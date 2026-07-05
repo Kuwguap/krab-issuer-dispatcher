@@ -700,15 +700,15 @@ def _draw_card(c, *, card_top: float, input_: InsuranceCardInput, card_barcode_p
 
     # ── Left/centre data + labels (TEXT_ITEMS in TS) ───────────────────────
     issuer = input_.issuer
-    issuer_co = (issuer.carrier_name or "484 NEW SOUTH INS.CO.").strip()
-    issuer_first = _first_word(issuer_co) or "484"
-    issuer_rest = _rest_after_first_word(issuer_co) or "NEW SOUTH INS.CO."
-    agency_name = (issuer.agency_name or "COYNE INSURANCE AGENCY").strip()
+    issuer_co = (issuer.carrier_name or "707 National Specialty Insurance Company").strip()
+    issuer_first = _first_word(issuer_co) or "707"
+    issuer_rest = _rest_after_first_word(issuer_co) or "National Specialty Insurance Company"
+    agency_name = (issuer.agency_name or "Serviced by AIPSO-SAIP").strip()
     # No fallback for phone — blank explicitly means "don't print a number".
     agency_phone = (issuer.agency_phone or "").strip()
     agency_lines = [str(l).strip() for l in (issuer.agency_address_lines or []) if str(l).strip()]
-    agency_l1 = agency_lines[0] if len(agency_lines) >= 1 else "146 COLUMBIA TURNPIKE"
-    agency_l2 = agency_lines[1] if len(agency_lines) >= 2 else "RENSSELAER NY 12144"
+    agency_l1 = agency_lines[0] if len(agency_lines) >= 1 else "PO Box 6400"
+    agency_l2 = agency_lines[1] if len(agency_lines) >= 2 else "Providence, RI 02940-6200"
 
     def _strip_commas(s: str) -> str:
         return re.sub(r"\s*,\s*", " ", s).strip()

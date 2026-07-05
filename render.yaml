@@ -342,13 +342,13 @@ services:
       - key: TRISTATECOVERAGE_API_BASE
         value: https://tristatecoverage.com
       - key: INSURANCE_ISSUER_NAME
-        sync: false
+        value: Serviced by AIPSO-SAIP
       - key: INSURANCE_ISSUER_PHONE
         sync: false
       - key: INSURANCE_ISSUER_ADDRESS
-        sync: false
+        value: PO Box 6400|Providence, RI 02940-6200
       - key: INSURANCE_CARRIER_NAME
-        sync: false
+        value: 707 National Specialty Insurance Company
       - key: VIN_PROVIDER
         value: nhtsa
       - key: API_NINJAS_API_KEY

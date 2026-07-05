@@ -23,14 +23,18 @@ class Config:
     )
     INTEGRATIONS_API_KEY = (os.getenv("INTEGRATIONS_API_KEY") or "").strip().lstrip("=") or None
 
-    INSURANCE_ISSUER_NAME = (os.getenv("INSURANCE_ISSUER_NAME") or "Serviced by AIPSO-SAIP").strip()
+    # NY FS-20 issuer block — fixed (matches NJ TEI layout, carrier code 707).
+    # Intentionally NOT read from env: stale Render dashboard values were still
+    # printing 746 American Road / Dearborn after code defaults changed.
+    NY_CARRIER_NAME = "707 National Specialty Insurance Company"
+    NY_AGENCY_NAME = "Serviced by AIPSO-SAIP"
+    NY_AGENCY_ADDRESS_LINES = ("PO Box 6400", "Providence, RI 02940-6200")
     INSURANCE_ISSUER_PHONE = (os.getenv("INSURANCE_ISSUER_PHONE") or "").strip()
-    INSURANCE_ISSUER_ADDRESS = (
-        os.getenv("INSURANCE_ISSUER_ADDRESS") or "PO Box 6400|Providence, RI 02940-6200"
-    ).strip()
-    INSURANCE_CARRIER_NAME = (
-        os.getenv("INSURANCE_CARRIER_NAME") or "707 National Specialty Insurance Company"
-    ).strip()
+
+    # Legacy aliases — always resolve to the fixed NY issuer above.
+    INSURANCE_ISSUER_NAME = NY_AGENCY_NAME
+    INSURANCE_ISSUER_ADDRESS = "|".join(NY_AGENCY_ADDRESS_LINES)
+    INSURANCE_CARRIER_NAME = NY_CARRIER_NAME
 
     VIN_PROVIDER = (os.getenv("VIN_PROVIDER") or "nhtsa").strip().lower()
     API_NINJAS_API_KEY = (os.getenv("API_NINJAS_API_KEY") or "").strip() or None

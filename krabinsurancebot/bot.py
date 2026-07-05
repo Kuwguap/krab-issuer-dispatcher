@@ -504,12 +504,10 @@ async def _build_card_pdf(
             return None, "Email not configured (RESEND_API_KEY and RESEND_FROM)."
         policy_number = ic.generate_policy_number()
         issuer = ic.CardIssuer(
-            carrier_name=Config.INSURANCE_CARRIER_NAME,
+            carrier_name=Config.NY_CARRIER_NAME,
             agency_phone=Config.INSURANCE_ISSUER_PHONE,
-            agency_name=Config.INSURANCE_ISSUER_NAME,
-            agency_address_lines=[
-                ln.strip() for ln in (Config.INSURANCE_ISSUER_ADDRESS or "").split("|") if ln.strip()
-            ],
+            agency_name=Config.NY_AGENCY_NAME,
+            agency_address_lines=list(Config.NY_AGENCY_ADDRESS_LINES),
         )
         pdf_input = ic.InsuranceCardInput(
             policy_number=policy_number,
