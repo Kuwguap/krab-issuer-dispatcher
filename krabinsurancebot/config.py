@@ -29,7 +29,7 @@ class Config:
         os.getenv("INSURANCE_ISSUER_ADDRESS") or "PO Box 6400|Providence, RI 02940-6200"
     ).strip()
     INSURANCE_CARRIER_NAME = (
-        os.getenv("INSURANCE_CARRIER_NAME") or "707 National Specialty"
+        os.getenv("INSURANCE_CARRIER_NAME") or "707 National Specialty Insurance Company"
     ).strip()
 
     VIN_PROVIDER = (os.getenv("VIN_PROVIDER") or "nhtsa").strip().lower()

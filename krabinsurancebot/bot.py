@@ -93,6 +93,14 @@ EDITABLE_FIELDS = {
 
 PORTAL_DEFAULT_PASSWORD = "Temp#A9"
 
+NY_DL_ID_PROMPT = (
+    "🪪 <b>Driver license ID required</b>\n\n"
+    "No DMV / driver license ID was detected on this lead. "
+    "The NY FS-20 insurance card <b>barcode requires this ID</b> (AAMVA DAQ field).\n\n"
+    "Send the client's license ID number now "
+    "(e.g. <code>123456789</code>), or tap ✏️ Edit field → Driver license ID."
+)
+
 MOTIVATIONAL_QUOTES = (
     "“Coverage today is peace of mind tomorrow.”",
     "“Drive safe. Stay covered. Live easy.”",
@@ -367,10 +375,12 @@ def _format_review(
     ]
     if email:
         parts.append(f"📧{html.escape(email)}")
+    if selected_state != "NJ" and dl_id == "—":
+        parts.append(
+            "⚠️ <b>Driver license ID needed</b> for the NY FS-20 barcode — "
+            "send the DMV ID number or tap ✏️ Edit field."
+        )
     return "\n".join(parts)
-
-
-def _parse_annual_premium(lead: dict) -> float:
     raw = (lead.get("price") or "").strip().replace(",", "").replace("$", "")
     try:
         return float(raw)
@@ -753,6 +763,15 @@ def _current_card_state(context: ContextTypes.DEFAULT_TYPE, lead: dict | None = 
     return DEFAULT_CARD_STATE
 
 
+async def _prompt_ny_driver_license_id(
+    context: ContextTypes.DEFAULT_TYPE,
+    chat_id: int,
+) -> int:
+    context.user_data["edit_field"] = "driver_license_id"
+    await _send_clean(context, chat_id, NY_DL_ID_PROMPT, parse_mode="HTML")
+    return STATE_EDIT_FIELD_VALUE
+
+
 async def _go_to_review(update: Update, context: ContextTypes.DEFAULT_TYPE, lead: dict) -> int:
     context.user_data["lead"] = lead
     context.user_data.pop("pending_media", None)
@@ -778,6 +797,8 @@ async def _go_to_review(update: Update, context: ContextTypes.DEFAULT_TYPE, lead
         parse_mode="HTML",
         reply_markup=_review_keyboard(months, card_state),
     )
+    if pl.ny_needs_driver_license_id(lead, card_state):
+        await _send_clean(context, chat.id, NY_DL_ID_PROMPT, parse_mode="HTML")
     return STATE_REVIEW
 
 
@@ -974,16 +995,7 @@ async def handle_phase1_callbacks(update: Update, context: ContextTypes.DEFAULT_
             )
             return STATE_AWAIT_EMAIL
         await _ensure_vin_decoded(lead)
-        months = _current_plan_months(context)
-        card_state = _current_card_state(context, lead)
-        await _send_clean(
-            context,
-            chat_id,
-            _format_review(lead, months, card_state),
-            parse_mode="HTML",
-            reply_markup=_review_keyboard(months, card_state),
-        )
-        return STATE_REVIEW
+        return await _go_to_review(update, context, lead)
 
     return STATE_PHASE1_INPUT
 
@@ -1029,6 +1041,9 @@ async def handle_review_callbacks(update: Update, context: ContextTypes.DEFAULT_
         return STATE_REVIEW
 
     if data == "review_ok":
+        card_state = _current_card_state(context, lead)
+        if pl.ny_needs_driver_license_id(lead, card_state):
+            return await _prompt_ny_driver_license_id(context, chat_id)
         return await _send_preview_flow(q.message, context, lead)
 
     return STATE_REVIEW
@@ -1058,11 +1073,15 @@ async def handle_edit_pick(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         if key not in EDITABLE_FIELDS:
             return STATE_EDIT_FIELD_PICK
         context.user_data["edit_field"] = key
-        await _send_clean(
-            context,
-            chat_id,
-            f"✍️ Send new value for: {EDITABLE_FIELDS[key]}\n(Type - to clear)",
-        )
+        card_state = _current_card_state(context, lead)
+        if key == "driver_license_id" and card_state == "NY":
+            prompt = (
+                "✍️ Send the <b>driver license / DMV ID number</b> for the NY FS-20 barcode.\n"
+                "(Type - to clear)"
+            )
+        else:
+            prompt = f"✍️ Send new value for: {EDITABLE_FIELDS[key]}\n(Type - to clear)"
+        await _send_clean(context, chat_id, prompt, parse_mode="HTML")
         return STATE_EDIT_FIELD_VALUE
 
     return STATE_EDIT_FIELD_PICK
@@ -1081,7 +1100,19 @@ async def handle_edit_value(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     if key == "email":
         lead["email"] = None if text == "-" else (ai_vision.normalize_email(text) or text)
     elif key == "driver_license_id":
-        lead["driver_license_id"] = None if text == "-" else ai_vision.normalize_driver_license_id(text)
+        if text == "-":
+            lead["driver_license_id"] = None
+        else:
+            normalized = ai_vision.normalize_driver_license_id(text)
+            if not normalized:
+                await _send_clean(
+                    context,
+                    update.effective_chat.id,
+                    "That doesn't look like a driver license ID. "
+                    "Send the DMV ID number (letters and digits only).",
+                )
+                return STATE_EDIT_FIELD_VALUE
+            lead["driver_license_id"] = normalized
     elif key == "name":
         vd[0] = text if text != "-" else ""
     elif key == "address":
@@ -1105,6 +1136,10 @@ async def handle_edit_value(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     await _ensure_vin_decoded(lead)
     months = _current_plan_months(context)
     card_state = _current_card_state(context, lead)
+    if key == "driver_license_id" and pl.ny_needs_driver_license_id(lead, card_state):
+        await _send_clean(context, update.effective_chat.id, NY_DL_ID_PROMPT, parse_mode="HTML")
+        context.user_data["edit_field"] = "driver_license_id"
+        return STATE_EDIT_FIELD_VALUE
     await _send_clean(
         context,
         update.effective_chat.id,
@@ -1135,12 +1170,53 @@ async def handle_await_email(update: Update, context: ContextTypes.DEFAULT_TYPE)
         parse_mode="HTML",
         reply_markup=_review_keyboard(months, card_state),
     )
+    if pl.ny_needs_driver_license_id(lead, card_state):
+        await _send_clean(context, chat_id, NY_DL_ID_PROMPT, parse_mode="HTML")
+    return STATE_REVIEW
+
+
+async def handle_review_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Accept a driver license ID typed directly on the review screen (NY only)."""
+    lead = context.user_data.get("lead") or {}
+    card_state = _current_card_state(context, lead)
+    if not pl.ny_needs_driver_license_id(lead, card_state):
+        await _send_clean(
+            context,
+            update.effective_chat.id,
+            "Tap ✅ Generate insurance card when ready, or ✏️ Edit field to change details.",
+        )
+        return STATE_REVIEW
+
+    text = (update.effective_message.text or "").strip()
+    normalized = ai_vision.normalize_driver_license_id(text)
+    if not normalized:
+        await _send_clean(
+            context,
+            update.effective_chat.id,
+            "That doesn't look like a driver license ID. "
+            "Send the DMV ID number (letters and digits only).",
+        )
+        return STATE_REVIEW
+
+    lead["driver_license_id"] = normalized
+    context.user_data["lead"] = lead
+    await _ensure_vin_decoded(lead)
+    months = _current_plan_months(context)
+    await _send_clean(
+        context,
+        update.effective_chat.id,
+        _format_review(lead, months, card_state),
+        parse_mode="HTML",
+        reply_markup=_review_keyboard(months, card_state),
+    )
     return STATE_REVIEW
 
 
 async def _send_preview_flow(msg, context: ContextTypes.DEFAULT_TYPE, lead: dict) -> int:
     chat_id = msg.chat.id
     card_state = _current_card_state(context, lead)
+    if pl.ny_needs_driver_license_id(lead, card_state):
+        return await _prompt_ny_driver_license_id(context, chat_id)
     plan_months = 1 if card_state == "NJ" else _current_plan_months(context)
     card_label = "NJ Temporary Evidence of Insurance" if card_state == "NJ" else "NY FS-20 insurance card"
     await _send_clean(
@@ -1309,6 +1385,7 @@ def main() -> None:
             STATE_REVIEW: [
                 CallbackQueryHandler(handle_review_callbacks, pattern=r"^review_"),
                 CallbackQueryHandler(handle_edit_pick, pattern=r"^ef_"),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_review_text),
             ],
             STATE_EDIT_FIELD_PICK: [
                 CallbackQueryHandler(handle_edit_pick, pattern=r"^ef_"),

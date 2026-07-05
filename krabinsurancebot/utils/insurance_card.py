@@ -218,8 +218,8 @@ def add_months(d: date, months: int) -> date:
 def generate_policy_number() -> str:
     """``ABP63<8 digits>`` (e.g. ``ABP6300173880``).
 
-    Matches the National Specialty Insurance Company (NAIC 169) numbering
-    style used across both NY FS-20 and NJ Temporary Evidence cards.
+    Matches the National Specialty Insurance Company numbering style used
+    across both NY FS-20 and NJ Temporary Evidence cards.
     """
     n = random.randint(0, 99_999_999)
     return f"ABP63{n:08d}"
@@ -534,7 +534,7 @@ class CardIssuer:
     as aliases so existing callers don't break.
     """
 
-    carrier_name: str = "707 National Specialty"
+    carrier_name: str = "707 National Specialty Insurance Company"
     agency_phone: str = ""
     agency_name: str = "Serviced by AIPSO-SAIP"
     agency_address_lines: list[str] = field(default_factory=lambda: [

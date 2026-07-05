@@ -337,3 +337,14 @@ def parse_from_media_parts(parts: list[tuple[bytes, str]]) -> Optional[dict[str,
     if not structured:
         return None
     return _parse_structured_output(structured)
+
+
+def has_driver_license_id(lead: dict[str, Any]) -> bool:
+    """True when the lead has a usable DMV / driver license ID."""
+    raw = (lead.get("driver_license_id") or "").strip()
+    return bool(ai_vision.normalize_driver_license_id(raw))
+
+
+def ny_needs_driver_license_id(lead: dict[str, Any], card_state: str) -> bool:
+    """NY FS-20 barcodes require a real DAQ / license ID."""
+    return (card_state or "").strip().upper() == "NY" and not has_driver_license_id(lead)
