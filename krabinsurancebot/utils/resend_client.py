@@ -59,6 +59,8 @@ class PurchaseWelcomeEmailInput:
     portal_email: str
     portal_password: str
     portal_website: str = "TriStateCoverage.com/login"
+    """When true, always render the Portal Login block (TriStateCoverage delivery)."""
+    include_portal_login: bool = False
 
 
 def _format_effective_date(d: date) -> str:
@@ -69,9 +71,9 @@ def _format_effective_date(d: date) -> str:
 def build_purchase_welcome_email(input_: PurchaseWelcomeEmailInput) -> tuple[str, str]:
     """Return (subject, body) for the policy-issued welcome email.
 
-    The Portal Login block is only rendered when both a portal email and
-    a portal password are provided — "PDF only" deliveries pass an empty
-    password and get a card summary email without any portal credentials.
+    Portal Login is included when ``include_portal_login`` is set (operator chose
+    "Send TriStateCoverage login") or when both email and password are provided.
+    PDF-only deliveries pass an empty password and omit the portal block.
     PDF is attached separately via Resend.
     """
     subject = f"Your policy is active — {input_.policy_number}"
@@ -79,13 +81,15 @@ def build_purchase_welcome_email(input_: PurchaseWelcomeEmailInput) -> tuple[str
     portal_password = (input_.portal_password or "").strip()
     portal_site = (input_.portal_website or "TriStateCoverage.com/login").strip()
 
-    if portal_email and portal_password:
+    show_portal = input_.include_portal_login or bool(portal_email and portal_password)
+    if show_portal and portal_email:
+        pwd = portal_password or "Temp#A9"
         portal_block = (
             "Log into your TRISTATECOVERAGE account anytime to manage your policy online.\n\n\n\n"
             "Portal Login:\n"
             f"Website: {portal_site}\n"
             f"Email: {portal_email}\n"
-            f"Password: {portal_password}\n\n\n\n"
+            f"Password: {pwd}\n\n\n\n"
         )
     else:
         portal_block = ""
@@ -111,7 +115,9 @@ def build_purchase_welcome_email(input_: PurchaseWelcomeEmailInput) -> tuple[str
         "Thank you again for choosing Tri State Coverage.\n\n"
         "Sincerely,\n\n\n"
         "Tri State Coverage Team\n\n"
+        "www.TriStateCoverage.com\n\n"
         "Tri State Coverage Inc\n"
+        "Thank you again for choosing Tri State Coverage.\n"
     )
     return subject, body
 

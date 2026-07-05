@@ -657,26 +657,11 @@ async def _email_pdf_only(card: dict) -> tuple[bool, Optional[str]]:
 async def _email_with_portal(card: dict) -> tuple[bool, Optional[str], Optional[str]]:
     """Email + create TriStateCoverage portal account. Returns (ok, error, portal_warning).
 
-    When the customer's email already has an account, the portal now adds a
-    second vehicle+policy to it (``added == "vehicle"``) instead of failing.
-    In that case ``portal_warning`` explains the outcome so the operator can
-    tell the customer their existing password still works.
+    NJ and NY both use the same Resend welcome email with the Portal Login block
+    so operators always get the TriStateCoverage credentials in the message.
     """
-    from utils import nj_card_api as nj
     from utils import resend_client as rc
     from utils import tristatecoverage_api as tsc
-
-    if card["card_state"] == "NJ":
-        nj_payload = card.get("nj_payload")
-        if not nj_payload:
-            return False, "Internal: missing NJ payload.", None
-        nj_result = await asyncio.to_thread(nj.send_nj_insurance_email, nj_payload)
-        if not nj_result.ok:
-            err = nj_result.error or "NJ card API failed."
-            if nj_result.status_code:
-                err = f"{err} (HTTP {nj_result.status_code})"
-            return False, err, None
-        return True, None, nj_result.portal_warning
 
     if not Config.is_portal_integration_configured():
         return False, "Portal integration not configured (INTEGRATIONS_API_KEY).", None
@@ -699,7 +684,6 @@ async def _email_with_portal(card: dict) -> tuple[bool, Optional[str], Optional[
         "vehicleYear": card["vehicle_year"] or None,
         "vehicleMake": card.get("vehicle_make_full") or None,
         "vehicleModel": card.get("vehicle_model") or None,
-        # Bot delivers the welcome email itself via Resend below.
         "skipWelcomeEmail": True,
     }
     portal_payload = {k: v for k, v in portal_payload.items() if v is not None}
@@ -718,9 +702,6 @@ async def _email_with_portal(card: dict) -> tuple[bool, Optional[str], Optional[
 
     today = datetime.fromisoformat(card["today_iso"]).date()
     effective_date_label = f"{today.strftime('%B')} {today.day}, {today.year}"
-    # For a returning customer, hide the temp password in the welcome email
-    # (they already have their own login); the fresh-signup flow still sees it.
-    welcome_password = "" if added_vehicle else portal_password
     subject, body = rc.build_purchase_welcome_email(
         rc.PurchaseWelcomeEmailInput(
             first_name=rc.first_name_from_full(card["name"]),
@@ -728,10 +709,15 @@ async def _email_with_portal(card: dict) -> tuple[bool, Optional[str], Optional[
             effective_date_label=effective_date_label,
             vehicle_line=card.get("vehicle_label") or "Vehicle on file",
             portal_email=card["email"],
-            portal_password=welcome_password,
+            portal_password=portal_password,
+            include_portal_login=True,
         )
     )
-    pdf_filename = f"insurance-id-card-{card['policy_number']}.pdf"
+    card_state = card.get("card_state") or "NY"
+    if card_state == "NJ":
+        pdf_filename = f"nj-tei-{card['policy_number']}.pdf"
+    else:
+        pdf_filename = f"insurance-id-card-{card['policy_number']}.pdf"
     send_result = await asyncio.to_thread(
         rc.send_insurance_card_email,
         to_address=card["email"],
