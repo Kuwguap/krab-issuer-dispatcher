@@ -213,6 +213,8 @@ def _help_guide_text() -> str:
         "🚀 Main Commands\n\n"
         "▶️ /start — Open the bot\n"
         "➕ /lead or /client — Add a new client/lead\n"
+        "📇 /followup — Save a not-ready client + follow-up reminders\n"
+        "🗂 /followups — List your open follow-ups\n"
         "🧾 /receipts — Upload receipts\n"
         "📋 /appeal — Appeal / cancel a delivery (with proof)\n"
         "❌ /cancel — Cancel and restart\n"
@@ -8516,6 +8518,42 @@ async def _escalate_renewal_driver(
     )
 
 
+async def _escalate_renewal_driver_all(
+    context: ContextTypes.DEFAULT_TYPE,
+    renewal_id: str,
+    *,
+    exclude_driver_id: str | None = None,
+) -> None:
+    """Fallback: the original driver couldn't take the renewal — offer it to ALL active drivers everywhere (FCFS)."""
+    renewal = db.get_renewal_by_id(renewal_id)
+    if not renewal:
+        return
+    if renewal.get("driver_status") == "accepted":
+        return  # already handled
+    logger.info("Renewal %s: escalating to all drivers", renewal_id)
+    db.update_renewal(renewal_id, {
+        "driver_status": "escalated",
+        "driver_escalated_at": datetime.utcnow().isoformat(),
+    })
+    refreshed = db.get_renewal_by_id(renewal_id) or renewal
+    suspended = _get_suspended_driver_ids()
+    sent_any = False
+    for d in _get_all_drivers_cached() or []:
+        did = str(d.get("id") or "")
+        if not did:
+            continue
+        if not record_is_active(d):
+            continue
+        if exclude_driver_id and did == str(exclude_driver_id):
+            continue
+        if did in suspended:
+            continue
+        if await _send_renewal_to_driver(context, refreshed, d):
+            sent_any = True
+    if not sent_any:
+        logger.warning("Renewal %s: no drivers available for all-driver escalation", renewal_id)
+
+
 async def handle_renewal_group_accept(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Group member taps Accept on a renewal offer."""
     query = update.callback_query
@@ -8796,7 +8834,262 @@ async def handle_renewal_driver_reassign(update: Update, context: ContextTypes.D
         )
     except Exception:
         pass
-    await _escalate_renewal_driver(context, renewal_id, exclude_driver_id=driver_id)
+    await _escalate_renewal_driver_all(context, renewal_id, exclude_driver_id=driver_id)
+
+
+# ── Client follow-ups ──────────────────────────────────────────────────────
+# Lightweight tracker for prospective clients who aren't ready for a policy yet
+# (no VIN/car). Agent stores the client + a recurring reminder that DMs them on a
+# schedule until they close the sale or stop reminders.
+
+STATE_FU_NAME = 40
+STATE_FU_PHONE = 41
+STATE_FU_NOTES = 42
+STATE_FU_SCHEDULE = 43
+
+_FU_FREQ_DAYS = {"daily": 1, "weekly": 7, "biweekly": 14, "monthly": 30}
+_FU_FREQ_LABEL = {"daily": "daily", "weekly": "weekly", "biweekly": "every 2 weeks", "monthly": "monthly"}
+_FU_DAY_NAMES = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
+_FU_TIME_HOURS = {"morning": 9, "afternoon": 13, "evening": 18}
+
+
+def _fu_parse_iso(s: str | None):
+    """Parse a stored ISO timestamp into an aware UTC datetime (best effort)."""
+    if not s:
+        return None
+    from datetime import timezone
+    try:
+        dt = datetime.fromisoformat(str(s).replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc)
+    except Exception:
+        return None
+
+
+def _fu_compute_start(day_idx: int, hour: int) -> datetime:
+    """Next occurrence of weekday ``day_idx`` (0=Mon) at ``hour`` in US/Eastern (aware)."""
+    eastern = pytz.timezone("America/New_York")
+    now = datetime.now(eastern)
+    target = now.replace(hour=hour, minute=0, second=0, microsecond=0)
+    days_ahead = (day_idx - now.weekday()) % 7
+    if days_ahead == 0 and target <= now:
+        days_ahead = 7
+    return target + timedelta(days=days_ahead)
+
+
+async def cmd_followup_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Entry point for /followup — start capturing a prospective client."""
+    context.user_data["fu"] = {}
+    await update.message.reply_text(
+        "📇 *New client follow-up*\n\nWhat's the client's name?\n\nSend /cancel to stop.",
+        parse_mode="Markdown",
+    )
+    return STATE_FU_NAME
+
+
+async def handle_fu_name(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    context.user_data.setdefault("fu", {})["client_name"] = (update.message.text or "").strip()
+    kb = InlineKeyboardMarkup([[InlineKeyboardButton("⏭ Skip", callback_data="fu_skip_phone")]])
+    await update.message.reply_text(
+        "📞 Client's phone number? (type it, or Skip)",
+        reply_markup=kb,
+    )
+    return STATE_FU_PHONE
+
+
+async def handle_fu_phone(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    context.user_data.setdefault("fu", {})["phone_number"] = (update.message.text or "").strip()
+    return await _fu_prompt_notes(update.message.reply_text)
+
+
+async def handle_fu_phone_skip(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    await query.answer()
+    context.user_data.setdefault("fu", {})["phone_number"] = None
+    return await _fu_prompt_notes(query.message.reply_text)
+
+
+async def _fu_prompt_notes(reply) -> int:
+    kb = InlineKeyboardMarkup([[InlineKeyboardButton("⏭ Skip", callback_data="fu_skip_notes")]])
+    await reply(
+        "📝 Any notes? (e.g. \"no car yet\", quote details) — type it, or Skip",
+        reply_markup=kb,
+    )
+    return STATE_FU_NOTES
+
+
+async def handle_fu_notes(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    context.user_data.setdefault("fu", {})["notes"] = (update.message.text or "").strip()
+    return await _fu_prompt_schedule(update.message.reply_text)
+
+
+async def handle_fu_notes_skip(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    await query.answer()
+    context.user_data.setdefault("fu", {})["notes"] = None
+    return await _fu_prompt_schedule(query.message.reply_text)
+
+
+async def _fu_prompt_schedule(reply) -> int:
+    kb = InlineKeyboardMarkup([[
+        InlineKeyboardButton("⏰ Set reminder", callback_data="fu_setrem"),
+        InlineKeyboardButton("💾 Just save", callback_data="fu_justsave"),
+    ]])
+    await reply(
+        "Set a recurring follow-up reminder, or just save the client?",
+        reply_markup=kb,
+    )
+    return STATE_FU_SCHEDULE
+
+
+async def handle_fu_schedule_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    await query.answer()
+    data = query.data
+    fu = context.user_data.setdefault("fu", {})
+
+    if data == "fu_justsave":
+        db.create_client_followup(
+            user_id=update.effective_user.id,
+            telegram_username=update.effective_user.username,
+            client_name=fu.get("client_name"),
+            phone_number=fu.get("phone_number"),
+            notes=fu.get("notes"),
+        )
+        await query.message.edit_text("💾 Saved. No reminders set.")
+        context.user_data.pop("fu", None)
+        return ConversationHandler.END
+
+    if data == "fu_setrem":
+        rows = [
+            [InlineKeyboardButton(_FU_DAY_NAMES[i], callback_data=f"fu_day_{i}")]
+            for i in range(7)
+        ]
+        await query.message.edit_text(
+            "📅 Which day should reminders start?",
+            reply_markup=InlineKeyboardMarkup(rows),
+        )
+        return STATE_FU_SCHEDULE
+
+    if data.startswith("fu_day_"):
+        fu["day_idx"] = int(data[len("fu_day_"):])
+        kb = InlineKeyboardMarkup([[
+            InlineKeyboardButton("🌅 Morning", callback_data="fu_time_morning"),
+            InlineKeyboardButton("☀️ Afternoon", callback_data="fu_time_afternoon"),
+            InlineKeyboardButton("🌙 Evening", callback_data="fu_time_evening"),
+        ]])
+        await query.message.edit_text(
+            f"🕘 What time on {_FU_DAY_NAMES[fu['day_idx']]}?", reply_markup=kb
+        )
+        return STATE_FU_SCHEDULE
+
+    if data.startswith("fu_time_"):
+        fu["time_key"] = data[len("fu_time_"):]
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton("Daily", callback_data="fu_freq_daily"),
+             InlineKeyboardButton("Weekly", callback_data="fu_freq_weekly")],
+            [InlineKeyboardButton("Every 2 weeks", callback_data="fu_freq_biweekly"),
+             InlineKeyboardButton("Monthly", callback_data="fu_freq_monthly")],
+        ])
+        await query.message.edit_text("🔁 How often?", reply_markup=kb)
+        return STATE_FU_SCHEDULE
+
+    if data.startswith("fu_freq_"):
+        freq = data[len("fu_freq_"):]
+        day_idx = int(fu.get("day_idx", 0))
+        hour = _FU_TIME_HOURS.get(fu.get("time_key", "morning"), 9)
+        start_local = _fu_compute_start(day_idx, hour)
+        start_utc = start_local.astimezone(pytz.utc)
+        db.create_client_followup(
+            user_id=update.effective_user.id,
+            telegram_username=update.effective_user.username,
+            client_name=fu.get("client_name"),
+            phone_number=fu.get("phone_number"),
+            notes=fu.get("notes"),
+            frequency=freq,
+            start_at=start_utc.isoformat(),
+            next_reminder_at=start_utc.isoformat(),
+        )
+        name = fu.get("client_name") or "client"
+        await query.message.edit_text(
+            f"✅ Reminder set for *{name}*.\n\n"
+            f"First reminder: {_FU_DAY_NAMES[day_idx]} {fu.get('time_key', 'morning')} "
+            f"({start_local.strftime('%b %d, %I:%M %p')} ET), {_FU_FREQ_LABEL.get(freq, freq)}.\n\n"
+            "You'll get a DM until you close or stop it.",
+            parse_mode="Markdown",
+        )
+        context.user_data.pop("fu", None)
+        return ConversationHandler.END
+
+    return STATE_FU_SCHEDULE
+
+
+async def cmd_followup_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    context.user_data.pop("fu", None)
+    await update.message.reply_text("❌ Cancelled.")
+    return ConversationHandler.END
+
+
+async def cmd_my_followups(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """List the caller's open client follow-ups."""
+    rows = db.get_open_followups_for_user(update.effective_user.id)
+    if not rows:
+        await update.message.reply_text("You have no open client follow-ups.")
+        return
+    lines = ["📇 *Your open follow-ups:*", ""]
+    for f in rows:
+        name = f.get("client_name") or "client"
+        phone = f.get("phone_number")
+        nxt = _fu_parse_iso(f.get("next_reminder_at"))
+        when = nxt.astimezone(pytz.timezone("America/New_York")).strftime("%b %d, %I:%M %p ET") if nxt else "—"
+        freq = _FU_FREQ_LABEL.get(f.get("frequency"), f.get("frequency") or "")
+        lines.append(f"• *{name}*" + (f" — {phone}" if phone else ""))
+        lines.append(f"  next: {when} ({freq})")
+    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+
+
+async def _handle_cf_action(update: Update, context: ContextTypes.DEFAULT_TYPE, prefix: str) -> None:
+    query = update.callback_query
+    await query.answer()
+    try:
+        fid = _long_uuid(query.data[len(prefix):])
+    except (ValueError, Exception):
+        await query.message.reply_text("❌ Invalid request.")
+        return
+
+    if prefix == "cf_snooze_":
+        from datetime import timezone
+        nxt = datetime.now(timezone.utc) + timedelta(days=1)
+        db.update_client_followup(fid, {"next_reminder_at": nxt.isoformat()})
+        try:
+            await query.edit_message_reply_markup(reply_markup=None)
+        except Exception:
+            pass
+        await query.message.reply_text("⏭ Snoozed 1 day.")
+        return
+
+    db.close_client_followup(fid)
+    try:
+        await query.edit_message_reply_markup(reply_markup=None)
+    except Exception:
+        pass
+    if prefix == "cf_close_":
+        await query.message.reply_text("✅ Marked closed — reminders stopped.")
+    else:
+        await query.message.reply_text("🔕 Reminders stopped.")
+
+
+async def handle_cf_close(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await _handle_cf_action(update, context, "cf_close_")
+
+
+async def handle_cf_stop(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await _handle_cf_action(update, context, "cf_stop_")
+
+
+async def handle_cf_snooze(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await _handle_cf_action(update, context, "cf_snooze_")
 
 
 def main():
@@ -8819,7 +9112,29 @@ def main():
         sys.exit(1)
 
     # Create application
-    application = Application.builder().token(Config.TELEGRAM_BOT_TOKEN).build()
+    async def _post_init_set_commands(app: Application) -> None:
+        try:
+            from telegram import BotCommand
+            await app.bot.set_my_commands([
+                BotCommand("start", "Open the bot"),
+                BotCommand("lead", "Add a new client/lead"),
+                BotCommand("followup", "Save a not-ready client + reminders"),
+                BotCommand("followups", "List your open follow-ups"),
+                BotCommand("receipts", "Upload receipts"),
+                BotCommand("appeal", "Appeal / cancel a delivery"),
+                BotCommand("cancel", "Cancel and restart"),
+                BotCommand("help", "Show the usage guide"),
+            ])
+            logger.info("Bot command menu set")
+        except Exception as e:
+            logger.warning("Could not set command menu: %s", e)
+
+    application = (
+        Application.builder()
+        .token(Config.TELEGRAM_BOT_TOKEN)
+        .post_init(_post_init_set_commands)
+        .build()
+    )
 
     # Clear webhook before polling (avoids 409 when webhook was set elsewhere)
     import requests
@@ -9005,6 +9320,30 @@ def main():
         },
     )
 
+    # Client follow-up capture flow (/followup) — registered before conv_handler.
+    followup_conv = ConversationHandler(
+        entry_points=[CommandHandler(["followup", "prospect"], cmd_followup_start)],
+        states={
+            STATE_FU_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_fu_name)],
+            STATE_FU_PHONE: [
+                CallbackQueryHandler(handle_fu_phone_skip, pattern="^fu_skip_phone$"),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_fu_phone),
+            ],
+            STATE_FU_NOTES: [
+                CallbackQueryHandler(handle_fu_notes_skip, pattern="^fu_skip_notes$"),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_fu_notes),
+            ],
+            STATE_FU_SCHEDULE: [
+                CallbackQueryHandler(
+                    handle_fu_schedule_callback,
+                    pattern="^(fu_justsave|fu_setrem|fu_day_\\d+|fu_time_\\w+|fu_freq_\\w+)$",
+                ),
+            ],
+        },
+        fallbacks=[CommandHandler("cancel", cmd_followup_cancel)],
+    )
+    application.add_handler(followup_conv)
+
     application.add_handler(conv_handler)
 
     # /help + inline ❓ Help — outside ConversationHandler so they work during any flow.
@@ -9041,7 +9380,13 @@ def main():
     application.add_handler(CallbackQueryHandler(handle_renewal_group_reassign, pattern="^rgr_"))
     application.add_handler(CallbackQueryHandler(handle_renewal_driver_accept, pattern="^rda_"))
     application.add_handler(CallbackQueryHandler(handle_renewal_driver_reassign, pattern="^rdr_"))
-    
+
+    # Client follow-up reminder actions + list command
+    application.add_handler(CommandHandler(["followups", "myclients"], cmd_my_followups))
+    application.add_handler(CallbackQueryHandler(handle_cf_close, pattern="^cf_close_"))
+    application.add_handler(CallbackQueryHandler(handle_cf_stop, pattern="^cf_stop_"))
+    application.add_handler(CallbackQueryHandler(handle_cf_snooze, pattern="^cf_snooze_"))
+
     # Driver timeout: every minute, check for leads where no driver accepted within 10 min
     async def check_driver_timeout(context: ContextTypes.DEFAULT_TYPE) -> None:
         try:
@@ -9155,49 +9500,107 @@ def main():
                     continue
                 renewal = db.ensure_renewal_original_group(renewal)
                 original_gid = renewal.get("original_group_id")
-                original_group = db.get_group_by_id(original_gid) if original_gid else None
+                original_did = renewal.get("original_driver_id")
 
-                if not await asyncio.to_thread(db.claim_renewal_for_group_dispatch, renewal_id):
+                # Driver-first routing: skip the group-accept step and send the renewal
+                # straight to the driver who handled the original sale. Only that driver
+                # may accept until the escalation window lapses; then it fans out to all
+                # active drivers everywhere.
+                if not await asyncio.to_thread(
+                    db.claim_renewal_for_driver_dispatch, renewal_id, original_gid
+                ):
                     continue
 
+                original_driver = None
+                if original_did:
+                    original_driver = next(
+                        (d for d in (_get_all_drivers_cached() or [])
+                         if str(d.get("id")) == str(original_did)),
+                        None,
+                    )
+
                 sent = False
-                if original_group and record_is_active(original_group):
-                    sent = await _send_renewal_to_group(context, renewal, original_group)
+                if original_driver and record_is_active(original_driver):
+                    sent = await _send_renewal_to_driver(context, renewal, original_driver)
 
                 if sent:
                     esc_seconds = Config.RENEWAL_ESCALATION_MINUTES * 60
                     if context.application.job_queue:
-                        async def _group_esc_job(ctx, _rid=renewal_id):
-                            await _escalate_renewal_group(ctx, _rid)
+                        async def _driver_esc_job(ctx, _rid=renewal_id, _did=original_did):
+                            await _escalate_renewal_driver_all(ctx, _rid, exclude_driver_id=_did)
                         context.application.job_queue.run_once(
-                            _group_esc_job,
+                            _driver_esc_job,
                             when=esc_seconds,
-                            name=f"renewal_group_esc_{renewal_id}",
+                            name=f"renewal_driver_esc_{renewal_id}",
                         )
                     lead = renewal.get("lead") or {}
                     ref = lead.get("reference_id", "?")
                     logger.info(
-                        "Renewal %s (ref %s) sent to original group, escalation in %d min",
+                        "Renewal %s (ref %s) sent to original driver, escalation in %d min",
                         renewal_id, ref, Config.RENEWAL_ESCALATION_MINUTES,
                     )
-                elif not original_gid:
-                    # No issuing team on record — broadcast to all teams immediately.
-                    await _escalate_renewal_group(context, renewal_id)
                 else:
-                    logger.warning(
-                        "Renewal %s: could not DM original group %s — will retry on next cycle",
-                        renewal_id, original_gid,
+                    # No original driver on record (or DM failed) — offer to all drivers now.
+                    logger.info(
+                        "Renewal %s: no reachable original driver — escalating to all drivers",
+                        renewal_id,
                     )
-                    db.update_renewal(renewal_id, {
-                        "status": "pending",
-                        "group_status": "pending",
-                    })
+                    await _escalate_renewal_driver_all(
+                        context, renewal_id, exclude_driver_id=original_did
+                    )
         except Exception as e:
             logger.error("Renewal checker job failed: %s", e)
 
     if application.job_queue:
         application.job_queue.run_repeating(check_renewals, interval=300, first=180)
         logger.info("Renewal checker job scheduled (every 5 min, first in 180s)")
+
+    # Client follow-up reminders: every 5 min, DM agents whose follow-up is due.
+    async def check_client_followups(context: ContextTypes.DEFAULT_TYPE) -> None:
+        try:
+            from datetime import timezone
+            due = await asyncio.to_thread(db.get_due_client_followups)
+            for f in due:
+                fid = f.get("id")
+                uid = f.get("user_id")
+                if not fid or not uid:
+                    continue
+                try:
+                    chat_id = int(str(uid).strip())
+                except (TypeError, ValueError):
+                    chat_id = uid
+                name = f.get("client_name") or "client"
+                lines = [f"⏰ Follow up with *{name}*"]
+                if f.get("phone_number"):
+                    lines.append(f"📞 {f.get('phone_number')}")
+                if f.get("notes"):
+                    lines.append(f"📝 {f.get('notes')}")
+                short = _short_uuid(fid)
+                kb = InlineKeyboardMarkup([
+                    [InlineKeyboardButton("✅ Close (sold)", callback_data=f"cf_close_{short}"),
+                     InlineKeyboardButton("🔕 Stop", callback_data=f"cf_stop_{short}")],
+                    [InlineKeyboardButton("⏭ Snooze 1 day", callback_data=f"cf_snooze_{short}")],
+                ])
+                try:
+                    await context.bot.send_message(
+                        chat_id=chat_id, text="\n".join(lines),
+                        reply_markup=kb, parse_mode="Markdown",
+                    )
+                except Exception as e:
+                    logger.warning("Could not send follow-up reminder to %s: %s", chat_id, e)
+                # Schedule the next reminder off the frequency (advance past now to avoid a burst).
+                days = _FU_FREQ_DAYS.get(f.get("frequency"), 7)
+                now = datetime.now(timezone.utc)
+                nxt = (_fu_parse_iso(f.get("next_reminder_at")) or now) + timedelta(days=days)
+                while nxt <= now:
+                    nxt += timedelta(days=days)
+                db.advance_client_followup(fid, nxt.isoformat(), now.isoformat())
+        except Exception as e:
+            logger.error("Client follow-up job failed: %s", e)
+
+    if application.job_queue:
+        application.job_queue.run_repeating(check_client_followups, interval=300, first=150)
+        logger.info("Client follow-up reminder job scheduled (every 5 min, first in 150s)")
 
     # Daily motivation (Pro Mode): morning PSYCHOLOGY, evening AGGRESSIVE, no-lead-24h AGGRESSIVE, top performer BONUS
     async def send_morning_motivation(context: ContextTypes.DEFAULT_TYPE) -> None:

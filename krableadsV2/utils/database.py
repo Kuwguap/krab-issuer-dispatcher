@@ -1574,6 +1574,38 @@ class Database:
             logger.error("claim_renewal_for_group_dispatch: %s", e)
             return False
 
+    def claim_renewal_for_driver_dispatch(self, renewal_id: str, original_group_id: str | None) -> bool:
+        """Atomically pending → driver_phase for driver-first renewal routing.
+
+        Skips the group-accept step entirely: the original group is auto-accepted so the
+        existing driver-accept path works, and the offer goes straight to the original driver.
+        Only one worker should get True.
+        """
+        if not self._check_tables_exist():
+            return False
+        try:
+            from datetime import datetime, timezone
+            now_iso = datetime.now(timezone.utc).isoformat()
+            update = {
+                "status": "driver_phase",
+                "group_status": "accepted",
+                "driver_status": "sent",
+                "driver_sent_at": now_iso,
+            }
+            if original_group_id:
+                update["group_accepted_by_id"] = original_group_id
+            r = (
+                self.client.table("lead_renewals")
+                .update(update)
+                .eq("id", renewal_id)
+                .eq("status", "pending")
+                .execute()
+            )
+            return bool(r.data)
+        except Exception as e:
+            logger.error("claim_renewal_for_driver_dispatch: %s", e)
+            return False
+
     def get_due_renewals(self) -> list:
         """Return renewals whose due date has passed and are still 'pending'."""
         if not self._check_tables_exist():
@@ -1678,13 +1710,22 @@ class Database:
                 return "already_accepted"
             if (existing.get("group_status") or "").strip().lower() != "accepted":
                 return "error"
+            # After escalation the renewal is offered to all drivers everywhere (FCFS),
+            # so skip the group-membership gate. Before escalation, only the original
+            # group's drivers (i.e. the original driver) may grab it.
+            ds = (existing.get("driver_status") or "").strip().lower()
             group_id = existing.get("group_accepted_by_id") or existing.get("original_group_id")
-            if group_id:
+            if ds != "escalated" and group_id:
                 allowed = {
                     str(d.get("id"))
                     for d in (self.get_active_drivers_for_group(str(group_id)) or [])
                     if d.get("id")
                 }
+                # Always allow the original driver we routed the renewal to, even if they
+                # aren't linked to this group (drivers can work across all groups).
+                orig_did = existing.get("original_driver_id")
+                if orig_did:
+                    allowed.add(str(orig_did))
                 if allowed and str(driver_id) not in allowed:
                     return "wrong_driver"
             from datetime import datetime, timezone
@@ -1724,6 +1765,120 @@ class Database:
         except Exception as e:
             logger.error(f"Error checking active renewal: {e}")
             return None
+
+    # ── Client follow-ups ──────────────────────────────────────────────
+
+    def create_client_followup(
+        self,
+        user_id: str,
+        telegram_username: str | None,
+        client_name: str | None,
+        phone_number: str | None,
+        notes: str | None,
+        frequency: str | None = None,
+        start_at: str | None = None,
+        next_reminder_at: str | None = None,
+    ) -> Optional[Dict[str, Any]]:
+        """Create a prospective-client follow-up record.
+
+        With no ``frequency``/``next_reminder_at`` this is just a stored contact
+        (status='closed'); with a schedule it's an active reminder (status='open').
+        """
+        if not self._check_tables_exist():
+            return None
+        try:
+            row = {
+                "user_id": str(user_id),
+                "telegram_username": telegram_username,
+                "client_name": client_name,
+                "phone_number": phone_number,
+                "notes": notes,
+                "status": "open" if next_reminder_at else "closed",
+            }
+            if frequency:
+                row["frequency"] = frequency
+            if start_at:
+                row["start_at"] = start_at
+            if next_reminder_at:
+                row["next_reminder_at"] = next_reminder_at
+            r = self.client.table("client_followups").insert(row).execute()
+            return r.data[0] if r.data else None
+        except Exception as e:
+            logger.error(f"Error creating client follow-up: {e}")
+            return None
+
+    def get_due_client_followups(self) -> list:
+        """Return open follow-ups whose next reminder time has passed."""
+        if not self._check_tables_exist():
+            return []
+        try:
+            from datetime import datetime, timezone
+            now_iso = datetime.now(timezone.utc).isoformat()
+            r = (
+                self.client.table("client_followups")
+                .select("*")
+                .eq("status", "open")
+                .lte("next_reminder_at", now_iso)
+                .execute()
+            )
+            return r.data or []
+        except Exception as e:
+            logger.error(f"Error fetching due client follow-ups: {e}")
+            return []
+
+    def get_client_followup_by_id(self, followup_id: str) -> Optional[Dict[str, Any]]:
+        if not self._check_tables_exist():
+            return None
+        try:
+            r = (
+                self.client.table("client_followups")
+                .select("*")
+                .eq("id", followup_id)
+                .limit(1)
+                .execute()
+            )
+            return r.data[0] if r.data else None
+        except Exception as e:
+            logger.error(f"Error fetching client follow-up: {e}")
+            return None
+
+    def update_client_followup(self, followup_id: str, data: dict) -> bool:
+        if not self._check_tables_exist():
+            return False
+        try:
+            self.client.table("client_followups").update(data).eq("id", followup_id).execute()
+            return True
+        except Exception as e:
+            logger.error(f"Error updating client follow-up: {e}")
+            return False
+
+    def advance_client_followup(self, followup_id: str, next_reminder_at: str, last_reminded_at: str) -> bool:
+        """Record that a reminder fired and schedule the next one."""
+        return self.update_client_followup(followup_id, {
+            "next_reminder_at": next_reminder_at,
+            "last_reminded_at": last_reminded_at,
+        })
+
+    def close_client_followup(self, followup_id: str) -> bool:
+        """Mark a follow-up as closed (sale done or reminders stopped)."""
+        return self.update_client_followup(followup_id, {"status": "closed"})
+
+    def get_open_followups_for_user(self, user_id: str) -> list:
+        if not self._check_tables_exist():
+            return []
+        try:
+            r = (
+                self.client.table("client_followups")
+                .select("*")
+                .eq("user_id", str(user_id))
+                .eq("status", "open")
+                .order("next_reminder_at")
+                .execute()
+            )
+            return r.data or []
+        except Exception as e:
+            logger.error(f"Error fetching open follow-ups for user: {e}")
+            return []
 
     # ── Lead appeals ───────────────────────────────────────────────────
 
