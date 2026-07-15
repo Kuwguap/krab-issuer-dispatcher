@@ -902,7 +902,14 @@ def _resolve_all_active_driver_ids() -> list[str]:
 
 
 async def process_pending_api_lead_dispatches(context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Poll Supabase for HTTP-ingested leads and post group Accept buttons."""
+    """Poll Supabase for HTTP-ingested (website) leads and dispatch each straight to
+    ALL active drivers (individual Accept/Decline requests) plus the main group.
+
+    Website leads skip the group-accept step: drivers are asked directly whether they
+    can deliver, exactly like the issuer driver flow. The lead is claimed
+    (ingest_dispatch_pending -> False) before sending so a slow send can't double-fire
+    on the next poll — no lead goes out twice.
+    """
     rows = db.list_leads_pending_ingest_dispatch(limit=10)
     if not rows:
         return
@@ -911,34 +918,43 @@ async def process_pending_api_lead_dispatches(context: ContextTypes.DEFAULT_TYPE
     if not active_groups:
         logger.warning("API ingest leads pending but no active groups configured")
         return
-    api_user_raw = (Config.API_LEAD_USER_ID or "tristatetag").strip()
-    user_id, _, resolve_err = resolve_api_lead_user_sync(db, api_user_raw)
-    if resolve_err or user_id is None:
-        logger.warning("API ingest: %s", resolve_err or "could not resolve API_LEAD_USER_ID")
-        return
-    issuer_user_id = user_id
 
-    driver_ids = _resolve_all_active_driver_ids()
     for lead in rows:
         lead_id = str(lead.get("id") or "")
         if not lead_id:
             continue
         try:
-            await _post_lead_to_all_groups_for_approval(context, lead, active_groups)
-            _store_issuer_await_group_accept(
-                issuer_user_id,
-                lead_id=lead_id,
-                await_mode="dispatch_pending",
-                selected_driver_ids=driver_ids,
-            )
+            # Main "Tri State Tag team" group = the one assigned at ingest (first active
+            # group), or the first active group if that is missing/inactive.
+            main_group = db.get_group_by_id(lead.get("group_id")) if lead.get("group_id") else None
+            if not main_group or not record_is_active(main_group):
+                main_group = active_groups[0]
+
+            # Claim the lead BEFORE sending so the 10s poller can't re-dispatch it.
             db.update_lead(lead_id, {
                 "ingest_dispatch_pending": False,
-                "awaiting_group_accept": True,
+                "awaiting_group_accept": False,
+                "group_id": main_group.get("id"),
             })
+
+            # 1) Post the full lead to the main group for visibility.
+            try:
+                await _send_full_group_lead_to_chat(
+                    context, main_group, lead, header_text="🏷NEW WEBSITE CLIENT❗️",
+                )
+            except Exception as e:
+                logger.warning("API ingest: could not post lead %s to main group: %s", lead_id, e)
+
+            # 2) DM every active driver individually with Accept/Decline. With no
+            #    group-linked drivers this falls back to the global pool ("drivers work
+            #    for all groups"), i.e. all active drivers.
+            assigned, names, reason, scope = await _send_driver_requests_for_group(
+                context, lead, main_group,
+            )
             logger.info(
-                "API ingest: posted group approval for lead %s ref %s",
-                lead_id,
-                lead.get("reference_id"),
+                "API ingest: lead %s ref %s dispatched to %d driver(s) [%s]%s",
+                lead_id, lead.get("reference_id"), assigned, scope,
+                f" reason={reason}" if reason else "",
             )
         except Exception as e:
             logger.error("process_pending_api_lead_dispatches failed for %s: %s", lead_id, e)
