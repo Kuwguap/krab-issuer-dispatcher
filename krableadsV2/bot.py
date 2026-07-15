@@ -8845,12 +8845,12 @@ async def handle_renewal_driver_reassign(update: Update, context: ContextTypes.D
     ref = (renewal.get("lead") or {}).get("reference_id", "N/A")
     try:
         await query.message.edit_text(
-            f"🔄 **Reassigned** — this renewal delivery (`{ref}`) has been sent to other drivers.",
+            f"🔄 **Reassigned** — this renewal delivery (`{ref}`) has been sent to the rest of the team.",
             parse_mode="Markdown",
         )
     except Exception:
         pass
-    await _escalate_renewal_driver_all(context, renewal_id, exclude_driver_id=driver_id)
+    await _escalate_renewal_driver(context, renewal_id, exclude_driver_id=driver_id)
 
 
 # ── Client follow-ups ──────────────────────────────────────────────────────
@@ -9543,7 +9543,7 @@ def main():
                     esc_seconds = Config.RENEWAL_ESCALATION_MINUTES * 60
                     if context.application.job_queue:
                         async def _driver_esc_job(ctx, _rid=renewal_id, _did=original_did):
-                            await _escalate_renewal_driver_all(ctx, _rid, exclude_driver_id=_did)
+                            await _escalate_renewal_driver(ctx, _rid, exclude_driver_id=_did)
                         context.application.job_queue.run_once(
                             _driver_esc_job,
                             when=esc_seconds,
@@ -9556,12 +9556,13 @@ def main():
                         renewal_id, ref, Config.RENEWAL_ESCALATION_MINUTES,
                     )
                 else:
-                    # No original driver on record (or DM failed) — offer to all drivers now.
+                    # No original driver reachable — offer to the rest of the group that
+                    # accepted the original lead (renewals stay in that group).
                     logger.info(
-                        "Renewal %s: no reachable original driver — escalating to all drivers",
+                        "Renewal %s: no reachable original driver — escalating to the accepting group",
                         renewal_id,
                     )
-                    await _escalate_renewal_driver_all(
+                    await _escalate_renewal_driver(
                         context, renewal_id, exclude_driver_id=original_did
                     )
         except Exception as e:
