@@ -54,8 +54,8 @@ export default function Home() {
               animate={{ opacity: 0.9, y: 0 }}
               transition={{ delay: 0.5 + i * 0.18, duration: 0.9, ease: [0.22, 1, 0.36, 1] }}
             >
-              <div className="animate-floaty w-full h-full" style={{ animationDelay: `${i * 0.8}s` }}>
-                <img src={src} alt="" className="w-full h-full object-cover" />
+              <div className="animate-floaty w-full h-full bg-bone" style={{ animationDelay: `${i * 0.8}s` }}>
+                <img src={src} alt="" className="w-full h-full object-cover mix-blend-multiply" />
               </div>
             </motion.div>
           ))}

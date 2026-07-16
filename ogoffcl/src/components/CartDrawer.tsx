@@ -52,8 +52,8 @@ export default function CartDrawer() {
                   exit={{ opacity: 0 }}
                   className="flex gap-4 border border-ash bg-ink/60 p-3"
                 >
-                  <div className="w-20 h-24 bg-ash overflow-hidden shrink-0">
-                    {i.image && <img src={i.image} alt={i.name} className="w-full h-full object-cover" />}
+                  <div className="w-20 h-24 bg-bone overflow-hidden shrink-0">
+                    {i.image && <img src={i.image} alt={i.name} className="w-full h-full object-cover mix-blend-multiply" />}
                   </div>
                   <div className="flex-1 min-w-0">
                     <p className="font-display uppercase text-sm text-bone truncate">{i.name}</p>

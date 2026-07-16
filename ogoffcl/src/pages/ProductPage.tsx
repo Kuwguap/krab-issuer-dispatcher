@@ -99,12 +99,12 @@ export default function ProductPage() {
             initial={{ opacity: 0.4, scale: 1.015 }}
             animate={{ opacity: 1, scale: 1 }}
             transition={{ duration: 0.35 }}
-            className="relative aspect-[4/5] bg-smoke border border-ash overflow-hidden"
+            className="relative aspect-[4/5] bg-bone border border-ash overflow-hidden"
           >
             {uniqueImgs[imgIdx] ? (
-              <img src={uniqueImgs[imgIdx]} alt={p.name} className="w-full h-full object-cover" />
+              <img src={uniqueImgs[imgIdx]} alt={p.name} className="w-full h-full object-cover mix-blend-multiply" />
             ) : (
-              <div className="absolute inset-0 flex items-center justify-center font-display text-bone/15 text-7xl">OG</div>
+              <div className="absolute inset-0 flex items-center justify-center font-display text-ink/10 text-7xl">OG</div>
             )}
             {soldOut && (
               <span className="absolute top-4 right-4 bg-blood text-bone text-xs font-display uppercase tracking-widest px-3 py-2">Sold out</span>
@@ -116,9 +116,9 @@ export default function ProductPage() {
                 <button
                   key={i}
                   onClick={() => setImgIdx(i)}
-                  className={`w-20 aspect-[4/5] shrink-0 overflow-hidden border-2 transition-colors ${i === imgIdx ? "border-acid" : "border-ash hover:border-bone/50"}`}
+                  className={`w-20 aspect-[4/5] shrink-0 overflow-hidden border-2 bg-bone transition-colors ${i === imgIdx ? "border-acid" : "border-ash hover:border-bone/50"}`}
                 >
-                  <img src={src} alt="" className="w-full h-full object-cover" />
+                  <img src={src} alt="" className="w-full h-full object-cover mix-blend-multiply" />
                 </button>
               ))}
             </div>

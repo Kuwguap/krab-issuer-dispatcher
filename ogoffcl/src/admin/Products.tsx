@@ -135,8 +135,8 @@ export default function AdminProducts() {
       <div className="grid gap-3">
         {rows.map((p) => (
           <div key={p.id} className="flex items-center gap-4 border border-ash bg-smoke/50 p-3">
-            <div className="w-14 h-16 bg-ash overflow-hidden shrink-0">
-              {p.image && <img src={publicImageUrl(String(p.image))} alt="" className="w-full h-full object-cover" />}
+            <div className="w-14 h-16 bg-bone overflow-hidden shrink-0">
+              {p.image && <img src={publicImageUrl(String(p.image))} alt="" className="w-full h-full object-cover mix-blend-multiply" />}
             </div>
             <div className="flex-1 min-w-0">
               <p className="font-display uppercase text-sm text-bone truncate">{p.name}</p>

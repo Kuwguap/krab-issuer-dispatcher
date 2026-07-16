@@ -224,8 +224,8 @@ export default function Checkout() {
             <div className="space-y-4 max-h-72 overflow-y-auto pr-1">
               {items.map((i) => (
                 <div key={i.productId + (i.size || "")} className="flex gap-3 items-center">
-                  <div className="w-14 h-16 bg-ash overflow-hidden shrink-0">
-                    {i.image && <img src={i.image} alt="" className="w-full h-full object-cover" />}
+                  <div className="w-14 h-16 bg-bone overflow-hidden shrink-0">
+                    {i.image && <img src={i.image} alt="" className="w-full h-full object-cover mix-blend-multiply" />}
                   </div>
                   <div className="flex-1 min-w-0">
                     <p className="font-display uppercase text-xs text-bone truncate">{i.name}</p>

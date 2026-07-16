@@ -22,26 +22,26 @@ export default function ProductCard({ p, index = 0 }: { p: Product; index?: numb
       className="group relative"
     >
       <Link to={`/product/${p.id}`} className="block">
-        <div className="relative aspect-[4/5] bg-smoke overflow-hidden border border-ash group-hover:border-acid/60 transition-colors">
+        <div className="relative aspect-[4/5] bg-bone overflow-hidden border border-ash group-hover:border-acid/60 transition-colors">
           {primary ? (
             <>
               <img
                 src={primary}
                 alt={p.name}
                 loading="lazy"
-                className="absolute inset-0 w-full h-full object-cover transition-all duration-700 ease-out group-hover:scale-[1.06]"
+                className="absolute inset-0 w-full h-full object-cover mix-blend-multiply transition-all duration-700 ease-out group-hover:scale-[1.06]"
               />
               {secondary && secondary !== primary && (
                 <img
                   src={secondary}
                   alt=""
                   loading="lazy"
-                  className="absolute inset-0 w-full h-full object-cover opacity-0 group-hover:opacity-100 transition-opacity duration-500"
+                  className="absolute inset-0 w-full h-full object-cover mix-blend-multiply opacity-0 group-hover:opacity-100 transition-opacity duration-500"
                 />
               )}
             </>
           ) : (
-            <div className="absolute inset-0 flex items-center justify-center font-display text-bone/15 text-5xl">OG</div>
+            <div className="absolute inset-0 flex items-center justify-center font-display text-ink/10 text-5xl">OG</div>
           )}
 
           {p.product_category && (
