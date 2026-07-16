@@ -17,6 +17,7 @@ import AdminOrders from "./admin/Orders";
 import AdminCategories from "./admin/Categories";
 import AdminDiscounts from "./admin/Discounts";
 import AdminGallery from "./admin/Gallery";
+import AdminSiteMail from "./admin/SiteMail";
 
 function ScrollTop() {
   const { pathname } = useLocation();
@@ -45,6 +46,7 @@ export default function App() {
               <Route path="categories" element={<AdminCategories />} />
               <Route path="discounts" element={<AdminDiscounts />} />
               <Route path="gallery" element={<AdminGallery />} />
+              <Route path="site" element={<AdminSiteMail />} />
             </Route>
             <Route path="*" element={<NotFound />} />
           </Routes>

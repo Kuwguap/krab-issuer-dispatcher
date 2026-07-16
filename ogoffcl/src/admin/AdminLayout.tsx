@@ -51,6 +51,7 @@ const tabs = [
   { to: "/admin/categories", label: "Categories" },
   { to: "/admin/discounts", label: "Discounts" },
   { to: "/admin/gallery", label: "Gallery" },
+  { to: "/admin/site", label: "Site & Mail" },
 ];
 
 export default function AdminLayout() {
