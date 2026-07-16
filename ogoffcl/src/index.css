@@ -85,3 +85,27 @@ input, textarea, select {
 }
 
 img { user-select: none; }
+
+/* ── Home: runway strip (vertical lookbook loop) ───────────────── */
+@keyframes stripY {
+  from { transform: translateY(0); }
+  to { transform: translateY(-50%); }
+}
+.strip-col {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  animation: stripY 46s linear infinite;
+  will-change: transform;
+}
+.strip-col.rev { animation-direction: reverse; animation-duration: 58s; }
+
+/* hide scrollbars on the rail but keep it scrollable */
+.no-scrollbar { -ms-overflow-style: none; scrollbar-width: none; }
+.no-scrollbar::-webkit-scrollbar { display: none; }
+
+@media (prefers-reduced-motion: reduce) {
+  .strip-col, .strip-col.rev { animation: none; }
+  .animate-marquee, .animate-marquee-fast, .animate-floaty { animation: none; }
+  html { scroll-behavior: auto; }
+}
