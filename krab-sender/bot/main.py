@@ -595,11 +595,12 @@ async def handle_confirmation(update: Update, context: ContextTypes.DEFAULT_TYPE
         email_sent = True
 
         # Notify issuer group that send was successful (if configured)
+        issuer_chat_notified = None
         if bot_config.issuer_group_chat_id:
             try:
                 gref = (tx.reference_id or "").strip() or _display_reference_for_tx(tx)
                 await bot.send_message(
-                    chat_id=bot_config.issuer_group_chat_id,
+                    chat_id=_coerce_chat_id(bot_config.issuer_group_chat_id),
                     text=(
                         f"✅ Send successful\n\n"
                         f"📄 {pending_doc['file_name']}\n"
@@ -609,6 +610,7 @@ async def handle_confirmation(update: Update, context: ContextTypes.DEFAULT_TYPE
                     ),
                     parse_mode=None,
                 )
+                issuer_chat_notified = str(bot_config.issuer_group_chat_id)
             except Exception as group_err:
                 logger.warning("Failed to notify issuer group: %s", group_err)
 
@@ -621,6 +623,7 @@ async def handle_confirmation(update: Update, context: ContextTypes.DEFAULT_TYPE
             recipient_name,
             pending_doc["file_name"],
             gref,
+            issuer_chat_notified=issuer_chat_notified,
         )
 
         # Mark as delivered and persist to DB.
@@ -1186,6 +1189,7 @@ def _ga_selection_keyboard(groups: List[dict], attached_id: str | None) -> Inlin
     extra = []
     if attached_id:
         extra.append(InlineKeyboardButton("🔌 Detach me", callback_data="ga_detach"))
+        extra.append(InlineKeyboardButton("📣 Test post", callback_data="ga_test"))
     extra.append(InlineKeyboardButton("🗑 Remove a group", callback_data="ga_rmmenu"))
     rows.append(extra)
     rows.append([InlineKeyboardButton("➕ Attach an ID manually", callback_data="ga_manmenu")])
@@ -1302,6 +1306,35 @@ async def handle_ga_back(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     )
 
 
+async def handle_ga_test(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Post a test message to the caller's attached group and report the result."""
+    query = update.callback_query
+    await query.answer()
+    user = update.effective_user
+    g = await asyncio.to_thread(get_user_group, user.id)
+    if not g:
+        await query.message.reply_text(
+            "❌ You're not attached to a group — run /groupattach and select one first."
+        )
+        return
+    try:
+        await context.bot.send_message(
+            chat_id=_coerce_chat_id(g["chat_id"]),
+            text=(
+                "📣 Test post\n\n"
+                f"Send confirmations for {user.full_name}'s tag emails will appear here."
+            ),
+        )
+        await query.message.reply_text(f"✅ Test posted to “{g['name']}” — check the group.")
+    except Exception as e:
+        await query.message.reply_text(
+            f"❌ Could not post to “{g['name']}” (chat id {g['chat_id']}):\n{e}\n\n"
+            "Usual causes: the bot was removed from the group, the group was upgraded "
+            "to a supergroup (new chat id — run /groupattach in the group again), or "
+            "the bot is muted/restricted there."
+        )
+
+
 async def handle_ga_manual_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Manual attach step 1: pick which group the ID should be attached to."""
     query = update.callback_query
@@ -1373,6 +1406,14 @@ async def handle_ga_manual_id(update: Update, context: ContextTypes.DEFAULT_TYPE
     return True
 
 
+def _coerce_chat_id(v):
+    """Telegram wants numeric chat ids as ints; stored values are strings."""
+    s = str(v or "").strip()
+    if re.fullmatch(r"-?\d+", s):
+        return int(s)
+    return s
+
+
 async def _notify_attached_group_of_send(
     bot,
     bot_config: BotConfig,
@@ -1380,20 +1421,28 @@ async def _notify_attached_group_of_send(
     recipient_name: str,
     file_name: str,
     reference_id: str | None,
+    issuer_chat_notified: str | None = None,
 ) -> None:
     """Post a send confirmation to the sender's attached group (if any).
 
-    Skips silently when the user has no attached group, and avoids double-posting
-    when the attached group is the same chat as the configured issuer group.
+    ``issuer_chat_notified`` is the chat id the issuer-group notice was ALREADY
+    successfully posted to (or None) — we only skip when that same chat already
+    got the notice, so a failed/unconfigured issuer notice never suppresses this.
+    On failure, the sender gets a DM with the exact error instead of a silent log.
     """
     try:
         g = await asyncio.to_thread(get_user_group, sender.id)
-        if not g:
-            return
-        if bot_config.issuer_group_chat_id and str(bot_config.issuer_group_chat_id) == str(g["chat_id"]):
-            return
+    except Exception as e:
+        logger.warning("Attached-group lookup failed for %s: %s", sender.id, e)
+        return
+    if not g:
+        logger.info("Send confirm: user %s has no attached group (/groupattach)", sender.id)
+        return
+    if issuer_chat_notified and str(issuer_chat_notified) == str(g["chat_id"]):
+        return  # that chat already received the issuer notice
+    try:
         await bot.send_message(
-            chat_id=g["chat_id"],
+            chat_id=_coerce_chat_id(g["chat_id"]),
             text=(
                 "✅ Tag email sent\n\n"
                 f"📄 {file_name}\n"
@@ -1403,8 +1452,20 @@ async def _notify_attached_group_of_send(
             ),
             parse_mode=None,
         )
+        logger.info("Send confirm posted to attached group %s (%s)", g["name"], g["chat_id"])
     except Exception as e:
-        logger.warning("Failed to notify attached group of send: %s", e)
+        logger.warning("Failed to notify attached group %s of send: %s", g.get("chat_id"), e)
+        try:
+            await bot.send_message(
+                chat_id=sender.id,
+                text=(
+                    f"⚠️ Email sent, but I couldn't post the confirmation to your group "
+                    f"“{g['name']}”: {e}\n\n"
+                    "Make sure I'm still in that group, then use /groupattach → 📣 Test post."
+                ),
+            )
+        except Exception:
+            pass
 
 
 def build_application(config: BotConfig):
@@ -1457,6 +1518,7 @@ def build_application(config: BotConfig):
     app.add_handler(CallbackQueryHandler(handle_ga_back, pattern="^ga_back$"))
     app.add_handler(CallbackQueryHandler(handle_ga_manual_menu, pattern="^ga_manmenu$"))
     app.add_handler(CallbackQueryHandler(handle_ga_manual_group, pattern="^ga_man_"))
+    app.add_handler(CallbackQueryHandler(handle_ga_test, pattern="^ga_test$"))
     app.add_handler(CallbackQueryHandler(handle_transactions_button, pattern="^view_transactions$"))
     app.add_handler(CallbackQueryHandler(handle_tx_page_callback, pattern=r"^tx_page_\d+$"))
     # Conversation handler should come before generic text handlers
