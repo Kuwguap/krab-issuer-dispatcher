@@ -8116,6 +8116,12 @@ async def handle_receipt_image(update: Update, context: ContextTypes.DEFAULT_TYP
     stored_url = _normalize_receipt_image_url(
         ((storage_url or "").strip() or telegram_file_url).strip()
     )
+    # Telegram file URLs expire after ~1h. When we fall back to one, append the
+    # permanent file_id as a URL fragment (#tgfid=...) — fragments are invisible
+    # to HTTP fetches, but the dispatch-api receipt viewer parses it to re-sign
+    # a fresh download URL via getFile whenever the stored path has expired.
+    if not (storage_url or "").strip() and receipt_file_id and "#" not in stored_url:
+        stored_url = f"{stored_url}#tgfid={receipt_file_id}"
     if not (stored_url or "").strip():
         logger.error("Receipt upload: no durable URL (lead_id=%s)", lead_id)
         await update.message.reply_text(

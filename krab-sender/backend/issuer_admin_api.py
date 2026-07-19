@@ -331,12 +331,35 @@ def _resolve_receipt_fetch_url(stored: str, bot_token: str) -> Optional[str]:
     return None
 
 
+def _telegram_refetch_by_file_id(client: httpx.Client, bot_token: str, file_id: str):
+    """Re-sign an expired Telegram file URL: file_ids are permanent, so getFile
+    returns a fresh file_path we can download even years later."""
+    try:
+        gf = client.get(
+            f"https://api.telegram.org/bot{bot_token}/getFile",
+            params={"file_id": file_id},
+        )
+        if gf.status_code != 200:
+            return None
+        path = ((gf.json() or {}).get("result") or {}).get("file_path")
+        if not path:
+            return None
+        return client.get(f"{_TELEGRAM_FILE_PREFIX}{bot_token}/{path}")
+    except Exception:
+        return None
+
+
 @router.get("/receipts/view")
 def issuer_receipt_view(
     ref: str = Query(..., min_length=1),
     config: ApiConfig = Depends(_api_config),
 ):
-    """Stream receipt image for a lead reference (re-signs Telegram file URLs server-side)."""
+    """Stream receipt image for a lead reference.
+
+    Telegram-hosted receipts expire after ~1h; when the stored URL carries a
+    permanent file_id (``#tgfid=`` fragment, written by the issuer bot), an
+    expired fetch is transparently retried via getFile re-signing.
+    """
     ref_key = ref.strip()
     if not config.supabase_configured():
         raise HTTPException(status_code=503, detail="Supabase not configured")
@@ -346,25 +369,31 @@ def issuer_receipt_view(
         [ref_key],
     )
     row = meta.get(ref_key) or {}
-    stored = (row.get("receipt_image_url") or "").strip()
-    if not stored:
+    stored_full = (row.get("receipt_image_url") or "").strip()
+    if not stored_full:
         raise HTTPException(status_code=404, detail="Receipt not found for this reference")
+    stored, _, frag = stored_full.partition("#")
+    file_id = frag[6:].strip() if frag.startswith("tgfid=") else None
     bot_token = _telegram_bot_token()
     fetch_url = _resolve_receipt_fetch_url(stored, bot_token)
-    if not fetch_url:
+    if not fetch_url and not (file_id and bot_token):
         raise HTTPException(status_code=502, detail="Cannot resolve receipt URL")
     try:
         with httpx.Client(timeout=30.0, follow_redirects=True) as client:
-            resp = client.get(fetch_url)
-        if resp.status_code != 200:
+            resp = client.get(fetch_url) if fetch_url else None
+            if (resp is None or resp.status_code != 200) and file_id and bot_token:
+                fresh = _telegram_refetch_by_file_id(client, bot_token, file_id)
+                if fresh is not None:
+                    resp = fresh
+        if resp is None or resp.status_code != 200:
             raise HTTPException(
                 status_code=502,
-                detail=f"Receipt file fetch failed ({resp.status_code})",
+                detail=f"Receipt file fetch failed ({resp.status_code if resp is not None else 'unreachable'})",
             )
         return _stream_receipt_image(
             resp.content,
             resp.headers.get("content-type"),
-            fetch_url,
+            fetch_url or stored,
             ref_key,
         )
     except HTTPException:
