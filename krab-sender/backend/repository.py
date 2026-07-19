@@ -8,7 +8,7 @@ from typing import Iterable, List, Optional
 from sqlalchemy import func
 from zoneinfo import ZoneInfo
 
-from .db import SessionLocal, TransactionORM, RecipientORM
+from .db import SessionLocal, TransactionORM, RecipientORM, IssuerGroupChatORM, UserGroupLinkORM
 from bot.models import Transaction
 
 
@@ -297,3 +297,111 @@ def delete_recipient(recipient_id: str) -> bool:
             return False
         session.delete(row)
         return True
+
+
+# Group-attach module (/groupattach): registered group chats + user→group links
+def _group_to_dict(row: IssuerGroupChatORM) -> dict:
+    return {
+        "id": row.id,
+        "name": row.name,
+        "chat_id": row.chat_id,
+        "created_at_utc": row.created_at_utc.isoformat() if row.created_at_utc else None,
+    }
+
+
+def list_group_chats() -> List[dict]:
+    """All registered group chats, ordered by name."""
+    with get_session() as session:
+        rows = session.query(IssuerGroupChatORM).order_by(IssuerGroupChatORM.name.asc()).all()
+        return [_group_to_dict(r) for r in rows]
+
+
+def get_group_chat_by_id(group_id: str) -> Optional[dict]:
+    with get_session() as session:
+        row = session.query(IssuerGroupChatORM).filter(IssuerGroupChatORM.id == group_id).first()
+        return _group_to_dict(row) if row else None
+
+
+def register_group_chat(name: str, chat_id: str) -> dict:
+    """
+    Register (or rename) a group chat by its Telegram chat id. Idempotent:
+    running /groupattach again in the same group just refreshes the name.
+    """
+    import uuid
+    chat_id = str(chat_id)
+    with get_session() as session:
+        row = session.query(IssuerGroupChatORM).filter(IssuerGroupChatORM.chat_id == chat_id).first()
+        if row:
+            row.name = name or row.name
+            return _group_to_dict(row)
+        row = IssuerGroupChatORM(
+            id=str(uuid.uuid4()),
+            name=name or chat_id,
+            chat_id=chat_id,
+            created_at_utc=datetime.now(timezone.utc),
+        )
+        session.add(row)
+        return _group_to_dict(row)
+
+
+def delete_group_chat(group_id: str) -> bool:
+    """Delete a registered group and any user links pointing at it."""
+    with get_session() as session:
+        row = session.query(IssuerGroupChatORM).filter(IssuerGroupChatORM.id == group_id).first()
+        if not row:
+            return False
+        session.query(UserGroupLinkORM).filter(UserGroupLinkORM.group_id == group_id).delete()
+        session.delete(row)
+        return True
+
+
+def set_user_group(telegram_user_id, group_id: str, telegram_name: str | None = None) -> None:
+    """Attach a user's Telegram id to a registered group (one group per user)."""
+    uid = str(telegram_user_id)
+    with get_session() as session:
+        row = session.query(UserGroupLinkORM).filter(UserGroupLinkORM.telegram_user_id == uid).first()
+        if row:
+            row.group_id = group_id
+            if telegram_name:
+                row.telegram_name = telegram_name
+        else:
+            session.add(UserGroupLinkORM(
+                telegram_user_id=uid,
+                telegram_name=telegram_name,
+                group_id=group_id,
+                created_at_utc=datetime.now(timezone.utc),
+            ))
+
+
+def clear_user_group(telegram_user_id) -> bool:
+    """Detach a user from their group. Returns True if a link was removed."""
+    uid = str(telegram_user_id)
+    with get_session() as session:
+        n = session.query(UserGroupLinkORM).filter(UserGroupLinkORM.telegram_user_id == uid).delete()
+        return n > 0
+
+
+def get_user_group(telegram_user_id) -> Optional[dict]:
+    """The group dict a user is attached to, or None."""
+    uid = str(telegram_user_id)
+    with get_session() as session:
+        link = session.query(UserGroupLinkORM).filter(UserGroupLinkORM.telegram_user_id == uid).first()
+        if not link:
+            return None
+        row = session.query(IssuerGroupChatORM).filter(IssuerGroupChatORM.id == link.group_id).first()
+        return _group_to_dict(row) if row else None
+
+
+def list_group_members(group_id: str) -> List[dict]:
+    """Users attached to a group."""
+    with get_session() as session:
+        rows = (
+            session.query(UserGroupLinkORM)
+            .filter(UserGroupLinkORM.group_id == group_id)
+            .order_by(UserGroupLinkORM.created_at_utc.asc())
+            .all()
+        )
+        return [
+            {"telegram_user_id": r.telegram_user_id, "telegram_name": r.telegram_name}
+            for r in rows
+        ]

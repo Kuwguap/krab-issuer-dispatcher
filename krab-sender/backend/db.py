@@ -84,6 +84,38 @@ class RecipientORM(Base):
     created_at_utc = Column(DateTime(timezone=True), nullable=False, default=lambda: datetime.now(timezone.utc))
 
 
+class IssuerGroupChatORM(Base):
+    """
+    A Telegram group chat registered via /groupattach.
+
+    Groups are added first (by running /groupattach inside the group);
+    users then attach their Telegram id to one of these groups so send
+    confirmations are posted to their group.
+    """
+
+    __tablename__ = "issuer_group_chats"
+
+    pk = Column(Integer, primary_key=True, autoincrement=True)
+    id = Column(String, unique=True, nullable=False, index=True)
+    name = Column(String, nullable=False)
+    chat_id = Column(String, unique=True, nullable=False, index=True)
+    created_at_utc = Column(DateTime(timezone=True), nullable=False, default=lambda: datetime.now(timezone.utc))
+
+
+class UserGroupLinkORM(Base):
+    """
+    Attaches a Telegram user id to a registered group chat (one group per user).
+    """
+
+    __tablename__ = "user_group_links"
+
+    pk = Column(Integer, primary_key=True, autoincrement=True)
+    telegram_user_id = Column(String, unique=True, nullable=False, index=True)
+    telegram_name = Column(String, nullable=True)
+    group_id = Column(String, nullable=False, index=True)  # issuer_group_chats.id
+    created_at_utc = Column(DateTime(timezone=True), nullable=False, default=lambda: datetime.now(timezone.utc))
+
+
 def init_db() -> None:
     """
     Initialize database and create tables if they don't exist.

@@ -32,7 +32,17 @@ from .email_client import create_email_provider
 from .models import Transaction
 from .reference_id import collect_reference_candidates
 from backend.db import init_db
-from backend.repository import save_transaction
+from backend.repository import (
+    save_transaction,
+    list_group_chats,
+    get_group_chat_by_id,
+    register_group_chat,
+    delete_group_chat,
+    set_user_group,
+    clear_user_group,
+    get_user_group,
+    list_group_members,
+)
 from backend.issuer_supabase import (
     get_lead_id_by_reference,
     get_pending_tag_lead_id_by_reference,
@@ -601,6 +611,17 @@ async def handle_confirmation(update: Update, context: ContextTypes.DEFAULT_TYPE
             except Exception as group_err:
                 logger.warning("Failed to notify issuer group: %s", group_err)
 
+        # Also confirm to the sender's attached group (/groupattach), naming the driver.
+        gref = (tx.reference_id or "").strip() or _display_reference_for_tx(tx)
+        await _notify_attached_group_of_send(
+            bot,
+            bot_config,
+            user,
+            recipient_name,
+            pending_doc["file_name"],
+            gref,
+        )
+
         # Mark as delivered and persist to DB.
         tx.delivery_status = "DELIVERED"
         try:
@@ -1150,6 +1171,169 @@ async def handle_tx_code(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await update.message.reply_text("❌ Invalid code. Please try again.")
 
 
+# ── Group-attach module (/groupattach) ─────────────────────────────────────
+# Group chats are registered first (run /groupattach INSIDE the group); then
+# each user DMs /groupattach and selects their group. After every successful
+# tag email, a confirmation is posted to the sender's attached group showing
+# which driver the email went to.
+
+def _ga_selection_keyboard(groups: List[dict], attached_id: str | None) -> InlineKeyboardMarkup:
+    rows = []
+    for g in groups:
+        mark = "✅ " if attached_id and g["id"] == attached_id else ""
+        rows.append([InlineKeyboardButton(f"{mark}{g['name']}", callback_data=f"ga_sel_{g['id']}")])
+    extra = []
+    if attached_id:
+        extra.append(InlineKeyboardButton("🔌 Detach me", callback_data="ga_detach"))
+    extra.append(InlineKeyboardButton("🗑 Remove a group", callback_data="ga_rmmenu"))
+    rows.append(extra)
+    return InlineKeyboardMarkup(rows)
+
+
+async def groupattach(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Register the current group chat, or (in private) pick your group."""
+    chat = update.effective_chat
+    user = update.effective_user
+    if chat and chat.type in ("group", "supergroup"):
+        g = await asyncio.to_thread(
+            register_group_chat, (chat.title or "").strip() or str(chat.id), str(chat.id)
+        )
+        await update.message.reply_text(
+            f"✅ Group registered: {g['name']}\n\n"
+            "Team members: DM me /groupattach to attach your Telegram ID to this group. "
+            "Send confirmations will be posted here for everyone attached."
+        )
+        return
+
+    groups = await asyncio.to_thread(list_group_chats)
+    if not groups:
+        await update.message.reply_text(
+            "No groups registered yet.\n\n"
+            "Step 1: add me to your team group chat and run /groupattach there.\n"
+            "Step 2: come back here and run /groupattach to select your group."
+        )
+        return
+    current = await asyncio.to_thread(get_user_group, user.id)
+    head = (
+        f"You are attached to: {current['name']}\n\nTap to switch groups:"
+        if current else "Select your group — send confirmations will be posted there:"
+    )
+    await update.message.reply_text(
+        "👥 Group attach\n\n" + head,
+        reply_markup=_ga_selection_keyboard(groups, current["id"] if current else None),
+    )
+
+
+async def handle_ga_select(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    group_id = query.data[len("ga_sel_"):]
+    g = await asyncio.to_thread(get_group_chat_by_id, group_id)
+    if not g:
+        await query.edit_message_text("❌ That group no longer exists. Run /groupattach again.")
+        return
+    user = update.effective_user
+    await asyncio.to_thread(set_user_group, user.id, group_id, user.full_name)
+    await query.edit_message_text(
+        f"✅ Attached!\n\n"
+        f"👤 {user.full_name} → 👥 {g['name']}\n\n"
+        "Every time you send a tag email, a confirmation will be posted to this group "
+        "showing which driver it went to.\n\n"
+        "Run /groupattach again anytime to switch or detach."
+    )
+
+
+async def handle_ga_detach(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    removed = await asyncio.to_thread(clear_user_group, update.effective_user.id)
+    await query.edit_message_text(
+        "🔌 Detached — send confirmations will no longer be posted to a group for you."
+        if removed else "You weren't attached to any group."
+    )
+
+
+async def handle_ga_remove_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    groups = await asyncio.to_thread(list_group_chats)
+    if not groups:
+        await query.edit_message_text("No groups registered.")
+        return
+    rows = [
+        [InlineKeyboardButton(f"🗑 {g['name']}", callback_data=f"ga_rm_{g['id']}")]
+        for g in groups
+    ]
+    rows.append([InlineKeyboardButton("↩️ Back", callback_data="ga_back")])
+    await query.edit_message_text(
+        "Which group should be removed? (Its attached users are detached too.)",
+        reply_markup=InlineKeyboardMarkup(rows),
+    )
+
+
+async def handle_ga_remove(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    group_id = query.data[len("ga_rm_"):]
+    g = await asyncio.to_thread(get_group_chat_by_id, group_id)
+    members = await asyncio.to_thread(list_group_members, group_id) if g else []
+    ok = await asyncio.to_thread(delete_group_chat, group_id)
+    if ok and g:
+        await query.edit_message_text(
+            f"🗑 Removed {g['name']} ({len(members)} attached user(s) detached)."
+        )
+    else:
+        await query.edit_message_text("❌ Group not found.")
+
+
+async def handle_ga_back(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    groups = await asyncio.to_thread(list_group_chats)
+    current = await asyncio.to_thread(get_user_group, update.effective_user.id)
+    if not groups:
+        await query.edit_message_text("No groups registered.")
+        return
+    await query.edit_message_text(
+        "👥 Group attach\n\nSelect your group:",
+        reply_markup=_ga_selection_keyboard(groups, current["id"] if current else None),
+    )
+
+
+async def _notify_attached_group_of_send(
+    bot,
+    bot_config: BotConfig,
+    sender,
+    recipient_name: str,
+    file_name: str,
+    reference_id: str | None,
+) -> None:
+    """Post a send confirmation to the sender's attached group (if any).
+
+    Skips silently when the user has no attached group, and avoids double-posting
+    when the attached group is the same chat as the configured issuer group.
+    """
+    try:
+        g = await asyncio.to_thread(get_user_group, sender.id)
+        if not g:
+            return
+        if bot_config.issuer_group_chat_id and str(bot_config.issuer_group_chat_id) == str(g["chat_id"]):
+            return
+        await bot.send_message(
+            chat_id=g["chat_id"],
+            text=(
+                "✅ Tag email sent\n\n"
+                f"📄 {file_name}\n"
+                + (f"📋 Reference: {reference_id}\n" if reference_id else "")
+                + f"🚘 Driver: {recipient_name}\n"
+                f"👤 Sent by: {sender.full_name}"
+            ),
+            parse_mode=None,
+        )
+    except Exception as e:
+        logger.warning("Failed to notify attached group of send: %s", e)
+
+
 def build_application(config: BotConfig):
     """
     Build the telegram Application with all handlers attached.
@@ -1191,6 +1375,13 @@ def build_application(config: BotConfig):
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("transactions", show_transactions))
+    # Group-attach module: register groups + attach user ids to a group.
+    app.add_handler(CommandHandler("groupattach", groupattach))
+    app.add_handler(CallbackQueryHandler(handle_ga_select, pattern="^ga_sel_"))
+    app.add_handler(CallbackQueryHandler(handle_ga_detach, pattern="^ga_detach$"))
+    app.add_handler(CallbackQueryHandler(handle_ga_remove_menu, pattern="^ga_rmmenu$"))
+    app.add_handler(CallbackQueryHandler(handle_ga_remove, pattern="^ga_rm_"))
+    app.add_handler(CallbackQueryHandler(handle_ga_back, pattern="^ga_back$"))
     app.add_handler(CallbackQueryHandler(handle_transactions_button, pattern="^view_transactions$"))
     app.add_handler(CallbackQueryHandler(handle_tx_page_callback, pattern=r"^tx_page_\d+$"))
     # Conversation handler should come before generic text handlers
