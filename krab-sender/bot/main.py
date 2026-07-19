@@ -4,6 +4,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import uuid
 from datetime import datetime, timedelta, timezone
 from enum import IntEnum, auto
@@ -1187,6 +1188,7 @@ def _ga_selection_keyboard(groups: List[dict], attached_id: str | None) -> Inlin
         extra.append(InlineKeyboardButton("🔌 Detach me", callback_data="ga_detach"))
     extra.append(InlineKeyboardButton("🗑 Remove a group", callback_data="ga_rmmenu"))
     rows.append(extra)
+    rows.append([InlineKeyboardButton("➕ Attach an ID manually", callback_data="ga_manmenu")])
     return InlineKeyboardMarkup(rows)
 
 
@@ -1300,6 +1302,77 @@ async def handle_ga_back(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     )
 
 
+async def handle_ga_manual_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Manual attach step 1: pick which group the ID should be attached to."""
+    query = update.callback_query
+    await query.answer()
+    groups = await asyncio.to_thread(list_group_chats)
+    if not groups:
+        await query.edit_message_text(
+            "No groups registered yet — run /groupattach inside the group first."
+        )
+        return
+    rows = [
+        [InlineKeyboardButton(g["name"], callback_data=f"ga_man_{g['id']}")]
+        for g in groups
+    ]
+    rows.append([InlineKeyboardButton("↩️ Back", callback_data="ga_back")])
+    await query.edit_message_text(
+        "➕ Manual attach\n\nSelect the group to attach a Telegram ID to:",
+        reply_markup=InlineKeyboardMarkup(rows),
+    )
+
+
+async def handle_ga_manual_group(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Manual attach step 2: group chosen — ask for the Telegram ID."""
+    query = update.callback_query
+    await query.answer()
+    group_id = query.data[len("ga_man_"):]
+    g = await asyncio.to_thread(get_group_chat_by_id, group_id)
+    if not g:
+        await query.edit_message_text("❌ That group no longer exists. Run /groupattach again.")
+        return
+    context.user_data["ga_manual_group"] = group_id
+    await query.edit_message_text(
+        f"👥 Group: {g['name']}\n\n"
+        "Now drop the Telegram ID to attach (numbers only, e.g. 123456789).\n\n"
+        "Send /cancel to stop."
+    )
+
+
+async def handle_ga_manual_id(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    """Manual attach step 3: consume the dropped Telegram ID.
+
+    Returns True when this message was handled by the manual-attach flow.
+    """
+    group_id = context.user_data.get("ga_manual_group")
+    if not group_id:
+        return False
+    text = (update.message.text or "").strip()
+    m = re.search(r"\d{5,15}", text.replace(" ", ""))
+    if not m:
+        await update.message.reply_text(
+            "⚠️ That doesn't look like a Telegram ID — send numbers only "
+            "(e.g. 123456789), or /cancel to stop."
+        )
+        return True
+    tg_id = m.group(0)
+    g = await asyncio.to_thread(get_group_chat_by_id, group_id)
+    if not g:
+        context.user_data.pop("ga_manual_group", None)
+        await update.message.reply_text("❌ That group no longer exists. Run /groupattach again.")
+        return True
+    await asyncio.to_thread(set_user_group, tg_id, group_id, None)
+    context.user_data.pop("ga_manual_group", None)
+    await update.message.reply_text(
+        f"✅ Attached!\n\n"
+        f"🆔 {tg_id} → 👥 {g['name']}\n\n"
+        "Send confirmations for that user's tag emails will be posted to this group.\n"
+        "Run /groupattach to attach another ID or make changes."
+    )
+    return True
+
+
 async def _notify_attached_group_of_send(
     bot,
     bot_config: BotConfig,
@@ -1382,17 +1455,25 @@ def build_application(config: BotConfig):
     app.add_handler(CallbackQueryHandler(handle_ga_remove_menu, pattern="^ga_rmmenu$"))
     app.add_handler(CallbackQueryHandler(handle_ga_remove, pattern="^ga_rm_"))
     app.add_handler(CallbackQueryHandler(handle_ga_back, pattern="^ga_back$"))
+    app.add_handler(CallbackQueryHandler(handle_ga_manual_menu, pattern="^ga_manmenu$"))
+    app.add_handler(CallbackQueryHandler(handle_ga_manual_group, pattern="^ga_man_"))
     app.add_handler(CallbackQueryHandler(handle_transactions_button, pattern="^view_transactions$"))
     app.add_handler(CallbackQueryHandler(handle_tx_page_callback, pattern=r"^tx_page_\d+$"))
     # Conversation handler should come before generic text handlers
     app.add_handler(conv_handler)
     # Global /cancel (works outside conversation too — clears all state).
     app.add_handler(CommandHandler("cancel", cancel))
-    # Handler for access code input (comes after conversation handler to avoid conflicts)
+    # Free-text dispatcher (after conversation handler to avoid conflicts):
+    # manual group-attach ID drop first, otherwise transactions access code.
+    async def handle_free_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        if await handle_ga_manual_id(update, context):
+            return
+        await handle_tx_code(update, context)
+
     app.add_handler(
         MessageHandler(
             filters.TEXT & ~filters.COMMAND,
-            handle_tx_code,
+            handle_free_text,
         )
     )
 
