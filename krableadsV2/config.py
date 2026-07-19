@@ -82,6 +82,14 @@ class Config:
     ).strip().rstrip("/")
     INTEGRATIONS_API_KEY = (os.getenv("INTEGRATIONS_API_KEY") or "").strip().lstrip("=") or None
 
+    # Client follow-up outreach (bot texts the client chasing the VIN).
+    # Optional — when unset, follow-ups fall back to email-only client contact.
+    TWILIO_ACCOUNT_SID = (os.getenv("TWILIO_ACCOUNT_SID") or "").strip().lstrip("=") or None
+    TWILIO_AUTH_TOKEN = (os.getenv("TWILIO_AUTH_TOKEN") or "").strip().lstrip("=") or None
+    TWILIO_FROM_NUMBER = (os.getenv("TWILIO_FROM_NUMBER") or "").strip().lstrip("=") or None
+    # Agency name used in client-facing follow-up texts/emails.
+    FOLLOWUP_AGENCY_NAME = (os.getenv("FOLLOWUP_AGENCY_NAME") or "Tri State Coverage").strip()
+
     # NJ Temporary Evidence of Insurance (upstream barcode-app HTTP endpoint).
     BARCODE_APP_BASE_URL = (os.getenv("BARCODE_APP_BASE_URL") or "").strip().rstrip("/") or None
 
@@ -93,6 +101,11 @@ class Config:
     @classmethod
     def is_lead_ingest_configured(cls) -> bool:
         return bool(cls.LEAD_INGEST_API_KEY and cls.API_LEAD_USER_ID)
+
+    @classmethod
+    def is_twilio_configured(cls) -> bool:
+        """True if the bot can text clients directly (follow-up chase SMS)."""
+        return bool(cls.TWILIO_ACCOUNT_SID and cls.TWILIO_AUTH_TOKEN and cls.TWILIO_FROM_NUMBER)
 
     @classmethod
     def is_nj_configured(cls) -> bool:

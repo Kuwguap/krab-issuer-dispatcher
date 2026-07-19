@@ -1778,6 +1778,10 @@ class Database:
         frequency: str | None = None,
         start_at: str | None = None,
         next_reminder_at: str | None = None,
+        email: str | None = None,
+        contact_client: bool = False,
+        end_at: str | None = None,
+        kind: str = "followup",
     ) -> Optional[Dict[str, Any]]:
         """Create a prospective-client follow-up record.
 
@@ -1801,6 +1805,14 @@ class Database:
                 row["start_at"] = start_at
             if next_reminder_at:
                 row["next_reminder_at"] = next_reminder_at
+            if email:
+                row["email"] = email
+            if contact_client:
+                row["contact_client"] = True
+            if end_at:
+                row["end_at"] = end_at
+            if kind and kind != "followup":
+                row["kind"] = kind
             r = self.client.table("client_followups").insert(row).execute()
             return r.data[0] if r.data else None
         except Exception as e:
@@ -1879,6 +1891,34 @@ class Database:
         except Exception as e:
             logger.error(f"Error fetching open follow-ups for user: {e}")
             return []
+
+    def get_all_open_followups(self) -> list:
+        """All open follow-ups across every agent (supervisor backend view)."""
+        if not self._check_tables_exist():
+            return []
+        try:
+            r = (
+                self.client.table("client_followups")
+                .select("*")
+                .eq("status", "open")
+                .order("next_reminder_at")
+                .execute()
+            )
+            return r.data or []
+        except Exception as e:
+            logger.error(f"Error fetching all open follow-ups: {e}")
+            return []
+
+    def delete_client_followup(self, followup_id: str) -> bool:
+        """Permanently delete a follow-up record (supervisor backend action)."""
+        if not self._check_tables_exist():
+            return False
+        try:
+            self.client.table("client_followups").delete().eq("id", followup_id).execute()
+            return True
+        except Exception as e:
+            logger.error(f"Error deleting client follow-up: {e}")
+            return False
 
     # ── Lead appeals ───────────────────────────────────────────────────
 

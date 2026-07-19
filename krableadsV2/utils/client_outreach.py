@@ -1,0 +1,141 @@
+"""Client-facing follow-up outreach: SMS (Twilio) + email (Resend).
+
+Used by the /followup flow: when the agent enables "bot chases client", every
+reminder tick also texts/emails the client directly (e.g. chasing them for a
+VIN) so the client follows up with the agent — not the other way around.
+
+Environment variables (read from ``Config``):
+  * ``TWILIO_ACCOUNT_SID`` / ``TWILIO_AUTH_TOKEN`` / ``TWILIO_FROM_NUMBER``
+    — optional; when unset, SMS is silently skipped and only email is sent.
+  * ``RESEND_API_KEY`` / ``RESEND_FROM`` — reused from the insurance-card flow.
+"""
+from __future__ import annotations
+
+import logging
+import re
+from typing import Optional
+
+import requests
+
+from utils.resend_client import get_resend_client, get_resend_from_address, first_name_from_full
+
+logger = logging.getLogger(__name__)
+
+_TWILIO_SMS_URL = "https://api.twilio.com/2010-04-01/Accounts/{sid}/Messages.json"
+
+
+def _twilio_credentials() -> Optional[tuple[str, str, str]]:
+    try:
+        from config import Config
+    except Exception:
+        return None
+    sid = (getattr(Config, "TWILIO_ACCOUNT_SID", None) or "").strip()
+    token = (getattr(Config, "TWILIO_AUTH_TOKEN", None) or "").strip()
+    from_num = (getattr(Config, "TWILIO_FROM_NUMBER", None) or "").strip()
+    if not (sid and token and from_num):
+        return None
+    return sid, token, from_num
+
+
+def normalize_us_phone(raw: str | None) -> Optional[str]:
+    """Best-effort E.164 for US/tri-state numbers; None if not phone-shaped."""
+    digits = re.sub(r"\D", "", raw or "")
+    if len(digits) == 11 and digits.startswith("1"):
+        return f"+{digits}"
+    if len(digits) == 10:
+        return f"+1{digits}"
+    if (raw or "").strip().startswith("+") and len(digits) >= 10:
+        return f"+{digits}"
+    return None
+
+
+def build_vin_chase_sms(client_name: str | None, agency_name: str) -> str:
+    first = first_name_from_full(client_name or "")
+    return (
+        f"Hi {first}, it's {agency_name}. Your auto insurance quote is ready to go — "
+        "we're just waiting on your VIN (vehicle identification number) to finalize it. "
+        "Reply here or call us with the VIN and we'll get you covered same day. Thank you!"
+    )
+
+
+def build_vin_chase_email(client_name: str | None, agency_name: str) -> tuple[str, str]:
+    first = first_name_from_full(client_name or "")
+    subject = f"Action needed: your VIN to finalize your auto insurance — {agency_name}"
+    body = (
+        f"Hi {first},\n\n"
+        f"Good news — your auto insurance quote with {agency_name} is approved and ready to be issued.\n\n"
+        "The only thing we still need is your VIN (Vehicle Identification Number).\n\n"
+        "Where to find it:\n"
+        "• On the driver's-side dashboard, visible through the windshield\n"
+        "• On the driver's-side door jamb sticker\n"
+        "• On your vehicle registration or title\n\n"
+        "Reply to this email (or text us back) with the VIN and we'll activate your coverage right away.\n\n"
+        f"Thank you,\n{agency_name}\n"
+    )
+    return subject, body
+
+
+def build_renewal_sms(client_name: str | None, agency_name: str) -> str:
+    first = first_name_from_full(client_name or "")
+    return (
+        f"Hi {first}, it's {agency_name}. Your monthly auto insurance renewal is coming up — "
+        "reply here or call us to renew and stay covered. Thank you!"
+    )
+
+
+def build_renewal_email(client_name: str | None, agency_name: str) -> tuple[str, str]:
+    first = first_name_from_full(client_name or "")
+    subject = f"Your monthly renewal is due — {agency_name}"
+    body = (
+        f"Hi {first},\n\n"
+        f"This is a friendly reminder from {agency_name} that your monthly auto insurance renewal is due.\n\n"
+        "Reply to this email or text us back and we'll process your renewal right away so your coverage stays active.\n\n"
+        f"Thank you,\n{agency_name}\n"
+    )
+    return subject, body
+
+
+def send_client_sms(to_phone: str | None, body: str) -> tuple[bool, Optional[str]]:
+    """Send an SMS via Twilio. Returns (ok, error). Skips cleanly when unconfigured."""
+    creds = _twilio_credentials()
+    if creds is None:
+        return False, "SMS not configured (TWILIO_ACCOUNT_SID/TWILIO_AUTH_TOKEN/TWILIO_FROM_NUMBER)."
+    to = normalize_us_phone(to_phone)
+    if not to:
+        return False, f"Phone number not SMS-able: {to_phone!r}"
+    sid, token, from_num = creds
+    try:
+        resp = requests.post(
+            _TWILIO_SMS_URL.format(sid=sid),
+            auth=(sid, token),
+            data={"From": from_num, "To": to, "Body": body},
+            timeout=15,
+        )
+        if resp.status_code >= 400:
+            msg = resp.json().get("message") if resp.headers.get("content-type", "").startswith("application/json") else resp.text
+            return False, f"Twilio {resp.status_code}: {msg}"
+        return True, None
+    except Exception as e:  # pragma: no cover — network paths exercised in prod
+        logger.warning("Twilio SMS send failed: %s", e)
+        return False, str(e)
+
+
+def send_client_email(to_address: str | None, subject: str, body: str) -> tuple[bool, Optional[str]]:
+    """Send a plain-text follow-up email via Resend. Returns (ok, error)."""
+    to = (to_address or "").strip()
+    if not to or "@" not in to:
+        return False, f"Email address not usable: {to_address!r}"
+    resend = get_resend_client()
+    from_addr = get_resend_from_address()
+    if resend is None or not from_addr:
+        return False, "Email not configured (RESEND_API_KEY and RESEND_FROM are required)."
+    try:
+        resend.Emails.send({"from": from_addr, "to": [to], "subject": subject, "text": body})
+        return True, None
+    except Exception as e:  # pragma: no cover
+        logger.warning("Resend follow-up email failed: %s", e)
+        return False, str(e)
+
+
+def sms_configured() -> bool:
+    return _twilio_credentials() is not None

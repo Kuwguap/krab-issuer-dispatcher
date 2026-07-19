@@ -213,8 +213,10 @@ def _help_guide_text() -> str:
         "🚀 Main Commands\n\n"
         "▶️ /start — Open the bot\n"
         "➕ /lead or /client — Add a new client/lead\n"
-        "📇 /followup — Save a not-ready client + follow-up reminders\n"
+        "📇 /followup — Client ready but missing VIN? The bot texts/emails\n"
+        "     them on your schedule so THEY chase YOU (start/stop/frequency)\n"
         "🗂 /followups — List your open follow-ups\n"
+        "👁 /allfollowups — Supervisors: view, stop or delete any follow-up\n"
         "🧾 /receipts — Upload receipts\n"
         "📋 /appeal — Appeal / cancel a delivery (with proof)\n"
         "❌ /cancel — Cancel and restart\n"
@@ -8377,7 +8379,11 @@ def _build_renewal_group_message(renewal: dict) -> str:
 
 
 def _build_renewal_driver_message(renewal: dict) -> str:
-    """Build the driver-facing renewal notice (plain text)."""
+    """Build the driver-facing renewal notice (plain text).
+
+    Shows the TAG INFO up front (client, vehicle, issue/expiration) so the
+    driver sees exactly which tag this is BEFORE choosing Accept or Reassign.
+    """
     lead = renewal.get("lead") or {}
     ref = lead.get("reference_id") or "N/A"
     delivery = _delivery_block_plain(lead)
@@ -8385,8 +8391,20 @@ def _build_renewal_driver_message(renewal: dict) -> str:
     link = (lead.get("encrypted_link") or "").strip() or "N/A"
     price = (lead.get("price") or "").strip() or "N/A"
     spec_d = _lead_driver_note(lead)
+    client_name = _client_display_name_from_lead(lead) or "N/A"
+    vd = (lead.get("vehicle_details") or "").strip().replace("\r\n", "\n") or "N/A"
+    issue_dt = _dt_from_lead_field(lead.get("issue_date"))
+    exp_dt = _dt_from_lead_field(lead.get("expiration_date"))
+    issue_s = issue_dt.strftime("%Y-%m-%d") if issue_dt else "—"
+    exp_s = exp_dt.strftime("%Y-%m-%d") if exp_dt else "—"
     lines = [
         "🔄 RENEWAL DELIVERY AVAILABLE",
+        "",
+        "🏷 TAG INFO",
+        f"👤 Client: {client_name}",
+        f"🚗 Vehicle: {vd}",
+        f"📅 Issued: {issue_s}",
+        f"⌛️ Expires: {exp_s}",
         "",
         "📍 Delivery Address",
         delivery,
@@ -8854,19 +8872,25 @@ async def handle_renewal_driver_reassign(update: Update, context: ContextTypes.D
 
 
 # ── Client follow-ups ──────────────────────────────────────────────────────
-# Lightweight tracker for prospective clients who aren't ready for a policy yet
-# (no VIN/car). Agent stores the client + a recurring reminder that DMs them on a
-# schedule until they close the sale or stop reminders.
+# Tracker for prospective clients who are ready to buy but missing something
+# (usually the VIN). The agent enters everything they have + the client's phone
+# and email; on the chosen start/stop/frequency the BOT chases the client by
+# text + email (so the client follows up with the agent), and DMs the agent +
+# all supervisors a reminder with a stop button.
 
 STATE_FU_NAME = 40
 STATE_FU_PHONE = 41
 STATE_FU_NOTES = 42
 STATE_FU_SCHEDULE = 43
+STATE_FU_EMAIL = 44
 
 _FU_FREQ_DAYS = {"daily": 1, "weekly": 7, "biweekly": 14, "monthly": 30}
 _FU_FREQ_LABEL = {"daily": "daily", "weekly": "weekly", "biweekly": "every 2 weeks", "monthly": "monthly"}
 _FU_DAY_NAMES = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
 _FU_TIME_HOURS = {"morning": 9, "afternoon": 13, "evening": 18}
+# "Stop" choices: how long the bot keeps chasing before auto-stopping.
+_FU_END_DAYS = {"1w": 7, "2w": 14, "1m": 30, "3m": 90}
+_FU_END_LABEL = {"1w": "1 week", "2w": "2 weeks", "1m": "1 month", "3m": "3 months", "forever": "until stopped"}
 
 
 def _fu_parse_iso(s: str | None):
@@ -8916,13 +8940,38 @@ async def handle_fu_name(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
 async def handle_fu_phone(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     context.user_data.setdefault("fu", {})["phone_number"] = (update.message.text or "").strip()
-    return await _fu_prompt_notes(update.message.reply_text)
+    return await _fu_prompt_email(update.message.reply_text)
 
 
 async def handle_fu_phone_skip(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     query = update.callback_query
     await query.answer()
     context.user_data.setdefault("fu", {})["phone_number"] = None
+    return await _fu_prompt_email(query.message.reply_text)
+
+
+async def _fu_prompt_email(reply) -> int:
+    kb = InlineKeyboardMarkup([[InlineKeyboardButton("⏭ Skip", callback_data="fu_skip_email")]])
+    await reply(
+        "📧 Client's email? (type it, or Skip)\n\n"
+        "Phone + email let the bot text/email the client for you.",
+        reply_markup=kb,
+    )
+    return STATE_FU_EMAIL
+
+
+async def handle_fu_email(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    text = (update.message.text or "").strip()
+    context.user_data.setdefault("fu", {})["email"] = text if "@" in text else None
+    if "@" not in text:
+        await update.message.reply_text("⚠️ That doesn't look like an email — skipping it.")
+    return await _fu_prompt_notes(update.message.reply_text)
+
+
+async def handle_fu_email_skip(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    await query.answer()
+    context.user_data.setdefault("fu", {})["email"] = None
     return await _fu_prompt_notes(query.message.reply_text)
 
 
@@ -8972,6 +9021,7 @@ async def handle_fu_schedule_callback(update: Update, context: ContextTypes.DEFA
             client_name=fu.get("client_name"),
             phone_number=fu.get("phone_number"),
             notes=fu.get("notes"),
+            email=fu.get("email"),
         )
         await query.message.edit_text("💾 Saved. No reminders set.")
         context.user_data.pop("fu", None)
@@ -9012,33 +9062,88 @@ async def handle_fu_schedule_callback(update: Update, context: ContextTypes.DEFA
         return STATE_FU_SCHEDULE
 
     if data.startswith("fu_freq_"):
-        freq = data[len("fu_freq_"):]
-        day_idx = int(fu.get("day_idx", 0))
-        hour = _FU_TIME_HOURS.get(fu.get("time_key", "morning"), 9)
-        start_local = _fu_compute_start(day_idx, hour)
-        start_utc = start_local.astimezone(pytz.utc)
-        db.create_client_followup(
-            user_id=update.effective_user.id,
-            telegram_username=update.effective_user.username,
-            client_name=fu.get("client_name"),
-            phone_number=fu.get("phone_number"),
-            notes=fu.get("notes"),
-            frequency=freq,
-            start_at=start_utc.isoformat(),
-            next_reminder_at=start_utc.isoformat(),
-        )
-        name = fu.get("client_name") or "client"
+        fu["freq"] = data[len("fu_freq_"):]
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton("1 week", callback_data="fu_end_1w"),
+             InlineKeyboardButton("2 weeks", callback_data="fu_end_2w")],
+            [InlineKeyboardButton("1 month", callback_data="fu_end_1m"),
+             InlineKeyboardButton("3 months", callback_data="fu_end_3m")],
+            [InlineKeyboardButton("♾ Until I stop it", callback_data="fu_end_forever")],
+        ])
         await query.message.edit_text(
-            f"✅ Reminder set for *{name}*.\n\n"
-            f"First reminder: {_FU_DAY_NAMES[day_idx]} {fu.get('time_key', 'morning')} "
-            f"({start_local.strftime('%b %d, %I:%M %p')} ET), {_FU_FREQ_LABEL.get(freq, freq)}.\n\n"
-            "You'll get a DM until you close or stop it.",
-            parse_mode="Markdown",
+            "🛑 When should the follow-ups stop (if the client never responds)?",
+            reply_markup=kb,
         )
-        context.user_data.pop("fu", None)
-        return ConversationHandler.END
+        return STATE_FU_SCHEDULE
+
+    if data.startswith("fu_end_"):
+        fu["end_key"] = data[len("fu_end_"):]
+        if fu.get("phone_number") or fu.get("email"):
+            channels = []
+            if fu.get("phone_number") and Config.is_twilio_configured():
+                channels.append("📲 text")
+            if fu.get("email") and Config.is_resend_configured():
+                channels.append("📧 email")
+            if channels:
+                kb = InlineKeyboardMarkup([[
+                    InlineKeyboardButton("🤖 Yes — bot chases client", callback_data="fu_chase_yes"),
+                    InlineKeyboardButton("🙅 No — just remind me", callback_data="fu_chase_no"),
+                ]])
+                await query.message.edit_text(
+                    f"🤖 Should the bot also {' + '.join(channels)} the client on this schedule "
+                    "(chasing them for the VIN so they follow up with YOU)?",
+                    reply_markup=kb,
+                )
+                return STATE_FU_SCHEDULE
+        return await _fu_finish_save(update, context, chase=False)
+
+    if data in ("fu_chase_yes", "fu_chase_no"):
+        return await _fu_finish_save(update, context, chase=(data == "fu_chase_yes"))
 
     return STATE_FU_SCHEDULE
+
+
+async def _fu_finish_save(update: Update, context: ContextTypes.DEFAULT_TYPE, chase: bool) -> int:
+    """Persist the follow-up with its schedule and confirm to the agent."""
+    query = update.callback_query
+    fu = context.user_data.setdefault("fu", {})
+    freq = fu.get("freq") or "weekly"
+    day_idx = int(fu.get("day_idx", 0))
+    hour = _FU_TIME_HOURS.get(fu.get("time_key", "morning"), 9)
+    start_local = _fu_compute_start(day_idx, hour)
+    start_utc = start_local.astimezone(pytz.utc)
+    end_key = fu.get("end_key") or "forever"
+    end_iso = None
+    if end_key in _FU_END_DAYS:
+        end_iso = (start_utc + timedelta(days=_FU_END_DAYS[end_key])).isoformat()
+    db.create_client_followup(
+        user_id=update.effective_user.id,
+        telegram_username=update.effective_user.username,
+        client_name=fu.get("client_name"),
+        phone_number=fu.get("phone_number"),
+        notes=fu.get("notes"),
+        email=fu.get("email"),
+        frequency=freq,
+        start_at=start_utc.isoformat(),
+        next_reminder_at=start_utc.isoformat(),
+        contact_client=chase,
+        end_at=end_iso,
+    )
+    name = fu.get("client_name") or "client"
+    chase_line = (
+        "🤖 The bot will text/email the client on this schedule — they'll chase YOU."
+        if chase else "You'll get a DM until you close or stop it."
+    )
+    await query.message.edit_text(
+        f"✅ Follow-up set for *{name}*.\n\n"
+        f"First: {_FU_DAY_NAMES[day_idx]} {fu.get('time_key', 'morning')} "
+        f"({start_local.strftime('%b %d, %I:%M %p')} ET), {_FU_FREQ_LABEL.get(freq, freq)}, "
+        f"stops: {_FU_END_LABEL.get(end_key, end_key)}.\n\n"
+        f"{chase_line}",
+        parse_mode="Markdown",
+    )
+    context.user_data.pop("fu", None)
+    return ConversationHandler.END
 
 
 async def cmd_followup_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -9085,12 +9190,60 @@ async def _handle_cf_action(update: Update, context: ContextTypes.DEFAULT_TYPE, 
         await query.message.reply_text("⏭ Snoozed 1 day.")
         return
 
+    if prefix == "cf_close_":
+        # Deal closed — offer to roll straight into a monthly renewal reminder.
+        short = _short_uuid(fid)
+        kb = InlineKeyboardMarkup([[
+            InlineKeyboardButton("🔁 Yes — monthly renewal", callback_data=f"cf_renew_{short}"),
+            InlineKeyboardButton("✔️ No — just close", callback_data=f"cf_done_{short}"),
+        ]])
+        try:
+            await query.edit_message_reply_markup(reply_markup=None)
+        except Exception:
+            pass
+        await query.message.reply_text(
+            "🎉 Deal closed! Start a *monthly renewal* reminder for this client?",
+            reply_markup=kb, parse_mode="Markdown",
+        )
+        return
+
+    if prefix == "cf_renew_":
+        from datetime import timezone
+        nxt = datetime.now(timezone.utc) + timedelta(days=30)
+        db.update_client_followup(fid, {
+            "status": "open",
+            "kind": "renewal",
+            "frequency": "monthly",
+            "next_reminder_at": nxt.isoformat(),
+            "end_at": None,
+        })
+        try:
+            await query.edit_message_reply_markup(reply_markup=None)
+        except Exception:
+            pass
+        await query.message.reply_text(
+            "🔁 Monthly renewal reminder started — first one in 30 days."
+        )
+        return
+
+    if prefix == "cf_del_":
+        if not _user_is_global_supervisor(update.effective_user.id):
+            await query.message.reply_text("⛔ Only supervisors can delete follow-ups.")
+            return
+        db.delete_client_followup(fid)
+        try:
+            await query.edit_message_reply_markup(reply_markup=None)
+        except Exception:
+            pass
+        await query.message.reply_text("🗑 Follow-up deleted.")
+        return
+
     db.close_client_followup(fid)
     try:
         await query.edit_message_reply_markup(reply_markup=None)
     except Exception:
         pass
-    if prefix == "cf_close_":
+    if prefix == "cf_done_":
         await query.message.reply_text("✅ Marked closed — reminders stopped.")
     else:
         await query.message.reply_text("🔕 Reminders stopped.")
@@ -9106,6 +9259,50 @@ async def handle_cf_stop(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
 async def handle_cf_snooze(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await _handle_cf_action(update, context, "cf_snooze_")
+
+
+async def handle_cf_renew(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await _handle_cf_action(update, context, "cf_renew_")
+
+
+async def handle_cf_done(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await _handle_cf_action(update, context, "cf_done_")
+
+
+async def handle_cf_delete(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await _handle_cf_action(update, context, "cf_del_")
+
+
+async def cmd_all_followups(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Supervisor backend: view ALL open follow-ups with stop/delete controls."""
+    if not _user_is_global_supervisor(update.effective_user.id):
+        await update.message.reply_text("⛔ Supervisors only.")
+        return
+    rows = db.get_all_open_followups()
+    if not rows:
+        await update.message.reply_text("No open follow-ups anywhere. ✅")
+        return
+    await update.message.reply_text(f"🗂 *All open follow-ups ({len(rows)}):*", parse_mode="Markdown")
+    for f in rows[:50]:
+        name = f.get("client_name") or "client"
+        agent = f.get("telegram_username")
+        nxt = _fu_parse_iso(f.get("next_reminder_at"))
+        when = nxt.astimezone(pytz.timezone("America/New_York")).strftime("%b %d, %I:%M %p ET") if nxt else "—"
+        freq = _FU_FREQ_LABEL.get(f.get("frequency"), f.get("frequency") or "no schedule")
+        kind = "🔁 renewal" if (f.get("kind") == "renewal") else "📇 follow-up"
+        chase = " · 🤖 bot chases client" if f.get("contact_client") else ""
+        lines = [f"{kind} *{name}*" + (f" (agent @{agent})" if agent else "")]
+        if f.get("phone_number"):
+            lines.append(f"📞 {f.get('phone_number')}")
+        if f.get("email"):
+            lines.append(f"📧 {f.get('email')}")
+        lines.append(f"⏰ next: {when} ({freq}){chase}")
+        short = _short_uuid(f.get("id"))
+        kb = InlineKeyboardMarkup([[
+            InlineKeyboardButton("🔕 Stop", callback_data=f"cf_stop_{short}"),
+            InlineKeyboardButton("🗑 Delete", callback_data=f"cf_del_{short}"),
+        ]])
+        await update.message.reply_text("\n".join(lines), reply_markup=kb, parse_mode="Markdown")
 
 
 def main():
@@ -9134,8 +9331,9 @@ def main():
             await app.bot.set_my_commands([
                 BotCommand("start", "Open the bot"),
                 BotCommand("lead", "Add a new client/lead"),
-                BotCommand("followup", "Save a not-ready client + reminders"),
+                BotCommand("followup", "Bot chases a client (VIN) by text/email"),
                 BotCommand("followups", "List your open follow-ups"),
+                BotCommand("allfollowups", "Supervisors: view/stop/delete all follow-ups"),
                 BotCommand("receipts", "Upload receipts"),
                 BotCommand("appeal", "Appeal / cancel a delivery"),
                 BotCommand("cancel", "Cancel and restart"),
@@ -9345,6 +9543,10 @@ def main():
                 CallbackQueryHandler(handle_fu_phone_skip, pattern="^fu_skip_phone$"),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, handle_fu_phone),
             ],
+            STATE_FU_EMAIL: [
+                CallbackQueryHandler(handle_fu_email_skip, pattern="^fu_skip_email$"),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_fu_email),
+            ],
             STATE_FU_NOTES: [
                 CallbackQueryHandler(handle_fu_notes_skip, pattern="^fu_skip_notes$"),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, handle_fu_notes),
@@ -9352,7 +9554,7 @@ def main():
             STATE_FU_SCHEDULE: [
                 CallbackQueryHandler(
                     handle_fu_schedule_callback,
-                    pattern="^(fu_justsave|fu_setrem|fu_day_\\d+|fu_time_\\w+|fu_freq_\\w+)$",
+                    pattern="^(fu_justsave|fu_setrem|fu_day_\\d+|fu_time_\\w+|fu_freq_\\w+|fu_end_\\w+|fu_chase_(yes|no))$",
                 ),
             ],
         },
@@ -9397,11 +9599,15 @@ def main():
     application.add_handler(CallbackQueryHandler(handle_renewal_driver_accept, pattern="^rda_"))
     application.add_handler(CallbackQueryHandler(handle_renewal_driver_reassign, pattern="^rdr_"))
 
-    # Client follow-up reminder actions + list command
+    # Client follow-up reminder actions + list commands
     application.add_handler(CommandHandler(["followups", "myclients"], cmd_my_followups))
+    application.add_handler(CommandHandler("allfollowups", cmd_all_followups))
     application.add_handler(CallbackQueryHandler(handle_cf_close, pattern="^cf_close_"))
     application.add_handler(CallbackQueryHandler(handle_cf_stop, pattern="^cf_stop_"))
     application.add_handler(CallbackQueryHandler(handle_cf_snooze, pattern="^cf_snooze_"))
+    application.add_handler(CallbackQueryHandler(handle_cf_renew, pattern="^cf_renew_"))
+    application.add_handler(CallbackQueryHandler(handle_cf_done, pattern="^cf_done_"))
+    application.add_handler(CallbackQueryHandler(handle_cf_delete, pattern="^cf_del_"))
 
     # Driver timeout: every minute, check for leads where no driver accepted within 10 min
     async def check_driver_timeout(context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -9572,10 +9778,14 @@ def main():
         application.job_queue.run_repeating(check_renewals, interval=300, first=180)
         logger.info("Renewal checker job scheduled (every 5 min, first in 180s)")
 
-    # Client follow-up reminders: every 5 min, DM agents whose follow-up is due.
+    # Client follow-up ticks: every 5 min. For each due follow-up the bot
+    # (1) texts/emails the CLIENT directly when "bot chases client" is on,
+    # (2) DMs the agent AND all supervisors a reminder with a stop button,
+    # (3) auto-stops when the end date (stop) has passed.
     async def check_client_followups(context: ContextTypes.DEFAULT_TYPE) -> None:
         try:
             from datetime import timezone
+            from utils import client_outreach
             due = await asyncio.to_thread(db.get_due_client_followups)
             for f in due:
                 fid = f.get("id")
@@ -9587,11 +9797,57 @@ def main():
                 except (TypeError, ValueError):
                     chat_id = uid
                 name = f.get("client_name") or "client"
-                lines = [f"⏰ Follow up with *{name}*"]
+                now = datetime.now(timezone.utc)
+                is_renewal = (f.get("kind") == "renewal")
+
+                # Stop date reached → auto-close and tell the agent.
+                end_at = _fu_parse_iso(f.get("end_at"))
+                if end_at and now >= end_at:
+                    db.close_client_followup(fid)
+                    try:
+                        await context.bot.send_message(
+                            chat_id=chat_id,
+                            text=f"🛑 Follow-up for *{name}* reached its stop date — reminders ended.",
+                            parse_mode="Markdown",
+                        )
+                    except Exception as e:
+                        logger.warning("Could not send follow-up stop notice to %s: %s", chat_id, e)
+                    continue
+
+                # 1) Bot chases the client directly (text + email).
+                client_results = []
+                if f.get("contact_client"):
+                    agency = Config.FOLLOWUP_AGENCY_NAME
+                    if is_renewal:
+                        sms_body = client_outreach.build_renewal_sms(name, agency)
+                        subj, mail_body = client_outreach.build_renewal_email(name, agency)
+                    else:
+                        sms_body = client_outreach.build_vin_chase_sms(name, agency)
+                        subj, mail_body = client_outreach.build_vin_chase_email(name, agency)
+                    if f.get("phone_number"):
+                        ok, err = await asyncio.to_thread(
+                            client_outreach.send_client_sms, f.get("phone_number"), sms_body
+                        )
+                        client_results.append("📲 texted" if ok else f"📲 text failed ({err})")
+                    if f.get("email"):
+                        ok, err = await asyncio.to_thread(
+                            client_outreach.send_client_email, f.get("email"), subj, mail_body
+                        )
+                        client_results.append("📧 emailed" if ok else f"📧 email failed ({err})")
+                    if client_results:
+                        db.update_client_followup(fid, {"last_client_contact_at": now.isoformat()})
+
+                # 2) Reminder DM to the agent + every supervisor, with stop button.
+                head = "🔁 Renewal due" if is_renewal else "⏰ Follow up with"
+                lines = [f"{head} *{name}*"]
                 if f.get("phone_number"):
                     lines.append(f"📞 {f.get('phone_number')}")
+                if f.get("email"):
+                    lines.append(f"📧 {f.get('email')}")
                 if f.get("notes"):
                     lines.append(f"📝 {f.get('notes')}")
+                if client_results:
+                    lines.append("🤖 Bot contacted the client: " + ", ".join(client_results))
                 short = _short_uuid(fid)
                 kb = InlineKeyboardMarkup([
                     [InlineKeyboardButton("✅ Close (sold)", callback_data=f"cf_close_{short}"),
@@ -9605,9 +9861,27 @@ def main():
                     )
                 except Exception as e:
                     logger.warning("Could not send follow-up reminder to %s: %s", chat_id, e)
-                # Schedule the next reminder off the frequency (advance past now to avoid a burst).
+                # Supervisory copies (skip the agent if they're also a supervisor).
+                agent_key = _norm_chat_id(chat_id)
+                sup_kb = InlineKeyboardMarkup([[
+                    InlineKeyboardButton("🔕 Stop", callback_data=f"cf_stop_{short}"),
+                    InlineKeyboardButton("🗑 Delete", callback_data=f"cf_del_{short}"),
+                ]])
+                agent_label = f.get("telegram_username")
+                sup_lines = [f"👁 Supervisor copy" + (f" (agent @{agent_label})" if agent_label else "")] + lines
+                for sup_id in _global_supervisory_chat_ids():
+                    if _norm_chat_id(sup_id) == agent_key:
+                        continue
+                    try:
+                        await context.bot.send_message(
+                            chat_id=sup_id, text="\n".join(sup_lines),
+                            reply_markup=sup_kb, parse_mode="Markdown",
+                        )
+                    except Exception as e:
+                        logger.warning("Could not send follow-up copy to supervisor %s: %s", sup_id, e)
+
+                # 3) Schedule the next tick off the frequency (advance past now to avoid a burst).
                 days = _FU_FREQ_DAYS.get(f.get("frequency"), 7)
-                now = datetime.now(timezone.utc)
                 nxt = (_fu_parse_iso(f.get("next_reminder_at")) or now) + timedelta(days=days)
                 while nxt <= now:
                     nxt += timedelta(days=days)
