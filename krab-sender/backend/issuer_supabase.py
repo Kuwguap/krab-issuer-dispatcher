@@ -508,7 +508,7 @@ def fetch_lead_meta_by_references(
         chunk = uniq[i : i + chunk_size]
         in_list = ",".join(chunk)
         params = {
-            "select": "reference_id,vehicle_details,receipt_image_url,price,receipt_price,phone_number",
+            "select": "reference_id,vehicle_details,receipt_image_url,price,receipt_price,phone_number,email",
             "reference_id": f"in.({in_list})",
         }
         try:
@@ -542,6 +542,7 @@ def fetch_lead_meta_by_references(
                     "price": price_str,
                     "receipt_price": receipt_price_str,
                     "lead_client_phone": (str(row.get("phone_number") or "").strip() or None),
+                    "lead_client_email": (str(row.get("email") or "").strip() or None),
                 }
         except Exception as e:
             logger.warning("fetch_lead_meta_by_references: %s", e)
