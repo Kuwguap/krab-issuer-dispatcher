@@ -213,8 +213,8 @@ def _help_guide_text() -> str:
         "🚀 Main Commands\n\n"
         "▶️ /start — Open the bot\n"
         "➕ /lead or /client — Add a new client/lead\n"
-        "📇 /followup — Client ready but missing VIN? The bot texts/emails\n"
-        "     them on your schedule so THEY chase YOU (start/stop/frequency)\n"
+        "📇 /followup — Client missing info for their temporary tag? The bot\n"
+        "     texts/emails them a reminder on your schedule (start/stop/frequency)\n"
         "🗂 /followups — List your open follow-ups\n"
         "👁 /allfollowups — Supervisors: view, stop or delete any follow-up\n"
         "🧾 /receipts — Upload receipts\n"
@@ -9097,7 +9097,8 @@ async def handle_fu_schedule_callback(update: Update, context: ContextTypes.DEFA
                 ]])
                 await query.message.edit_text(
                     f"🤖 Should the bot also {' + '.join(channels)} the client on this schedule "
-                    "(chasing them for the VIN so they follow up with YOU)?",
+                    "(reminding them to send the missing info for their temporary tag, "
+                    "so they follow up with YOU)?",
                     reply_markup=kb,
                 )
                 return STATE_FU_SCHEDULE
@@ -9337,7 +9338,7 @@ def main():
             await app.bot.set_my_commands([
                 BotCommand("start", "Open the bot"),
                 BotCommand("lead", "Add a new client/lead"),
-                BotCommand("followup", "Bot chases a client (VIN) by text/email"),
+                BotCommand("followup", "Bot reminds a client by text/email (temp tag info)"),
                 BotCommand("followups", "List your open follow-ups"),
                 BotCommand("allfollowups", "Supervisors: view/stop/delete all follow-ups"),
                 BotCommand("receipts", "Upload receipts"),
@@ -9828,8 +9829,8 @@ def main():
                         sms_body = client_outreach.build_renewal_sms(name, agency)
                         subj, mail_body = client_outreach.build_renewal_email(name, agency)
                     else:
-                        sms_body = client_outreach.build_vin_chase_sms(name, agency)
-                        subj, mail_body = client_outreach.build_vin_chase_email(name, agency)
+                        sms_body = client_outreach.build_followup_sms(name, agency)
+                        subj, mail_body = client_outreach.build_followup_email(name, agency)
                     if f.get("phone_number"):
                         ok, err = await asyncio.to_thread(
                             client_outreach.send_client_sms, f.get("phone_number"), sms_body

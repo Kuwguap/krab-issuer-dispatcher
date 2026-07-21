@@ -49,27 +49,26 @@ def normalize_us_phone(raw: str | None) -> Optional[str]:
     return None
 
 
-def build_vin_chase_sms(client_name: str | None, agency_name: str) -> str:
+def build_followup_sms(client_name: str | None, agency_name: str) -> str:
     first = first_name_from_full(client_name or "")
     return (
-        f"Hi {first}, it's {agency_name}. Your auto insurance quote is ready to go — "
-        "we're just waiting on your VIN (vehicle identification number) to finalize it. "
-        "Reply here or call us with the VIN and we'll get you covered same day. Thank you!"
+        f"Hi {first}, it's {agency_name}. This is a friendly reminder to send or provide "
+        "the remaining information needed to complete your temporary tag. "
+        "Reply here or call us and we'll get it processed same day. Thank you!"
     )
 
 
-def build_vin_chase_email(client_name: str | None, agency_name: str) -> tuple[str, str]:
+def build_followup_email(client_name: str | None, agency_name: str) -> tuple[str, str]:
     first = first_name_from_full(client_name or "")
-    subject = f"Action needed: your VIN to finalize your auto insurance — {agency_name}"
+    subject = f"Reminder: information needed to complete your temporary tag — {agency_name}"
     body = (
         f"Hi {first},\n\n"
-        f"Good news — your auto insurance quote with {agency_name} is approved and ready to be issued.\n\n"
-        "The only thing we still need is your VIN (Vehicle Identification Number).\n\n"
-        "Where to find it:\n"
-        "• On the driver's-side dashboard, visible through the windshield\n"
-        "• On the driver's-side door jamb sticker\n"
-        "• On your vehicle registration or title\n\n"
-        "Reply to this email (or text us back) with the VIN and we'll activate your coverage right away.\n\n"
+        f"This is a friendly reminder from {agency_name} that we're still waiting on some "
+        "information to complete your temporary tag.\n\n"
+        "Please send or provide the remaining details (for example your VIN — found on the "
+        "driver's-side dashboard, the door jamb sticker, or your registration/title) so we "
+        "can finish processing it for you.\n\n"
+        "Reply to this email (or text us back) and we'll take care of it right away.\n\n"
         f"Thank you,\n{agency_name}\n"
     )
     return subject, body
