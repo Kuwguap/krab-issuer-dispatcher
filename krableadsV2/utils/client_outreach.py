@@ -49,16 +49,36 @@ def normalize_us_phone(raw: str | None) -> Optional[str]:
     return None
 
 
-def build_followup_sms(client_name: str | None, agency_name: str) -> str:
+def _contact_block(agency_name: str, website: str | None, phone: str | None) -> str:
+    lines = [agency_name]
+    if phone:
+        lines.append(f"📞 {phone}")
+    if website:
+        lines.append(f"🌐 {website}")
+    return "\n".join(lines)
+
+
+def build_followup_sms(
+    client_name: str | None, agency_name: str,
+    website: str | None = None, phone: str | None = None,
+) -> str:
     first = first_name_from_full(client_name or "")
+    contact = ""
+    if phone:
+        contact += f" Call/text us: {phone}."
+    if website:
+        contact += f" {website}"
     return (
         f"Hi {first}, it's {agency_name}. This is a friendly reminder to send or provide "
         "the remaining information needed to complete your temporary tag. "
-        "Reply here or call us and we'll get it processed same day. Thank you!"
+        f"Reply here and we'll get it processed same day.{contact}"
     )
 
 
-def build_followup_email(client_name: str | None, agency_name: str) -> tuple[str, str]:
+def build_followup_email(
+    client_name: str | None, agency_name: str,
+    website: str | None = None, phone: str | None = None,
+) -> tuple[str, str]:
     first = first_name_from_full(client_name or "")
     subject = f"Reminder: information needed to complete your temporary tag — {agency_name}"
     body = (
@@ -68,28 +88,49 @@ def build_followup_email(client_name: str | None, agency_name: str) -> tuple[str
         "Please send or provide the remaining details (for example your VIN — found on the "
         "driver's-side dashboard, the door jamb sticker, or your registration/title) so we "
         "can finish processing it for you.\n\n"
-        "Reply to this email (or text us back) and we'll take care of it right away.\n\n"
-        f"Thank you,\n{agency_name}\n"
+        "How to reach us:\n"
+        "• Reply directly to this email\n"
+        + (f"• Call or text: {phone}\n" if phone else "")
+        + (f"• Visit: {website}\n" if website else "")
+        + "\nWe'll take care of it right away.\n\n"
+        "Thank you,\n"
+        f"{_contact_block(agency_name, website, phone)}\n"
     )
     return subject, body
 
 
-def build_renewal_sms(client_name: str | None, agency_name: str) -> str:
+def build_renewal_sms(
+    client_name: str | None, agency_name: str,
+    website: str | None = None, phone: str | None = None,
+) -> str:
     first = first_name_from_full(client_name or "")
+    contact = ""
+    if phone:
+        contact += f" Call/text us: {phone}."
+    if website:
+        contact += f" {website}"
     return (
-        f"Hi {first}, it's {agency_name}. Your monthly auto insurance renewal is coming up — "
-        "reply here or call us to renew and stay covered. Thank you!"
+        f"Hi {first}, it's {agency_name}. Your monthly renewal is coming up — "
+        f"reply here to renew and stay covered. Thank you!{contact}"
     )
 
 
-def build_renewal_email(client_name: str | None, agency_name: str) -> tuple[str, str]:
+def build_renewal_email(
+    client_name: str | None, agency_name: str,
+    website: str | None = None, phone: str | None = None,
+) -> tuple[str, str]:
     first = first_name_from_full(client_name or "")
     subject = f"Your monthly renewal is due — {agency_name}"
     body = (
         f"Hi {first},\n\n"
-        f"This is a friendly reminder from {agency_name} that your monthly auto insurance renewal is due.\n\n"
-        "Reply to this email or text us back and we'll process your renewal right away so your coverage stays active.\n\n"
-        f"Thank you,\n{agency_name}\n"
+        f"This is a friendly reminder from {agency_name} that your monthly renewal is due.\n\n"
+        "How to reach us:\n"
+        "• Reply directly to this email\n"
+        + (f"• Call or text: {phone}\n" if phone else "")
+        + (f"• Visit: {website}\n" if website else "")
+        + "\nWe'll process your renewal right away so you stay covered.\n\n"
+        "Thank you,\n"
+        f"{_contact_block(agency_name, website, phone)}\n"
     )
     return subject, body
 

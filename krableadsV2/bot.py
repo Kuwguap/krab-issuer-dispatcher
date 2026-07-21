@@ -9825,12 +9825,14 @@ def main():
                 client_results = []
                 if f.get("contact_client"):
                     agency = Config.FOLLOWUP_AGENCY_NAME
+                    site = Config.FOLLOWUP_WEBSITE
+                    tel = Config.FOLLOWUP_PHONE
                     if is_renewal:
-                        sms_body = client_outreach.build_renewal_sms(name, agency)
-                        subj, mail_body = client_outreach.build_renewal_email(name, agency)
+                        sms_body = client_outreach.build_renewal_sms(name, agency, site, tel)
+                        subj, mail_body = client_outreach.build_renewal_email(name, agency, site, tel)
                     else:
-                        sms_body = client_outreach.build_followup_sms(name, agency)
-                        subj, mail_body = client_outreach.build_followup_email(name, agency)
+                        sms_body = client_outreach.build_followup_sms(name, agency, site, tel)
+                        subj, mail_body = client_outreach.build_followup_email(name, agency, site, tel)
                     if f.get("phone_number"):
                         ok, err = await asyncio.to_thread(
                             client_outreach.send_client_sms, f.get("phone_number"), sms_body

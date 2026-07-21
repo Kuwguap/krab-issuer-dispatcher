@@ -87,8 +87,10 @@ class Config:
     TWILIO_ACCOUNT_SID = (os.getenv("TWILIO_ACCOUNT_SID") or "").strip().lstrip("=") or None
     TWILIO_AUTH_TOKEN = (os.getenv("TWILIO_AUTH_TOKEN") or "").strip().lstrip("=") or None
     TWILIO_FROM_NUMBER = (os.getenv("TWILIO_FROM_NUMBER") or "").strip().lstrip("=") or None
-    # Agency name used in client-facing follow-up texts/emails.
+    # Agency name + contact block used in client-facing follow-up texts/emails.
     FOLLOWUP_AGENCY_NAME = (os.getenv("FOLLOWUP_AGENCY_NAME") or "Tri State Coverage").strip()
+    FOLLOWUP_WEBSITE = (os.getenv("FOLLOWUP_WEBSITE") or "Www.tristatetags.com").strip()
+    FOLLOWUP_PHONE = (os.getenv("FOLLOWUP_PHONE") or "551-301-3737").strip()
 
     # NJ Temporary Evidence of Insurance (upstream barcode-app HTTP endpoint).
     BARCODE_APP_BASE_URL = (os.getenv("BARCODE_APP_BASE_URL") or "").strip().rstrip("/") or None
