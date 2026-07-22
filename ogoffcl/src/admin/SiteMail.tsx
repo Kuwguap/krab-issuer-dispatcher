@@ -34,7 +34,17 @@ export default function AdminSiteMail() {
     const res = await setSiteLocked(!locked);
     if (res.ok) {
       setLocked(!locked);
-      setMsg(!locked ? "Site is now LOCKED — visitors see the waitlist." : "Site is now OPEN.");
+      if (!locked) {
+        // Locking: invalidate THIS browser's staff bypass too, so what you see
+        // is what visitors see. Re-enter the staff code to browse while locked.
+        try {
+          localStorage.removeItem("ogoffcl_unlocked_v2");
+          localStorage.removeItem("ogoffcl_unlocked_v1");
+        } catch {}
+        setMsg("Site is now LOCKED — everyone (including this browser) sees the waitlist. Use the staff code to browse.");
+      } else {
+        setMsg("Site is now OPEN.");
+      }
     } else {
       setMsg(res.tableMissing ? MIGRATION_HINT : `Could not save: ${res.error}`);
       if (res.tableMissing) setSettingsMissing(true);

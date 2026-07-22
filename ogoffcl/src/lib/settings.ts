@@ -27,25 +27,30 @@ export function cachedLocked(): boolean | null {
   return null;
 }
 
-export async function fetchSiteLocked(): Promise<{ locked: boolean; tableMissing: boolean }> {
+export async function fetchSiteLocked(): Promise<{ locked: boolean; lockedAt: number; tableMissing: boolean }> {
   try {
     const { data, error } = await supabase.from("site_settings").select("value").eq("key", "site_locked").maybeSingle();
     if (error) {
-      if (isMissingTable(error)) return { locked: false, tableMissing: true };
-      return { locked: false, tableMissing: false };
+      if (isMissingTable(error)) return { locked: false, lockedAt: 0, tableMissing: true };
+      return { locked: false, lockedAt: 0, tableMissing: false };
     }
-    const locked = !!(data?.value as { locked?: boolean } | null)?.locked;
+    const v = (data?.value || {}) as { locked?: boolean; locked_at?: string | number };
+    const locked = !!v.locked;
+    const lockedAt = v.locked_at ? new Date(v.locked_at).getTime() : 0;
     try { localStorage.setItem(CACHE_KEY, locked ? "1" : "0"); } catch {}
-    return { locked, tableMissing: false };
+    return { locked, lockedAt, tableMissing: false };
   } catch {
-    return { locked: false, tableMissing: false };
+    return { locked: false, lockedAt: 0, tableMissing: false };
   }
 }
 
 export async function setSiteLocked(locked: boolean): Promise<{ ok: boolean; error?: string; tableMissing?: boolean }> {
+  // locked_at stamps each NEW lock: staff bypasses granted before this moment
+  // become invalid, so re-locking always locks everyone out again.
+  const value = locked ? { locked: true, locked_at: new Date().toISOString() } : { locked: false };
   const { error } = await supabase
     .from("site_settings")
-    .upsert({ key: "site_locked", value: { locked }, updated_at: new Date().toISOString() }, { onConflict: "key" });
+    .upsert({ key: "site_locked", value, updated_at: new Date().toISOString() }, { onConflict: "key" });
   if (error) {
     if (isMissingTable(error)) return { ok: false, tableMissing: true, error: error.message };
     return { ok: false, error: error.message };

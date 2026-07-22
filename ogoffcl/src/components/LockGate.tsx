@@ -1,47 +1,71 @@
-import { useEffect, useMemo, useState, ReactNode, FormEvent } from "react";
+import { useEffect, useState, ReactNode, FormEvent } from "react";
 import { AnimatePresence, motion } from "framer-motion";
 import { cachedLocked, fetchSiteLocked, subscribe } from "../lib/settings";
 
 /**
- * Site lock with waitlist. The lock is flipped live from Admin → Site & Mail
- * (site_settings table). VITE_SITE_LOCKED=1 force-locks regardless of the DB.
- * Staff bypass with VITE_SITE_PASSWORD (default OG2026) — persists per browser,
- * `?unlock=<code>` also works.
+ * Site lock with waitlist. Lock state lives in site_settings and is flipped
+ * from Admin → Site & Mail. VITE_SITE_LOCKED=1 force-locks regardless.
+ *
+ * Staff bypass is GENERATION-AWARE: each lock stamps value.locked_at, and a
+ * bypass is only valid if it was granted AFTER the current lock started —
+ * re-locking the store always locks every browser out again (this is what
+ * made the lock look "broken" before: old bypasses lived forever).
  */
 const ENV_FORCED = /^(1|true|yes|on)$/i.test(String(import.meta.env.VITE_SITE_LOCKED ?? "").trim());
 const PASSWORD = String(import.meta.env.VITE_SITE_PASSWORD ?? "OG2026").replace(/\\r|\\n/g, "").trim() || "OG2026";
-const BYPASS_KEY = "ogoffcl_unlocked_v1";
+const BYPASS_KEY = "ogoffcl_unlocked_v2";
 
-function hasBypass(): boolean {
+interface Grant { pw: string; at: number }
+
+function readGrant(): Grant | null {
   try {
-    if (localStorage.getItem(BYPASS_KEY) === PASSWORD) return true;
+    const raw = localStorage.getItem(BYPASS_KEY);
+    if (!raw) return null;
+    const g = JSON.parse(raw) as Grant;
+    if (g && g.pw === PASSWORD && Number.isFinite(g.at)) return g;
+  } catch {}
+  return null;
+}
+
+function grantBypass() {
+  try { localStorage.setItem(BYPASS_KEY, JSON.stringify({ pw: PASSWORD, at: Date.now() })); } catch {}
+}
+
+/** Consume ?unlock=<code> — grants a fresh bypass for the CURRENT lock. */
+function consumeUnlockQuery(): boolean {
+  try {
     const q = new URLSearchParams(window.location.search).get("unlock");
-    if (q && q === PASSWORD) {
-      localStorage.setItem(BYPASS_KEY, PASSWORD);
-      return true;
-    }
+    if (q && q === PASSWORD) { grantBypass(); return true; }
   } catch {}
   return false;
 }
 
+function bypassValid(lockedAt: number): boolean {
+  const g = readGrant();
+  if (!g) return false;
+  return g.at > lockedAt;
+}
+
 export default function LockGate({ children }: { children: ReactNode }) {
-  const bypass = useMemo(hasBypass, []);
-  // null = still resolving (only blocks first paint when the cache says "locked")
+  // null = resolving (black splash). Optimistically show the site only when
+  // the cache says "unlocked"; everything else waits for the real answer.
   const [locked, setLocked] = useState<boolean | null>(() => {
-    if (bypass) return false;
-    if (ENV_FORCED) return true;
+    const fresh = consumeUnlockQuery();
+    if (ENV_FORCED) return !(fresh || readGrant() !== null);
     const cached = cachedLocked();
-    return cached === false ? false : cached === true ? true : null;
+    if (cached === false) return false;
+    return null;
   });
 
   useEffect(() => {
-    if (bypass || ENV_FORCED) return;
+    if (ENV_FORCED) return;
     let alive = true;
-    fetchSiteLocked().then(({ locked: dbLocked }) => {
-      if (alive) setLocked(dbLocked);
+    fetchSiteLocked().then(({ locked: dbLocked, lockedAt }) => {
+      if (!alive) return;
+      setLocked(dbLocked && !bypassValid(lockedAt));
     });
     return () => { alive = false; };
-  }, [bypass]);
+  }, []);
 
   // waitlist form
   const [email, setEmail] = useState("");
@@ -70,7 +94,7 @@ export default function LockGate({ children }: { children: ReactNode }) {
   const staffSubmit = (e: FormEvent) => {
     e.preventDefault();
     if (code.trim() === PASSWORD) {
-      try { localStorage.setItem(BYPASS_KEY, PASSWORD); } catch {}
+      grantBypass();
       setLocked(false);
     } else {
       setShake((s) => s + 1);
@@ -79,7 +103,6 @@ export default function LockGate({ children }: { children: ReactNode }) {
   };
 
   if (locked === null) {
-    // resolving lock state — brief black splash, no layout flash
     return (
       <div className="fixed inset-0 bg-ink flex items-center justify-center">
         <span className="font-display uppercase tracking-[0.4em] text-bone/25 text-xs animate-pulseSoft">OG.OFFCL</span>
