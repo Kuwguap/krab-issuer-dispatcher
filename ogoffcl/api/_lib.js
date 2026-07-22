@@ -89,6 +89,14 @@ async function appendStatusHistory(order, entry) {
 const PAY_CHANNELS = { mtn: "13", telecel: "6", at: "7" };       // collections
 const TRANSFER_CHANNELS = { mtn: "1", telecel: "6", at: "7" };   // disbursements/refunds
 
+// Moolre requires local Ghana format: starts with 0, no country code.
+function ghPhone(raw) {
+  let d = String(raw || "").replace(/\D/g, "");
+  if (d.startsWith("233")) d = "0" + d.slice(3);
+  else if (d.length === 9) d = "0" + d;      // missing leading 0
+  return d;
+}
+
 async function moolre(path, payload, keyType) {
   const headers = {
     "Content-Type": "application/json",
@@ -107,20 +115,22 @@ async function moolre(path, payload, keyType) {
   return { http: r.status, ...((data && typeof data === "object") ? data : { data }) };
 }
 
-/** Initiate a MoMo collection. Returns Moolre envelope {status, code, message, data}. */
+/** Initiate a MoMo collection. Returns Moolre envelope {status, code, message, data}.
+ *  Collections authenticate with the PUBLIC key (X-API-PUBKEY) — confirmed
+ *  against the live API; the private key returns AIN01 Authentication Error. */
 function moolrePay({ channel, phone, amount, externalref, reference, otpcode }) {
   const payload = {
     type: 1,
     channel: PAY_CHANNELS[channel] || channel,
     currency: "GHS",
-    payer: phone,
+    payer: ghPhone(phone),
     amount: String(amount),
     externalref,
     reference: reference || "OG OFFCL order",
     accountnumber: env.moolreAccount,
   };
   if (otpcode) payload.otpcode = String(otpcode).trim();
-  return moolre("/open/transact/payment", payload, "private");
+  return moolre("/open/transact/payment", payload, "public");
 }
 
 /** Check a transaction by external reference. */
@@ -140,7 +150,7 @@ function moolreTransfer({ channel, phone, amount, externalref, reference }) {
     channel: TRANSFER_CHANNELS[channel] || channel,
     currency: "GHS",
     amount: String(amount),
-    receiver: phone,
+    receiver: ghPhone(phone),
     externalref,
     reference: reference || "OG OFFCL refund",
     accountnumber: env.moolreAccount,
