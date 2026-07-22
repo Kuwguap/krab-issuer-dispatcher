@@ -42,8 +42,10 @@ export default async (req, res) => {
       const line = money2(price * qty);
       subtotal += line;
       lineItems.push({
+        // order_items.size is NOT NULL — no-size products (caps/headwear) must
+        // send "" not null, or the insert fails with "Could not save order items".
         product_id: p.id, product_name: p.name, product_image: p.image || null,
-        size: it.size || null, quantity: qty, unit_price: price, price, subtotal: line,
+        size: it.size || "", quantity: qty, unit_price: price, price, subtotal: line,
       });
     }
     subtotal = money2(subtotal);

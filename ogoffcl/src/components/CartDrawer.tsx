@@ -4,7 +4,7 @@ import { useCart } from "../store/CartContext";
 import { money } from "../lib/money";
 
 export default function CartDrawer() {
-  const { items, open, setOpen, setQty, remove, subtotal } = useCart();
+  const { items, open, setOpen, setQty, remove, clear, subtotal } = useCart();
 
   return (
     <AnimatePresence>
@@ -28,9 +28,19 @@ export default function CartDrawer() {
               <h2 className="font-display uppercase text-bone tracking-wide">
                 Your Cart <span className="text-acid">({items.reduce((a, i) => a + i.qty, 0)})</span>
               </h2>
-              <button aria-label="Close cart" onClick={() => setOpen(false)} className="text-bone text-3xl font-display leading-none px-1 hover:text-acid">
-                ×
-              </button>
+              <div className="flex items-center gap-3">
+                {items.length > 0 && (
+                  <button
+                    onClick={() => clear()}
+                    className="text-bone/50 text-[11px] uppercase tracking-[0.2em] font-display hover:text-blood transition-colors"
+                  >
+                    Clear cart
+                  </button>
+                )}
+                <button aria-label="Close cart" onClick={() => setOpen(false)} className="text-bone text-3xl font-display leading-none px-1 hover:text-acid">
+                  ×
+                </button>
+              </div>
             </div>
 
             <div className="flex-1 overflow-y-auto px-5 py-4 space-y-4">

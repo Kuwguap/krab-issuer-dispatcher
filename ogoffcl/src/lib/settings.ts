@@ -65,19 +65,27 @@ export async function subscribe(emailRaw: string, source: SubscribeSource): Prom
   const email = emailRaw.trim().toLowerCase();
   if (!/^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/.test(email)) return { ok: false, error: "Enter a valid email address." };
 
-  const { error } = await supabase.from("subscribers").insert({ email, source });
-  if (!error) {
-    // Welcome email — server-side via Resend, best-effort.
+  // Welcome/confirmation email — server-side via Resend, best-effort. Sent on
+  // every join (new OR already-on-list) so people always get the confirmation.
+  const fireWelcome = () => {
     fetch("/api/email/welcome", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ email, source }),
     }).catch(() => {});
+  };
+
+  const { error } = await supabase.from("subscribers").insert({ email, source });
+  if (!error) {
+    fireWelcome();
     return { ok: true };
   }
 
-  // duplicate — already subscribed is a success for the user
-  if (error.code === "23505" || /duplicate key/i.test(error.message || "")) return { ok: true, already: true };
+  // duplicate — already subscribed is a success for the user; still confirm.
+  if (error.code === "23505" || /duplicate key/i.test(error.message || "")) {
+    fireWelcome();
+    return { ok: true, already: true };
+  }
 
   if (isMissingTable(error)) {
     // Fallback so signups are never lost before the migration runs:
