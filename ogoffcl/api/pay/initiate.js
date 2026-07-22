@@ -1,7 +1,10 @@
-// POST /api/pay/initiate  { orderId, phone, channel: mtn|telecel|at, otpcode? }
+// POST /api/pay/initiate  { orderId, phone, channel: mtn|telecel|at, otpcode?, ref? }
 // Starts (or resumes, when otpcode is present) a Moolre MoMo charge for an
 // order. Amount ALWAYS comes from the order row in the database — never from
 // the client. Also sends the "order received" email on first attempt.
+// `ref` is the externalref echoed back by the client on OTP submit: Moolre
+// only completes the OTP flow when the SAME externalref is reused — a new one
+// starts a brand-new charge and triggers ANOTHER OTP.
 import {
   moolreConfigured, getOrder, updateOrder, appendStatusHistory,
   moolrePay, sendEmail, emailShell, orderItemsHtml, getOrderItems,
@@ -13,7 +16,7 @@ export default async (req, res) => {
     if (!moolreConfigured()) {
       return res.status(503).json({ error: "Payments not configured yet (set MOOLRE_* env vars on Vercel)." });
     }
-    const { orderId, phone, channel, otpcode } = req.body || {};
+    const { orderId, phone, channel, otpcode, ref } = req.body || {};
     const digits = String(phone || "").replace(/\D/g, "");
     if (!orderId || digits.length < 9) return res.status(400).json({ error: "orderId and a valid MoMo number are required." });
     if (!["mtn", "telecel", "at"].includes(String(channel))) return res.status(400).json({ error: "channel must be mtn, telecel or at." });
@@ -27,7 +30,12 @@ export default async (req, res) => {
 
     // Unique per attempt (Moolre requires non-repeating externalref); the
     // order number prefix keeps callbacks resolvable back to the order.
-    const attempt = otpcode && order.payment_ref ? order.payment_ref : `${order.order_number}-${Date.now().toString(36).slice(-5).toUpperCase()}`;
+    // On OTP submit, resume the SAME externalref: prefer the ref echoed by the
+    // client (works even before the payment_ref column migration has run),
+    // fall back to the stored payment_ref. Only accept refs for THIS order.
+    const clientRef = typeof ref === "string" && ref.startsWith(`${order.order_number}-`) ? ref : null;
+    const resumeRef = otpcode ? (clientRef || order.payment_ref || null) : null;
+    const attempt = resumeRef || `${order.order_number}-${Date.now().toString(36).slice(-5).toUpperCase()}`;
 
     await updateOrder(order.id, {
       momo_phone: digits,

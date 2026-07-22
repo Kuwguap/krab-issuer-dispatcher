@@ -93,7 +93,7 @@ export default function CartDrawer() {
                 <Link to="/checkout" onClick={() => setOpen(false)} className="btn-og w-full bg-acid text-ink py-4 text-sm hover:bg-bone">
                   Checkout →
                 </Link>
-                <p className="text-bone/30 text-[11px] text-center uppercase tracking-widest">Secure payment via Paystack</p>
+                <p className="text-bone/30 text-[11px] text-center uppercase tracking-widest">Secure mobile-money payment via Moolre</p>
               </div>
             )}
           </motion.aside>

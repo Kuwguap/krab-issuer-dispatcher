@@ -35,6 +35,7 @@ export default function Checkout() {
   const [err, setErr] = useState<string | null>(null);
   const [pay, setPay] = useState<PayState>({ step: "form" });
   const [otp, setOtp] = useState("");
+  const [otpBusy, setOtpBusy] = useState(false);
   const pollRef = useRef<number | null>(null);
 
   const discountAmount = useMemo(
@@ -87,13 +88,17 @@ export default function Checkout() {
     }, 3000);
   };
 
-  const initiate = async (orderId: string, otpcode?: string) => {
+  const initiate = async (orderId: string, otpcode?: string, ref?: string) => {
     const r = await fetch("/api/pay/initiate", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ orderId, phone: momoPhone, channel: network, otpcode }),
+      // ref is passed back verbatim on OTP submit so Moolre continues the SAME
+      // charge (same externalref) instead of starting a new one + new OTP.
+      body: JSON.stringify({ orderId, phone: momoPhone, channel: network, otpcode, ref }),
     });
     const j = await r.json().catch(() => ({}));
+    setOtpBusy(false);
+    if (j.state === "otp" && otpcode) setOtp(""); // wrong/expired code — clear for retry
     if (j.state === "paid") {
       clear();
       navigate(`/order-confirmation?ref=${encodeURIComponent(j.ref)}&paid=1`);
@@ -163,6 +168,9 @@ export default function Checkout() {
           Approve the <strong className="text-bone">{money(total)}</strong> mobile-money prompt on{" "}
           <strong className="text-acid">{momoPhone}</strong>. This page updates automatically once it lands.
         </p>
+        <p className="text-bone/40 text-xs mt-3">
+          Payment is processed by <strong className="text-bone/70">Moolre</strong> — any SMS about this payment comes from Moolre.
+        </p>
         <p className="text-bone/30 text-xs uppercase tracking-[0.25em] mt-8 animate-pulseSoft">Waiting for approval…</p>
       </div>
     );
@@ -172,9 +180,14 @@ export default function Checkout() {
     return (
       <div className="max-w-md mx-auto px-4 py-28 text-center">
         <h1 className="display-xl text-4xl text-bone">Enter the code</h1>
-        <p className="text-bone/60 mt-4">{pay.message || "Your network sent you a verification code by SMS."}</p>
+        <p className="text-bone/60 mt-4">
+          {pay.message || "A one-time code was sent to your phone."}
+        </p>
+        <p className="text-bone/40 text-xs uppercase tracking-[0.2em] mt-3">
+          Look for an SMS from <strong className="text-acid">Moolre</strong> · sent to {momoPhone}
+        </p>
         <form
-          onSubmit={(e) => { e.preventDefault(); if (otp.trim()) initiate(pay.orderId, otp.trim()); }}
+          onSubmit={(e) => { e.preventDefault(); if (otp.trim()) { setOtpBusy(true); initiate(pay.orderId, otp.trim(), pay.ref); } }}
           className="mt-8 flex border-2 border-bone/20 focus-within:border-acid transition-colors"
         >
           <input
@@ -182,8 +195,11 @@ export default function Checkout() {
             inputMode="numeric" placeholder="OTP CODE"
             className="flex-1 min-w-0 bg-transparent border-0 px-5 py-4 font-display uppercase tracking-[0.3em] text-sm text-bone placeholder:text-bone/25 focus:outline-none"
           />
-          <button type="submit" className="btn-og bg-acid text-ink px-6 text-xs hover:bg-bone">Verify & pay</button>
+          <button type="submit" disabled={otpBusy} className="btn-og bg-acid text-ink px-6 text-xs hover:bg-bone whitespace-nowrap">
+            {otpBusy ? "Verifying…" : "Verify & pay"}
+          </button>
         </form>
+        <p className="text-bone/30 text-[11px] mt-4">Didn't get it? Approve the prompt on your phone, or wait for the SMS.</p>
       </div>
     );
   }
