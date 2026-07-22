@@ -116,60 +116,24 @@ export default function Checkout() {
     if (momo.length < 9) { setErr("Enter the mobile money number that will pay."); return; }
     setBusy(true);
     try {
-      const orderNumber = `OG-${Date.now().toString(36).toUpperCase()}${Math.floor(Math.random() * 90 + 10)}`;
-      const shipping = [form.address.trim(), form.city.trim()].filter(Boolean).join(", ") + (form.note.trim() ? ` — Note: ${form.note.trim()}` : "");
+      // Order is created SERVER-SIDE (service-role): bypasses RLS and computes
+      // the real total from the DB so the price can't be tampered with.
+      const r = await fetch("/api/order/create", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          customer: {
+            name: form.name.trim(), email: form.email.trim(), phone: form.phone.trim(),
+            address: form.address.trim(), city: form.city.trim(), note: form.note.trim(),
+          },
+          items: items.map((i) => ({ productId: i.productId, size: i.size, qty: i.qty })),
+          discountCode: applied?.code ?? null,
+        }),
+      });
+      const j = await r.json().catch(() => ({}));
+      if (!r.ok || !j.orderId) throw new Error(j.error || "Could not create the order. Try again.");
 
-      let customerId: string | null = null;
-      try {
-        const { data: existing } = await supabase.from("customers").select("id").eq("email", form.email.trim()).limit(1);
-        if (existing && existing[0]) {
-          customerId = existing[0].id;
-          await supabase.from("customers").update({ name: form.name.trim(), phone: form.phone.trim(), address: form.address.trim(), city: form.city.trim() || null }).eq("id", customerId);
-        } else {
-          const { data: created } = await supabase
-            .from("customers")
-            .insert({ name: form.name.trim(), full_name: form.name.trim(), email: form.email.trim(), phone: form.phone.trim(), address: form.address.trim(), city: form.city.trim() || null, country: "Ghana" })
-            .select("id").single();
-          customerId = created?.id ?? null;
-        }
-      } catch { /* best-effort */ }
-
-      const { data: order, error: orderErr } = await supabase
-        .from("orders")
-        .insert({
-          order_number: orderNumber,
-          customer_id: customerId,
-          customer_name: form.name.trim(),
-          customer_email: form.email.trim(),
-          customer_phone: form.phone.trim(),
-          shipping_address: shipping,
-          status: "pending",
-          payment_status: "pending",
-          payment_method: "moolre_momo",
-          currency: CURRENCY,
-          total_amount: total,
-          discount_code: applied?.code ?? null,
-          discount_amount: discountAmount || null,
-        })
-        .select("id, order_number")
-        .single();
-      if (orderErr || !order) throw new Error(orderErr?.message || "Could not create the order.");
-
-      const itemRows = items.map((i) => ({
-        order_id: order.id,
-        product_id: i.productId,
-        product_name: i.name,
-        product_image: i.image || null,
-        size: i.size,
-        quantity: i.qty,
-        unit_price: i.price,
-        price: i.price,
-        subtotal: Math.round(i.price * i.qty * 100) / 100,
-      }));
-      const { error: itemsErr } = await supabase.from("order_items").insert(itemRows);
-      if (itemsErr) throw new Error(itemsErr.message);
-
-      await initiate(order.id);
+      await initiate(j.orderId);
     } catch (ex) {
       setErr(ex instanceof Error ? ex.message : "Something went wrong. Try again.");
     } finally {
