@@ -61,7 +61,15 @@ export async function subscribe(emailRaw: string, source: SubscribeSource): Prom
   if (!/^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/.test(email)) return { ok: false, error: "Enter a valid email address." };
 
   const { error } = await supabase.from("subscribers").insert({ email, source });
-  if (!error) return { ok: true };
+  if (!error) {
+    // Welcome email — server-side via Resend, best-effort.
+    fetch("/api/email/welcome", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ email, source }),
+    }).catch(() => {});
+    return { ok: true };
+  }
 
   // duplicate — already subscribed is a success for the user
   if (error.code === "23505" || /duplicate key/i.test(error.message || "")) return { ok: true, already: true };

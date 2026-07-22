@@ -7,6 +7,23 @@ import { NavLink, Outlet } from "react-router-dom";
  */
 const ADMIN_PASSWORD = String(import.meta.env.VITE_ADMIN_PASSWORD ?? "OGADMIN26").replace(/\\r|\\n/g, "").trim() || "OGADMIN26";
 const KEY = "ogoffcl_admin_v1";
+const PW_KEY = "ogoffcl_admin_pw";
+
+/** The password the admin typed — sent as x-admin-password to /api/admin/* .*/
+export function adminPassword(): string {
+  try { return sessionStorage.getItem(PW_KEY) || ADMIN_PASSWORD; } catch { return ADMIN_PASSWORD; }
+}
+
+/** fetch wrapper for admin API calls. */
+export async function adminApi(path: string, body: unknown): Promise<{ ok: boolean; [k: string]: unknown }> {
+  const r = await fetch(path, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", "x-admin-password": adminPassword() },
+    body: JSON.stringify(body),
+  });
+  const j = await r.json().catch(() => ({}));
+  return { ok: r.ok && j.ok !== false, status: r.status, ...j };
+}
 
 function Gate({ children }: { children: ReactNode }) {
   const [ok, setOk] = useState(() => {
@@ -18,7 +35,10 @@ function Gate({ children }: { children: ReactNode }) {
   const submit = (e: FormEvent) => {
     e.preventDefault();
     if (pw === ADMIN_PASSWORD) {
-      try { sessionStorage.setItem(KEY, "1"); } catch {}
+      try {
+        sessionStorage.setItem(KEY, "1");
+        sessionStorage.setItem(PW_KEY, pw);
+      } catch {}
       setOk(true);
     } else setBad(true);
   };
@@ -52,6 +72,7 @@ const tabs = [
   { to: "/admin/discounts", label: "Discounts" },
   { to: "/admin/gallery", label: "Gallery" },
   { to: "/admin/site", label: "Site & Mail" },
+  { to: "/admin/email", label: "Email Studio" },
 ];
 
 export default function AdminLayout() {

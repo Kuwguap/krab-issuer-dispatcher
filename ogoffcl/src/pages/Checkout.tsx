@@ -1,30 +1,41 @@
-import { useMemo, useState, FormEvent } from "react";
+import { useEffect, useMemo, useRef, useState, FormEvent } from "react";
 import { Link, useNavigate } from "react-router-dom";
-import { supabase, PAYSTACK_PUBLIC_KEY } from "../lib/supabase";
+import { supabase } from "../lib/supabase";
 import { money, CURRENCY } from "../lib/money";
 import { useCart } from "../store/CartContext";
 import Reveal from "../components/Reveal";
-
-declare global {
-  interface Window {
-    PaystackPop?: { setup: (opts: Record<string, unknown>) => { openIframe: () => void } };
-  }
-}
 
 interface Applied {
   code: string;
   percentage: number;
 }
 
+type PayState =
+  | { step: "form" }
+  | { step: "otp"; orderId: string; ref: string; message: string }
+  | { step: "waiting"; orderId: string; ref: string }
+  | { step: "failed"; orderId: string; error: string };
+
+const NETWORKS: { key: "mtn" | "telecel" | "at"; label: string }[] = [
+  { key: "mtn", label: "MTN MoMo" },
+  { key: "telecel", label: "Telecel Cash" },
+  { key: "at", label: "AT Money" },
+];
+
 export default function Checkout() {
   const { items, subtotal, clear } = useCart();
   const navigate = useNavigate();
   const [form, setForm] = useState({ name: "", email: "", phone: "", address: "", city: "", note: "" });
+  const [momoPhone, setMomoPhone] = useState("");
+  const [network, setNetwork] = useState<"mtn" | "telecel" | "at">("mtn");
   const [codeInput, setCodeInput] = useState("");
   const [applied, setApplied] = useState<Applied | null>(null);
   const [codeMsg, setCodeMsg] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState<string | null>(null);
+  const [pay, setPay] = useState<PayState>({ step: "form" });
+  const [otp, setOtp] = useState("");
+  const pollRef = useRef<number | null>(null);
 
   const discountAmount = useMemo(
     () => (applied ? Math.round(subtotal * (applied.percentage / 100) * 100) / 100 : 0),
@@ -35,34 +46,62 @@ export default function Checkout() {
   const set = (k: keyof typeof form) => (e: { target: { value: string } }) =>
     setForm((f) => ({ ...f, [k]: e.target.value }));
 
+  useEffect(() => () => { if (pollRef.current) window.clearInterval(pollRef.current); }, []);
+
   const applyCode = async () => {
     const code = codeInput.trim().toUpperCase();
     if (!code) return;
     setCodeMsg(null);
     const { data, error } = await supabase
-      .from("discount_codes")
-      .select("*")
-      .eq("code", code)
-      .eq("is_active", true)
-      .single();
-    if (error || !data) {
-      setApplied(null);
-      setCodeMsg("Invalid or inactive code.");
-      return;
-    }
-    if (data.expires_at && new Date(data.expires_at) < new Date()) {
-      setApplied(null);
-      setCodeMsg("This code has expired.");
-      return;
-    }
+      .from("discount_codes").select("*").eq("code", code).eq("is_active", true).single();
+    if (error || !data) { setApplied(null); setCodeMsg("Invalid or inactive code."); return; }
+    if (data.expires_at && new Date(data.expires_at) < new Date()) { setApplied(null); setCodeMsg("This code has expired."); return; }
     const pct = Number(data.percentage ?? 0);
-    if (!pct) {
-      setApplied(null);
-      setCodeMsg("This code has no discount attached.");
-      return;
-    }
+    if (!pct) { setApplied(null); setCodeMsg("This code has no discount attached."); return; }
     setApplied({ code, percentage: pct });
     setCodeMsg(`Applied — ${pct}% off.`);
+  };
+
+  const startPolling = (orderId: string, ref: string) => {
+    setPay({ step: "waiting", orderId, ref });
+    let tries = 0;
+    if (pollRef.current) window.clearInterval(pollRef.current);
+    pollRef.current = window.setInterval(async () => {
+      tries += 1;
+      try {
+        const r = await fetch(`/api/pay/status?ref=${encodeURIComponent(ref)}`);
+        const j = await r.json();
+        if (j.state === "paid") {
+          if (pollRef.current) window.clearInterval(pollRef.current);
+          clear();
+          navigate(`/order-confirmation?ref=${encodeURIComponent(j.orderNumber || ref)}&paid=1`);
+        } else if (j.state === "failed") {
+          if (pollRef.current) window.clearInterval(pollRef.current);
+          setPay({ step: "failed", orderId, error: j.message || "Payment failed or was declined." });
+        } else if (tries > 40) {
+          // ~2 minutes — leave the order pending, show the confirmation page.
+          if (pollRef.current) window.clearInterval(pollRef.current);
+          navigate(`/order-confirmation?ref=${encodeURIComponent(ref)}&paid=0`);
+        }
+      } catch { /* keep polling */ }
+    }, 3000);
+  };
+
+  const initiate = async (orderId: string, otpcode?: string) => {
+    const r = await fetch("/api/pay/initiate", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ orderId, phone: momoPhone, channel: network, otpcode }),
+    });
+    const j = await r.json().catch(() => ({}));
+    if (j.state === "paid") {
+      clear();
+      navigate(`/order-confirmation?ref=${encodeURIComponent(j.ref)}&paid=1`);
+      return;
+    }
+    if (j.state === "otp") { setPay({ step: "otp", orderId, ref: j.ref, message: j.message }); return; }
+    if (j.state === "pending") { startPolling(orderId, j.ref); return; }
+    setPay({ step: "failed", orderId, error: j.error || "Could not start the payment." });
   };
 
   const submit = async (e: FormEvent) => {
@@ -73,12 +112,13 @@ export default function Checkout() {
       setErr("Fill in your name, a valid email, phone and delivery address.");
       return;
     }
+    const momo = momoPhone.replace(/\D/g, "");
+    if (momo.length < 9) { setErr("Enter the mobile money number that will pay."); return; }
     setBusy(true);
     try {
       const orderNumber = `OG-${Date.now().toString(36).toUpperCase()}${Math.floor(Math.random() * 90 + 10)}`;
       const shipping = [form.address.trim(), form.city.trim()].filter(Boolean).join(", ") + (form.note.trim() ? ` — Note: ${form.note.trim()}` : "");
 
-      // upsert-ish customer by email (same table the old site used)
       let customerId: string | null = null;
       try {
         const { data: existing } = await supabase.from("customers").select("id").eq("email", form.email.trim()).limit(1);
@@ -89,11 +129,10 @@ export default function Checkout() {
           const { data: created } = await supabase
             .from("customers")
             .insert({ name: form.name.trim(), full_name: form.name.trim(), email: form.email.trim(), phone: form.phone.trim(), address: form.address.trim(), city: form.city.trim() || null, country: "Ghana" })
-            .select("id")
-            .single();
+            .select("id").single();
           customerId = created?.id ?? null;
         }
-      } catch { /* customer row is best-effort */ }
+      } catch { /* best-effort */ }
 
       const { data: order, error: orderErr } = await supabase
         .from("orders")
@@ -106,7 +145,7 @@ export default function Checkout() {
           shipping_address: shipping,
           status: "pending",
           payment_status: "pending",
-          payment_method: "paystack",
+          payment_method: "moolre_momo",
           currency: CURRENCY,
           total_amount: total,
           discount_code: applied?.code ?? null,
@@ -130,49 +169,15 @@ export default function Checkout() {
       const { error: itemsErr } = await supabase.from("order_items").insert(itemRows);
       if (itemsErr) throw new Error(itemsErr.message);
 
-      // Paystack inline
-      if (!window.PaystackPop || !PAYSTACK_PUBLIC_KEY) {
-        throw new Error("Payment library not loaded. Check your connection and retry.");
-      }
-      const handler = window.PaystackPop.setup({
-        key: PAYSTACK_PUBLIC_KEY,
-        email: form.email.trim(),
-        amount: Math.round(total * 100),
-        currency: CURRENCY,
-        ref: order.order_number,
-        metadata: { custom_fields: [{ display_name: "Order", variable_name: "order_number", value: order.order_number }] },
-        callback: (resp: { reference: string }) => {
-          (async () => {
-            try {
-              await supabase
-                .from("orders")
-                .update({ payment_status: "paid", status: "confirmed", payment_method: "paystack" })
-                .eq("id", order.id);
-              // best-effort stock decrement
-              for (const i of items) {
-                const { data: prow } = await supabase.from("products").select("id, stock").eq("id", i.productId).single();
-                if (prow && prow.stock !== null && prow.stock !== undefined) {
-                  await supabase.from("products").update({ stock: Math.max(0, Number(prow.stock) - i.qty) }).eq("id", i.productId);
-                }
-              }
-            } catch {}
-            clear();
-            navigate(`/order-confirmation?ref=${encodeURIComponent(order.order_number)}&paid=1&reference=${encodeURIComponent(resp.reference)}`);
-          })();
-        },
-        onClose: () => {
-          setBusy(false);
-          navigate(`/order-confirmation?ref=${encodeURIComponent(order.order_number)}&paid=0`);
-        },
-      });
-      handler.openIframe();
+      await initiate(order.id);
     } catch (ex) {
       setErr(ex instanceof Error ? ex.message : "Something went wrong. Try again.");
+    } finally {
       setBusy(false);
     }
   };
 
-  if (items.length === 0) {
+  if (items.length === 0 && pay.step === "form") {
     return (
       <div className="max-w-2xl mx-auto px-4 py-32 text-center">
         <p className="display-xl text-6xl text-bone/15">Empty bag</p>
@@ -180,6 +185,58 @@ export default function Checkout() {
         <Link to="/shop" className="btn-og bg-acid text-ink px-8 py-4 text-sm mt-8 inline-flex hover:bg-bone">
           Back to the shop →
         </Link>
+      </div>
+    );
+  }
+
+  // ── Payment overlay states ────────────────────────────────────────────
+  if (pay.step === "waiting") {
+    return (
+      <div className="max-w-md mx-auto px-4 py-28 text-center">
+        <div className="w-20 h-20 mx-auto border-4 border-acid border-t-transparent rounded-full animate-spin mb-8" />
+        <h1 className="display-xl text-4xl text-bone">Check your phone</h1>
+        <p className="text-bone/60 mt-4 leading-relaxed">
+          Approve the <strong className="text-bone">{money(total)}</strong> mobile-money prompt on{" "}
+          <strong className="text-acid">{momoPhone}</strong>. This page updates automatically once it lands.
+        </p>
+        <p className="text-bone/30 text-xs uppercase tracking-[0.25em] mt-8 animate-pulseSoft">Waiting for approval…</p>
+      </div>
+    );
+  }
+
+  if (pay.step === "otp") {
+    return (
+      <div className="max-w-md mx-auto px-4 py-28 text-center">
+        <h1 className="display-xl text-4xl text-bone">Enter the code</h1>
+        <p className="text-bone/60 mt-4">{pay.message || "Your network sent you a verification code by SMS."}</p>
+        <form
+          onSubmit={(e) => { e.preventDefault(); if (otp.trim()) initiate(pay.orderId, otp.trim()); }}
+          className="mt-8 flex border-2 border-bone/20 focus-within:border-acid transition-colors"
+        >
+          <input
+            autoFocus value={otp} onChange={(e) => setOtp(e.target.value)}
+            inputMode="numeric" placeholder="OTP CODE"
+            className="flex-1 min-w-0 bg-transparent border-0 px-5 py-4 font-display uppercase tracking-[0.3em] text-sm text-bone placeholder:text-bone/25 focus:outline-none"
+          />
+          <button type="submit" className="btn-og bg-acid text-ink px-6 text-xs hover:bg-bone">Verify & pay</button>
+        </form>
+      </div>
+    );
+  }
+
+  if (pay.step === "failed") {
+    return (
+      <div className="max-w-md mx-auto px-4 py-28 text-center">
+        <h1 className="display-xl text-4xl text-blood">Payment failed</h1>
+        <p className="text-bone/60 mt-4">{pay.error}</p>
+        <div className="flex gap-3 justify-center mt-8">
+          <button onClick={() => initiate(pay.orderId)} className="btn-og bg-acid text-ink px-6 py-3 text-xs hover:bg-bone">
+            Try again
+          </button>
+          <button onClick={() => setPay({ step: "form" })} className="btn-og border-2 border-bone text-bone px-6 py-3 text-xs hover:bg-bone hover:text-ink">
+            Edit details
+          </button>
+        </div>
       </div>
     );
   }
@@ -193,7 +250,6 @@ export default function Checkout() {
       </Reveal>
 
       <div className="grid lg:grid-cols-[1fr_420px] gap-12">
-        {/* form */}
         <form onSubmit={submit} className="space-y-5 order-2 lg:order-1">
           <p className="font-display uppercase text-xs tracking-[0.3em] text-bone/50">Delivery details</p>
           <div className="grid sm:grid-cols-2 gap-4">
@@ -207,17 +263,33 @@ export default function Checkout() {
             <input placeholder="Delivery note (optional)" value={form.note} onChange={set("note")} className="px-4 py-4 text-sm w-full" />
           </div>
 
+          <p className="font-display uppercase text-xs tracking-[0.3em] text-bone/50 pt-4">Pay with mobile money</p>
+          <div className="flex gap-2">
+            {NETWORKS.map((n) => (
+              <button
+                key={n.key} type="button" onClick={() => setNetwork(n.key)}
+                className={`btn-og flex-1 px-3 py-3 text-xs border-2 ${network === n.key ? "bg-acid border-acid text-ink" : "border-ash text-bone/70 hover:border-bone"}`}
+              >
+                {n.label}
+              </button>
+            ))}
+          </div>
+          <input
+            required type="tel" placeholder="MoMo number that will pay *"
+            value={momoPhone} onChange={(e) => setMomoPhone(e.target.value)}
+            className="px-4 py-4 text-sm w-full"
+          />
+
           {err && <p className="text-blood text-sm border border-blood/40 bg-blood/10 px-4 py-3">{err}</p>}
 
           <button type="submit" disabled={busy} className={`btn-og w-full py-5 text-sm ${busy ? "bg-ash text-bone/40" : "bg-acid text-ink hover:bg-bone"}`}>
-            {busy ? "Opening secure payment…" : `Pay ${money(total)} with Paystack →`}
+            {busy ? "Sending prompt…" : `Pay ${money(total)} — approve on your phone`}
           </button>
           <p className="text-bone/30 text-[11px] uppercase tracking-widest text-center">
-            Card · Mobile money · Bank — secured by Paystack
+            MTN · Telecel · AT — secured by Moolre · <Link to="/refund-policy" className="underline hover:text-bone/60">Refund policy</Link>
           </p>
         </form>
 
-        {/* summary */}
         <aside className="order-1 lg:order-2">
           <div className="border border-ash bg-smoke/60 p-6 lg:sticky lg:top-24">
             <p className="font-display uppercase text-xs tracking-[0.3em] text-bone/50 mb-5">Order summary</p>
@@ -236,12 +308,9 @@ export default function Checkout() {
               ))}
             </div>
 
-            {/* discount */}
             <div className="mt-6 flex">
               <input
-                placeholder="DISCOUNT CODE"
-                value={codeInput}
-                onChange={(e) => setCodeInput(e.target.value)}
+                placeholder="DISCOUNT CODE" value={codeInput} onChange={(e) => setCodeInput(e.target.value)}
                 className="flex-1 px-3 py-3 text-xs font-display uppercase tracking-[0.2em]"
               />
               <button type="button" onClick={applyCode} className="btn-og bg-bone text-ink px-5 text-xs hover:bg-acid">

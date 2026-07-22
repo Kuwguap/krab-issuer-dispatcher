@@ -70,7 +70,8 @@ export default function Footer() {
           <p className="font-display uppercase text-xs tracking-[0.3em] text-bone/40 mb-1">Connect</p>
           <a href="https://instagram.com" target="_blank" rel="noreferrer" className="link-sweep w-fit text-bone/80 hover:text-bone uppercase text-sm font-display tracking-wider">Instagram</a>
           <a href="mailto:ogoffcl@gmail.com" className="link-sweep w-fit text-bone/80 hover:text-bone uppercase text-sm font-display tracking-wider">Email us</a>
-          <p className="text-bone/30 text-xs mt-4">Payments secured by Paystack · GHS</p>
+          <Link to="/refund-policy" className="link-sweep w-fit text-bone/80 hover:text-bone uppercase text-sm font-display tracking-wider">Refund policy</Link>
+          <p className="text-bone/30 text-xs mt-4">Mobile money payments secured by Moolre · GHS</p>
         </div>
       </div>
       <div className="border-t border-ash py-5 text-center text-bone/25 text-[11px] uppercase tracking-[0.3em]">

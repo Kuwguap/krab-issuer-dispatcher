@@ -9,6 +9,7 @@ import Shop from "./pages/Shop";
 import ProductPage from "./pages/ProductPage";
 import Checkout from "./pages/Checkout";
 import Confirmation from "./pages/Confirmation";
+import RefundPolicy from "./pages/RefundPolicy";
 import NotFound from "./pages/NotFound";
 import AdminLayout from "./admin/AdminLayout";
 import Dashboard from "./admin/Dashboard";
@@ -18,6 +19,7 @@ import AdminCategories from "./admin/Categories";
 import AdminDiscounts from "./admin/Discounts";
 import AdminGallery from "./admin/Gallery";
 import AdminSiteMail from "./admin/SiteMail";
+import AdminEmail from "./admin/Email";
 
 function ScrollTop() {
   const { pathname } = useLocation();
@@ -39,6 +41,7 @@ export default function App() {
             <Route path="/product/:id" element={<ProductPage />} />
             <Route path="/checkout" element={<Checkout />} />
             <Route path="/order-confirmation" element={<Confirmation />} />
+            <Route path="/refund-policy" element={<RefundPolicy />} />
             <Route path="/admin" element={<AdminLayout />}>
               <Route index element={<Dashboard />} />
               <Route path="products" element={<AdminProducts />} />
@@ -47,6 +50,7 @@ export default function App() {
               <Route path="discounts" element={<AdminDiscounts />} />
               <Route path="gallery" element={<AdminGallery />} />
               <Route path="site" element={<AdminSiteMail />} />
+              <Route path="email" element={<AdminEmail />} />
             </Route>
             <Route path="*" element={<NotFound />} />
           </Routes>
