@@ -1,9 +1,9 @@
 // POST /api/admin/campaign  { subject, html, audience: waitlist|newsletter|both, test? }
 // Admin-only. test = send only to the given test email. Otherwise fetches the
 // audience from subscribers, sends via Resend batch, records the campaign.
-const { env, sb, sendEmail, sendEmailBatch, emailShell } = require("../_lib");
+import { env, sb, sendEmail, sendEmailBatch, emailShell } from "../_lib.js";
 
-module.exports = async (req, res) => {
+export default async (req, res) => {
   if (req.method !== "POST") return res.status(405).json({ error: "POST only" });
   if (String(req.headers["x-admin-password"] || "") !== env.adminPassword) {
     return res.status(401).json({ error: "unauthorized" });

@@ -1,8 +1,8 @@
 // POST /api/email/welcome  { email, source: waitlist|newsletter }
 // Fired by the site right after a successful subscribe. Best-effort.
-const { sendEmail, emailShell } = require("../_lib");
+import { sendEmail, emailShell } from "../_lib.js";
 
-module.exports = async (req, res) => {
+export default async (req, res) => {
   if (req.method !== "POST") return res.status(405).json({ error: "POST only" });
   try {
     const email = String((req.body || {}).email || "").trim().toLowerCase();

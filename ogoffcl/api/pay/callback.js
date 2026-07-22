@@ -2,10 +2,10 @@
 // Moolre's webhook has no documented signature, so we NEVER trust the body:
 // we extract the reference, re-verify against Moolre's status API with our
 // keys, and only then finalize. Always answers 200 so Moolre stops retrying.
-const { moolreStatus, sb, getOrderByNumber } = require("../_lib");
-const { finalizePaidOrder } = require("../_finalize");
+import { moolreStatus, sb, getOrderByNumber } from "../_lib.js";
+import { finalizePaidOrder } from "../_finalize.js";
 
-module.exports = async (req, res) => {
+export default async (req, res) => {
   try {
     const body = req.body || {};
     const d = typeof body.data === "object" && body.data ? body.data : body;

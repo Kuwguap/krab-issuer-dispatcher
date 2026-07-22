@@ -2,12 +2,12 @@
 // Starts (or resumes, when otpcode is present) a Moolre MoMo charge for an
 // order. Amount ALWAYS comes from the order row in the database — never from
 // the client. Also sends the "order received" email on first attempt.
-const {
+import {
   moolreConfigured, getOrder, updateOrder, appendStatusHistory,
   moolrePay, sendEmail, emailShell, orderItemsHtml, getOrderItems,
-} = require("../_lib");
+} from "../_lib.js";
 
-module.exports = async (req, res) => {
+export default async (req, res) => {
   if (req.method !== "POST") return res.status(405).json({ error: "POST only" });
   try {
     if (!moolreConfigured()) {

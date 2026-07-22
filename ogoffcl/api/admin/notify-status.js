@@ -1,9 +1,9 @@
 // POST /api/admin/notify-status  { orderId, status, note? }
 // Admin-only. Records the status change on the order timeline and emails the
 // customer a tracking update.
-const {
+import {
   env, getOrder, updateOrder, appendStatusHistory, sendEmail, emailShell,
-} = require("../_lib");
+} from "../_lib.js";
 
 const FRIENDLY = {
   confirmed: ["Order confirmed", "Your order is confirmed and getting packed."],
@@ -14,7 +14,7 @@ const FRIENDLY = {
   cancelled: ["Order cancelled", "Your order has been cancelled. If this is unexpected, reply to this email."],
 };
 
-module.exports = async (req, res) => {
+export default async (req, res) => {
   if (req.method !== "POST") return res.status(405).json({ error: "POST only" });
   if (String(req.headers["x-admin-password"] || "") !== env.adminPassword) {
     return res.status(401).json({ error: "unauthorized" });

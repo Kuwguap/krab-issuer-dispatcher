@@ -1,9 +1,9 @@
 // Mark an order paid exactly once, then side effects: stock decrement +
 // customer/store emails. Shared by status polling and the Moolre callback.
-const {
+import {
   sb, getOrderItems, updateOrder, appendStatusHistory,
   sendEmail, emailShell, orderItemsHtml, env,
-} = require("./_lib");
+} from "./_lib.js";
 
 async function finalizePaidOrder(order, moolreTx) {
   if (!order) return { ok: false, error: "no order" };
@@ -66,4 +66,4 @@ async function finalizePaidOrder(order, moolreTx) {
   return { ok: true };
 }
 
-module.exports = { finalizePaidOrder };
+export { finalizePaidOrder };

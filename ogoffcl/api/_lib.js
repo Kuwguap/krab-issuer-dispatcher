@@ -202,7 +202,7 @@ function orderItemsHtml(items) {
     </tr>`).join("");
 }
 
-module.exports = {
+export {
   env, moolreConfigured, sb, getOrder, getOrderByNumber, getOrderItems, updateOrder,
   appendStatusHistory, moolrePay, moolreStatus, moolreTransfer, PAY_CHANNELS,
   sendEmail, sendEmailBatch, emailShell, orderItemsHtml,

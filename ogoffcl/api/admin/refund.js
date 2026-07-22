@@ -1,12 +1,12 @@
 // POST /api/admin/refund  { orderId, amount?, phone?, channel?, reason? }
 // Admin-only. Sends money back to the customer's MoMo via Moolre transfer,
 // records it on the order, and emails the customer.
-const {
+import {
   env, moolreConfigured, getOrder, updateOrder, appendStatusHistory,
   moolreTransfer, sendEmail, emailShell,
-} = require("../_lib");
+} from "../_lib.js";
 
-module.exports = async (req, res) => {
+export default async (req, res) => {
   if (req.method !== "POST") return res.status(405).json({ error: "POST only" });
   if (String(req.headers["x-admin-password"] || "") !== env.adminPassword) {
     return res.status(401).json({ error: "unauthorized" });

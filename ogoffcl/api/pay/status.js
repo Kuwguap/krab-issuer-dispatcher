@@ -1,8 +1,8 @@
 // GET /api/pay/status?ref=<externalref>
 // The checkout polls this. Confirms with Moolre's status API (source of
 // truth) and finalizes the order the moment the charge succeeds.
-const { moolreStatus, getOrderByNumber, sb } = require("../_lib");
-const { finalizePaidOrder } = require("../_finalize");
+import { moolreStatus, getOrderByNumber, sb } from "../_lib.js";
+import { finalizePaidOrder } from "../_finalize.js";
 
 async function orderForRef(ref) {
   // externalref is "<order_number>-<suffix>"; also match a bare order number.
@@ -15,7 +15,7 @@ async function orderForRef(ref) {
   return getOrderByNumber(orderNumber);
 }
 
-module.exports = async (req, res) => {
+export default async (req, res) => {
   try {
     const ref = String((req.query && req.query.ref) || "").trim();
     if (!ref) return res.status(400).json({ error: "ref required" });
