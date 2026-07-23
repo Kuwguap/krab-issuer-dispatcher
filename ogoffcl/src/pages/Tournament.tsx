@@ -248,7 +248,7 @@ export default function Tournament() {
 
         <div className="relative max-w-7xl mx-auto px-4 sm:px-6 w-full py-20">
           <motion.p initial={{ opacity: 0, y: 10 }} animate={{ opacity: 1, y: 0 }} transition={{ delay: 0.1, duration: 0.5 }} className="font-display uppercase text-acid tracking-[0.45em] text-[11px] mb-6">
-            OG OFFCL presents · Online + The Hub, Accra
+            OG OFFCL presents · Online + The Hub, KNUST Kumasi
           </motion.p>
 
           <h1 className="display-xl text-[15vw] sm:text-[11vw] lg:text-[8rem] leading-[0.85]">
@@ -407,7 +407,11 @@ export default function Tournament() {
             <div className="flex-1 min-w-[240px]">
               <p className="font-display uppercase text-acid text-lg tracking-wide">No console? Shaky internet? Play from The Hub.</p>
               <p className="text-bone/60 text-sm leading-relaxed mt-2">
-                For GH₵{HUB_FEE} extra we seat you at the OGOFFCL Hub in Accra — console, screen and a stable connection handled. Hub matches also go straight onto the live stream.
+                For GH₵{HUB_FEE} extra we seat you at the OGOFFCL Hub — console, screen and a
+                <strong className="text-bone"> minimum 200&nbsp;Mbps connection</strong> handled. Hub matches also go straight onto the live stream.
+              </p>
+              <p className="text-acid/80 text-xs uppercase tracking-[0.2em] mt-3">
+                ⚠ Hub seats are only available at KNUST, Kumasi — playing from anywhere else? You need your own console and a stable connection.
               </p>
             </div>
             <a href="#register" className="btn-og bg-acid text-ink px-6 py-3.5 text-xs hover:bg-bone whitespace-nowrap">Add The Hub — GH₵{BASE_FEE + HUB_FEE} total</a>
@@ -481,8 +485,8 @@ export default function Tournament() {
             <label className={`flex items-start gap-4 border-2 p-4 cursor-pointer transition-colors ${hub ? "border-acid bg-acid/5" : "border-ash hover:border-bone/40"}`}>
               <input type="checkbox" checked={hub} onChange={(e) => setHub(e.target.checked)} className="mt-1 accent-[#C8FF00] w-4 h-4" />
               <span className="min-w-0">
-                <span className="font-display uppercase text-sm text-bone block">Play from the OGOFFCL Hub <span className="text-acid">+GH₵{HUB_FEE}</span></span>
-                <span className="text-bone/50 text-xs leading-relaxed block mt-1">Console, screen and stable internet provided at the Hub in Accra. Pick this if your connection or setup can't be trusted on game day.</span>
+                <span className="font-display uppercase text-sm text-bone block">Play from the OGOFFCL Hub <span className="text-acid">+GH₵{HUB_FEE}</span> <span className="text-bone/40 text-xs normal-case">· KNUST, Kumasi only</span></span>
+                <span className="text-bone/50 text-xs leading-relaxed block mt-1">Console, screen and a minimum 200 Mbps connection provided at the Hub at KNUST, Kumasi. Only pick this if you can be there in person on game day — everyone else plays on their own console and internet.</span>
               </span>
             </label>
 
@@ -536,7 +540,8 @@ export default function Tournament() {
               "Winner reports the full-time screenshot in the official group within 10 minutes.",
               "No-show after 15 minutes past your kickoff time = walkover to your opponent.",
               "Disconnects: leading player takes the win if past 60'; otherwise replay the tie.",
-              "Hub seats are limited — first paid, first seated.",
+              "Hub seats are KNUST (Kumasi) only, with consoles + 200 Mbps internet provided — limited, first paid, first seated.",
+              "Playing remotely? Your own console and a stable connection are on you — test before game day.",
               "Entry fees are non-refundable once the bracket drops.",
             ].map((r, i) => (
               <p key={i} className="flex gap-3"><span className="text-acid font-display">{String(i + 1).padStart(2, "0")}</span>{r}</p>

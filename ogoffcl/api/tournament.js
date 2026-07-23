@@ -137,7 +137,7 @@ async function status(req, res) {
           subject: "You're in the OG OFFCL FC26 Tournament ⚽",
           html: emailShell("Spot locked in. 🎮", `
             <p><strong style="color:#C8FF00;">${player.gamertag}</strong> — payment received, your spot in the OG OFFCL FC26 tournament is confirmed.</p>
-            <p style="color:#8b877e;">Entry: GH₵${Number(player.fee)}${player.hub ? " (playing from the OGOFFCL Hub — console + stable connection covered)" : ""}.<br/>
+            <p style="color:#8b877e;">Entry: GH₵${Number(player.fee)}${player.hub ? " (playing from the OGOFFCL Hub at KNUST, Kumasi — console + 200 Mbps connection covered; be there in person on game day)" : ""}.<br/>
             Platform: ${String(player.platform).toUpperCase()}.</p>
             <p>The pot: <strong style="color:#C8FF00;">GH₵1,000 cash + 2 merch pieces</strong> from the store.</p>
             <p>What happens next: we'll email + WhatsApp the bracket, your kickoff time and the official match group before game day. Add your opponent via EA ID, invite them from <strong style="color:#F5F2EA;">Ultimate Team → Friendlies → Play a Friend</strong>, screenshot the final score.</p>

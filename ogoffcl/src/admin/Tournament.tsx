@@ -238,7 +238,7 @@ async function renderAdPoster(playerCount: number): Promise<string> {
     ctx.fillText(small, x + 30, 1118);
   };
   card(60, 460, "GH₵50", "ENTRY · SPOT + MATCH CARD");
-  card(560, 460, "+GH₵20", "HUB SEAT · CONSOLE + WIFI");
+  card(560, 460, "+GH₵20", "HUB · KNUST KUMASI · 200MBPS");
 
   ctx.fillStyle = playerCount > 0 ? ACID : "rgba(245,242,234,0.5)";
   ctx.font = '700 30px "Space Grotesk"'; ctx.textAlign = "left";
