@@ -21,10 +21,17 @@ import AdminDiscounts from "./admin/Discounts";
 import AdminGallery from "./admin/Gallery";
 import AdminSiteMail from "./admin/SiteMail";
 import AdminEmail from "./admin/Email";
+import AdminAnalytics from "./admin/Analytics";
+import { usePageTracking } from "./lib/track";
 
 function ScrollTop() {
   const { pathname } = useLocation();
   useEffect(() => { window.scrollTo({ top: 0 }); }, [pathname]);
+  return null;
+}
+
+function Tracker() {
+  usePageTracking();
   return null;
 }
 
@@ -33,6 +40,7 @@ export default function App() {
     <LockGate>
       <div className="noise min-h-screen flex flex-col">
         <ScrollTop />
+        <Tracker />
         <Navbar />
         <CartDrawer />
         <main className="flex-1">
@@ -53,6 +61,7 @@ export default function App() {
               <Route path="gallery" element={<AdminGallery />} />
               <Route path="site" element={<AdminSiteMail />} />
               <Route path="email" element={<AdminEmail />} />
+              <Route path="analytics" element={<AdminAnalytics />} />
             </Route>
             <Route path="*" element={<NotFound />} />
           </Routes>
