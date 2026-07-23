@@ -24,7 +24,15 @@ const MIGRATION_HINT = "Run supabase/migration_tournament.sql in the Supabase SQ
 const INK = "#0A0A0A", SMOKE = "#141414", ASH = "#2a2a2a", BONE = "#F5F2EA", ACID = "#C8FF00";
 
 async function loadFonts() {
-  try { await Promise.all([document.fonts.load('90px "Archivo Black"'), document.fonts.load('40px "Space Grotesk"')]); } catch {}
+  // fonts.ready + explicit loads: drawing before Archivo Black is in memory
+  // renders fallback glyphs (or half-painted text) into the exported PNG.
+  try {
+    await document.fonts.ready;
+    await Promise.all([
+      document.fonts.load('90px "Archivo Black"'),
+      document.fonts.load('700 40px "Space Grotesk"'),
+    ]);
+  } catch {}
 }
 
 function grid(ctx: CanvasRenderingContext2D, w: number, h: number) {
@@ -124,7 +132,7 @@ async function renderPlayerCard(p: Player): Promise<string> {
   ctx.fillStyle = INK; ctx.font = '44px "Archivo Black"'; ctx.textAlign = "left";
   ctx.fillText("OGOFFCL.STORE/TOURNAMENT", 70, H - 40);
   ctx.textAlign = "right"; ctx.font = '700 28px "Space Grotesk"';
-  ctx.fillText("GH₵50 ENTRY", W - 70, H - 42);
+  ctx.fillText("GH₵1,000 POT", W - 70, H - 42);
   return c.toDataURL("image/png");
 }
 
@@ -181,46 +189,68 @@ async function renderAdPoster(playerCount: number): Promise<string> {
   const ctx = c.getContext("2d")!;
   ctx.fillStyle = INK; ctx.fillRect(0, 0, W, H);
   grid(ctx, W, H);
-  slash(ctx, W, 320, 110);
-  slash(ctx, W, 1040, 70);
+  slash(ctx, W, 470, 100);
 
-  ctx.fillStyle = ACID; ctx.font = '700 30px "Space Grotesk"'; ctx.textAlign = "left";
-  ctx.fillText("O G   O F F C L   P R E S E N T S", 70, 120);
+  // top ribbon
+  ctx.fillStyle = ACID; ctx.fillRect(0, 0, W, 78);
+  ctx.fillStyle = INK; ctx.font = '700 30px "Space Grotesk"'; ctx.textAlign = "center";
+  ctx.fillText("O G   O F F C L   P R E S E N T S", W / 2, 51);
 
-  ctx.fillStyle = BONE;
-  ctx.font = '170px "Archivo Black"';
-  ctx.fillText("FC26", 62, 330);
-  ctx.strokeStyle = ACID; ctx.lineWidth = 5;
-  ctx.strokeText("KNOCKOUT", 62, 500);
-  ctx.fillStyle = BONE; ctx.font = '112px "Archivo Black"';
-  ctx.fillText("TOURNAMENT", 62, 630);
+  // headline stack
+  ctx.textAlign = "left";
+  ctx.fillStyle = BONE; ctx.font = '186px "Archivo Black"';
+  ctx.fillText("FC26", 60, 300);
+  ctx.strokeStyle = ACID; ctx.lineWidth = 5; ctx.font = '104px "Archivo Black"';
+  ctx.strokeText("ULTIMATE TEAM", 62, 420);
+  ctx.fillStyle = BONE; ctx.font = '128px "Archivo Black"';
+  ctx.fillText("KNOCKOUT", 60, 560);
 
-  ctx.fillStyle = "rgba(245,242,234,0.65)"; ctx.font = '700 34px "Space Grotesk"';
-  ctx.fillText("1V1 ONLINE FRIENDLIES · PS5 / XBOX / PC", 70, 720);
-  ctx.fillText("PLAY FROM ANYWHERE — OR THE OGOFFCL HUB", 70, 772);
+  // prize banner
+  ctx.fillStyle = SMOKE; ctx.fillRect(60, 620, W - 120, 220);
+  ctx.strokeStyle = ACID; ctx.lineWidth = 4; ctx.strokeRect(60, 620, W - 120, 220);
+  ctx.fillStyle = "rgba(200,255,0,0.6)"; ctx.font = '700 26px "Space Grotesk"';
+  ctx.fillText("THE POT — WINNER TAKES ALL", 96, 675);
+  ctx.fillStyle = ACID; ctx.font = '84px "Archivo Black"';
+  ctx.fillText("GH₵1,000 CASH", 92, 762);
+  ctx.fillStyle = BONE; ctx.font = '46px "Archivo Black"';
+  ctx.fillText("+ 2 MERCH PIECES FROM THE RACK", 94, 820);
+
+  // chips row
+  const chips = ["1V1", "ULTIMATE TEAM", "6-MIN HALVES", "PS5 · XBOX · PC", "STREAMED LIVE"];
+  let cx = 60;
+  ctx.font = '700 24px "Space Grotesk"';
+  for (const t of chips) {
+    const w = ctx.measureText(t).width + 44;
+    if (cx + w > W - 60) break;
+    ctx.strokeStyle = ASH; ctx.lineWidth = 2; ctx.strokeRect(cx, 880, w, 56);
+    ctx.fillStyle = "rgba(245,242,234,0.7)";
+    ctx.fillText(t, cx + 22, 917);
+    cx += w + 14;
+  }
 
   // fee cards
   const card = (x: number, w: number, big: string, small: string) => {
-    ctx.fillStyle = SMOKE; ctx.fillRect(x, 830, w, 190);
-    ctx.strokeStyle = ACID; ctx.lineWidth = 3; ctx.strokeRect(x, 830, w, 190);
-    ctx.fillStyle = ACID; ctx.font = '72px "Archivo Black"'; ctx.textAlign = "left";
-    ctx.fillText(big, x + 30, 925);
-    ctx.fillStyle = "rgba(245,242,234,0.6)"; ctx.font = '700 24px "Space Grotesk"';
-    ctx.fillText(small, x + 30, 975);
+    ctx.fillStyle = SMOKE; ctx.fillRect(x, 980, w, 180);
+    ctx.strokeStyle = ACID; ctx.lineWidth = 3; ctx.strokeRect(x, 980, w, 180);
+    ctx.fillStyle = ACID; ctx.font = '68px "Archivo Black"'; ctx.textAlign = "left";
+    ctx.fillText(big, x + 30, 1070);
+    ctx.fillStyle = "rgba(245,242,234,0.6)"; ctx.font = '700 23px "Space Grotesk"';
+    ctx.fillText(small, x + 30, 1118);
   };
-  card(70, 450, "GH₵50", "ENTRY · SPOT + MATCH CARD");
-  card(560, 450, "+GH₵20", "HUB SEAT · CONSOLE + WIFI");
+  card(60, 460, "GH₵50", "ENTRY · SPOT + MATCH CARD");
+  card(560, 460, "+GH₵20", "HUB SEAT · CONSOLE + WIFI");
 
-  if (playerCount > 0) {
-    ctx.fillStyle = ACID; ctx.font = '700 30px "Space Grotesk"';
-    ctx.fillText(`${playerCount} PLAYERS ALREADY LOCKED IN`, 70, 1105);
-  }
-  ctx.fillStyle = "rgba(245,242,234,0.5)"; ctx.font = '700 28px "Space Grotesk"';
-  ctx.fillText("STREAMED LIVE · WINNER TAKES THE CROWN", 70, playerCount > 0 ? 1150 : 1105);
+  ctx.fillStyle = playerCount > 0 ? ACID : "rgba(245,242,234,0.5)";
+  ctx.font = '700 30px "Space Grotesk"'; ctx.textAlign = "left";
+  ctx.fillText(
+    playerCount > 0 ? `${playerCount} PLAYERS ALREADY LOCKED IN — DON'T WATCH FROM THE BENCH` : "LIMITED SPOTS — FIRST PAID, FIRST SEATED",
+    60, 1208,
+  );
 
-  ctx.fillStyle = ACID; ctx.fillRect(0, H - 120, W, 120);
-  ctx.fillStyle = INK; ctx.font = '52px "Archivo Black"'; ctx.textAlign = "center";
-  ctx.fillText("OGOFFCL.STORE/TOURNAMENT", W / 2, H - 44);
+  // footer ribbon
+  ctx.fillStyle = ACID; ctx.fillRect(0, H - 100, W, 100);
+  ctx.fillStyle = INK; ctx.font = '50px "Archivo Black"'; ctx.textAlign = "center";
+  ctx.fillText("OGOFFCL.STORE/TOURNAMENT", W / 2, H - 32);
   return c.toDataURL("image/png");
 }
 
@@ -236,6 +266,10 @@ export default function AdminTournament() {
   const [msg, setMsg] = useState<string | null>(null);
   const [tablesMissing, setTablesMissing] = useState(false);
   const [busy, setBusy] = useState<string | null>(null);
+
+  // studio previews — rendered automatically once players load
+  const [posterUrl, setPosterUrl] = useState<string | null>(null);
+  const [cardUrls, setCardUrls] = useState<Record<string, string>>({});
 
   // simulator
   const [simN, setSimN] = useState(20);
@@ -254,6 +288,24 @@ export default function AdminTournament() {
     }
   };
   useEffect(() => { load(); }, []);
+
+  // auto-render the studio: poster + one card per signup (photo + name on the card)
+  useEffect(() => {
+    let alive = true;
+    (async () => {
+      const paidCount = players.filter((p) => p.payment_status === "paid").length;
+      const poster = await renderAdPoster(paidCount).catch(() => null);
+      if (alive && poster) setPosterUrl(poster);
+      for (const p of players) {
+        if (!alive) return;
+        if (cardUrls[p.id]) continue;
+        const url = await renderPlayerCard(p).catch(() => null);
+        if (alive && url) setCardUrls((m) => ({ ...m, [p.id]: url }));
+      }
+    })();
+    return () => { alive = false; };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [players]);
 
   const paid = useMemo(() => players.filter((p) => p.payment_status === "paid"), [players]);
   const revenue = useMemo(() => paid.reduce((a, p) => a + Number(p.fee || 0), 0), [paid]);
@@ -380,16 +432,45 @@ export default function AdminTournament() {
         ))}
       </div>
 
-      {/* marketing assets */}
+      {/* studio — live previews, download exactly what you see */}
       <section>
-        <p className="font-display uppercase text-xs tracking-[0.3em] text-bone/50 mb-3">Marketing assets</p>
-        <div className="flex flex-wrap gap-2">
-          <button onClick={async () => { setBusy("ad"); download(await renderAdPoster(paid.length), "og-fc26-tournament-ad.png"); setBusy(null); }}
-            className="btn-og bg-acid text-ink px-5 py-3 text-xs hover:bg-bone">
-            {busy === "ad" ? "Rendering…" : "⬇ Ad poster (1080×1350)"}
-          </button>
-          <span className="text-bone/40 text-xs self-center">Player cards & VS graphics: per-row buttons below. All PNGs sized for IG feed.</span>
+        <p className="font-display uppercase text-xs tracking-[0.3em] text-bone/50 mb-4">Card studio</p>
+        <div className="grid sm:grid-cols-2 lg:grid-cols-4 gap-4">
+          {/* ad poster */}
+          <div className="border border-ash bg-smoke/40">
+            <div className="aspect-[4/5] bg-ink">
+              {posterUrl
+                ? <img src={posterUrl} alt="Tournament ad poster" className="w-full h-full object-contain" />
+                : <div className="w-full h-full flex items-center justify-center text-bone/30 text-xs animate-pulseSoft">Rendering poster…</div>}
+            </div>
+            <div className="flex items-center justify-between px-3 py-2.5 border-t border-ash">
+              <span className="font-display uppercase text-[10px] tracking-[0.2em] text-acid">Ad poster</span>
+              <button disabled={!posterUrl} onClick={() => posterUrl && download(posterUrl, "og-fc26-tournament-ad.png")}
+                className="btn-og bg-acid text-ink px-3 py-2 text-[10px] hover:bg-bone">⬇ PNG</button>
+            </div>
+          </div>
+          {/* player cards — rendered automatically from each signup's photo + name */}
+          {players.map((p) => (
+            <div key={p.id} className="border border-ash bg-smoke/40">
+              <div className="aspect-[4/5] bg-ink">
+                {cardUrls[p.id]
+                  ? <img src={cardUrls[p.id]} alt={`${p.gamertag} card`} className="w-full h-full object-contain" />
+                  : <div className="w-full h-full flex items-center justify-center text-bone/30 text-xs animate-pulseSoft">Rendering…</div>}
+              </div>
+              <div className="flex items-center justify-between gap-2 px-3 py-2.5 border-t border-ash">
+                <span className="font-display uppercase text-[10px] tracking-[0.2em] text-bone/70 truncate min-w-0">
+                  {p.gamertag}{p.payment_status !== "paid" ? " · unpaid" : ""}
+                </span>
+                <button disabled={!cardUrls[p.id]} onClick={() => cardUrls[p.id] && download(cardUrls[p.id], `og-card-${p.gamertag}.png`)}
+                  className="btn-og bg-bone text-ink px-3 py-2 text-[10px] hover:bg-acid shrink-0">⬇ PNG</button>
+              </div>
+            </div>
+          ))}
         </div>
+        <p className="text-bone/35 text-[11px] mt-3">
+          Cards render themselves the moment someone signs up — their photo and name land straight on the OG card.
+          Downloads are 1080×1350, ready for the feed. VS graphics live on each bracket match below.
+        </p>
       </section>
 
       {/* fixture simulator */}

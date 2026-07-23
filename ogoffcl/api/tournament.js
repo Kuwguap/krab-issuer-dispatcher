@@ -59,6 +59,20 @@ async function register(req, res) {
     const detail = JSON.stringify(ins.data || {}).slice(0, 160);
     return res.status(500).json({ error: "Could not save your registration.", detail });
   }
+
+  // signup email straight away — spot locks when the payment lands
+  sendEmail({
+    to: email,
+    subject: "You've signed up — OG OFFCL FC26 Tournament ⚽",
+    html: emailShell("Signed up. One step left.", `
+      <p><strong style="color:#C8FF00;">${gamertag}</strong> — your registration is in. Complete the
+      <strong style="color:#C8FF00;">GH₵${fee}</strong> mobile-money payment to lock your spot on the bracket.</p>
+      <p style="color:#8b877e;">The pot: <strong style="color:#F5F2EA;">GH₵1,000 cash + 2 merch pieces</strong> from the store.
+      Matches are FC26 <strong style="color:#F5F2EA;">Ultimate Team</strong> — bring your best squad.</p>
+      <p>You'll get a second email the moment your payment is received.</p>
+    `),
+  }).catch(() => {});
+
   return res.json({ playerId: ins.data[0].id, fee });
 }
 
@@ -125,8 +139,9 @@ async function status(req, res) {
             <p><strong style="color:#C8FF00;">${player.gamertag}</strong> — payment received, your spot in the OG OFFCL FC26 tournament is confirmed.</p>
             <p style="color:#8b877e;">Entry: GH₵${Number(player.fee)}${player.hub ? " (playing from the OGOFFCL Hub — console + stable connection covered)" : ""}.<br/>
             Platform: ${String(player.platform).toUpperCase()}.</p>
-            <p>What happens next: we'll email + WhatsApp the bracket, your kickoff time and the official match group before game day. Add your opponent via EA ID, play the Online Friendly, screenshot the final score.</p>
-            <p style="color:#8b877e;">Bring your A-game. Limited spots — no restocks on glory.</p>
+            <p>The pot: <strong style="color:#C8FF00;">GH₵1,000 cash + 2 merch pieces</strong> from the store.</p>
+            <p>What happens next: we'll email + WhatsApp the bracket, your kickoff time and the official match group before game day. Add your opponent via EA ID, invite them from <strong style="color:#F5F2EA;">Ultimate Team → Friendlies → Play a Friend</strong>, screenshot the final score.</p>
+            <p style="color:#8b877e;">Bring your best squad. Limited spots — no restocks on glory.</p>
           `),
         }).catch(() => {});
       }

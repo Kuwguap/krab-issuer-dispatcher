@@ -9,6 +9,7 @@ import { buildSchedule, fmtDuration } from "../lib/fixtures";
 const EASE = [0.22, 1, 0.36, 1] as const;
 const BASE_FEE = 50;
 const HUB_FEE = 20;
+const PRIZE_CASH = 1000;
 
 const NETWORKS: { key: "mtn" | "telecel" | "at"; label: string }[] = [
   { key: "mtn", label: "MTN MoMo" },
@@ -51,16 +52,16 @@ function Stat({ value, label, suffix = "" }: { value: number; label: string; suf
 
 export default function Tournament() {
   usePageMeta({
-    title: "FC26 Tournament — OG OFFCL | GH₵50 entry, Accra & online",
+    title: "FC26 Tournament — OG OFFCL | GH₵1,000 prize pool, GH₵50 entry",
     description:
-      "The OG OFFCL FC26 knockout tournament. 1v1 online friendlies, GH₵50 entry, play from anywhere — or from the OGOFFCL Hub with a console and stable connection for GH₵20 extra. Register, upload your player photo, get on the bracket.",
+      "The OG OFFCL FC26 Ultimate Team knockout. GH₵1,000 cash + 2 merch pieces on the line. GH₵50 entry, play from anywhere — or from the OGOFFCL Hub with a console and stable connection for GH₵20 extra. Register, upload your player photo, get on the bracket.",
     path: "/tournament",
   });
   useJsonLd("tournament", {
     "@context": "https://schema.org",
     "@type": "Event",
     name: "OG OFFCL FC26 Tournament",
-    description: "1v1 FC26 online knockout tournament by OG OFFCL. GH₵50 entry.",
+    description: "1v1 FC26 Ultimate Team knockout tournament by OG OFFCL. GH₵50 entry, GH₵1,000 cash + merch prize pool.",
     eventAttendanceMode: "https://schema.org/MixedEventAttendanceMode",
     eventStatus: "https://schema.org/EventScheduled",
     location: { "@type": "VirtualLocation", url: `${SITE_URL}/tournament` },
@@ -277,7 +278,7 @@ export default function Tournament() {
 
           {/* scoreboard chips */}
           <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} transition={{ delay: 1.25, duration: 0.6 }} className="flex flex-wrap gap-2 mt-10">
-            {["1V1 KNOCKOUT", "ONLINE FRIENDLIES", "6-MIN HALVES", "PS5 · XBOX · PC", "STREAMED LIVE"].map((t) => (
+            {["1V1 KNOCKOUT", "ULTIMATE TEAM", "6-MIN HALVES", "PS5 · XBOX · PC", "STREAMED LIVE", `GH₵${PRIZE_CASH.toLocaleString()} + MERCH POT`].map((t) => (
               <span key={t} className="border border-ash bg-smoke/60 text-bone/70 font-display text-[10px] uppercase tracking-[0.2em] px-3 py-2">{t}</span>
             ))}
           </motion.div>
@@ -286,13 +287,32 @@ export default function Tournament() {
 
       <Marquee text="FC26 KNOCKOUT — GH₵50 ENTRY — WINNER TAKES THE CROWN — REGISTER NOW — " fast />
 
-      {/* ── LIVE ROSTER COUNT ──────────────────────────────────── */}
+      {/* ── LIVE ROSTER COUNT + POT ────────────────────────────── */}
       <section className="max-w-7xl mx-auto px-4 sm:px-6 py-14">
-        <div className="grid grid-cols-3 gap-px bg-ash border border-ash">
+        <div className="grid grid-cols-2 sm:grid-cols-4 gap-px bg-ash border border-ash">
+          <Stat value={PRIZE_CASH} label="Cash prize pool (GH₵)" />
+          <Stat value={2} label="Merch pieces in the pot" />
           <Stat value={players.length} label="Players locked in" />
           <Stat value={BASE_FEE} label="Entry fee (GH₵)" />
-          <Stat value={HUB_FEE} label="Hub add-on (GH₵)" suffix="+" />
         </div>
+      </section>
+
+      {/* ── THE POT ────────────────────────────────────────────── */}
+      <section className="max-w-7xl mx-auto px-4 sm:px-6 pb-14">
+        <Reveal>
+          <div className="relative border-2 border-acid bg-acid/5 p-8 sm:p-12 overflow-hidden">
+            <div className="absolute -right-6 -top-10 font-display text-[10rem] leading-none text-acid/10 select-none pointer-events-none" aria-hidden>₵</div>
+            <p className="font-display uppercase text-acid tracking-[0.45em] text-[11px] mb-4">The pot</p>
+            <h2 className="display-xl text-5xl sm:text-7xl text-bone">
+              GH₵{PRIZE_CASH.toLocaleString()} <span className="text-stroke-acid">+ 2 merch</span>
+            </h2>
+            <p className="text-bone/60 text-sm sm:text-base leading-relaxed mt-4 max-w-xl">
+              Winner takes <strong className="text-acid">GH₵{PRIZE_CASH.toLocaleString()} cash</strong> and
+              <strong className="text-bone"> two pieces from the OG OFFCL rack</strong> — your pick.
+              Champion's name goes on the stream, the socials and the next drop.
+            </p>
+          </div>
+        </Reveal>
       </section>
 
       {/* ── ROSTER WALL — the hype grid ────────────────────────── */}
@@ -368,7 +388,7 @@ export default function Tournament() {
           {[
             ["01", "Register & pay", `GH₵${BASE_FEE} locks your spot. Name, PSN / EA ID, platform and your player photo — it goes on your official match card.`],
             ["02", "Get the bracket", "We seed the knockout bracket and drop it here plus the official WhatsApp group. You'll know exactly who you face and when."],
-            ["03", "Play your tie", "Add your opponent via EA ID → invite them to an Online Friendly (not Kick-Off — that's couch-only). 6-minute halves, current club rosters, no custom squads."],
+            ["03", "Play your tie", "Add your opponent via EA ID → invite them from Ultimate Team → Friendlies → Play a Friend. 6-minute halves. Bring your best squad — UT is the battleground."],
             ["04", "Report the score", "Winner screenshots the full-time screen and drops it in the group. Bracket updates live on this page. Win out. Take the crown."],
           ].map(([n, t, d]) => (
             <Reveal key={n}>
@@ -497,7 +517,7 @@ export default function Tournament() {
                 </div>
               </div>
               <div className="border-t border-ash mt-5 pt-4 space-y-2.5">
-                {["Official match card with your photo", "Seeded knockout bracket spot", "Live-stream feature when you play", "Winner takes the crown + prize"].map((t) => (
+                {[`Shot at GH₵${PRIZE_CASH.toLocaleString()} cash + 2 merch pieces`, "Official match card with your photo", "Seeded knockout bracket spot", "Live-stream feature when you play"].map((t) => (
                   <p key={t} className="text-bone/50 text-xs flex gap-2"><span className="text-acid">✓</span>{t}</p>
                 ))}
               </div>
@@ -512,7 +532,7 @@ export default function Tournament() {
           <p className="font-display uppercase text-xs tracking-[0.3em] text-bone/50 mb-5">Ground rules</p>
           <div className="grid sm:grid-cols-2 lg:grid-cols-3 gap-x-10 gap-y-3 text-sm text-bone/60">
             {[
-              "Online Friendlies only — 6-minute halves, standard club teams. No Ultimate Team squads.",
+              "Matches are FC26 Ultimate Team — Play a Friend, 6-minute halves. Bring your best squad.",
               "Winner reports the full-time screenshot in the official group within 10 minutes.",
               "No-show after 15 minutes past your kickoff time = walkover to your opponent.",
               "Disconnects: leading player takes the win if past 60'; otherwise replay the tie.",
