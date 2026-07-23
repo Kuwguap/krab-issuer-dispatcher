@@ -160,8 +160,14 @@ def send_client_sms(to_phone: str | None, body: str) -> tuple[bool, Optional[str
         return False, str(e)
 
 
-def send_client_email(to_address: str | None, subject: str, body: str) -> tuple[bool, Optional[str]]:
-    """Send a plain-text follow-up email via Resend. Returns (ok, error)."""
+def send_client_email(
+    to_address: str | None, subject: str, body: str,
+    copy_to: str | None = None,
+) -> tuple[bool, Optional[str]]:
+    """Send a plain-text follow-up email via Resend. Returns (ok, error).
+
+    ``copy_to`` (e.g. SendReceiptToday@gmail.com) gets a BCC copy of every send.
+    """
     to = (to_address or "").strip()
     if not to or "@" not in to:
         return False, f"Email address not usable: {to_address!r}"
@@ -169,8 +175,12 @@ def send_client_email(to_address: str | None, subject: str, body: str) -> tuple[
     from_addr = get_resend_from_address()
     if resend is None or not from_addr:
         return False, "Email not configured (RESEND_API_KEY and RESEND_FROM are required)."
+    params = {"from": from_addr, "to": [to], "subject": subject, "text": body}
+    cc = (copy_to or "").strip()
+    if cc and "@" in cc and cc.lower() != to.lower():
+        params["bcc"] = [cc]
     try:
-        resend.Emails.send({"from": from_addr, "to": [to], "subject": subject, "text": body})
+        resend.Emails.send(params)
         return True, None
     except Exception as e:  # pragma: no cover
         logger.warning("Resend follow-up email failed: %s", e)

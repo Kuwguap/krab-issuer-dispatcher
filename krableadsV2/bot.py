@@ -8935,11 +8935,33 @@ def _fu_menu_text(fu: dict) -> str:
         return _FU_TEXT_FIELDS[pending][1] + "\n\n(or tap a button below)"
     return (
         "📇 New client follow-up\n\n"
-        "Tap a field to fill it in — same as the lead editor.\n"
-        "📞/📧 let the bot text/email the client on your schedule "
-        "(reminding them to send the missing info for their temporary tag).\n\n"
+        "📥 Paste ALL the client info in one message and AI fills the fields — "
+        "or tap a field to type it yourself.\n"
+        "📧 The bot emails/texts the client on your schedule by default "
+        "(reminder to send the missing info for their temporary tag) — "
+        "tap the 🤖 button to turn that off.\n\n"
         "Send /cancel to stop."
     )
+
+
+def _fu_parse_paste(text: str) -> dict:
+    """Regex fallback when AI parsing is unavailable: email, phone, name, notes."""
+    out: dict = {"name": None, "phone": None, "email": None, "notes": None}
+    em = re.search(r"[\w.+-]+@[\w-]+\.[\w.-]+", text)
+    if em:
+        out["email"] = em.group(0)
+    ph = re.search(r"\+?1?[\s\-.(]*\d{3}[)\s\-.]*\d{3}[\s\-.]*\d{4}", text)
+    if ph:
+        out["phone"] = ph.group(0).strip()
+    for line in (l.strip() for l in text.splitlines() if l.strip()):
+        if "@" in line or re.search(r"\d{3}", line):
+            continue
+        if 1 <= len(line.split()) <= 4 and len(line) <= 40:
+            out["name"] = line
+            break
+    notes = " ".join(text.split())
+    out["notes"] = notes[:300] if notes else None
+    return out
 
 
 def _fu_menu_keyboard(fu: dict) -> InlineKeyboardMarkup:
@@ -8993,18 +9015,44 @@ async def _fu_render_menu(fu: dict, query=None, reply=None) -> None:
 
 
 async def cmd_followup_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Entry point for /followup — one-message form with tap-to-fill buttons."""
-    context.user_data["fu"] = {}
+    """Entry point for /followup — one-message form with tap-to-fill buttons.
+
+    Client contact defaults to ON: the bot emails/texts the client unless the
+    agent taps the 🤖 button to turn it off.
+    """
+    context.user_data["fu"] = {"chase": True}
     await _fu_render_menu(context.user_data["fu"], reply=update.message.reply_text)
     return STATE_FU_MENU
 
 
 async def handle_fu_menu_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Free-text input for whichever field was tapped last."""
+    """Free-text input: fills the tapped field, or AI-parses a full paste."""
     fu = context.user_data.setdefault("fu", {})
     pending = fu.pop("pending", None)
     text = (update.message.text or "").strip()
     if not pending or pending not in _FU_TEXT_FIELDS:
+        # No field tapped → treat as a data paste and parse it (AI first, regex fallback).
+        parsed = None
+        try:
+            parsed = await asyncio.to_thread(ai_vision.extract_followup_fields, text)
+        except Exception as e:
+            logger.warning("Follow-up AI parse failed: %s", e)
+        if not parsed or not any(parsed.get(k) for k in ("name", "phone", "email")):
+            parsed = _fu_parse_paste(text)
+        if parsed.get("name"):
+            fu["client_name"] = parsed["name"]
+        if parsed.get("phone"):
+            fu["phone_number"] = parsed["phone"]
+        if parsed.get("email"):
+            fu["email"] = parsed["email"]
+        if parsed.get("notes") and not fu.get("notes"):
+            fu["notes"] = parsed["notes"]
+        filled = [n for n, k in (("name", "client_name"), ("phone", "phone_number"),
+                                 ("email", "email"), ("notes", "notes")) if fu.get(k)]
+        await update.message.reply_text(
+            "🤖 Parsed your message → filled: " + (", ".join(filled) if filled else "nothing recognized")
+            + ". Review below, tap any field to fix it."
+        )
         await _fu_render_menu(fu, reply=update.message.reply_text)
         return STATE_FU_MENU
     key = _FU_TEXT_FIELDS[pending][0]
@@ -9111,6 +9159,12 @@ async def handle_fu_menu_callback(update: Update, context: ContextTypes.DEFAULT_
         return STATE_FU_MENU
 
     if data == "fuf_chase":
+        if fu.get("chase"):
+            # Turning OFF is always allowed.
+            await query.answer()
+            fu["chase"] = False
+            await _fu_render_menu(fu, query=query)
+            return STATE_FU_MENU
         if not (fu.get("phone_number") or fu.get("email")):
             await query.answer("Add a phone or email first 📞📧", show_alert=True)
             return STATE_FU_MENU
@@ -9118,11 +9172,11 @@ async def handle_fu_menu_callback(update: Update, context: ContextTypes.DEFAULT_
             (fu.get("phone_number") and Config.is_twilio_configured())
             or (fu.get("email") and Config.is_resend_configured())
         )
-        if not fu.get("chase") and not has_channel:
+        if not has_channel:
             await query.answer("Text/email sending isn't configured on the server.", show_alert=True)
             return STATE_FU_MENU
         await query.answer()
-        fu["chase"] = not fu.get("chase")
+        fu["chase"] = True
         await _fu_render_menu(fu, query=query)
         return STATE_FU_MENU
 
@@ -9148,7 +9202,8 @@ async def _fu_finish_save(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     query = update.callback_query
     fu = context.user_data.setdefault("fu", {})
     name = fu.get("client_name") or "client"
-    chase = bool(fu.get("chase"))
+    # Chase is ON by default but only meaningful with a phone or email on file.
+    chase = bool(fu.get("chase")) and bool(fu.get("phone_number") or fu.get("email"))
 
     # No frequency chosen → save as a plain contact, no reminders.
     if not fu.get("freq"):
@@ -9880,7 +9935,9 @@ def main():
                         client_results.append("📲 texted" if ok else f"📲 text failed ({err})")
                     if f.get("email"):
                         ok, err = await asyncio.to_thread(
-                            client_outreach.send_client_email, f.get("email"), subj, mail_body
+                            client_outreach.send_client_email,
+                            f.get("email"), subj, mail_body,
+                            Config.FOLLOWUP_EMAIL_COPY,
                         )
                         client_results.append("📧 emailed" if ok else f"📧 email failed ({err})")
                     if client_results:

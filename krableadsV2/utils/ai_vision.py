@@ -241,6 +241,43 @@ def extract_structured_from_text(user_message: str) -> Optional[str]:
     return _call_openai_text([{"role": "user", "content": prompt}])
 
 
+FOLLOWUP_EXTRACT_PROMPT = (
+    "Extract the client's contact details from the text below (any format/order). "
+    "Reply with ONLY a JSON object exactly like "
+    '{"name": "", "phone": "", "email": "", "notes": ""}. '
+    "Rules: name = the client's full name; phone = their phone number digits; "
+    "email = their email address; notes = one short line with any other useful "
+    "details (vehicle, quote/price, missing VIN, address, timing). "
+    "Use an empty string for anything not present.\n\nTEXT:\n"
+)
+
+
+def extract_followup_fields(user_message: str) -> Optional[dict]:
+    """AI-parse a freeform /followup paste into {name, phone, email, notes}.
+
+    Returns None when the API is unconfigured/fails so the caller can fall back
+    to regex extraction. Values are stripped; missing fields come back as None.
+    """
+    txt = (user_message or "").strip()
+    if not txt:
+        return None
+    raw = _call_openai_text([
+        {"role": "user", "content": FOLLOWUP_EXTRACT_PROMPT + txt[:4000]}
+    ])
+    if not raw:
+        return None
+    data = _parse_json_from_model(raw)
+    if not isinstance(data, dict):
+        return None
+    out: dict = {}
+    for k in ("name", "phone", "email", "notes"):
+        v = str(data.get(k) or "").strip()
+        out[k] = v or None
+    if out.get("email"):
+        out["email"] = normalize_email(out["email"]) or out["email"]
+    return out
+
+
 def extract_structured_from_image(image_bytes: bytes, mime_type: str = "image/jpeg") -> Optional[str]:
     """
     Send image to OpenAI Vision and get back 11-line structured text suitable for parse_phase1_structured.

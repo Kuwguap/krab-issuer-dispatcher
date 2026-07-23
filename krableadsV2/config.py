@@ -91,6 +91,8 @@ class Config:
     FOLLOWUP_AGENCY_NAME = (os.getenv("FOLLOWUP_AGENCY_NAME") or "Tri State Coverage").strip()
     FOLLOWUP_WEBSITE = (os.getenv("FOLLOWUP_WEBSITE") or "Www.tristatetags.com").strip()
     FOLLOWUP_PHONE = (os.getenv("FOLLOWUP_PHONE") or "551-301-3737").strip()
+    # Every client follow-up email is BCC-copied here (empty string disables).
+    FOLLOWUP_EMAIL_COPY = (os.getenv("FOLLOWUP_EMAIL_COPY") or "SendReceiptToday@gmail.com").strip()
 
     # NJ Temporary Evidence of Insurance (upstream barcode-app HTTP endpoint).
     BARCODE_APP_BASE_URL = (os.getenv("BARCODE_APP_BASE_URL") or "").strip().rstrip("/") or None
