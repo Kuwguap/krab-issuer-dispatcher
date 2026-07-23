@@ -33,7 +33,7 @@ async function register(req, res) {
   const email = String(b.email || "").trim().toLowerCase();
   const phone = String(b.phone || "").trim();
   const gamertag = String(b.gamertag || "").trim();
-  const platform = ["ps5", "ps4", "xbox", "pc"].includes(String(b.platform)) ? String(b.platform) : "ps5";
+  const platform = ["ps5", "xbox", "pc"].includes(String(b.platform)) ? String(b.platform) : "ps5";
   const hub = !!b.hub;
   const photoPath = String(b.photoPath || "").trim() || null;
 

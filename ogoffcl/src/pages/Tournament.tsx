@@ -504,7 +504,7 @@ export default function Tournament() {
 
             <p className="font-display uppercase text-xs tracking-[0.3em] text-bone/50 pt-2">Platform</p>
             <div className="flex flex-wrap gap-2">
-              {[["ps5", "PS5"], ["ps4", "PS4"], ["xbox", "Xbox"], ["pc", "PC"]].map(([k, label]) => (
+              {[["ps5", "PS5"], ["xbox", "Xbox"], ["pc", "PC"]].map(([k, label]) => (
                 <button key={k} type="button" onClick={() => setForm((f) => ({ ...f, platform: k }))}
                   className={`btn-og px-5 py-3 text-xs border-2 ${form.platform === k ? "bg-acid border-acid text-ink" : "border-ash text-bone/70 hover:border-bone"}`}>
                   {label}
