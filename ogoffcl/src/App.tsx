@@ -10,6 +10,7 @@ import ProductPage from "./pages/ProductPage";
 import Gallery from "./pages/Gallery";
 import Tournament from "./pages/Tournament";
 import Fixtures from "./pages/Fixtures";
+import TournamentPay from "./pages/TournamentPay";
 import Checkout from "./pages/Checkout";
 import Confirmation from "./pages/Confirmation";
 import RefundPolicy from "./pages/RefundPolicy";
@@ -54,6 +55,7 @@ export default function App() {
             <Route path="/gallery" element={<Gallery />} />
             <Route path="/tournament" element={<Tournament />} />
             <Route path="/tournament/fixtures" element={<Fixtures />} />
+            <Route path="/tournament/pay/:playerId" element={<TournamentPay />} />
             <Route path="/checkout" element={<Checkout />} />
             <Route path="/order-confirmation" element={<Confirmation />} />
             <Route path="/refund-policy" element={<RefundPolicy />} />

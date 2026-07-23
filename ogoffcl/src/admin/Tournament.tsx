@@ -647,9 +647,20 @@ export default function AdminTournament() {
               <span className={`text-[10px] uppercase tracking-widest px-2 py-1 ${p.payment_status === "paid" ? "bg-acid/15 text-acid" : "bg-blood/15 text-blood"}`}>
                 {p.payment_status}
               </span>
-              <div className="flex gap-2 ml-auto">
+              <div className="flex flex-wrap gap-2 ml-auto">
                 {p.payment_status !== "paid" && (
-                  <button onClick={() => verify(p)} className="btn-og border-2 border-acid/50 text-acid px-3 py-2.5 text-[10px] hover:bg-acid hover:text-ink">Mark paid</button>
+                  <>
+                    <button
+                      onClick={async () => {
+                        const link = `https://ogoffcl.store/tournament/pay/${p.id}`;
+                        try { await navigator.clipboard.writeText(link); say(`Pay link for ${p.gamertag} copied ✓ — send it to them`); }
+                        catch { prompt("Copy the pay link:", link); }
+                      }}
+                      className="btn-og border-2 border-bone/40 text-bone/80 px-3 py-2.5 text-[10px] hover:border-acid hover:text-acid">
+                      Pay link
+                    </button>
+                    <button onClick={() => verify(p)} className="btn-og border-2 border-acid/50 text-acid px-3 py-2.5 text-[10px] hover:bg-acid hover:text-ink">Mark paid</button>
+                  </>
                 )}
                 <button onClick={() => cardFor(p)} disabled={busy === p.id} className="btn-og bg-bone text-ink px-3 py-2.5 text-[10px] hover:bg-acid">
                   {busy === p.id ? "…" : "⬇ Card"}

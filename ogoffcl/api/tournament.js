@@ -174,6 +174,19 @@ async function status(req, res) {
   return res.json({ state: "pending" });
 }
 
+// sanitized single-player lookup for the standalone pay page — the UUID in
+// the link is the capability; no email/phone/name is ever returned
+async function playerInfo(req, res) {
+  const id = String((req.query && req.query.id) || "").trim();
+  if (!id) return res.status(400).json({ error: "id required" });
+  const p = await getPlayer(id);
+  if (!p) return res.status(404).json({ error: "Registration not found." });
+  return res.json({
+    id: p.id, gamertag: p.gamertag, platform: p.platform, hub: !!p.hub,
+    fee: Number(p.fee || BASE_FEE), paymentStatus: p.payment_status,
+  });
+}
+
 async function bracket(_req, res) {
   const [pRes, mRes] = await Promise.all([
     sb("GET", "tournament_players?payment_status=eq.paid&select=id,gamertag,platform,photo_path,seed&order=created_at.asc"),
@@ -252,6 +265,7 @@ export default async (req, res) => {
     if (action === "register" && req.method === "POST") return await register(req, res);
     if (action === "pay" && req.method === "POST") return await pay(req, res);
     if (action === "status") return await status(req, res);
+    if (action === "player") return await playerInfo(req, res);
     if (action === "bracket") return await bracket(req, res);
     if (action === "admin" && req.method === "POST") return await admin(req, res);
     return res.status(400).json({ error: "unknown action" });
