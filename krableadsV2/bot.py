@@ -8884,19 +8884,24 @@ async def handle_renewal_driver_reassign(update: Update, context: ContextTypes.D
 # text + email (so the client follows up with the agent), and DMs the agent +
 # all supervisors a reminder with a stop button.
 
-STATE_FU_NAME = 40
-STATE_FU_PHONE = 41
-STATE_FU_NOTES = 42
-STATE_FU_SCHEDULE = 43
-STATE_FU_EMAIL = 44
+STATE_FU_MENU = 40
 
 _FU_FREQ_DAYS = {"daily": 1, "weekly": 7, "biweekly": 14, "monthly": 30}
 _FU_FREQ_LABEL = {"daily": "daily", "weekly": "weekly", "biweekly": "every 2 weeks", "monthly": "monthly"}
 _FU_DAY_NAMES = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
 _FU_TIME_HOURS = {"morning": 9, "afternoon": 13, "evening": 18}
+_FU_TIME_LABEL = {"morning": "🌅 Morning", "afternoon": "☀️ Afternoon", "evening": "🌙 Evening"}
 # "Stop" choices: how long the bot keeps chasing before auto-stopping.
 _FU_END_DAYS = {"1w": 7, "2w": 14, "1m": 30, "3m": 90}
 _FU_END_LABEL = {"1w": "1 week", "2w": "2 weeks", "1m": "1 month", "3m": "3 months", "forever": "until stopped"}
+
+# Text-input prompts for the tap-to-fill fields on the /followup menu.
+_FU_TEXT_FIELDS = {
+    "name": ("client_name", "👤 Type the client's name:"),
+    "phone": ("phone_number", "📞 Type the client's phone number:"),
+    "email": ("email", "📧 Type the client's email:"),
+    "notes": ("notes", "📝 Type any notes (e.g. \"no VIN yet\", quote details):"),
+}
 
 
 def _fu_parse_iso(s: str | None):
@@ -8924,103 +8929,229 @@ def _fu_compute_start(day_idx: int, hour: int) -> datetime:
     return target + timedelta(days=days_ahead)
 
 
+def _fu_menu_text(fu: dict) -> str:
+    pending = fu.get("pending")
+    if pending in _FU_TEXT_FIELDS:
+        return _FU_TEXT_FIELDS[pending][1] + "\n\n(or tap a button below)"
+    return (
+        "📇 New client follow-up\n\n"
+        "Tap a field to fill it in — same as the lead editor.\n"
+        "📞/📧 let the bot text/email the client on your schedule "
+        "(reminding them to send the missing info for their temporary tag).\n\n"
+        "Send /cancel to stop."
+    )
+
+
+def _fu_menu_keyboard(fu: dict) -> InlineKeyboardMarkup:
+    def val(key):
+        v = (fu.get(key) or "").strip() if fu.get(key) else ""
+        return _truncate_btn_val(v) if v else "—"
+
+    day = _FU_DAY_NAMES[fu["day_idx"]] if fu.get("day_idx") is not None else "—"
+    time_lbl = _FU_TIME_LABEL.get(fu.get("time_key"), "—")
+    freq_lbl = _FU_FREQ_LABEL.get(fu.get("freq"), "—")
+    end_lbl = _FU_END_LABEL.get(fu.get("end_key"), "—")
+    chase = "ON 🤖" if fu.get("chase") else "OFF"
+    rows = [
+        [
+            InlineKeyboardButton(f"👤 Name: {val('client_name')}", callback_data="fuf_name"),
+            InlineKeyboardButton(f"📞 Phone: {val('phone_number')}", callback_data="fuf_phone"),
+        ],
+        [
+            InlineKeyboardButton(f"📧 Email: {val('email')}", callback_data="fuf_email"),
+            InlineKeyboardButton(f"📝 Notes: {val('notes')}", callback_data="fuf_notes"),
+        ],
+        [
+            InlineKeyboardButton(f"📅 Start: {day}", callback_data="fuf_day"),
+            InlineKeyboardButton(f"🕘 Time: {time_lbl}", callback_data="fuf_time"),
+        ],
+        [
+            InlineKeyboardButton(f"🔁 Every: {freq_lbl}", callback_data="fuf_freq"),
+            InlineKeyboardButton(f"🛑 Stop: {end_lbl}", callback_data="fuf_end"),
+        ],
+        [InlineKeyboardButton(f"🤖 Bot texts/emails client: {chase}", callback_data="fuf_chase")],
+        [
+            InlineKeyboardButton("💾 Save", callback_data="fuf_save"),
+            InlineKeyboardButton("❌ Cancel", callback_data="fuf_cancel"),
+        ],
+    ]
+    return InlineKeyboardMarkup(rows)
+
+
+async def _fu_render_menu(fu: dict, query=None, reply=None) -> None:
+    """Show/update the follow-up form (edit in place when possible)."""
+    text = _fu_menu_text(fu)
+    kb = _fu_menu_keyboard(fu)
+    if query is not None:
+        try:
+            await query.message.edit_text(text, reply_markup=kb)
+            return
+        except Exception:
+            pass
+    if reply is not None:
+        await reply(text, reply_markup=kb)
+
+
 async def cmd_followup_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Entry point for /followup — start capturing a prospective client."""
+    """Entry point for /followup — one-message form with tap-to-fill buttons."""
     context.user_data["fu"] = {}
-    await update.message.reply_text(
-        "📇 *New client follow-up*\n\nWhat's the client's name?\n\nSend /cancel to stop.",
-        parse_mode="Markdown",
-    )
-    return STATE_FU_NAME
+    await _fu_render_menu(context.user_data["fu"], reply=update.message.reply_text)
+    return STATE_FU_MENU
 
 
-async def handle_fu_name(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    context.user_data.setdefault("fu", {})["client_name"] = (update.message.text or "").strip()
-    kb = InlineKeyboardMarkup([[InlineKeyboardButton("⏭ Skip", callback_data="fu_skip_phone")]])
-    await update.message.reply_text(
-        "📞 Client's phone number? (type it, or Skip)",
-        reply_markup=kb,
-    )
-    return STATE_FU_PHONE
-
-
-async def handle_fu_phone(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    context.user_data.setdefault("fu", {})["phone_number"] = (update.message.text or "").strip()
-    return await _fu_prompt_email(update.message.reply_text)
-
-
-async def handle_fu_phone_skip(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    query = update.callback_query
-    await query.answer()
-    context.user_data.setdefault("fu", {})["phone_number"] = None
-    return await _fu_prompt_email(query.message.reply_text)
-
-
-async def _fu_prompt_email(reply) -> int:
-    kb = InlineKeyboardMarkup([[InlineKeyboardButton("⏭ Skip", callback_data="fu_skip_email")]])
-    await reply(
-        "📧 Client's email? (type it, or Skip)\n\n"
-        "Phone + email let the bot text/email the client for you.",
-        reply_markup=kb,
-    )
-    return STATE_FU_EMAIL
-
-
-async def handle_fu_email(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+async def handle_fu_menu_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Free-text input for whichever field was tapped last."""
+    fu = context.user_data.setdefault("fu", {})
+    pending = fu.pop("pending", None)
     text = (update.message.text or "").strip()
-    context.user_data.setdefault("fu", {})["email"] = text if "@" in text else None
-    if "@" not in text:
-        await update.message.reply_text("⚠️ That doesn't look like an email — skipping it.")
-    return await _fu_prompt_notes(update.message.reply_text)
+    if not pending or pending not in _FU_TEXT_FIELDS:
+        await _fu_render_menu(fu, reply=update.message.reply_text)
+        return STATE_FU_MENU
+    key = _FU_TEXT_FIELDS[pending][0]
+    if pending == "email" and "@" not in text:
+        fu["pending"] = pending
+        await update.message.reply_text("⚠️ That doesn't look like an email — try again (or /cancel).")
+        return STATE_FU_MENU
+    fu[key] = text or None
+    await _fu_render_menu(fu, reply=update.message.reply_text)
+    return STATE_FU_MENU
 
 
-async def handle_fu_email_skip(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+async def handle_fu_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     query = update.callback_query
-    await query.answer()
-    context.user_data.setdefault("fu", {})["email"] = None
-    return await _fu_prompt_notes(query.message.reply_text)
-
-
-async def _fu_prompt_notes(reply) -> int:
-    kb = InlineKeyboardMarkup([[InlineKeyboardButton("⏭ Skip", callback_data="fu_skip_notes")]])
-    await reply(
-        "📝 Any notes? (e.g. \"no car yet\", quote details) — type it, or Skip",
-        reply_markup=kb,
-    )
-    return STATE_FU_NOTES
-
-
-async def handle_fu_notes(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    context.user_data.setdefault("fu", {})["notes"] = (update.message.text or "").strip()
-    return await _fu_prompt_schedule(update.message.reply_text)
-
-
-async def handle_fu_notes_skip(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    query = update.callback_query
-    await query.answer()
-    context.user_data.setdefault("fu", {})["notes"] = None
-    return await _fu_prompt_schedule(query.message.reply_text)
-
-
-async def _fu_prompt_schedule(reply) -> int:
-    kb = InlineKeyboardMarkup([[
-        InlineKeyboardButton("⏰ Set reminder", callback_data="fu_setrem"),
-        InlineKeyboardButton("💾 Just save", callback_data="fu_justsave"),
-    ]])
-    await reply(
-        "Set a recurring follow-up reminder, or just save the client?",
-        reply_markup=kb,
-    )
-    return STATE_FU_SCHEDULE
-
-
-async def handle_fu_schedule_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    query = update.callback_query
-    await query.answer()
     data = query.data
     fu = context.user_data.setdefault("fu", {})
 
-    if data == "fu_justsave":
+    # Tap-to-type fields: show the prompt inside the same message.
+    if data in ("fuf_name", "fuf_phone", "fuf_email", "fuf_notes"):
+        await query.answer()
+        fu["pending"] = data[len("fuf_"):]
+        await _fu_render_menu(fu, query=query)
+        return STATE_FU_MENU
+
+    # Sub-pickers (edit the same message, Back returns to the form).
+    if data == "fuf_day":
+        await query.answer()
+        rows = [
+            [InlineKeyboardButton(_FU_DAY_NAMES[i], callback_data=f"fud_{i}"),
+             InlineKeyboardButton(_FU_DAY_NAMES[i + 1], callback_data=f"fud_{i + 1}")]
+            for i in (0, 2, 4)
+        ]
+        rows.append([InlineKeyboardButton(_FU_DAY_NAMES[6], callback_data="fud_6"),
+                     InlineKeyboardButton("⬅️ Back", callback_data="fuf_back")])
+        await query.message.edit_text("📅 Which day should reminders start?",
+                                      reply_markup=InlineKeyboardMarkup(rows))
+        return STATE_FU_MENU
+
+    if data == "fuf_time":
+        await query.answer()
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton("🌅 Morning", callback_data="fut_morning"),
+             InlineKeyboardButton("☀️ Afternoon", callback_data="fut_afternoon")],
+            [InlineKeyboardButton("🌙 Evening", callback_data="fut_evening"),
+             InlineKeyboardButton("⬅️ Back", callback_data="fuf_back")],
+        ])
+        await query.message.edit_text("🕘 What time of day?", reply_markup=kb)
+        return STATE_FU_MENU
+
+    if data == "fuf_freq":
+        await query.answer()
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton("Daily", callback_data="fufr_daily"),
+             InlineKeyboardButton("Weekly", callback_data="fufr_weekly")],
+            [InlineKeyboardButton("Every 2 weeks", callback_data="fufr_biweekly"),
+             InlineKeyboardButton("Monthly", callback_data="fufr_monthly")],
+            [InlineKeyboardButton("⬅️ Back", callback_data="fuf_back")],
+        ])
+        await query.message.edit_text("🔁 How often?", reply_markup=kb)
+        return STATE_FU_MENU
+
+    if data == "fuf_end":
+        await query.answer()
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton("1 week", callback_data="fue_1w"),
+             InlineKeyboardButton("2 weeks", callback_data="fue_2w")],
+            [InlineKeyboardButton("1 month", callback_data="fue_1m"),
+             InlineKeyboardButton("3 months", callback_data="fue_3m")],
+            [InlineKeyboardButton("♾ Until I stop it", callback_data="fue_forever"),
+             InlineKeyboardButton("⬅️ Back", callback_data="fuf_back")],
+        ])
+        await query.message.edit_text(
+            "🛑 When should follow-ups stop (if the client never responds)?",
+            reply_markup=kb,
+        )
+        return STATE_FU_MENU
+
+    # Picker selections → back to the form.
+    if data.startswith("fud_"):
+        await query.answer()
+        fu["day_idx"] = int(data[len("fud_"):])
+        await _fu_render_menu(fu, query=query)
+        return STATE_FU_MENU
+    if data.startswith("fut_"):
+        await query.answer()
+        fu["time_key"] = data[len("fut_"):]
+        await _fu_render_menu(fu, query=query)
+        return STATE_FU_MENU
+    if data.startswith("fufr_"):
+        await query.answer()
+        fu["freq"] = data[len("fufr_"):]
+        await _fu_render_menu(fu, query=query)
+        return STATE_FU_MENU
+    if data.startswith("fue_"):
+        await query.answer()
+        fu["end_key"] = data[len("fue_"):]
+        await _fu_render_menu(fu, query=query)
+        return STATE_FU_MENU
+
+    if data == "fuf_back":
+        await query.answer()
+        fu.pop("pending", None)
+        await _fu_render_menu(fu, query=query)
+        return STATE_FU_MENU
+
+    if data == "fuf_chase":
+        if not (fu.get("phone_number") or fu.get("email")):
+            await query.answer("Add a phone or email first 📞📧", show_alert=True)
+            return STATE_FU_MENU
+        has_channel = (
+            (fu.get("phone_number") and Config.is_twilio_configured())
+            or (fu.get("email") and Config.is_resend_configured())
+        )
+        if not fu.get("chase") and not has_channel:
+            await query.answer("Text/email sending isn't configured on the server.", show_alert=True)
+            return STATE_FU_MENU
+        await query.answer()
+        fu["chase"] = not fu.get("chase")
+        await _fu_render_menu(fu, query=query)
+        return STATE_FU_MENU
+
+    if data == "fuf_cancel":
+        await query.answer()
+        context.user_data.pop("fu", None)
+        await query.message.edit_text("❌ Cancelled.")
+        return ConversationHandler.END
+
+    if data == "fuf_save":
+        if not (fu.get("client_name") or "").strip():
+            await query.answer("Set the client's name first 👤", show_alert=True)
+            return STATE_FU_MENU
+        await query.answer()
+        return await _fu_finish_save(update, context)
+
+    await query.answer()
+    return STATE_FU_MENU
+
+
+async def _fu_finish_save(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Persist the follow-up (with schedule when set) and confirm to the agent."""
+    query = update.callback_query
+    fu = context.user_data.setdefault("fu", {})
+    name = fu.get("client_name") or "client"
+    chase = bool(fu.get("chase"))
+
+    # No frequency chosen → save as a plain contact, no reminders.
+    if not fu.get("freq"):
         db.create_client_followup(
             user_id=update.effective_user.id,
             telegram_username=update.effective_user.username,
@@ -9029,93 +9160,14 @@ async def handle_fu_schedule_callback(update: Update, context: ContextTypes.DEFA
             notes=fu.get("notes"),
             email=fu.get("email"),
         )
-        await query.message.edit_text("💾 Saved. No reminders set.")
+        await query.message.edit_text(
+            f"💾 Saved {name}. No reminders set (no frequency chosen)."
+        )
         context.user_data.pop("fu", None)
         return ConversationHandler.END
 
-    if data == "fu_setrem":
-        rows = [
-            [InlineKeyboardButton(_FU_DAY_NAMES[i], callback_data=f"fu_day_{i}")]
-            for i in range(7)
-        ]
-        await query.message.edit_text(
-            "📅 Which day should reminders start?",
-            reply_markup=InlineKeyboardMarkup(rows),
-        )
-        return STATE_FU_SCHEDULE
-
-    if data.startswith("fu_day_"):
-        fu["day_idx"] = int(data[len("fu_day_"):])
-        kb = InlineKeyboardMarkup([[
-            InlineKeyboardButton("🌅 Morning", callback_data="fu_time_morning"),
-            InlineKeyboardButton("☀️ Afternoon", callback_data="fu_time_afternoon"),
-            InlineKeyboardButton("🌙 Evening", callback_data="fu_time_evening"),
-        ]])
-        await query.message.edit_text(
-            f"🕘 What time on {_FU_DAY_NAMES[fu['day_idx']]}?", reply_markup=kb
-        )
-        return STATE_FU_SCHEDULE
-
-    if data.startswith("fu_time_"):
-        fu["time_key"] = data[len("fu_time_"):]
-        kb = InlineKeyboardMarkup([
-            [InlineKeyboardButton("Daily", callback_data="fu_freq_daily"),
-             InlineKeyboardButton("Weekly", callback_data="fu_freq_weekly")],
-            [InlineKeyboardButton("Every 2 weeks", callback_data="fu_freq_biweekly"),
-             InlineKeyboardButton("Monthly", callback_data="fu_freq_monthly")],
-        ])
-        await query.message.edit_text("🔁 How often?", reply_markup=kb)
-        return STATE_FU_SCHEDULE
-
-    if data.startswith("fu_freq_"):
-        fu["freq"] = data[len("fu_freq_"):]
-        kb = InlineKeyboardMarkup([
-            [InlineKeyboardButton("1 week", callback_data="fu_end_1w"),
-             InlineKeyboardButton("2 weeks", callback_data="fu_end_2w")],
-            [InlineKeyboardButton("1 month", callback_data="fu_end_1m"),
-             InlineKeyboardButton("3 months", callback_data="fu_end_3m")],
-            [InlineKeyboardButton("♾ Until I stop it", callback_data="fu_end_forever")],
-        ])
-        await query.message.edit_text(
-            "🛑 When should the follow-ups stop (if the client never responds)?",
-            reply_markup=kb,
-        )
-        return STATE_FU_SCHEDULE
-
-    if data.startswith("fu_end_"):
-        fu["end_key"] = data[len("fu_end_"):]
-        if fu.get("phone_number") or fu.get("email"):
-            channels = []
-            if fu.get("phone_number") and Config.is_twilio_configured():
-                channels.append("📲 text")
-            if fu.get("email") and Config.is_resend_configured():
-                channels.append("📧 email")
-            if channels:
-                kb = InlineKeyboardMarkup([[
-                    InlineKeyboardButton("🤖 Yes — bot chases client", callback_data="fu_chase_yes"),
-                    InlineKeyboardButton("🙅 No — just remind me", callback_data="fu_chase_no"),
-                ]])
-                await query.message.edit_text(
-                    f"🤖 Should the bot also {' + '.join(channels)} the client on this schedule "
-                    "(reminding them to send the missing info for their temporary tag, "
-                    "so they follow up with YOU)?",
-                    reply_markup=kb,
-                )
-                return STATE_FU_SCHEDULE
-        return await _fu_finish_save(update, context, chase=False)
-
-    if data in ("fu_chase_yes", "fu_chase_no"):
-        return await _fu_finish_save(update, context, chase=(data == "fu_chase_yes"))
-
-    return STATE_FU_SCHEDULE
-
-
-async def _fu_finish_save(update: Update, context: ContextTypes.DEFAULT_TYPE, chase: bool) -> int:
-    """Persist the follow-up with its schedule and confirm to the agent."""
-    query = update.callback_query
-    fu = context.user_data.setdefault("fu", {})
-    freq = fu.get("freq") or "weekly"
-    day_idx = int(fu.get("day_idx", 0))
+    freq = fu["freq"]
+    day_idx = int(fu.get("day_idx") if fu.get("day_idx") is not None else 0)
     hour = _FU_TIME_HOURS.get(fu.get("time_key", "morning"), 9)
     start_local = _fu_compute_start(day_idx, hour)
     start_utc = start_local.astimezone(pytz.utc)
@@ -9136,7 +9188,6 @@ async def _fu_finish_save(update: Update, context: ContextTypes.DEFAULT_TYPE, ch
         contact_client=chase,
         end_at=end_iso,
     )
-    name = fu.get("client_name") or "client"
     chase_line = (
         "🤖 The bot will text/email the client on this schedule — they'll chase YOU."
         if chase else "You'll get a DM until you close or stop it."
@@ -9542,27 +9593,16 @@ def main():
     )
 
     # Client follow-up capture flow (/followup) — registered before conv_handler.
+    # Single-message form with tap-to-fill inline buttons (same style as the lead editor).
     followup_conv = ConversationHandler(
         entry_points=[CommandHandler(["followup", "prospect"], cmd_followup_start)],
         states={
-            STATE_FU_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_fu_name)],
-            STATE_FU_PHONE: [
-                CallbackQueryHandler(handle_fu_phone_skip, pattern="^fu_skip_phone$"),
-                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_fu_phone),
-            ],
-            STATE_FU_EMAIL: [
-                CallbackQueryHandler(handle_fu_email_skip, pattern="^fu_skip_email$"),
-                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_fu_email),
-            ],
-            STATE_FU_NOTES: [
-                CallbackQueryHandler(handle_fu_notes_skip, pattern="^fu_skip_notes$"),
-                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_fu_notes),
-            ],
-            STATE_FU_SCHEDULE: [
+            STATE_FU_MENU: [
                 CallbackQueryHandler(
-                    handle_fu_schedule_callback,
-                    pattern="^(fu_justsave|fu_setrem|fu_day_\\d+|fu_time_\\w+|fu_freq_\\w+|fu_end_\\w+|fu_chase_(yes|no))$",
+                    handle_fu_menu_callback,
+                    pattern="^(fuf_\\w+|fud_\\d+|fut_\\w+|fufr_\\w+|fue_\\w+)$",
                 ),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_fu_menu_text),
             ],
         },
         fallbacks=[CommandHandler("cancel", cmd_followup_cancel)],
