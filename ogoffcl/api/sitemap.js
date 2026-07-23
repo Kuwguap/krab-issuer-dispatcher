@@ -12,6 +12,7 @@ export default async (_req, res) => {
     { loc: `${SITE}/shop`, priority: "0.9", changefreq: "daily" },
     { loc: `${SITE}/gallery`, priority: "0.7", changefreq: "weekly" },
     { loc: `${SITE}/tournament`, priority: "0.9", changefreq: "daily" },
+    { loc: `${SITE}/tournament/fixtures`, priority: "0.8", changefreq: "hourly" },
     { loc: `${SITE}/refund-policy`, priority: "0.3", changefreq: "yearly" },
   ];
 

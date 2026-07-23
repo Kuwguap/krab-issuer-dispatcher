@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useRef, useState, FormEvent } from "react";
+import { Link } from "react-router-dom";
 import { motion, useInView } from "framer-motion";
 import { uploadImage } from "../lib/supabase";
 import { usePageMeta, useJsonLd, SITE_URL } from "../lib/seo";
@@ -344,7 +345,12 @@ export default function Tournament() {
         <section className="border-y border-ash bg-smoke/30 py-14">
           <div className="max-w-7xl mx-auto px-4 sm:px-6">
             <Reveal>
-              <h2 className="display-xl text-4xl sm:text-6xl text-bone mb-8">The <span className="text-stroke-acid">bracket</span></h2>
+              <div className="flex flex-wrap items-end justify-between gap-4 mb-8">
+                <h2 className="display-xl text-4xl sm:text-6xl text-bone">The <span className="text-stroke-acid">bracket</span></h2>
+                <Link to="/tournament/fixtures" className="link-sweep font-display uppercase text-xs tracking-[0.25em] text-acid hover:text-bone whitespace-nowrap py-3">
+                  Live fixtures ↗
+                </Link>
+              </div>
             </Reveal>
             <div className="overflow-x-auto pb-4 -mx-4 px-4">
               <div className="flex gap-6 min-w-max">
@@ -387,7 +393,7 @@ export default function Tournament() {
         <div className="grid sm:grid-cols-2 lg:grid-cols-4 gap-px bg-ash border border-ash">
           {[
             ["01", "Register & pay", `GH₵${BASE_FEE} locks your spot. Name, PSN / EA ID, platform and your player photo — it goes on your official match card.`],
-            ["02", "Get the bracket", "We seed the knockout bracket and drop it here plus the official WhatsApp group. You'll know exactly who you face and when."],
+            ["02", "Random draw", "The bracket is a fully random draw — no seeds, no favours. It goes live at ogoffcl.store/tournament/fixtures plus the official WhatsApp group. You'll know exactly who you face and when."],
             ["03", "Play your tie", "Add your opponent via EA ID → invite them from Ultimate Team → Friendlies → Play a Friend. 6-minute halves. Bring your best squad — UT is the battleground."],
             ["04", "Report the score", "Winner screenshots the full-time screen and drops it in the group. Bracket updates live on this page. Win out. Take the crown."],
           ].map(([n, t, d]) => (

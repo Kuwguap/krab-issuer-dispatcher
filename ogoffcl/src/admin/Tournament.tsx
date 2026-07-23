@@ -254,9 +254,25 @@ async function renderAdPoster(playerCount: number): Promise<string> {
   return c.toDataURL("image/png");
 }
 
-function download(dataUrl: string, name: string) {
-  const a = document.createElement("a");
-  a.href = dataUrl; a.download = name; a.click();
+/** Mobile-safe download: share sheet where supported (iOS/Android), else a
+ *  blob object-URL — `a.download` on a data: URL silently does nothing in
+ *  iOS Safari, which is why studio downloads failed on phones. */
+async function download(dataUrl: string, name: string) {
+  try {
+    const blob = await (await fetch(dataUrl)).blob();
+    const file = new File([blob], name, { type: "image/png" });
+    if (navigator.canShare && navigator.canShare({ files: [file] })) {
+      try { await navigator.share({ files: [file], title: name }); return; }
+      catch (ex) { if ((ex as Error).name === "AbortError") return; /* else fall through */ }
+    }
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url; a.download = name;
+    document.body.appendChild(a); a.click(); a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 60_000);
+  } catch {
+    window.open(dataUrl, "_blank"); // last resort: open full-size, long-press to save
+  }
 }
 
 // ── component ──────────────────────────────────────────────────────────────
@@ -269,7 +285,9 @@ export default function AdminTournament() {
 
   // studio previews — rendered automatically once players load
   const [posterUrl, setPosterUrl] = useState<string | null>(null);
+  const [sampleUrl, setSampleUrl] = useState<string | null>(null);
   const [cardUrls, setCardUrls] = useState<Record<string, string>>({});
+  const [copied, setCopied] = useState(false);
 
   // simulator
   const [simN, setSimN] = useState(20);
@@ -296,6 +314,13 @@ export default function AdminTournament() {
       const paidCount = players.filter((p) => p.payment_status === "paid").length;
       const poster = await renderAdPoster(paidCount).catch(() => null);
       if (alive && poster) setPosterUrl(poster);
+      // template player card — always available for ads even with zero signups
+      const sample = await renderPlayerCard({
+        id: "sample", full_name: "This could be you", gamertag: "YOUR TAG",
+        platform: "ps5", email: "", phone: "", hub: false, fee: 50,
+        payment_status: "paid", photo: null, created_at: "",
+      } as Player).catch(() => null);
+      if (alive && sample) setSampleUrl(sample);
       for (const p of players) {
         if (!alive) return;
         if (cardUrls[p.id]) continue;
@@ -331,7 +356,12 @@ export default function AdminTournament() {
     if (n < 2) { say("Need at least 2 paid players."); return; }
     if (matches.length && !confirm("Regenerate? The current bracket and all recorded results will be wiped.")) return;
     const shape = bracketShape(n);
-    const shuffled = [...paid].sort(() => Math.random() - 0.5);
+    // Fisher–Yates: a genuinely random draw (sort(random) is biased)
+    const shuffled = [...paid];
+    for (let i = shuffled.length - 1; i > 0; i--) {
+      const j = Math.floor(Math.random() * (i + 1));
+      [shuffled[i], shuffled[j]] = [shuffled[j], shuffled[i]];
+    }
     const byePlayers = shuffled.slice(0, shape.byes);
     const prelimPlayers = shuffled.slice(shape.byes);
     const rows: { round: number; slot: number; player1: string | null; player2: string | null }[] = [];
@@ -449,6 +479,19 @@ export default function AdminTournament() {
                 className="btn-og bg-acid text-ink px-3 py-2 text-[10px] hover:bg-bone">⬇ PNG</button>
             </div>
           </div>
+          {/* template player card — always downloadable, even before signups */}
+          <div className="border border-ash bg-smoke/40">
+            <div className="aspect-[4/5] bg-ink">
+              {sampleUrl
+                ? <img src={sampleUrl} alt="Player card template" className="w-full h-full object-contain" />
+                : <div className="w-full h-full flex items-center justify-center text-bone/30 text-xs animate-pulseSoft">Rendering card…</div>}
+            </div>
+            <div className="flex items-center justify-between px-3 py-2.5 border-t border-ash">
+              <span className="font-display uppercase text-[10px] tracking-[0.2em] text-acid">Player card</span>
+              <button disabled={!sampleUrl} onClick={() => sampleUrl && download(sampleUrl, "og-player-card.png")}
+                className="btn-og bg-acid text-ink px-3 py-2 text-[10px] hover:bg-bone">⬇ PNG</button>
+            </div>
+          </div>
           {/* player cards — rendered automatically from each signup's photo + name */}
           {players.map((p) => (
             <div key={p.id} className="border border-ash bg-smoke/40">
@@ -537,7 +580,14 @@ export default function AdminTournament() {
               Clear
             </button>
           )}
-          <span className="text-bone/35 text-xs">Bracket is live on /tournament the moment it's generated. Tap a match to record the score — winners advance automatically.</span>
+          <button
+            onClick={async () => { try { await navigator.clipboard.writeText("https://ogoffcl.store/tournament/fixtures"); setCopied(true); setTimeout(() => setCopied(false), 1500); } catch {} }}
+            className="btn-og border-2 border-ash text-bone/70 px-4 py-2.5 text-[10px] hover:border-acid hover:text-acid">
+            {copied ? "✓ Copied" : "Copy live fixtures link"}
+          </button>
+          <span className="text-bone/35 text-xs">
+            Random draw. Fixtures are live at <span className="text-acid">ogoffcl.store/tournament/fixtures</span> the moment you generate — share that link in the match group. Tap Score to record a result; winners advance automatically.
+          </span>
         </div>
 
         {roundsGrouped.length === 0 ? (
