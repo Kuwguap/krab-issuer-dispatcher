@@ -118,6 +118,9 @@ export default function Tournament() {
   const [photoPreview, setPhotoPreview] = useState<string | null>(null);
   const [momoPhone, setMomoPhone] = useState("");
   const [network, setNetwork] = useState<"mtn" | "telecel" | "at">("mtn");
+  // Payments run on Moolre's hosted page (they collect the MoMo number there);
+  // the direct-prompt fields only appear if the hosted link ever fails.
+  const [showDirect, setShowDirect] = useState(false);
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState<string | null>(null);
   const [pay, setPay] = useState<PayState>({ step: "form" });
@@ -174,6 +177,7 @@ export default function Tournament() {
     // hosted Moolre payment page — hand the browser over; Moolre redirects
     // back to /tournament/pay/:id which confirms the spot
     if (j.state === "link" && j.url) { window.location.href = j.url; return; }
+    if (j.state === "need-details") { setShowDirect(true); setErr(j.error || "Enter your MoMo number to pay by direct prompt."); return; }
     if (j.state === "otp") { setPay({ step: "otp", playerId, ref: j.ref, message: j.message }); return; }
     if (j.state === "pending") { startPolling(playerId, j.ref); return; }
     setPay({ step: "failed", playerId, error: j.error || "Could not start the payment." });
@@ -187,7 +191,7 @@ export default function Tournament() {
       return;
     }
     if (!photo) { setErr("Upload your player photo — it goes on your match card."); return; }
-    if (momoPhone.replace(/\D/g, "").length < 9) { setErr("Enter the mobile money number that will pay."); return; }
+    if (showDirect && momoPhone.replace(/\D/g, "").length < 9) { setErr("Enter the mobile money number that will pay."); return; }
     setBusy(true);
     try {
       const url = await uploadImage(photo, "tournament");
@@ -548,23 +552,29 @@ export default function Tournament() {
               </span>
             </label>
 
-            <p className="font-display uppercase text-xs tracking-[0.3em] text-bone/50 pt-2">Pay with mobile money</p>
-            <div className="flex gap-2">
-              {NETWORKS.map((n) => (
-                <button key={n.key} type="button" onClick={() => setNetwork(n.key)}
-                  className={`btn-og flex-1 px-3 py-3 text-xs border-2 ${network === n.key ? "bg-acid border-acid text-ink" : "border-ash text-bone/70 hover:border-bone"}`}>
-                  {n.label}
-                </button>
-              ))}
-            </div>
-            <input required type="tel" placeholder="MoMo number that will pay *" value={momoPhone} onChange={(e) => setMomoPhone(e.target.value)} className="px-4 py-4 text-sm w-full" />
+            {showDirect && (
+              <>
+                <p className="font-display uppercase text-xs tracking-[0.3em] text-bone/50 pt-2">Pay with mobile money</p>
+                <div className="flex gap-2">
+                  {NETWORKS.map((n) => (
+                    <button key={n.key} type="button" onClick={() => setNetwork(n.key)}
+                      className={`btn-og flex-1 px-3 py-3 text-xs border-2 ${network === n.key ? "bg-acid border-acid text-ink" : "border-ash text-bone/70 hover:border-bone"}`}>
+                      {n.label}
+                    </button>
+                  ))}
+                </div>
+                <input type="tel" placeholder="MoMo number that will pay *" value={momoPhone} onChange={(e) => setMomoPhone(e.target.value)} className="px-4 py-4 text-sm w-full" />
+              </>
+            )}
 
             {err && <p className="text-blood text-sm border border-blood/40 bg-blood/10 px-4 py-3">{err}</p>}
 
             <button type="submit" disabled={busy} className={`btn-og w-full py-5 text-sm ${busy ? "bg-ash text-bone/40" : "bg-acid text-ink hover:bg-bone"}`}>
               {busy ? "Locking your spot…" : `Pay GH₵${fee} — lock my spot`}
             </button>
-            <p className="text-bone/30 text-[11px] uppercase tracking-widest text-center">MTN · Telecel · AT — secured by Moolre</p>
+            <p className="text-bone/30 text-[11px] uppercase tracking-widest text-center">
+              You'll enter your MoMo number on Moolre's secure page — MTN · Telecel · AT
+            </p>
             <p className="text-bone/30 text-[11px] text-center leading-relaxed">
               Registering also puts your email on the OG OFFCL list — first to hear about future tournaments and drops.
             </p>

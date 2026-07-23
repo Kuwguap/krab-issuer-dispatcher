@@ -123,7 +123,11 @@ async function pay(req, res) {
   }
 
   const digits = String(phone || "").replace(/\D/g, "");
-  if (digits.length < 9) return res.status(400).json({ error: "Enter a valid MoMo number." });
+  if (digits.length < 9) {
+    // link creation failed and we have no number for the direct fallback —
+    // tell the client to reveal the direct-payment fields
+    return res.json({ state: "need-details", error: "Hosted payment is unavailable right now — enter your MoMo number to pay by direct prompt instead." });
+  }
   if (!["mtn", "telecel", "at"].includes(String(channel))) return res.status(400).json({ error: "channel must be mtn, telecel or at." });
 
   // same externalref continuity rule as checkout: resume the exact ref on OTP submit
