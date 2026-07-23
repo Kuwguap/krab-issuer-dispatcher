@@ -1875,6 +1875,24 @@ class Database:
         """Mark a follow-up as closed (sale done or reminders stopped)."""
         return self.update_client_followup(followup_id, {"status": "closed"})
 
+    def get_followups_for_user(self, user_id: str, limit: int = 30) -> list:
+        """Full follow-up history for a user (open + closed), newest first."""
+        if not self._check_tables_exist():
+            return []
+        try:
+            r = (
+                self.client.table("client_followups")
+                .select("*")
+                .eq("user_id", str(user_id))
+                .order("created_at", desc=True)
+                .limit(limit)
+                .execute()
+            )
+            return r.data or []
+        except Exception as e:
+            logger.error(f"Error fetching follow-up history for user: {e}")
+            return []
+
     def get_open_followups_for_user(self, user_id: str) -> list:
         if not self._check_tables_exist():
             return []

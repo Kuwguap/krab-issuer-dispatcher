@@ -9353,21 +9353,47 @@ async def cmd_followup_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 
 async def cmd_my_followups(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """List the caller's open client follow-ups."""
-    rows = db.get_open_followups_for_user(update.effective_user.id)
+    """Follow-up history (open + closed), one message each; open ones get a Stop button."""
+    rows = db.get_followups_for_user(update.effective_user.id)
     if not rows:
-        await update.message.reply_text("You have no open client follow-ups.")
+        await update.message.reply_text("You have no client follow-ups yet. Use /followup to add one.")
         return
-    lines = ["📇 *Your open follow-ups:*", ""]
+    open_n = sum(1 for f in rows if f.get("status") == "open")
+    await update.message.reply_text(
+        f"📇 *Your follow-up history* ({open_n} active / {len(rows)} total):",
+        parse_mode="Markdown",
+    )
+    ny = pytz.timezone("America/New_York")
     for f in rows:
         name = f.get("client_name") or "client"
-        phone = f.get("phone_number")
-        nxt = _fu_parse_iso(f.get("next_reminder_at"))
-        when = nxt.astimezone(pytz.timezone("America/New_York")).strftime("%b %d, %I:%M %p ET") if nxt else "—"
-        freq = _FU_FREQ_LABEL.get(f.get("frequency"), f.get("frequency") or "")
-        lines.append(f"• *{name}*" + (f" — {phone}" if phone else ""))
-        lines.append(f"  next: {when} ({freq})")
-    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+        is_open = f.get("status") == "open"
+        kind = "🔁 renewal" if f.get("kind") == "renewal" else "📇 follow-up"
+        head = f"{kind} — {name}" if is_open else f"✔️ CLOSED {kind} — {name}"
+        lines = [head]
+        if f.get("phone_number"):
+            lines.append(f"📞 {f.get('phone_number')}")
+        if f.get("email"):
+            lines.append(f"📧 {f.get('email')}")
+        if f.get("notes"):
+            lines.append(f"📝 {f.get('notes')}")
+        if is_open:
+            nxt = _fu_parse_iso(f.get("next_reminder_at"))
+            when = nxt.astimezone(ny).strftime("%b %d, %I:%M %p ET") if nxt else "—"
+            freq = _FU_FREQ_LABEL.get(f.get("frequency"), f.get("frequency") or "no schedule")
+            chase = " · 🤖 bot contacts client" if f.get("contact_client") else ""
+            lines.append(f"⏰ next: {when} ({freq}){chase}")
+        else:
+            last = _fu_parse_iso(f.get("last_reminded_at")) or _fu_parse_iso(f.get("updated_at"))
+            if last:
+                lines.append(f"🕘 last activity: {last.astimezone(ny).strftime('%b %d, %I:%M %p ET')}")
+        kb = None
+        if is_open:
+            short = _short_uuid(f.get("id"))
+            kb = InlineKeyboardMarkup([[
+                InlineKeyboardButton("🔕 Stop", callback_data=f"cf_stop_{short}"),
+                InlineKeyboardButton("✅ Close (sold)", callback_data=f"cf_close_{short}"),
+            ]])
+        await update.message.reply_text("\n".join(lines), reply_markup=kb)
 
 
 async def _handle_cf_action(update: Update, context: ContextTypes.DEFAULT_TYPE, prefix: str) -> None:
