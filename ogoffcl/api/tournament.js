@@ -26,6 +26,37 @@ async function playerForRef(ref) {
   return Array.isArray(data) && data[0] ? data[0] : null;
 }
 
+/** Confirmation emails on a spot locking in — shared by the Moolre status
+ *  check AND the admin's manual Mark-paid (cash/direct transfers). */
+function sendPaidEmails(player) {
+  if ((player.email || "").includes("@")) {
+    sendEmail({
+      to: player.email,
+      subject: "You're in the OG OFFCL FC26 Tournament ⚽",
+      html: emailShell("Spot locked in. 🎮", `
+        <p><strong style="color:#C8FF00;">${player.gamertag}</strong> — payment received, your spot in the OG OFFCL FC26 tournament is confirmed.</p>
+        <p style="color:#8b877e;">Entry: GH₵${Number(player.fee)}${player.hub ? " (playing from the OGOFFCL Hub at KNUST, Kumasi — console + 200 Mbps connection covered; be there in person on game day)" : ""}.<br/>
+        Platform: ${String(player.platform).toUpperCase()}.</p>
+        <p>Kickoff: <strong style="color:#C8FF00;">1st August</strong>. The pot: <strong style="color:#C8FF00;">GH₵1,000 cash + 2 merch pieces</strong> from the store.</p>
+        <p style="margin:18px 0;"><a href="${SNAP_GROUP}" style="display:inline-block;background:#C8FF00;color:#0A0A0A;font-weight:900;text-decoration:none;padding:14px 22px;text-transform:uppercase;letter-spacing:1px;">👻 Join the Snapchat group</a></p>
+        <p style="color:#8b877e;">The Snapchat group is where the bracket drops, kickoff times land and winners report scores — <strong style="color:#F5F2EA;">joining it is not optional</strong>. Link: <a href="${SNAP_GROUP}" style="color:#C8FF00;">${SNAP_GROUP}</a></p>
+        <p>On game day: add your opponent via EA ID, invite them from <strong style="color:#F5F2EA;">Ultimate Team → Friendlies → Play a Friend</strong>, screenshot the final score, drop it in the group.</p>
+        <p style="color:#8b877e;">Bring your best squad. Limited spots — no restocks on glory.</p>
+      `),
+    }).catch(() => {});
+  }
+  if (env.storeNotify) {
+    sendEmail({
+      to: env.storeNotify,
+      subject: `🎮 TOURNAMENT ENTRY — ${player.gamertag} paid GH₵${Number(player.fee)}`,
+      html: emailShell("New tournament entry", `
+        <p><strong>${player.full_name}</strong> (${player.gamertag}, ${String(player.platform).toUpperCase()})${player.hub ? " · HUB PLAYER" : ""}</p>
+        <p style="color:#8b877e;">${player.email} · ${player.phone}</p>
+      `),
+    }).catch(() => {});
+  }
+}
+
 // ── handlers ───────────────────────────────────────────────────────────────
 
 async function register(req, res) {
@@ -139,32 +170,7 @@ async function status(req, res) {
       await sb("PATCH", `tournament_players?id=eq.${player.id}`, {
         payment_status: "paid", paid_at: new Date().toISOString(),
       });
-      if ((player.email || "").includes("@")) {
-        sendEmail({
-          to: player.email,
-          subject: "You're in the OG OFFCL FC26 Tournament ⚽",
-          html: emailShell("Spot locked in. 🎮", `
-            <p><strong style="color:#C8FF00;">${player.gamertag}</strong> — payment received, your spot in the OG OFFCL FC26 tournament is confirmed.</p>
-            <p style="color:#8b877e;">Entry: GH₵${Number(player.fee)}${player.hub ? " (playing from the OGOFFCL Hub at KNUST, Kumasi — console + 200 Mbps connection covered; be there in person on game day)" : ""}.<br/>
-            Platform: ${String(player.platform).toUpperCase()}.</p>
-            <p>Kickoff: <strong style="color:#C8FF00;">1st August</strong>. The pot: <strong style="color:#C8FF00;">GH₵1,000 cash + 2 merch pieces</strong> from the store.</p>
-            <p style="margin:18px 0;"><a href="${SNAP_GROUP}" style="display:inline-block;background:#C8FF00;color:#0A0A0A;font-weight:900;text-decoration:none;padding:14px 22px;text-transform:uppercase;letter-spacing:1px;">👻 Join the Snapchat group</a></p>
-            <p style="color:#8b877e;">The Snapchat group is where the bracket drops, kickoff times land and winners report scores — <strong style="color:#F5F2EA;">joining it is not optional</strong>. Link: <a href="${SNAP_GROUP}" style="color:#C8FF00;">${SNAP_GROUP}</a></p>
-            <p>On game day: add your opponent via EA ID, invite them from <strong style="color:#F5F2EA;">Ultimate Team → Friendlies → Play a Friend</strong>, screenshot the final score, drop it in the group.</p>
-            <p style="color:#8b877e;">Bring your best squad. Limited spots — no restocks on glory.</p>
-          `),
-        }).catch(() => {});
-      }
-      if (env.storeNotify) {
-        sendEmail({
-          to: env.storeNotify,
-          subject: `🎮 TOURNAMENT ENTRY — ${player.gamertag} paid GH₵${Number(player.fee)}`,
-          html: emailShell("New tournament entry", `
-            <p><strong>${player.full_name}</strong> (${player.gamertag}, ${String(player.platform).toUpperCase()})${player.hub ? " · HUB PLAYER" : ""}</p>
-            <p style="color:#8b877e;">${player.email} · ${player.phone}</p>
-          `),
-        }).catch(() => {});
-      }
+      sendPaidEmails(player);
     }
     return res.json({ state: "paid", gamertag: player ? player.gamertag : null });
   }
@@ -216,11 +222,16 @@ async function admin(req, res) {
     return res.json({ ok: true, players, matches: Array.isArray(mRes.data) ? mRes.data : [] });
   }
   if (act === "verify") {
-    // manual mark-paid (cash / direct momo)
+    // manual mark-paid (cash / direct momo) — completes the FULL process:
+    // marks paid AND sends the same confirmation emails as an online payment
+    const player = await getPlayer(b.playerId);
+    if (!player) return res.status(404).json({ error: "player not found" });
+    if (player.payment_status === "paid") return res.json({ ok: true, already: true });
     await sb("PATCH", `tournament_players?id=eq.${encodeURIComponent(b.playerId)}`, {
       payment_status: "paid", paid_at: new Date().toISOString(),
     });
-    return res.json({ ok: true });
+    sendPaidEmails(player);
+    return res.json({ ok: true, emailed: (player.email || "").includes("@") });
   }
   if (act === "remove") {
     await sb("DELETE", `tournament_players?id=eq.${encodeURIComponent(b.playerId)}`);

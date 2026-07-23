@@ -2,6 +2,7 @@ import { useEffect, useRef, useState, FormEvent } from "react";
 import { Link, useParams } from "react-router-dom";
 import { motion } from "framer-motion";
 import { usePageMeta } from "../lib/seo";
+import MomoHelp from "../components/MomoHelp";
 
 /**
  * Standalone payment page for an existing tournament registration —
@@ -78,7 +79,8 @@ export default function TournamentPay() {
         } else if (j.state === "failed") {
           if (pollRef.current) window.clearInterval(pollRef.current);
           setPay({ step: "failed", error: j.message || "Payment failed or was declined." });
-        } else if (tries > 40) {
+        } else if (tries > 100) {
+          // ~5 min — manual USSD approval takes a while; don't cut people off early
           if (pollRef.current) window.clearInterval(pollRef.current);
           setPay({ step: "failed", error: "The payment window timed out — try again." });
         }
@@ -148,6 +150,7 @@ export default function TournamentPay() {
         <h1 className="display-xl text-4xl text-bone">Check your phone</h1>
         <p className="text-bone/60 mt-4 leading-relaxed">Approve the <strong className="text-bone">GH₵{player.fee}</strong> mobile-money prompt on <strong className="text-acid">{momoPhone}</strong>.</p>
         <p className="text-bone/40 text-xs mt-3">Payment is processed by <strong className="text-bone/70">Moolre</strong> — any SMS about this payment comes from Moolre.</p>
+        <MomoHelp network={network} />
       </div>
     );
   }

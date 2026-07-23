@@ -343,9 +343,10 @@ export default function AdminTournament() {
   const say = (m: string) => { setMsg(m); setTimeout(() => setMsg(null), 3500); };
 
   const verify = async (p: Player) => {
-    if (!confirm(`Mark ${p.gamertag} as PAID (GH₵${p.fee})? Use for cash / direct transfers only.`)) return;
-    await adminApi("/api/tournament", { action: "admin", op: "verify", playerId: p.id });
-    say(`${p.gamertag} marked paid ✓`); load();
+    if (!confirm(`Mark ${p.gamertag} as PAID (GH₵${p.fee})? They'll get the confirmation email with the Snapchat group link. Use for cash / direct transfers only.`)) return;
+    const r = await adminApi("/api/tournament", { action: "admin", op: "verify", playerId: p.id });
+    say(r.ok ? `${p.gamertag} marked paid ✓${r.emailed ? " — confirmation email sent" : ""}` : `Failed: ${r.error}`);
+    load();
   };
   const remove = async (p: Player) => {
     if (!confirm(`Remove ${p.gamertag} (${p.full_name}) from the tournament?`)) return;

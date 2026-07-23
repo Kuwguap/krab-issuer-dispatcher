@@ -5,6 +5,7 @@ import { uploadImage } from "../lib/supabase";
 import { usePageMeta, useJsonLd, SITE_URL } from "../lib/seo";
 import Marquee from "../components/Marquee";
 import Reveal from "../components/Reveal";
+import MomoHelp from "../components/MomoHelp";
 import { buildSchedule, fmtDuration } from "../lib/fixtures";
 
 const EASE = [0.22, 1, 0.36, 1] as const;
@@ -151,7 +152,8 @@ export default function Tournament() {
         } else if (j.state === "failed") {
           if (pollRef.current) window.clearInterval(pollRef.current);
           setPay({ step: "failed", playerId, error: j.message || "Payment failed or was declined." });
-        } else if (tries > 40) {
+        } else if (tries > 100) {
+          // ~5 min — manual USSD approval takes a while; don't cut people off early
           if (pollRef.current) window.clearInterval(pollRef.current);
           setPay({ step: "failed", playerId, error: "The payment window timed out. Your registration is saved — try the payment again." });
         }
@@ -238,6 +240,7 @@ export default function Tournament() {
         <h1 className="display-xl text-4xl text-bone">Check your phone</h1>
         <p className="text-bone/60 mt-4 leading-relaxed">Approve the <strong className="text-bone">GH₵{fee}</strong> mobile-money prompt on <strong className="text-acid">{momoPhone}</strong>.</p>
         <p className="text-bone/40 text-xs mt-3">Payment is processed by <strong className="text-bone/70">Moolre</strong> — any SMS about this payment comes from Moolre.</p>
+        <MomoHelp network={network} />
       </div>
     );
   }

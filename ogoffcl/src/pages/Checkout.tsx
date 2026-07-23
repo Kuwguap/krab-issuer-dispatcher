@@ -4,6 +4,7 @@ import { supabase } from "../lib/supabase";
 import { money, CURRENCY } from "../lib/money";
 import { useCart } from "../store/CartContext";
 import Reveal from "../components/Reveal";
+import MomoHelp from "../components/MomoHelp";
 import { usePageMeta } from "../lib/seo";
 
 interface Applied {
@@ -87,8 +88,9 @@ export default function Checkout() {
         } else if (j.state === "failed") {
           if (pollRef.current) window.clearInterval(pollRef.current);
           setPay({ step: "failed", orderId, error: j.message || "Payment failed or was declined." });
-        } else if (tries > 40) {
-          // ~2 minutes — leave the order pending, show the confirmation page.
+        } else if (tries > 100) {
+          // ~5 minutes (manual USSD approval is slow) — leave the order
+          // pending, show the confirmation page.
           if (pollRef.current) window.clearInterval(pollRef.current);
           navigate(`/order-confirmation?ref=${encodeURIComponent(ref)}&paid=0`);
         }
@@ -179,6 +181,7 @@ export default function Checkout() {
         <p className="text-bone/40 text-xs mt-3">
           Payment is processed by <strong className="text-bone/70">Moolre</strong> — any SMS about this payment comes from Moolre.
         </p>
+        <MomoHelp network={network} />
         <p className="text-bone/30 text-xs uppercase tracking-[0.25em] mt-8 animate-pulseSoft">Waiting for approval…</p>
       </div>
     );
