@@ -11,6 +11,7 @@ import {
 
 const BASE_FEE = 50;
 const HUB_FEE = 20;
+const SNAP_GROUP = "https://snapchat.com/t/kHlg89aj";
 
 const publicPhoto = (p) =>
   p ? `${env.supabaseUrl}/storage/v1/object/public/images/${String(p).replace(/^\/+/, "")}` : null;
@@ -59,6 +60,11 @@ async function register(req, res) {
     const detail = JSON.stringify(ins.data || {}).slice(0, 160);
     return res.status(500).json({ error: "Could not save your registration.", detail });
   }
+
+  // registering also joins the site mailing list (source: tournament) —
+  // disclosed on the form; duplicate emails are ignored, never an error
+  sb("POST", "subscribers?on_conflict=email", { email, source: "tournament" },
+    { Prefer: "resolution=ignore-duplicates,return=minimal" }).catch(() => {});
 
   // signup email straight away — spot locks when the payment lands
   sendEmail({
@@ -142,7 +148,9 @@ async function status(req, res) {
             <p style="color:#8b877e;">Entry: GH₵${Number(player.fee)}${player.hub ? " (playing from the OGOFFCL Hub at KNUST, Kumasi — console + 200 Mbps connection covered; be there in person on game day)" : ""}.<br/>
             Platform: ${String(player.platform).toUpperCase()}.</p>
             <p>Kickoff: <strong style="color:#C8FF00;">1st August</strong>. The pot: <strong style="color:#C8FF00;">GH₵1,000 cash + 2 merch pieces</strong> from the store.</p>
-            <p>What happens next: we'll email + WhatsApp the bracket, your kickoff time and the official match group before game day. Add your opponent via EA ID, invite them from <strong style="color:#F5F2EA;">Ultimate Team → Friendlies → Play a Friend</strong>, screenshot the final score.</p>
+            <p style="margin:18px 0;"><a href="${SNAP_GROUP}" style="display:inline-block;background:#C8FF00;color:#0A0A0A;font-weight:900;text-decoration:none;padding:14px 22px;text-transform:uppercase;letter-spacing:1px;">👻 Join the Snapchat group</a></p>
+            <p style="color:#8b877e;">The Snapchat group is where the bracket drops, kickoff times land and winners report scores — <strong style="color:#F5F2EA;">joining it is not optional</strong>. Link: <a href="${SNAP_GROUP}" style="color:#C8FF00;">${SNAP_GROUP}</a></p>
+            <p>On game day: add your opponent via EA ID, invite them from <strong style="color:#F5F2EA;">Ultimate Team → Friendlies → Play a Friend</strong>, screenshot the final score, drop it in the group.</p>
             <p style="color:#8b877e;">Bring your best squad. Limited spots — no restocks on glory.</p>
           `),
         }).catch(() => {});

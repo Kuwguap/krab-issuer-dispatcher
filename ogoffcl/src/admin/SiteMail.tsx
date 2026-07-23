@@ -15,7 +15,7 @@ export default function AdminSiteMail() {
 
   const [subs, setSubs] = useState<SubscriberRow[]>([]);
   const [subsMissing, setSubsMissing] = useState(false);
-  const [filter, setFilter] = useState<"all" | "waitlist" | "newsletter">("all");
+  const [filter, setFilter] = useState<"all" | "waitlist" | "newsletter" | "tournament">("all");
   const [copied, setCopied] = useState(false);
 
   const load = async () => {
@@ -120,7 +120,7 @@ export default function AdminSiteMail() {
             Mailing list <span className="text-acid">({visible.length})</span>
           </p>
           <div className="flex gap-2 ml-2">
-            {(["all", "waitlist", "newsletter"] as const).map((f) => (
+            {(["all", "waitlist", "newsletter", "tournament"] as const).map((f) => (
               <button key={f} onClick={() => setFilter(f)} className={`btn-og px-3 py-2.5 text-[10px] border-2 ${filter === f ? "bg-acid border-acid text-ink" : "border-ash text-bone/60 hover:border-bone"}`}>
                 {f}
               </button>

@@ -13,6 +13,7 @@ const HUB_FEE = 20;
 const PRIZE_CASH = 1000;
 const EVENT_DATE = new Date("2026-08-01T10:00:00");
 const EVENT_DATE_LABEL = "1st August";
+const SNAP_GROUP = "https://snapchat.com/t/kHlg89aj";
 
 /** Live countdown to kickoff — urgency in the hero. */
 function Countdown() {
@@ -218,8 +219,15 @@ export default function Tournament() {
       <div className="max-w-md mx-auto px-4 py-28 text-center">
         <motion.div initial={{ scale: 0.7, opacity: 0 }} animate={{ scale: 1, opacity: 1 }} className="w-24 h-24 mx-auto border-4 border-acid flex items-center justify-center font-display text-5xl text-acid mb-8">✓</motion.div>
         <h1 className="display-xl text-4xl sm:text-5xl text-bone">{pay.gamertag}, <span className="text-acid">you're on the bracket.</span></h1>
-        <p className="text-bone/60 mt-5 leading-relaxed">Payment received. Check your email — bracket, kickoff time and the official match group land there before game day.</p>
-        <p className="text-bone/30 text-[11px] uppercase tracking-[0.25em] mt-6">No restocks on glory.</p>
+        <p className="text-bone/60 mt-5 leading-relaxed">Payment received. One thing left — join the Snapchat group. That's where the bracket, kickoff times and score reporting happen.</p>
+        <a
+          href={SNAP_GROUP} target="_blank" rel="noreferrer"
+          className="btn-og bg-acid text-ink px-8 py-4 text-sm mt-8 inline-flex hover:bg-bone"
+        >
+          👻 Join the Snapchat group →
+        </a>
+        <p className="text-bone/40 text-xs mt-4">Also linked in your confirmation email — don't skip it, no group = no kickoff alerts.</p>
+        <p className="text-bone/30 text-[11px] uppercase tracking-[0.25em] mt-8">No restocks on glory.</p>
       </div>
     );
   }
@@ -428,7 +436,7 @@ export default function Tournament() {
         <div className="grid sm:grid-cols-2 lg:grid-cols-4 gap-px bg-ash border border-ash">
           {[
             ["01", "Register & pay", `GH₵${BASE_FEE} locks your spot. Name, PSN / EA ID, platform and your player photo — it goes on your official match card.`],
-            ["02", "Random draw", "The bracket is a fully random draw — no seeds, no favours. It goes live at ogoffcl.store/tournament/fixtures plus the official WhatsApp group. You'll know exactly who you face and when."],
+            ["02", "Random draw", "The bracket is a fully random draw — no seeds, no favours. It goes live at ogoffcl.store/tournament/fixtures plus the official Snapchat group. You'll know exactly who you face and when."],
             ["03", "Play your tie", "Add your opponent via EA ID → invite them from Ultimate Team → Friendlies → Play a Friend. 6-minute halves. Bring your best squad — UT is the battleground."],
             ["04", "Report the score", "Winner screenshots the full-time screen and drops it in the group. Bracket updates live on this page. Win out. Take the crown."],
           ].map(([n, t, d]) => (
@@ -551,6 +559,9 @@ export default function Tournament() {
               {busy ? "Locking your spot…" : `Pay GH₵${fee} — lock my spot`}
             </button>
             <p className="text-bone/30 text-[11px] uppercase tracking-widest text-center">MTN · Telecel · AT — secured by Moolre</p>
+            <p className="text-bone/30 text-[11px] text-center leading-relaxed">
+              Registering also puts your email on the OG OFFCL list — first to hear about future tournaments and drops.
+            </p>
           </div>
 
           {/* summary card */}
