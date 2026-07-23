@@ -9499,6 +9499,51 @@ async def handle_cf_delete(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     await _handle_cf_action(update, context, "cf_del_")
 
 
+async def handle_cf_info(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """📝 View full info — everything on the record, incl. complete notes
+    (the AI paste-parse stores all unparsed data there)."""
+    query = update.callback_query
+    await query.answer()
+    try:
+        fid = _long_uuid(query.data[len("cf_info_"):])
+    except (ValueError, Exception):
+        await query.message.reply_text("❌ Invalid request.")
+        return
+    f = db.get_client_followup_by_id(fid)
+    if not f:
+        await query.message.reply_text("❌ Follow-up not found.")
+        return
+    ny = pytz.timezone("America/New_York")
+
+    def ts(key):
+        dt = _fu_parse_iso(f.get(key))
+        return dt.astimezone(ny).strftime("%b %d, %Y %I:%M %p ET") if dt else "—"
+
+    status = "🟢 open" if f.get("status") == "open" else "✔️ closed"
+    kind = "🔁 renewal" if f.get("kind") == "renewal" else "📇 follow-up"
+    freq = _FU_FREQ_LABEL.get(f.get("frequency"), f.get("frequency") or "no schedule")
+    lines = [
+        f"📋 FULL INFO — {f.get('client_name') or 'client'}",
+        "",
+        f"Status: {status} ({kind})",
+        f"👤 Agent: @{f.get('telegram_username')}" if f.get("telegram_username") else f"👤 Agent id: {f.get('user_id')}",
+        f"📞 Phone: {f.get('phone_number') or '—'}",
+        f"📧 Email: {f.get('email') or '—'}",
+        f"🔁 Frequency: {freq}",
+        f"🤖 Bot contacts client: {'ON' if f.get('contact_client') else 'OFF'}",
+        f"▶️ Started: {ts('start_at')}",
+        f"⏰ Next reminder: {ts('next_reminder_at')}",
+        f"🔔 Last reminded: {ts('last_reminded_at')}",
+        f"📨 Last client contact: {ts('last_client_contact_at')}",
+        f"🛑 Stops: {ts('end_at') if f.get('end_at') else '🧾 when they order / manual'}",
+        f"🗓 Created: {ts('created_at')}",
+        "",
+        "📝 NOTES:",
+        (f.get("notes") or "—"),
+    ]
+    await query.message.reply_text("\n".join(lines))
+
+
 async def cmd_all_followups(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Supervisor backend: view ALL open follow-ups with stop/delete controls."""
     if not _user_is_global_supervisor(update.effective_user.id):
@@ -9524,10 +9569,11 @@ async def cmd_all_followups(update: Update, context: ContextTypes.DEFAULT_TYPE) 
             lines.append(f"📧 {f.get('email')}")
         lines.append(f"⏰ next: {when} ({freq}){chase}")
         short = _short_uuid(f.get("id"))
-        kb = InlineKeyboardMarkup([[
-            InlineKeyboardButton("🔕 Stop", callback_data=f"cf_stop_{short}"),
-            InlineKeyboardButton("🗑 Delete", callback_data=f"cf_del_{short}"),
-        ]])
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton("🔕 Stop", callback_data=f"cf_stop_{short}"),
+             InlineKeyboardButton("🗑 Delete", callback_data=f"cf_del_{short}")],
+            [InlineKeyboardButton("📝 View full info / notes", callback_data=f"cf_info_{short}")],
+        ])
         await update.message.reply_text("\n".join(lines), reply_markup=kb, parse_mode="Markdown")
 
 
@@ -9823,6 +9869,7 @@ def main():
     application.add_handler(CallbackQueryHandler(handle_cf_renew, pattern="^cf_renew_"))
     application.add_handler(CallbackQueryHandler(handle_cf_done, pattern="^cf_done_"))
     application.add_handler(CallbackQueryHandler(handle_cf_delete, pattern="^cf_del_"))
+    application.add_handler(CallbackQueryHandler(handle_cf_info, pattern="^cf_info_"))
 
     # Driver timeout: every minute, check for leads where no driver accepted within 10 min
     async def check_driver_timeout(context: ContextTypes.DEFAULT_TYPE) -> None:
