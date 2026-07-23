@@ -74,6 +74,7 @@ const tabs = [
   { to: "/admin/site", label: "Site & Mail" },
   { to: "/admin/email", label: "Email Studio" },
   { to: "/admin/analytics", label: "Analytics" },
+  { to: "/admin/tournament", label: "Tournament" },
 ];
 
 export default function AdminLayout() {

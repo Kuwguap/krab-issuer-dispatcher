@@ -3,12 +3,13 @@ import { Link, NavLink, useLocation } from "react-router-dom";
 import { AnimatePresence, motion } from "framer-motion";
 import { useCart } from "../store/CartContext";
 
-const links = [
+const links: { to: string; label: string; hot?: boolean }[] = [
   { to: "/", label: "Home" },
   { to: "/shop", label: "Shop" },
   { to: "/shop?c=og", label: "OG" },
   { to: "/shop?c=og-femme", label: "OG Femme" },
   { to: "/gallery", label: "Gallery" },
+  { to: "/tournament", label: "Tournament", hot: true },
 ];
 
 export default function Navbar() {
@@ -54,7 +55,7 @@ export default function Navbar() {
 
           <nav className="hidden md:flex items-center gap-8">
             {links.map((l) => (
-              <NavLink key={l.label} to={l.to} className="link-sweep font-display uppercase text-xs tracking-[0.2em] text-bone/80 hover:text-bone">
+              <NavLink key={l.label} to={l.to} className={`link-sweep font-display uppercase text-xs tracking-[0.2em] ${l.hot ? "text-acid hover:text-bone" : "text-bone/80 hover:text-bone"}`}>
                 {l.label}
               </NavLink>
             ))}
@@ -99,7 +100,7 @@ export default function Navbar() {
                   animate={{ opacity: 1, x: 0 }}
                   transition={{ delay: 0.15 + i * 0.07 }}
                 >
-                  <NavLink to={l.to} className="display-xl text-5xl text-bone hover:text-acid transition-colors block py-2">
+                  <NavLink to={l.to} className={`display-xl text-5xl ${l.hot ? "text-acid" : "text-bone"} hover:text-acid transition-colors block py-2`}>
                     {l.label}
                   </NavLink>
                 </motion.div>

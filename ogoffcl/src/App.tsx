@@ -8,6 +8,7 @@ import Home from "./pages/Home";
 import Shop from "./pages/Shop";
 import ProductPage from "./pages/ProductPage";
 import Gallery from "./pages/Gallery";
+import Tournament from "./pages/Tournament";
 import Checkout from "./pages/Checkout";
 import Confirmation from "./pages/Confirmation";
 import RefundPolicy from "./pages/RefundPolicy";
@@ -22,6 +23,7 @@ import AdminGallery from "./admin/Gallery";
 import AdminSiteMail from "./admin/SiteMail";
 import AdminEmail from "./admin/Email";
 import AdminAnalytics from "./admin/Analytics";
+import AdminTournament from "./admin/Tournament";
 import { usePageTracking } from "./lib/track";
 
 function ScrollTop() {
@@ -49,6 +51,7 @@ export default function App() {
             <Route path="/shop" element={<Shop />} />
             <Route path="/product/:id" element={<ProductPage />} />
             <Route path="/gallery" element={<Gallery />} />
+            <Route path="/tournament" element={<Tournament />} />
             <Route path="/checkout" element={<Checkout />} />
             <Route path="/order-confirmation" element={<Confirmation />} />
             <Route path="/refund-policy" element={<RefundPolicy />} />
@@ -62,6 +65,7 @@ export default function App() {
               <Route path="site" element={<AdminSiteMail />} />
               <Route path="email" element={<AdminEmail />} />
               <Route path="analytics" element={<AdminAnalytics />} />
+              <Route path="tournament" element={<AdminTournament />} />
             </Route>
             <Route path="*" element={<NotFound />} />
           </Routes>
