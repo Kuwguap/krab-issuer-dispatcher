@@ -2,7 +2,7 @@
 // Moolre's webhook has no documented signature, so we NEVER trust the body:
 // we extract the reference, re-verify against Moolre's status API with our
 // keys, and only then finalize. Always answers 200 so Moolre stops retrying.
-import { moolreStatus, sb, getOrderByNumber } from "../_lib.js";
+import { env, moolreStatus, sb, getOrderByNumber } from "../_lib.js";
 import { finalizePaidOrder } from "../_finalize.js";
 import { finalizeTournamentByRef } from "../_tournament.js";
 
@@ -10,6 +10,15 @@ export default async (req, res) => {
   try {
     const body = req.body || {};
     const d = typeof body.data === "object" && body.data ? body.data : body;
+
+    // Moolre includes the account's Secret Key in every webhook — when
+    // MOOLRE_CALLBACK_SECRET is configured, silently drop non-matching
+    // requests (we still re-verify via the status API either way).
+    if (env.moolreCallbackSecret) {
+      const secret = String(body.secret || d.secret || "").trim();
+      if (secret !== env.moolreCallbackSecret) return res.status(200).json({ received: true });
+    }
+
     const ref = String(d.externalref || d.reference || d.ref || "").trim();
     if (!ref) return res.status(200).json({ received: true });
 

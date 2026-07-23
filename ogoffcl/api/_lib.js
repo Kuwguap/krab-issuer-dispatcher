@@ -15,6 +15,7 @@ const env = {
   moolrePrivateKey: clean(process.env.MOOLRE_API_KEY || process.env.MOOLRE_PRIVATE_KEY),
   moolrePubKey: clean(process.env.MOOLRE_PUBKEY || process.env.MOOLRE_PUBLIC_KEY),
   moolreAccount: clean(process.env.MOOLRE_ACCOUNT_NUMBER),
+  moolreCallbackSecret: clean(process.env.MOOLRE_CALLBACK_SECRET),
   moolreBase: /^(1|true|sandbox)$/i.test(clean(process.env.MOOLRE_SANDBOX))
     ? "https://sandbox.moolre.com"
     : "https://api.moolre.com",

@@ -261,16 +261,28 @@ async function admin(req, res) {
     return res.json({ ok: true });
   }
   if (act === "linkdiag") {
-    // probe /embed/link with current credentials (admin-gated, no secrets):
-    // tells you whether hosted payment links are active yet
-    const resp = await moolrePaymentLink({
-      amount: "1.00",
-      externalref: `DIAG-${Date.now().toString(36).toUpperCase()}`,
+    // probe /embed/link (admin-gated, no secrets returned): reports whether
+    // hosted payment links are active. Optional b.user tries a candidate
+    // X-API-USER without touching the environment.
+    const headers = {
+      "Content-Type": "application/json",
+      "X-API-USER": b.user ? String(b.user) : env.moolreUser,
+      "X-API-PUBKEY": env.moolrePubKey,
+    };
+    const r = await fetch("https://api.moolre.com/embed/link", {
+      method: "POST",
+      headers,
+      body: JSON.stringify({
+        type: 1, amount: "1.00", email: env.storeNotify || "ogoffcl@gmail.com",
+        externalref: `DIAG-${Date.now().toString(36).toUpperCase()}`,
+        currency: "GHS", accountnumber: env.moolreAccount, reusable: "0",
+      }),
     });
+    const j = await r.json().catch(() => ({}));
     return res.json({
-      ok: true,
-      linkWorks: Number(resp.status) === 1 && !!(resp.data && resp.data.authorization_url),
-      code: resp.code, message: resp.message,
+      ok: true, triedUser: b.user ? "candidate" : "env",
+      linkWorks: Number(j.status) === 1 && !!(j.data && j.data.authorization_url),
+      code: j.code, message: j.message,
     });
   }
   return res.status(400).json({ error: `unknown op ${act}` });
