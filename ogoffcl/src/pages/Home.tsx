@@ -7,6 +7,7 @@ import { money } from "../lib/money";
 import Marquee from "../components/Marquee";
 import Reveal from "../components/Reveal";
 import ProductCard from "../components/ProductCard";
+import { usePageMeta } from "../lib/seo";
 
 const EASE = [0.22, 1, 0.36, 1] as const;
 
@@ -50,6 +51,13 @@ export default function Home() {
   const [products, setProducts] = useState<Product[]>([]);
   const [cats, setCats] = useState<Category[]>([]);
   const clock = useAccraClock();
+
+  usePageMeta({
+    title: "OG OFFCL — Original Gangster Official | Streetwear from Accra, Ghana",
+    description:
+      "Bold streetwear born in Accra: heavyweight tees, Gye Nyame jerseys, hoodies and the OG Femme line. Limited runs, no restocks. Pay with MTN, Telecel or AT mobile money.",
+    path: "/",
+  });
   const reduced = useReducedMotion();
 
   const heroRef = useRef<HTMLElement>(null);

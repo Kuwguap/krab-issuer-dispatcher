@@ -1,0 +1,7 @@
+User-agent: *
+Allow: /
+Disallow: /admin
+Disallow: /checkout
+Disallow: /order-confirmation
+
+Sitemap: https://ogoffcl.store/sitemap.xml

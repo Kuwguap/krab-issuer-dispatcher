@@ -4,10 +4,18 @@ import { supabase } from "../lib/supabase";
 import type { Category, Product } from "../lib/types";
 import ProductCard from "../components/ProductCard";
 import Reveal from "../components/Reveal";
+import { usePageMeta } from "../lib/seo";
 
 export default function Shop() {
   const [params, setParams] = useSearchParams();
   const activeSlug = params.get("c") || "";
+
+  usePageMeta({
+    title: "Shop — OG OFFCL | Streetwear drops from Accra",
+    description:
+      "Shop the OG OFFCL rack: heavyweight tees, Gye Nyame jerseys, hoodies and the OG Femme line. Limited runs, no restocks — pay with mobile money.",
+    path: "/shop",
+  });
   const [products, setProducts] = useState<Product[]>([]);
   const [cats, setCats] = useState<Category[]>([]);
   const [loading, setLoading] = useState(true);

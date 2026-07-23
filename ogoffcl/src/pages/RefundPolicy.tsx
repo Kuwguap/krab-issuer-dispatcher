@@ -1,5 +1,6 @@
 import { Link } from "react-router-dom";
 import Reveal from "../components/Reveal";
+import { usePageMeta } from "../lib/seo";
 
 const SECTIONS: [string, string][] = [
   [
@@ -25,6 +26,11 @@ const SECTIONS: [string, string][] = [
 ];
 
 export default function RefundPolicy() {
+  usePageMeta({
+    title: "Refund Policy — OG OFFCL",
+    description: "OG OFFCL refund policy: wrong or damaged items, change of mind, cancellations and how mobile money refunds are paid.",
+    path: "/refund-policy",
+  });
   return (
     <div className="max-w-3xl mx-auto px-4 sm:px-6 py-16">
       <Reveal>

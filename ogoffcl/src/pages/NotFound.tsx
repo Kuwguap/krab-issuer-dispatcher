@@ -1,6 +1,8 @@
 import { Link } from "react-router-dom";
+import { usePageMeta } from "../lib/seo";
 
 export default function NotFound() {
+  usePageMeta({ title: "404 — OG OFFCL", description: "This page ain't official.", noindex: true });
   return (
     <div className="max-w-2xl mx-auto px-4 py-32 text-center">
       <p className="display-xl text-[8rem] leading-none text-stroke">404</p>

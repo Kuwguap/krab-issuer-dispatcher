@@ -8,6 +8,7 @@ const links = [
   { to: "/shop", label: "Shop" },
   { to: "/shop?c=og", label: "OG" },
   { to: "/shop?c=og-femme", label: "OG Femme" },
+  { to: "/gallery", label: "Gallery" },
 ];
 
 export default function Navbar() {

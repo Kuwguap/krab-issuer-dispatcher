@@ -65,6 +65,7 @@ export default function Footer() {
           <Link to="/shop" className="link-sweep w-fit text-bone/80 hover:text-bone uppercase text-sm font-display tracking-wider">All products</Link>
           <Link to="/shop?c=og" className="link-sweep w-fit text-bone/80 hover:text-bone uppercase text-sm font-display tracking-wider">OG</Link>
           <Link to="/shop?c=og-femme" className="link-sweep w-fit text-bone/80 hover:text-bone uppercase text-sm font-display tracking-wider">OG Femme</Link>
+          <Link to="/gallery" className="link-sweep w-fit text-bone/80 hover:text-bone uppercase text-sm font-display tracking-wider">Gallery</Link>
         </div>
         <div className="flex flex-col gap-3">
           <p className="font-display uppercase text-xs tracking-[0.3em] text-bone/40 mb-1">Connect</p>

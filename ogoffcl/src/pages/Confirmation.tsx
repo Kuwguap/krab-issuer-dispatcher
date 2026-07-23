@@ -3,6 +3,7 @@ import { Link, useSearchParams } from "react-router-dom";
 import { motion } from "framer-motion";
 import Marquee from "../components/Marquee";
 import { money } from "../lib/money";
+import { usePageMeta } from "../lib/seo";
 
 interface SummaryItem {
   name: string;
@@ -45,6 +46,13 @@ export default function Confirmation() {
   const paid = params.get("paid") === "1";
 
   const [sum, setSum] = useState<Summary | null>(null);
+
+  usePageMeta({
+    title: "Order confirmation — OG OFFCL",
+    description: "Your OG OFFCL order status.",
+    path: "/order-confirmation",
+    noindex: true,
+  });
 
   useEffect(() => {
     if (!ref || ref === "—") return;

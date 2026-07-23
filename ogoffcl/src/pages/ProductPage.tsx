@@ -6,6 +6,7 @@ import type { Product } from "../lib/types";
 import { money } from "../lib/money";
 import { useCart } from "../store/CartContext";
 import ProductCard from "../components/ProductCard";
+import { usePageMeta, useJsonLd, SITE_URL } from "../lib/seo";
 
 interface VariantRow {
   id: string;
@@ -55,6 +56,40 @@ export default function ProductPage() {
     const fromProduct = Array.isArray(p?.sizes) ? p!.sizes!.map((s) => String(s).toUpperCase()) : [];
     return [...new Set([...fromVariants, ...fromProduct])];
   }, [variants, p]);
+
+  // SEO: per-product title/description/OG + schema.org Product rich result
+  usePageMeta({
+    title: p ? `${p.name} — OG OFFCL | ${money(Number(p.price))}` : "OG OFFCL — Original Gangster Official",
+    description: p
+      ? `${p.name} by OG OFFCL — ${String(p.description || "bold streetwear born in Accra").slice(0, 150)}. ${money(Number(p.price))}, mobile money accepted.`
+      : "Bold streetwear born in Accra.",
+    path: id ? `/product/${id}` : undefined,
+    image: p ? publicImageUrl(String(p.image || (p.images || [])[0] || "")) : undefined,
+    type: "product",
+  });
+  useJsonLd(
+    "product",
+    p
+      ? {
+          "@context": "https://schema.org",
+          "@type": "Product",
+          name: p.name,
+          image: [p.image, ...(p.images || [])].filter(Boolean).map((x) => publicImageUrl(String(x))),
+          description: String(p.description || `${p.name} — bold streetwear by OG OFFCL, born in Accra.`),
+          brand: { "@type": "Brand", name: "OG OFFCL" },
+          offers: {
+            "@type": "Offer",
+            url: `${SITE_URL}/product/${p.id}`,
+            price: Number(p.price),
+            priceCurrency: "GHS",
+            availability:
+              (p.stock ?? 0) <= 0 && p.stock !== null
+                ? "https://schema.org/OutOfStock"
+                : "https://schema.org/InStock",
+          },
+        }
+      : null,
+  );
 
   if (!p) {
     return (

@@ -7,6 +7,7 @@ import Footer from "./components/Footer";
 import Home from "./pages/Home";
 import Shop from "./pages/Shop";
 import ProductPage from "./pages/ProductPage";
+import Gallery from "./pages/Gallery";
 import Checkout from "./pages/Checkout";
 import Confirmation from "./pages/Confirmation";
 import RefundPolicy from "./pages/RefundPolicy";
@@ -39,6 +40,7 @@ export default function App() {
             <Route path="/" element={<Home />} />
             <Route path="/shop" element={<Shop />} />
             <Route path="/product/:id" element={<ProductPage />} />
+            <Route path="/gallery" element={<Gallery />} />
             <Route path="/checkout" element={<Checkout />} />
             <Route path="/order-confirmation" element={<Confirmation />} />
             <Route path="/refund-policy" element={<RefundPolicy />} />

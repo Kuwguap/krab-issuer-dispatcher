@@ -4,6 +4,7 @@ import { supabase } from "../lib/supabase";
 import { money, CURRENCY } from "../lib/money";
 import { useCart } from "../store/CartContext";
 import Reveal from "../components/Reveal";
+import { usePageMeta } from "../lib/seo";
 
 interface Applied {
   code: string;
@@ -36,6 +37,13 @@ export default function Checkout() {
   const [pay, setPay] = useState<PayState>({ step: "form" });
   const [otp, setOtp] = useState("");
   const [otpBusy, setOtpBusy] = useState(false);
+
+  usePageMeta({
+    title: "Checkout — OG OFFCL",
+    description: "Secure mobile-money checkout — MTN, Telecel and AT, powered by Moolre.",
+    path: "/checkout",
+    noindex: true,
+  });
   const pollRef = useRef<number | null>(null);
 
   const discountAmount = useMemo(
