@@ -132,7 +132,7 @@ async function renderPlayerCard(p: Player): Promise<string> {
   ctx.fillStyle = INK; ctx.font = '44px "Archivo Black"'; ctx.textAlign = "left";
   ctx.fillText("OGOFFCL.STORE/TOURNAMENT", 70, H - 40);
   ctx.textAlign = "right"; ctx.font = '700 28px "Space Grotesk"';
-  ctx.fillText("GH₵1,000 POT", W - 70, H - 42);
+  ctx.fillText("1ST AUGUST", W - 70, H - 42);
   return c.toDataURL("image/png");
 }
 
