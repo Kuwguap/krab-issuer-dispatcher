@@ -103,15 +103,23 @@ export default function AdminEmail() {
     else say(`Send failed: ${r.error || "unknown"}`);
   };
 
-  const preview = useMemo(() => `<!doctype html><html><body style="margin:0;background:#0A0A0A;padding:24px 12px;font-family:Arial,Helvetica,sans-serif;">
-  <div style="max-width:560px;margin:0 auto;background:#141414;border:1px solid #2a2a2a;">
-    <div style="padding:20px 24px;border-bottom:2px solid #C8FF00;"><span style="font-size:22px;font-weight:900;color:#F5F2EA;letter-spacing:1px;">OG<span style="color:#C8FF00;">.</span>OFFCL</span></div>
-    <div style="padding:24px;color:#d8d5cc;font-size:14px;line-height:1.65;">
-      <h1 style="margin:0 0 14px;font-size:20px;color:#F5F2EA;text-transform:uppercase;letter-spacing:1px;">${subject || "Subject preview"}</h1>
-      ${html || "<p style='color:#6b675e'>Your email body will preview here…</p>"}
-    </div>
-    <div style="padding:16px 24px;border-top:1px solid #2a2a2a;color:#6b675e;font-size:11px;text-transform:uppercase;letter-spacing:2px;">Original Gangster Official — Accra</div>
-  </div></body></html>`, [subject, html]);
+  // Mirrors the table-based shell the server wraps real sends in (api/_lib.js
+  // emailShell) so the preview matches what subscribers actually receive.
+  const preview = useMemo(() => `<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><meta name="color-scheme" content="dark"><style>:root{color-scheme:dark}body{margin:0;padding:0}table{border-collapse:collapse}</style></head>
+<body style="margin:0;padding:0;background-color:#0a0a0a;">
+<table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" bgcolor="#0a0a0a" style="width:100%;background-color:#0a0a0a;">
+  <tr><td align="center" style="padding:24px 12px;background-color:#0a0a0a;">
+    <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" bgcolor="#141414" style="max-width:560px;width:100%;background-color:#141414;border:1px solid #2a2a2a;">
+      <tr><td style="padding:20px 24px;border-bottom:2px solid #C8FF00;font-family:Arial,Helvetica,sans-serif;"><span style="font-size:22px;font-weight:900;color:#F5F2EA;letter-spacing:1px;">OG<span style="color:#C8FF00;">.</span>OFFCL</span></td></tr>
+      <tr><td style="padding:24px;color:#d8d5cc;font-size:15px;line-height:1.65;font-family:Arial,Helvetica,sans-serif;">
+        <h1 style="margin:0 0 14px;font-size:20px;color:#F5F2EA;text-transform:uppercase;letter-spacing:1px;">${subject || "Subject preview"}</h1>
+        ${html || "<p style='color:#6b675e'>Your email body will preview here…</p>"}
+      </td></tr>
+      <tr><td style="padding:16px 24px;border-top:1px solid #2a2a2a;color:#6b675e;font-size:11px;text-transform:uppercase;letter-spacing:2px;font-family:Arial,Helvetica,sans-serif;">Original Gangster Official — Accra</td></tr>
+    </table>
+  </td></tr>
+</table>
+</body></html>`, [subject, html]);
 
   return (
     <div className="space-y-10">

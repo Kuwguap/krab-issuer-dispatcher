@@ -187,28 +187,59 @@ async function sendEmailBatch(messages) {
 }
 
 // ── Email HTML (shared shell) ──────────────────────────────────────────────
+// Table-based + fully inline-styled: mobile mail apps (Gmail especially)
+// strip <body> styles and choke on div layouts, which left the emails looking
+// unstyled on phones. The wrapper TABLE carries the dark canvas so it survives
+// body-stripping; color-scheme metas stop Gmail's auto-dark from inverting the
+// design; the media query bumps padding/type for small screens.
 function emailShell(title, bodyHtml) {
-  return `<!doctype html><html><body style="margin:0;background:#0A0A0A;padding:24px 12px;font-family:Arial,Helvetica,sans-serif;">
-  <div style="max-width:560px;margin:0 auto;background:#141414;border:1px solid #2a2a2a;">
-    <div style="padding:20px 24px;border-bottom:2px solid #C8FF00;">
-      <span style="font-size:22px;font-weight:900;color:#F5F2EA;letter-spacing:1px;">OG<span style="color:#C8FF00;">.</span>OFFCL</span>
-    </div>
-    <div style="padding:24px;color:#d8d5cc;font-size:14px;line-height:1.65;">
-      <h1 style="margin:0 0 14px;font-size:20px;color:#F5F2EA;text-transform:uppercase;letter-spacing:1px;">${title}</h1>
-      ${bodyHtml}
-    </div>
-    <div style="padding:16px 24px;border-top:1px solid #2a2a2a;color:#6b675e;font-size:11px;text-transform:uppercase;letter-spacing:2px;">
-      Original Gangster Official — Accra · <a href="${env.siteUrl}" style="color:#C8FF00;text-decoration:none;">ogoffcl.store</a>
-    </div>
-  </div></body></html>`;
+  return `<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="dark">
+<meta name="supported-color-schemes" content="dark">
+<style>
+  :root { color-scheme: dark; supported-color-schemes: dark; }
+  body { margin: 0; padding: 0; }
+  table { border-collapse: collapse; }
+  @media only screen and (max-width: 620px) {
+    .og-outer { padding: 12px 8px !important; }
+    .og-inner { padding: 22px 16px !important; }
+    .og-head, .og-foot { padding-left: 16px !important; padding-right: 16px !important; }
+    .og-h1 { font-size: 22px !important; }
+    .og-body { font-size: 16px !important; }
+  }
+</style>
+</head>
+<body style="margin:0;padding:0;background-color:#0a0a0a;">
+<table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" bgcolor="#0a0a0a" style="width:100%;background-color:#0a0a0a;">
+  <tr><td class="og-outer" align="center" style="padding:24px 12px;background-color:#0a0a0a;">
+    <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" bgcolor="#141414" style="max-width:560px;width:100%;background-color:#141414;border:1px solid #2a2a2a;">
+      <tr><td class="og-head" style="padding:20px 24px;border-bottom:2px solid #C8FF00;font-family:Arial,Helvetica,sans-serif;">
+        <span style="font-size:22px;font-weight:900;color:#F5F2EA;letter-spacing:1px;">OG<span style="color:#C8FF00;">.</span>OFFCL</span>
+      </td></tr>
+      <tr><td class="og-inner og-body" style="padding:24px;color:#d8d5cc;font-size:15px;line-height:1.65;font-family:Arial,Helvetica,sans-serif;">
+        <h1 class="og-h1" style="margin:0 0 14px;font-size:20px;color:#F5F2EA;text-transform:uppercase;letter-spacing:1px;font-family:Arial,Helvetica,sans-serif;">${title}</h1>
+        ${bodyHtml}
+      </td></tr>
+      <tr><td class="og-foot" style="padding:16px 24px;border-top:1px solid #2a2a2a;color:#6b675e;font-size:11px;text-transform:uppercase;letter-spacing:2px;font-family:Arial,Helvetica,sans-serif;">
+        Original Gangster Official — Accra · <a href="${env.siteUrl}" style="color:#C8FF00;text-decoration:none;">ogoffcl.store</a>
+      </td></tr>
+    </table>
+  </td></tr>
+</table>
+</body></html>`;
 }
 
 function orderItemsHtml(items) {
+  const td = "padding:8px 10px;border-bottom:1px solid #2a2a2a;font-family:Arial,Helvetica,sans-serif;font-size:14px;";
   return items.map((i) =>
     `<tr>
-      <td style="padding:8px 10px;border-bottom:1px solid #2a2a2a;color:#F5F2EA;">${i.product_name}${i.size ? ` <span style="color:#8b877e;">(${i.size})</span>` : ""}</td>
-      <td style="padding:8px 10px;border-bottom:1px solid #2a2a2a;color:#8b877e;">×${i.quantity}</td>
-      <td style="padding:8px 10px;border-bottom:1px solid #2a2a2a;color:#C8FF00;text-align:right;">GH₵${Number(i.price ?? i.unit_price ?? 0) * Number(i.quantity || 1)}</td>
+      <td style="${td}color:#F5F2EA;">${i.product_name}${i.size ? ` <span style="color:#8b877e;">(${i.size})</span>` : ""}</td>
+      <td style="${td}color:#8b877e;white-space:nowrap;">×${i.quantity}</td>
+      <td style="${td}color:#C8FF00;text-align:right;white-space:nowrap;">GH₵${Number(i.price ?? i.unit_price ?? 0) * Number(i.quantity || 1)}</td>
     </tr>`).join("");
 }
 
