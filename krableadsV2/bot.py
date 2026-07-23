@@ -9034,7 +9034,7 @@ async def cmd_followup_start(update: Update, context: ContextTypes.DEFAULT_TYPE)
     Client contact defaults to ON: the bot emails/texts the client unless the
     agent taps the 🤖 button to turn it off.
     """
-    context.user_data["fu"] = {"chase": True, "end_key": "on_order"}
+    context.user_data["fu"] = {"chase": True, "end_key": "on_order", "freq": "daily"}
     await _fu_render_menu(context.user_data["fu"], reply=update.message.reply_text)
     return STATE_FU_MENU
 
@@ -9059,8 +9059,22 @@ async def handle_fu_menu_text(update: Update, context: ContextTypes.DEFAULT_TYPE
             fu["phone_number"] = parsed["phone"]
         if parsed.get("email"):
             fu["email"] = parsed["email"]
-        if parsed.get("notes") and not fu.get("notes"):
-            fu["notes"] = parsed["notes"]
+        # Everything NOT parsed into a field is kept as notes: strip the
+        # recognized name/phone/email out of the paste and save the rest.
+        leftover = text
+        for v in (parsed.get("name"), parsed.get("email")):
+            if v:
+                leftover = re.sub(re.escape(v), " ", leftover, flags=re.IGNORECASE)
+        leftover = re.sub(r"\+?1?[\s\-.(]*\d{3}[)\s\-.]*\d{3}[\s\-.]*\d{4}", " ", leftover)
+        leftover = re.sub(r"[\w.+-]+@[\w-]+\.[\w.-]+", " ", leftover)
+        leftover = " ".join(leftover.split()).strip(" -–—•,;:|")
+        pieces = []
+        for p in (fu.get("notes"), parsed.get("notes"), leftover):
+            p = (p or "").strip()
+            if p and all(p.lower() not in q.lower() for q in pieces):
+                pieces.append(p)
+        if pieces:
+            fu["notes"] = " | ".join(pieces)[:500]
         filled = [n for n, k in (("name", "client_name"), ("phone", "phone_number"),
                                  ("email", "email"), ("notes", "notes")) if fu.get(k)]
         await update.message.reply_text(
@@ -9230,7 +9244,7 @@ async def _fu_finish_save(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
     # No frequency chosen → save as a plain contact, no reminders.
     if not fu.get("freq"):
-        db.create_client_followup(
+        row = db.create_client_followup(
             user_id=update.effective_user.id,
             telegram_username=update.effective_user.username,
             client_name=fu.get("client_name"),
@@ -9238,6 +9252,12 @@ async def _fu_finish_save(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             notes=fu.get("notes"),
             email=fu.get("email"),
         )
+        if not row:
+            await query.message.edit_text(
+                "❌ Could not save the follow-up to the database.\n"
+                "Run database/migration_client_followups.sql (+ _v2) on Supabase, then try again."
+            )
+            return STATE_FU_MENU
         await query.message.edit_text(
             f"💾 Saved {name}. No reminders set (no frequency chosen)."
         )
@@ -9263,7 +9283,7 @@ async def _fu_finish_save(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     end_iso = None
     if end_key in _FU_END_DAYS:
         end_iso = (start_utc + timedelta(days=_FU_END_DAYS[end_key])).isoformat()
-    db.create_client_followup(
+    row = db.create_client_followup(
         user_id=update.effective_user.id,
         telegram_username=update.effective_user.username,
         client_name=fu.get("client_name"),
@@ -9276,6 +9296,12 @@ async def _fu_finish_save(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         contact_client=chase,
         end_at=end_iso,
     )
+    if not row:
+        await query.message.edit_text(
+            "❌ Could not save the follow-up to the database.\n"
+            "Run database/migration_client_followups.sql (+ _v2) on Supabase, then try again."
+        )
+        return STATE_FU_MENU
     chase_line = (
         "🤖 The bot will text/email the client on this schedule — they'll chase YOU."
         if chase else "You'll get a DM until you close or stop it."

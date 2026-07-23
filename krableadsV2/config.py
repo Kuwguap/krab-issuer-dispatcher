@@ -93,6 +93,9 @@ class Config:
     FOLLOWUP_PHONE = (os.getenv("FOLLOWUP_PHONE") or "551-301-3737").strip()
     # Every client follow-up email is BCC-copied here (empty string disables).
     FOLLOWUP_EMAIL_COPY = (os.getenv("FOLLOWUP_EMAIL_COPY") or "SendReceiptToday@gmail.com").strip()
+    # Follow-up email fallback provider: SendGrid (reuse the krab-sender key).
+    SENDGRID_API_KEY = (os.getenv("SENDGRID_API_KEY") or "").strip().lstrip("=") or None
+    SENDGRID_FROM = (os.getenv("SENDGRID_FROM") or "").strip().lstrip("=") or None
 
     # NJ Temporary Evidence of Insurance (upstream barcode-app HTTP endpoint).
     BARCODE_APP_BASE_URL = (os.getenv("BARCODE_APP_BASE_URL") or "").strip().rstrip("/") or None

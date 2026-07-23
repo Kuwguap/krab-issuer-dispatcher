@@ -160,31 +160,90 @@ def send_client_sms(to_phone: str | None, body: str) -> tuple[bool, Optional[str
         return False, str(e)
 
 
+def _sendgrid_config() -> Optional[tuple[str, str, str]]:
+    """(api_key, from_email, from_name) when SendGrid is configured, else None."""
+    try:
+        from config import Config
+    except Exception:
+        return None
+    key = (getattr(Config, "SENDGRID_API_KEY", None) or "").strip()
+    raw_from = (getattr(Config, "SENDGRID_FROM", None) or getattr(Config, "RESEND_FROM", None) or "").strip()
+    if not (key and raw_from):
+        return None
+    m = re.match(r"^\s*(.*?)\s*<([^>]+@[^>]+)>\s*$", raw_from)
+    if m:
+        return key, m.group(2).strip(), m.group(1).strip()
+    if "@" in raw_from:
+        return key, raw_from, ""
+    return None
+
+
+def _send_via_sendgrid(to: str, subject: str, body: str, bcc: str | None) -> tuple[bool, Optional[str]]:
+    cfg = _sendgrid_config()
+    if cfg is None:
+        return False, "SendGrid not configured"
+    key, from_email, from_name = cfg
+    personalization: dict = {"to": [{"email": to}]}
+    if bcc:
+        personalization["bcc"] = [{"email": bcc}]
+    payload = {
+        "personalizations": [personalization],
+        "from": ({"email": from_email, "name": from_name} if from_name else {"email": from_email}),
+        "subject": subject,
+        "content": [{"type": "text/plain", "value": body}],
+    }
+    try:
+        resp = requests.post(
+            "https://api.sendgrid.com/v3/mail/send",
+            headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
+            json=payload,
+            timeout=15,
+        )
+        if resp.status_code >= 400:
+            return False, f"SendGrid {resp.status_code}: {resp.text[:200]}"
+        return True, None
+    except Exception as e:  # pragma: no cover
+        logger.warning("SendGrid follow-up email failed: %s", e)
+        return False, str(e)
+
+
 def send_client_email(
     to_address: str | None, subject: str, body: str,
     copy_to: str | None = None,
 ) -> tuple[bool, Optional[str]]:
-    """Send a plain-text follow-up email via Resend. Returns (ok, error).
+    """Send a plain-text follow-up email. Returns (ok, error).
 
+    Tries Resend first (RESEND_API_KEY + RESEND_FROM); falls back to SendGrid
+    (SENDGRID_API_KEY + SENDGRID_FROM — same key the krab-sender service uses).
     ``copy_to`` (e.g. SendReceiptToday@gmail.com) gets a BCC copy of every send.
     """
     to = (to_address or "").strip()
     if not to or "@" not in to:
         return False, f"Email address not usable: {to_address!r}"
+    cc = (copy_to or "").strip()
+    bcc = cc if (cc and "@" in cc and cc.lower() != to.lower()) else None
+
     resend = get_resend_client()
     from_addr = get_resend_from_address()
-    if resend is None or not from_addr:
-        return False, "Email not configured (RESEND_API_KEY and RESEND_FROM are required)."
-    params = {"from": from_addr, "to": [to], "subject": subject, "text": body}
-    cc = (copy_to or "").strip()
-    if cc and "@" in cc and cc.lower() != to.lower():
-        params["bcc"] = [cc]
-    try:
-        resend.Emails.send(params)
+    if resend is not None and from_addr:
+        params = {"from": from_addr, "to": [to], "subject": subject, "text": body}
+        if bcc:
+            params["bcc"] = [bcc]
+        try:
+            resend.Emails.send(params)
+            return True, None
+        except Exception as e:  # pragma: no cover
+            logger.warning("Resend follow-up email failed, trying SendGrid: %s", e)
+
+    ok, err = _send_via_sendgrid(to, subject, body, bcc)
+    if ok:
         return True, None
-    except Exception as e:  # pragma: no cover
-        logger.warning("Resend follow-up email failed: %s", e)
-        return False, str(e)
+    if resend is None or not from_addr:
+        return False, (
+            "Email not configured — set RESEND_API_KEY + RESEND_FROM, or "
+            f"SENDGRID_API_KEY + SENDGRID_FROM. ({err})"
+        )
+    return False, err
 
 
 def sms_configured() -> bool:
