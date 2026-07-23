@@ -216,7 +216,7 @@ async function renderAdPoster(playerCount: number): Promise<string> {
   ctx.fillText("+ 2 MERCH PIECES FROM THE RACK", 94, 820);
 
   // chips row
-  const chips = ["1V1", "ULTIMATE TEAM", "6-MIN HALVES", "PS5 · XBOX · PC", "STREAMED LIVE"];
+  const chips = ["AUG 1ST", "1V1", "ULTIMATE TEAM", "PS5 · XBOX · PC", "STREAMED LIVE"];
   let cx = 60;
   ctx.font = '700 24px "Space Grotesk"';
   for (const t of chips) {
@@ -240,10 +240,12 @@ async function renderAdPoster(playerCount: number): Promise<string> {
   card(60, 460, "GH₵50", "ENTRY · SPOT + MATCH CARD");
   card(560, 460, "+GH₵20", "HUB · KNUST KUMASI · 200MBPS");
 
-  ctx.fillStyle = playerCount > 0 ? ACID : "rgba(245,242,234,0.5)";
+  ctx.fillStyle = ACID;
   ctx.font = '700 30px "Space Grotesk"'; ctx.textAlign = "left";
   ctx.fillText(
-    playerCount > 0 ? `${playerCount} PLAYERS ALREADY LOCKED IN — DON'T WATCH FROM THE BENCH` : "LIMITED SPOTS — FIRST PAID, FIRST SEATED",
+    playerCount > 0
+      ? `1ST AUGUST · ${playerCount} LOCKED IN · LIMITED SPOTS LEFT`
+      : "1ST AUGUST · LIMITED SPOTS — FIRST PAID, FIRST SEATED",
     60, 1208,
   );
 

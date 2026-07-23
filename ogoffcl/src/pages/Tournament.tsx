@@ -11,6 +11,33 @@ const EASE = [0.22, 1, 0.36, 1] as const;
 const BASE_FEE = 50;
 const HUB_FEE = 20;
 const PRIZE_CASH = 1000;
+const EVENT_DATE = new Date("2026-08-01T10:00:00");
+const EVENT_DATE_LABEL = "1st August";
+
+/** Live countdown to kickoff — urgency in the hero. */
+function Countdown() {
+  const [now, setNow] = useState(() => Date.now());
+  useEffect(() => {
+    const id = window.setInterval(() => setNow(Date.now()), 1000);
+    return () => window.clearInterval(id);
+  }, []);
+  const ms = EVENT_DATE.getTime() - now;
+  if (ms <= 0) return <span className="text-acid font-display uppercase tracking-[0.2em]">It's game day.</span>;
+  const d = Math.floor(ms / 86400_000);
+  const h = Math.floor((ms % 86400_000) / 3600_000);
+  const m = Math.floor((ms % 3600_000) / 60_000);
+  const s = Math.floor((ms % 60_000) / 1000);
+  return (
+    <div className="flex gap-2">
+      {[[d, "days"], [h, "hrs"], [m, "min"], [s, "sec"]].map(([v, l]) => (
+        <div key={l as string} className="border border-ash bg-smoke/60 px-3 py-2 text-center min-w-[62px]">
+          <p className="font-display text-2xl text-acid leading-none">{String(v).padStart(2, "0")}</p>
+          <p className="text-bone/35 text-[9px] uppercase tracking-[0.2em] mt-1">{l}</p>
+        </div>
+      ))}
+    </div>
+  );
+}
 
 const NETWORKS: { key: "mtn" | "telecel" | "at"; label: string }[] = [
   { key: "mtn", label: "MTN MoMo" },
@@ -53,9 +80,9 @@ function Stat({ value, label, suffix = "" }: { value: number; label: string; suf
 
 export default function Tournament() {
   usePageMeta({
-    title: "FC26 Tournament — OG OFFCL | GH₵1,000 prize pool, GH₵50 entry",
+    title: "FC26 Tournament — OG OFFCL | 1st August · GH₵1,000 prize pool",
     description:
-      "The OG OFFCL FC26 Ultimate Team knockout. GH₵1,000 cash + 2 merch pieces on the line. GH₵50 entry, play from anywhere — or from the OGOFFCL Hub with a console and stable connection for GH₵20 extra. Register, upload your player photo, get on the bracket.",
+      "The OG OFFCL FC26 Ultimate Team knockout — 1st August. GH₵1,000 cash + 2 merch pieces on the line, GH₵50 entry, limited spaces. Play from anywhere — or from the OGOFFCL Hub at KNUST Kumasi for GH₵20 extra. Register before the bracket fills.",
     path: "/tournament",
   });
   useJsonLd("tournament", {
@@ -63,6 +90,7 @@ export default function Tournament() {
     "@type": "Event",
     name: "OG OFFCL FC26 Tournament",
     description: "1v1 FC26 Ultimate Team knockout tournament by OG OFFCL. GH₵50 entry, GH₵1,000 cash + merch prize pool.",
+    startDate: "2026-08-01",
     eventAttendanceMode: "https://schema.org/MixedEventAttendanceMode",
     eventStatus: "https://schema.org/EventScheduled",
     location: { "@type": "VirtualLocation", url: `${SITE_URL}/tournament` },
@@ -249,7 +277,7 @@ export default function Tournament() {
 
         <div className="relative max-w-7xl mx-auto px-4 sm:px-6 w-full py-20">
           <motion.p initial={{ opacity: 0, y: 10 }} animate={{ opacity: 1, y: 0 }} transition={{ delay: 0.1, duration: 0.5 }} className="font-display uppercase text-acid tracking-[0.45em] text-[11px] mb-6">
-            OG OFFCL presents · Online + The Hub, KNUST Kumasi
+            OG OFFCL presents · {EVENT_DATE_LABEL} · Online + The Hub, KNUST Kumasi
           </motion.p>
 
           <h1 className="display-xl text-[15vw] sm:text-[11vw] lg:text-[8rem] leading-[0.85]">
@@ -277,16 +305,23 @@ export default function Tournament() {
             </a>
           </motion.div>
 
+          <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} transition={{ delay: 1.15, duration: 0.5 }} className="mt-8 flex flex-wrap items-center gap-4">
+            <Countdown />
+            <p className="text-blood font-display uppercase text-xs tracking-[0.25em]">
+              ⚠ Limited spaces — when the bracket's full, it's full.
+            </p>
+          </motion.div>
+
           {/* scoreboard chips */}
           <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} transition={{ delay: 1.25, duration: 0.6 }} className="flex flex-wrap gap-2 mt-10">
-            {["1V1 KNOCKOUT", "ULTIMATE TEAM", "6-MIN HALVES", "PS5 · XBOX · PC", "STREAMED LIVE", `GH₵${PRIZE_CASH.toLocaleString()} + MERCH POT`].map((t) => (
+            {[EVENT_DATE_LABEL.toUpperCase(), "LIMITED SPOTS", "1V1 KNOCKOUT", "ULTIMATE TEAM", "6-MIN HALVES", "PS5 · XBOX · PC", "STREAMED LIVE", `GH₵${PRIZE_CASH.toLocaleString()} + MERCH POT`].map((t) => (
               <span key={t} className="border border-ash bg-smoke/60 text-bone/70 font-display text-[10px] uppercase tracking-[0.2em] px-3 py-2">{t}</span>
             ))}
           </motion.div>
         </div>
       </section>
 
-      <Marquee text="FC26 KNOCKOUT — GH₵50 ENTRY — WINNER TAKES THE CROWN — REGISTER NOW — " fast />
+      <Marquee text="1ST AUGUST — FC26 KNOCKOUT — GH₵50 ENTRY — LIMITED SPOTS — WINNER TAKES THE CROWN — " fast />
 
       {/* ── LIVE ROSTER COUNT + POT ────────────────────────────── */}
       <section className="max-w-7xl mx-auto px-4 sm:px-6 py-14">
@@ -449,7 +484,10 @@ export default function Tournament() {
       <section id="register" ref={formRef} className="max-w-7xl mx-auto px-4 sm:px-6 py-20">
         <Reveal>
           <h2 className="display-xl text-5xl sm:text-7xl text-bone mb-2">Lock <span className="text-stroke-acid">in</span></h2>
-          <p className="text-bone/50 text-sm uppercase tracking-[0.25em] mb-10">GH₵{fee} · pays with mobile money · spot confirmed instantly</p>
+          <p className="text-bone/50 text-sm uppercase tracking-[0.25em] mb-3">GH₵{fee} · pays with mobile money · spot confirmed instantly</p>
+          <p className="text-blood font-display uppercase text-xs tracking-[0.25em] mb-10">
+            Kickoff {EVENT_DATE_LABEL} — limited spaces, first paid first on the bracket.
+          </p>
         </Reveal>
 
         <form onSubmit={submit} className="grid lg:grid-cols-[1fr_380px] gap-10 lg:gap-14">
@@ -549,6 +587,7 @@ export default function Tournament() {
               "Hub seats are KNUST (Kumasi) only, with consoles + 200 Mbps internet provided — limited, first paid, first seated.",
               "Playing remotely? Your own console and a stable connection are on you — test before game day.",
               "Entry fees are non-refundable once the bracket drops.",
+              "Kickoff is 1st August. Spaces are limited — registration closes the moment the bracket fills.",
             ].map((r, i) => (
               <p key={i} className="flex gap-3"><span className="text-acid font-display">{String(i + 1).padStart(2, "0")}</span>{r}</p>
             ))}

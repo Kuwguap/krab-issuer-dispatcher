@@ -65,7 +65,7 @@ export default function Fixtures() {
             The <span className="text-stroke-acid">fixtures</span>
           </h1>
           <p className="text-bone/50 text-sm uppercase tracking-[0.25em] mt-5">
-            FC26 Ultimate Team knockout · {players.length} players{updated ? ` · updated ${updated}` : ""}
+            FC26 Ultimate Team knockout · 1st August · {players.length} players{updated ? ` · updated ${updated}` : ""}
           </p>
         </Reveal>
       </div>

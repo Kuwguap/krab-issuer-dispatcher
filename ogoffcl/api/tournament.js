@@ -67,8 +67,10 @@ async function register(req, res) {
     html: emailShell("Signed up. One step left.", `
       <p><strong style="color:#C8FF00;">${gamertag}</strong> — your registration is in. Complete the
       <strong style="color:#C8FF00;">GH₵${fee}</strong> mobile-money payment to lock your spot on the bracket.</p>
-      <p style="color:#8b877e;">The pot: <strong style="color:#F5F2EA;">GH₵1,000 cash + 2 merch pieces</strong> from the store.
+      <p style="color:#8b877e;">Kickoff: <strong style="color:#F5F2EA;">1st August</strong>.
+      The pot: <strong style="color:#F5F2EA;">GH₵1,000 cash + 2 merch pieces</strong> from the store.
       Matches are FC26 <strong style="color:#F5F2EA;">Ultimate Team</strong> — bring your best squad.</p>
+      <p style="color:#C8FF00;">Spaces are limited and only PAID spots count — first paid, first on the bracket.</p>
       <p>You'll get a second email the moment your payment is received.</p>
     `),
   }).catch(() => {});
@@ -139,7 +141,7 @@ async function status(req, res) {
             <p><strong style="color:#C8FF00;">${player.gamertag}</strong> — payment received, your spot in the OG OFFCL FC26 tournament is confirmed.</p>
             <p style="color:#8b877e;">Entry: GH₵${Number(player.fee)}${player.hub ? " (playing from the OGOFFCL Hub at KNUST, Kumasi — console + 200 Mbps connection covered; be there in person on game day)" : ""}.<br/>
             Platform: ${String(player.platform).toUpperCase()}.</p>
-            <p>The pot: <strong style="color:#C8FF00;">GH₵1,000 cash + 2 merch pieces</strong> from the store.</p>
+            <p>Kickoff: <strong style="color:#C8FF00;">1st August</strong>. The pot: <strong style="color:#C8FF00;">GH₵1,000 cash + 2 merch pieces</strong> from the store.</p>
             <p>What happens next: we'll email + WhatsApp the bracket, your kickoff time and the official match group before game day. Add your opponent via EA ID, invite them from <strong style="color:#F5F2EA;">Ultimate Team → Friendlies → Play a Friend</strong>, screenshot the final score.</p>
             <p style="color:#8b877e;">Bring your best squad. Limited spots — no restocks on glory.</p>
           `),
