@@ -115,7 +115,7 @@ export default function AdminEmail() {
 
   return (
     <div className="space-y-10">
-      {msg && <div className="fixed top-4 right-4 z-50 bg-acid text-ink font-display uppercase text-xs px-4 py-3 shadow-lg">{msg}</div>}
+      {msg && <div className="fixed top-4 inset-x-4 sm:inset-x-auto sm:right-4 z-50 bg-acid text-ink font-display uppercase text-xs px-4 py-3 shadow-lg">{msg}</div>}
       {tableMissing && (
         <p className="border border-blood/40 bg-blood/10 text-blood text-sm px-4 py-3">
           Email tables don't exist yet — run <code>supabase/migration_moolre_email.sql</code> in the Supabase SQL editor, then reload.
@@ -133,7 +133,7 @@ export default function AdminEmail() {
             {templates.map((t) => (
               <div key={t.id} className={`flex items-center gap-2 px-3 py-2.5 cursor-pointer ${activeTemplate === t.id ? "bg-acid/10" : "hover:bg-bone/5"}`} onClick={() => openTemplate(t)}>
                 <span className="text-sm text-bone truncate flex-1">{t.name}</span>
-                <button onClick={(e) => { e.stopPropagation(); delTemplate(t); }} className="text-blood/60 hover:text-blood text-xs">✕</button>
+                <button onClick={(e) => { e.stopPropagation(); delTemplate(t); }} className="px-3 py-2.5 -my-2.5 -mr-1 text-blood/60 hover:text-blood text-xs">✕</button>
               </div>
             ))}
             {templates.length === 0 && <p className="px-3 py-4 text-bone/40 text-xs">No saved templates yet.</p>}

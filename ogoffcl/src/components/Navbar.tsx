@@ -40,7 +40,7 @@ export default function Navbar() {
           <button
             aria-label="Menu"
             onClick={() => setMenu(true)}
-            className="md:hidden flex flex-col gap-1.5 p-2 -ml-2"
+            className="md:hidden flex flex-col justify-center gap-1.5 p-3 -ml-3 min-h-[44px] min-w-[44px]"
           >
             <span className="block w-6 h-0.5 bg-bone" />
             <span className="block w-4 h-0.5 bg-acid" />
@@ -87,7 +87,10 @@ export default function Navbar() {
                 ×
               </button>
             </div>
-            <nav className="flex-1 flex flex-col justify-center px-8 gap-2">
+            {/* min-h-0 + overflow: on landscape phones the links are taller than
+                the viewport — scroll instead of clipping the first/last link */}
+            <nav className="flex-1 min-h-0 overflow-y-auto flex flex-col px-8 py-4">
+              <div className="m-auto w-full flex flex-col gap-2">
               {links.map((l, i) => (
                 <motion.div
                   key={l.label}
@@ -100,6 +103,7 @@ export default function Navbar() {
                   </NavLink>
                 </motion.div>
               ))}
+              </div>
             </nav>
             <div className="p-8 text-bone/40 text-xs uppercase tracking-[0.3em]">Original Gangster Official</div>
           </motion.div>

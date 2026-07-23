@@ -134,22 +134,26 @@ export default function AdminProducts() {
 
       <div className="grid gap-3">
         {rows.map((p) => (
-          <div key={p.id} className="flex items-center gap-4 border border-ash bg-smoke/50 p-3">
+          // flex-wrap: without it the three buttons crushed the name column to
+          // ~3 characters at 375px — on wrap the buttons drop to their own row
+          <div key={p.id} className="flex flex-wrap items-center gap-3 border border-ash bg-smoke/50 p-3">
             <div className="w-14 h-16 bg-bone overflow-hidden shrink-0">
               {p.image && <img src={publicImageUrl(String(p.image))} alt="" className="w-full h-full object-cover mix-blend-multiply" />}
             </div>
-            <div className="flex-1 min-w-0">
+            <div className="flex-1 min-w-[10rem]">
               <p className="font-display uppercase text-sm text-bone truncate">{p.name}</p>
               <p className="text-bone/40 text-xs mt-0.5">
                 {money(p.price)} · {p.product_category || "—"} · stock {p.stock ?? "∞"}
                 {!p.is_active && <span className="text-blood ml-2">HIDDEN</span>}
               </p>
             </div>
-            <button onClick={() => toggleActive(p)} className="btn-og border-2 border-ash text-bone/70 px-3 py-1.5 text-[10px] hover:border-bone">
-              {p.is_active ? "Hide" : "Show"}
-            </button>
-            <button onClick={() => openEdit(p)} className="btn-og bg-bone text-ink px-3 py-1.5 text-[10px] hover:bg-acid">Edit</button>
-            <button onClick={() => del(p)} className="btn-og border-2 border-blood/40 text-blood px-3 py-1.5 text-[10px] hover:bg-blood hover:text-bone">Del</button>
+            <div className="flex gap-2 ml-auto">
+              <button onClick={() => toggleActive(p)} className="btn-og border-2 border-ash text-bone/70 px-3 py-2.5 text-[10px] hover:border-bone">
+                {p.is_active ? "Hide" : "Show"}
+              </button>
+              <button onClick={() => openEdit(p)} className="btn-og bg-bone text-ink px-3 py-2.5 text-[10px] hover:bg-acid">Edit</button>
+              <button onClick={() => del(p)} className="btn-og border-2 border-blood/40 text-blood px-3 py-2.5 text-[10px] hover:bg-blood hover:text-bone">Del</button>
+            </div>
           </div>
         ))}
       </div>

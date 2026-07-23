@@ -84,6 +84,13 @@ input, textarea, select {
   @apply bg-smoke border border-ash text-bone placeholder:text-bone/30 focus:border-acid focus:outline-none;
 }
 
+/* iOS Safari force-zooms the whole page when focusing a control whose
+   font-size is under 16px (our inputs are text-sm/text-xs). Keep form
+   controls at 16px on phones so tapping a field never zooms the layout. */
+@media (max-width: 639px) {
+  input, textarea, select { font-size: 16px !important; }
+}
+
 img { user-select: none; }
 
 /* ── Home: runway strip (vertical lookbook loop) ───────────────── */

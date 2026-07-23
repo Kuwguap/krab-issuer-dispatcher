@@ -116,11 +116,16 @@ export default function LockGate({ children }: { children: ReactNode }) {
         {locked && (
           <motion.div
             key="lock"
-            className="fixed inset-0 z-[100] bg-ink flex flex-col items-center justify-center px-6 overflow-hidden"
+            // Scrollable overlay (was justify-center + overflow-hidden): on short
+            // viewports — landscape phones, keyboard up — centered content clipped
+            // at BOTH ends with no scroll path, stranding the waitlist button.
+            // my-auto on the content centers when there's room, scrolls when not.
+            className="fixed inset-0 z-[100] bg-ink flex flex-col items-center px-6 py-10 overflow-y-auto"
             exit={{ y: "-100%", transition: { duration: 0.7, ease: [0.76, 0, 0.24, 1] } }}
           >
-            {/* moving backdrop type */}
-            <div className="absolute inset-0 opacity-[0.05] pointer-events-none select-none" aria-hidden>
+            {/* moving backdrop type (overflow-hidden here so its nowrap rows
+                can't hand the now-scrollable parent a horizontal scrollbar) */}
+            <div className="fixed inset-0 overflow-hidden opacity-[0.05] pointer-events-none select-none" aria-hidden>
               {[...Array(7)].map((_, r) => (
                 <div key={r} className="whitespace-nowrap font-display uppercase text-[11vh] leading-none" style={{ transform: `translateX(${r % 2 ? -12 : 0}%)` }}>
                   {Array(8).fill("NEXT DROP LOADING ").join("")}
@@ -132,7 +137,7 @@ export default function LockGate({ children }: { children: ReactNode }) {
               initial={{ opacity: 0, y: 24 }}
               animate={{ opacity: 1, y: 0 }}
               transition={{ duration: 0.7, ease: [0.22, 1, 0.36, 1] }}
-              className="relative text-center w-full max-w-md"
+              className="relative text-center w-full max-w-md my-auto"
             >
               <div className="font-display uppercase text-acid tracking-[0.4em] text-[11px] mb-6 animate-pulseSoft">
                 Next drop loading
@@ -175,7 +180,7 @@ export default function LockGate({ children }: { children: ReactNode }) {
               {/* staff access */}
               <div className="mt-14">
                 {!staffOpen ? (
-                  <button onClick={() => setStaffOpen(true)} className="text-bone/25 hover:text-bone/60 text-[10px] uppercase tracking-[0.35em] transition-colors">
+                  <button onClick={() => setStaffOpen(true)} className="p-3 -m-3 text-bone/25 hover:text-bone/60 text-[10px] uppercase tracking-[0.35em] transition-colors">
                     Staff access →
                   </button>
                 ) : (

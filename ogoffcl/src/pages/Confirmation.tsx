@@ -28,9 +28,11 @@ export default function Confirmation() {
             ? "Payment received. Your order is confirmed and we're getting it packed. You'll hear from us on the phone number you dropped."
             : "Your order was saved but the payment window closed before completing. Reach us with your order number and we'll sort you out — or try checkout again."}
         </p>
-        <div className="inline-block border border-ash bg-smoke px-8 py-4 mt-8">
+        <div className="inline-block max-w-full border border-ash bg-smoke px-5 sm:px-8 py-4 mt-8">
           <p className="text-bone/40 text-[11px] uppercase tracking-[0.3em]">Order number</p>
-          <p className="font-display text-2xl text-acid mt-1">{ref}</p>
+          {/* break-all: the pending path carries the full payment ref, which is
+              longer than the mobile content box and otherwise wraps at hyphens */}
+          <p className="font-display text-xl sm:text-2xl text-acid mt-1 break-all">{ref}</p>
         </div>
         <div className="flex flex-wrap justify-center gap-4 mt-12">
           <Link to="/shop" className="btn-og bg-acid text-ink px-8 py-4 text-sm hover:bg-bone">

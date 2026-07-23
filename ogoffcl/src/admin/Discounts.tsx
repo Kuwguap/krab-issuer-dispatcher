@@ -44,7 +44,9 @@ export default function AdminDiscounts() {
         <input placeholder="CODE" value={form.code} onChange={(e) => setForm({ ...form, code: e.target.value.toUpperCase() })} className="px-4 py-3 text-sm font-display uppercase tracking-widest" />
         <input type="number" min="1" max="100" placeholder="% off" value={form.percentage} onChange={(e) => setForm({ ...form, percentage: e.target.value })} className="px-4 py-3 text-sm" />
         <input type="date" value={form.expires_at} onChange={(e) => setForm({ ...form, expires_at: e.target.value })} className="px-4 py-3 text-sm" />
-        <button className="btn-og bg-acid text-ink text-xs hover:bg-bone">Create</button>
+        {/* py-3: below sm the grid stacks and the button no longer stretches to
+            the inputs' height — without padding it collapsed to a 16px bar */}
+        <button className="btn-og bg-acid text-ink text-xs py-3 hover:bg-bone">Create</button>
       </form>
       {msg && <p className="text-blood text-sm mb-4">{msg}</p>}
       <div className="border border-ash divide-y divide-ash">

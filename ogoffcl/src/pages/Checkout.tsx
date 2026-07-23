@@ -224,13 +224,16 @@ export default function Checkout() {
   return (
     <div className="max-w-7xl mx-auto px-4 sm:px-6 py-12">
       <Reveal>
-        <h1 className="display-xl text-6xl sm:text-7xl text-bone mb-12">
+        <h1 className="display-xl text-5xl sm:text-7xl text-bone mb-10 sm:mb-12">
           Check<span className="text-stroke-acid">out</span>
         </h1>
       </Reveal>
 
-      <div className="grid lg:grid-cols-[1fr_420px] gap-12">
-        <form onSubmit={submit} className="space-y-5 order-2 lg:order-1">
+      {/* min-w-0 on both grid children: grid items default to min-width auto, so
+          the truncated (nowrap) cart-item names inflate the mobile column past
+          the viewport — 507px page on a 375px phone. */}
+      <div className="grid lg:grid-cols-[1fr_420px] gap-10 lg:gap-12">
+        <form onSubmit={submit} className="space-y-5 order-2 lg:order-1 min-w-0">
           <p className="font-display uppercase text-xs tracking-[0.3em] text-bone/50">Delivery details</p>
           <div className="grid sm:grid-cols-2 gap-4">
             <input required placeholder="Full name *" value={form.name} onChange={set("name")} className="px-4 py-4 text-sm w-full" />
@@ -270,7 +273,7 @@ export default function Checkout() {
           </p>
         </form>
 
-        <aside className="order-1 lg:order-2">
+        <aside className="order-1 lg:order-2 min-w-0">
           <div className="border border-ash bg-smoke/60 p-6 lg:sticky lg:top-24">
             <p className="font-display uppercase text-xs tracking-[0.3em] text-bone/50 mb-5">Order summary</p>
             <div className="space-y-4 max-h-72 overflow-y-auto pr-1">
@@ -291,7 +294,7 @@ export default function Checkout() {
             <div className="mt-6 flex">
               <input
                 placeholder="DISCOUNT CODE" value={codeInput} onChange={(e) => setCodeInput(e.target.value)}
-                className="flex-1 px-3 py-3 text-xs font-display uppercase tracking-[0.2em]"
+                className="flex-1 min-w-0 px-3 py-3 text-xs font-display uppercase tracking-[0.2em]"
               />
               <button type="button" onClick={applyCode} className="btn-og bg-bone text-ink px-5 text-xs hover:bg-acid">
                 Apply

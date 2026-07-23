@@ -126,7 +126,7 @@ export default function Home() {
             Streetwear · Accra, Ghana
           </motion.p>
 
-          <h1 className="display-xl text-[16vw] sm:text-[12vw] lg:text-[8.6rem]">
+          <h1 className="display-xl text-[15vw] sm:text-[12vw] lg:text-[8.6rem]">
             {["Original", "Gangster", "Official"].map((w, i) => (
               <span key={w} className="block overflow-hidden pb-[0.06em] -mb-[0.06em]">
                 <motion.span
@@ -157,7 +157,7 @@ export default function Home() {
             <Link to="/shop" className="btn-og bg-acid text-ink px-8 py-4 text-sm hover:bg-bone">
               Shop the drop →
             </Link>
-            <Link to="/shop?c=og-femme" className="link-sweep font-display uppercase text-xs tracking-[0.3em] text-bone/80 hover:text-bone py-2">
+            <Link to="/shop?c=og-femme" className="link-sweep font-display uppercase text-xs tracking-[0.3em] text-bone/80 hover:text-bone py-3">
               OG Femme
             </Link>
           </motion.div>
@@ -170,7 +170,7 @@ export default function Home() {
           transition={{ delay: 1.3, duration: 0.8 }}
           className="absolute bottom-0 inset-x-0 z-10 border-t border-ash bg-ink/70 backdrop-blur-sm"
         >
-          <div className="max-w-7xl mx-auto px-4 sm:px-6 h-11 flex items-center justify-between text-[10px] sm:text-[11px] uppercase tracking-[0.3em] text-bone/50">
+          <div className="max-w-7xl mx-auto px-4 sm:px-6 h-11 flex items-center justify-between text-[9px] tracking-[0.2em] sm:text-[11px] sm:tracking-[0.3em] uppercase text-bone/50">
             <span>Accra {clock || "—"} GMT</span>
             <span className="hidden sm:block">{products.length || "—"} pieces live</span>
             <span className="text-acid">Limited runs — no restocks</span>
@@ -185,7 +185,7 @@ export default function Home() {
         <div className="max-w-7xl mx-auto px-4 sm:px-6">
           <Reveal>
             <div className="flex items-end justify-between gap-6 mb-2">
-              <h2 className="display-xl text-5xl sm:text-7xl text-bone">
+              <h2 className="display-xl text-4xl sm:text-7xl text-bone">
                 The <span className="text-stroke-acid">Rack</span>
               </h2>
               <Link to="/shop" className="link-sweep font-display uppercase text-xs tracking-[0.25em] text-bone/70 hover:text-bone whitespace-nowrap pb-2">
@@ -233,7 +233,7 @@ export default function Home() {
             <Reveal>
               <p className="font-display uppercase text-acid tracking-[0.45em] text-[11px] mb-4">The jersey line</p>
               <div className="flex flex-wrap items-end justify-between gap-6 mb-10">
-                <h2 className="display-xl text-5xl sm:text-7xl text-bone">
+                <h2 className="display-xl text-4xl sm:text-7xl text-bone">
                   One symbol.<br />
                   <span className="text-stroke">{jerseys.length} colorways.</span>
                 </h2>
@@ -315,7 +315,7 @@ export default function Home() {
             </p>
           </Reveal>
           <Reveal delay={0.12}>
-            <div className="flex md:flex-col gap-8 md:gap-6 md:text-right">
+            <div className="flex flex-wrap gap-x-8 gap-y-5 md:flex-col md:gap-6 md:text-right">
               {[
                 ["100%", "Heavyweight cotton"],
                 ["LTD", "Limited runs only"],

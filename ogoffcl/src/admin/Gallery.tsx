@@ -49,7 +49,8 @@ export default function AdminGallery() {
         {rows.map((r) => (
           <div key={r.id} className="group relative aspect-square bg-smoke border border-ash overflow-hidden">
             <img src={publicImageUrl(String(r.image_path))} alt="" className="w-full h-full object-cover" />
-            <button onClick={() => del(r)} className="absolute inset-x-0 bottom-0 bg-blood text-bone text-xs font-display uppercase py-2 translate-y-full group-hover:translate-y-0 transition-transform">
+            {/* visible by default on touch — hover-reveal made Remove unreachable on phones */}
+            <button onClick={() => del(r)} className="absolute inset-x-0 bottom-0 bg-blood text-bone text-xs font-display uppercase py-2.5 sm:translate-y-full sm:group-hover:translate-y-0 transition-transform">
               Remove
             </button>
           </div>

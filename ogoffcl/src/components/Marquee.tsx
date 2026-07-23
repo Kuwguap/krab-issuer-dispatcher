@@ -12,7 +12,10 @@ export default function Marquee({
   const chunk = Array(6).fill(text).join("");
   return (
     <div className={`overflow-hidden py-2.5 select-none ${className}`}>
-      <div className={`whitespace-nowrap font-display uppercase text-sm tracking-wider will-change-transform ${fast ? "animate-marquee-fast" : "animate-marquee"}`}>
+      {/* w-max: translateX(-50%) resolves against the element's own width — as a
+          block it was viewport-wide, so the ticker slid ~half a screen then
+          visibly snapped back. Sized to content, -50% = exactly one chunk. */}
+      <div className={`w-max whitespace-nowrap font-display uppercase text-sm tracking-wider will-change-transform ${fast ? "animate-marquee-fast" : "animate-marquee"}`}>
         <span>{chunk}</span>
         <span aria-hidden>{chunk}</span>
       </div>

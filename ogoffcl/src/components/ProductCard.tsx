@@ -73,8 +73,8 @@ export default function ProductCard({ p, index = 0 }: { p: Product; index?: numb
           )}
         </div>
 
-        <div className="pt-3 flex items-start justify-between gap-3">
-          <h3 className="font-display uppercase text-[13px] leading-snug text-bone group-hover:text-acid transition-colors">
+        <div className="pt-3 flex flex-wrap items-start justify-between gap-x-3 gap-y-1">
+          <h3 className="font-display uppercase text-[13px] leading-snug text-bone group-hover:text-acid transition-colors min-w-0 break-words">
             {p.name}
           </h3>
           <span className="text-bone/90 text-sm whitespace-nowrap">{money(p.price)}</span>

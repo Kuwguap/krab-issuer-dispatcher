@@ -119,9 +119,9 @@ export default function AdminSiteMail() {
           <p className="font-display uppercase text-xs tracking-[0.3em] text-bone/50">
             Mailing list <span className="text-acid">({visible.length})</span>
           </p>
-          <div className="flex gap-1.5 ml-2">
+          <div className="flex gap-2 ml-2">
             {(["all", "waitlist", "newsletter"] as const).map((f) => (
-              <button key={f} onClick={() => setFilter(f)} className={`btn-og px-3 py-1.5 text-[10px] border-2 ${filter === f ? "bg-acid border-acid text-ink" : "border-ash text-bone/60 hover:border-bone"}`}>
+              <button key={f} onClick={() => setFilter(f)} className={`btn-og px-3 py-2.5 text-[10px] border-2 ${filter === f ? "bg-acid border-acid text-ink" : "border-ash text-bone/60 hover:border-bone"}`}>
                 {f}
               </button>
             ))}
@@ -148,12 +148,12 @@ export default function AdminSiteMail() {
           <div className="border border-ash divide-y divide-ash">
             {visible.map((s) => (
               <div key={s.id} className="flex flex-wrap items-center gap-3 px-4 py-3 text-sm">
-                <span className="text-bone">{s.email}</span>
+                <span className="text-bone break-all min-w-0">{s.email}</span>
                 <span className={`text-[10px] uppercase tracking-widest px-2 py-0.5 ${s.source === "waitlist" ? "bg-acid/15 text-acid" : "bg-bone/10 text-bone/60"}`}>
                   {s.source || "newsletter"}
                 </span>
                 <span className="ml-auto text-bone/30 text-xs">{new Date(s.created_at).toLocaleString()}</span>
-                <button onClick={() => del(s)} className="btn-og border-2 border-blood/40 text-blood px-3 py-1 text-[10px] hover:bg-blood hover:text-bone">
+                <button onClick={() => del(s)} className="btn-og border-2 border-blood/40 text-blood px-3 py-2.5 text-[10px] hover:bg-blood hover:text-bone">
                   Remove
                 </button>
               </div>

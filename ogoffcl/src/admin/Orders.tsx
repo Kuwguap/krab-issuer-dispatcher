@@ -141,14 +141,14 @@ export default function AdminOrders() {
   return (
     <div>
       {flash && (
-        <div className="fixed top-4 right-4 z-50 bg-acid text-ink font-display uppercase text-xs px-4 py-3 shadow-lg">{flash}</div>
+        <div className="fixed top-4 inset-x-4 sm:inset-x-auto sm:right-4 z-50 bg-acid text-ink font-display uppercase text-xs px-4 py-3 shadow-lg">{flash}</div>
       )}
 
       {/* pipeline filters */}
-      <div className="flex gap-1.5 flex-wrap mb-4">
+      <div className="flex gap-2 flex-wrap mb-4">
         {["all", "unpaid", ...PIPELINE, ...TERMINAL].map((f) => (
           <button key={f} onClick={() => setFilter(f)}
-            className={`btn-og px-3 py-2 text-[11px] border-2 ${filter === f ? "bg-acid border-acid text-ink" : "border-ash text-bone/60 hover:border-bone"}`}>
+            className={`btn-og px-3 py-2.5 text-[11px] border-2 ${filter === f ? "bg-acid border-acid text-ink" : "border-ash text-bone/60 hover:border-bone"}`}>
             {f === "all" ? "All" : f === "unpaid" ? "⚠ Unpaid" : STATUS_LABEL[f] || f}
             <span className="ml-1 opacity-60">({counts[f] ?? 0})</span>
           </button>
@@ -175,15 +175,16 @@ export default function AdminOrders() {
 
             {openId === o.id && (
               <div className="border-t border-ash px-4 py-4 grid gap-6 lg:grid-cols-2 text-sm">
-                {/* left: customer + payment + items + timeline */}
-                <div className="space-y-4">
+                {/* left: customer + payment + items + timeline
+                    (min-w-0: long emails otherwise inflate the mobile column) */}
+                <div className="space-y-4 min-w-0">
                   <div className="space-y-1.5 text-bone/70">
                     <p className="font-display uppercase text-[10px] tracking-[0.3em] text-bone/40">Customer</p>
                     <p className="text-bone">{o.customer_name || "—"}</p>
                     <p>
                       {o.customer_phone && <a className="text-acid hover:underline" href={`tel:${o.customer_phone}`}>{o.customer_phone}</a>}
                       {wa(o.customer_phone) && <a className="ml-3 text-acid hover:underline" target="_blank" rel="noreferrer" href={wa(o.customer_phone)!}>WhatsApp ↗</a>}
-                      {o.customer_email && <a className="ml-3 text-acid hover:underline" href={`mailto:${o.customer_email}`}>{o.customer_email}</a>}
+                      {o.customer_email && <a className="ml-3 text-acid hover:underline break-all" href={`mailto:${o.customer_email}`}>{o.customer_email}</a>}
                     </p>
                     <p><span className="text-bone/40">Ship to:</span> {o.shipping_address || "—"}</p>
                     {o.discount_code && <p><span className="text-bone/40">Discount:</span> {o.discount_code} (−{money(o.discount_amount || 0)})</p>}
@@ -226,7 +227,7 @@ export default function AdminOrders() {
                 </div>
 
                 {/* right: actions */}
-                <div className="space-y-4">
+                <div className="space-y-4 min-w-0">
                   <div>
                     <p className="font-display uppercase text-[10px] tracking-[0.3em] text-bone/40 mb-1.5">
                       Update status <span className="normal-case tracking-normal">(emails the customer)</span>
@@ -237,15 +238,16 @@ export default function AdminOrders() {
                       onChange={(e) => setNoteDraft((m) => ({ ...m, [o.id]: e.target.value }))}
                       className="w-full px-3 py-2.5 text-xs mb-2"
                     />
-                    <div className="flex flex-wrap gap-1.5">
+                    <div className="flex flex-wrap gap-2">
                       {PIPELINE.map((s) => (
                         <button key={s} disabled={busyId === o.id} onClick={() => setStatus(o, s, true)}
-                          className={`btn-og px-3 py-1.5 text-[10px] border-2 ${o.status === s ? "bg-bone border-bone text-ink" : "border-ash text-bone/60 hover:border-bone"}`}>
+                          className={`btn-og px-3 py-2.5 text-[10px] border-2 ${o.status === s ? "bg-bone border-bone text-ink" : "border-ash text-bone/60 hover:border-bone"}`}>
                           {STATUS_LABEL[s]}
                         </button>
                       ))}
-                      <button disabled={busyId === o.id} onClick={() => setStatus(o, "cancelled", true)}
-                        className="btn-og px-3 py-1.5 text-[10px] border-2 border-blood/40 text-blood hover:bg-blood hover:text-bone">
+                      <button disabled={busyId === o.id}
+                        onClick={() => { if (confirm(`Cancel order ${o.order_number}? The customer gets a cancellation email.`)) setStatus(o, "cancelled", true); }}
+                        className="btn-og px-3 py-2.5 text-[10px] border-2 border-blood/40 text-blood hover:bg-blood hover:text-bone">
                         Cancel order
                       </button>
                     </div>
@@ -253,15 +255,15 @@ export default function AdminOrders() {
 
                   <div>
                     <p className="font-display uppercase text-[10px] tracking-[0.3em] text-bone/40 mb-1.5">Money</p>
-                    <div className="flex flex-wrap gap-1.5">
+                    <div className="flex flex-wrap gap-2">
                       {o.payment_status !== "paid" && (
-                        <button onClick={() => markPaid(o)} className="btn-og px-3 py-1.5 text-[10px] border-2 border-acid/50 text-acid hover:bg-acid hover:text-ink">
+                        <button onClick={() => markPaid(o)} className="btn-og px-3 py-2.5 text-[10px] border-2 border-acid/50 text-acid hover:bg-acid hover:text-ink">
                           Mark paid (manual)
                         </button>
                       )}
                       {o.payment_status === "paid" && o.refund_status !== "refunded" && (
                         <button disabled={busyId === o.id} onClick={() => refund(o)}
-                          className="btn-og px-3 py-1.5 text-[10px] border-2 border-blood/40 text-blood hover:bg-blood hover:text-bone">
+                          className="btn-og px-3 py-2.5 text-[10px] border-2 border-blood/40 text-blood hover:bg-blood hover:text-bone">
                           {busyId === o.id ? "Working…" : "Refund via MoMo"}
                         </button>
                       )}

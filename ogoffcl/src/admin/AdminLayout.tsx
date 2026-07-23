@@ -87,7 +87,7 @@ export default function AdminLayout() {
               to={t.to}
               end={t.end as boolean | undefined}
               className={({ isActive }) =>
-                `btn-og px-4 py-2 text-xs border-2 ${isActive ? "bg-acid border-acid text-ink" : "border-ash text-bone/70 hover:border-bone"}`
+                `btn-og px-4 py-3 sm:py-2 text-xs border-2 ${isActive ? "bg-acid border-acid text-ink" : "border-ash text-bone/70 hover:border-bone"}`
               }
             >
               {t.label}

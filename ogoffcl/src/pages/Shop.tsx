@@ -54,7 +54,7 @@ export default function Shop() {
       <div className="flex flex-wrap items-center gap-2 mb-10 sticky top-16 z-30 bg-ink/90 backdrop-blur-md py-3 -mx-4 px-4 sm:-mx-6 sm:px-6 border-b border-ash">
         <button
           onClick={() => setParams({}, { replace: true })}
-          className={`btn-og px-4 py-2 text-xs border-2 ${!activeSlug ? "bg-acid border-acid text-ink" : "border-ash text-bone/70 hover:border-bone"}`}
+          className={`btn-og px-4 py-3 sm:py-2 text-xs border-2 ${!activeSlug ? "bg-acid border-acid text-ink" : "border-ash text-bone/70 hover:border-bone"}`}
         >
           All
         </button>
@@ -62,7 +62,7 @@ export default function Shop() {
           <button
             key={c.id}
             onClick={() => setParams({ c: c.slug }, { replace: true })}
-            className={`btn-og px-4 py-2 text-xs border-2 ${activeSlug === c.slug ? "bg-acid border-acid text-ink" : "border-ash text-bone/70 hover:border-bone"}`}
+            className={`btn-og px-4 py-3 sm:py-2 text-xs border-2 ${activeSlug === c.slug ? "bg-acid border-acid text-ink" : "border-ash text-bone/70 hover:border-bone"}`}
           >
             {c.name}
           </button>
@@ -71,7 +71,7 @@ export default function Shop() {
           <select
             value={sort}
             onChange={(e) => setSort(e.target.value as typeof sort)}
-            className="px-3 py-2 text-xs font-display uppercase tracking-wider"
+            className="px-3 py-3 sm:py-2 text-xs font-display uppercase tracking-wider"
           >
             <option value="new">Newest</option>
             <option value="low">Price ↑</option>

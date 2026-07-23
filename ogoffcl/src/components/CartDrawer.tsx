@@ -28,16 +28,16 @@ export default function CartDrawer() {
               <h2 className="font-display uppercase text-bone tracking-wide">
                 Your Cart <span className="text-acid">({items.reduce((a, i) => a + i.qty, 0)})</span>
               </h2>
-              <div className="flex items-center gap-3">
+              <div className="flex items-center gap-4">
                 {items.length > 0 && (
                   <button
                     onClick={() => clear()}
-                    className="text-bone/50 text-[11px] uppercase tracking-[0.2em] font-display hover:text-blood transition-colors"
+                    className="px-3 py-3 -my-3 text-bone/50 text-[11px] uppercase tracking-[0.2em] font-display hover:text-blood transition-colors"
                   >
                     Clear cart
                   </button>
                 )}
-                <button aria-label="Close cart" onClick={() => setOpen(false)} className="text-bone text-3xl font-display leading-none px-1 hover:text-acid">
+                <button aria-label="Close cart" onClick={() => setOpen(false)} className="min-w-[40px] py-2 -my-2 text-bone text-3xl font-display leading-none px-1 hover:text-acid">
                   ×
                 </button>
               </div>
@@ -71,11 +71,11 @@ export default function CartDrawer() {
                     <p className="text-acid text-sm mt-1">{money(i.price)}</p>
                     <div className="flex items-center gap-3 mt-2">
                       <div className="flex items-center border border-ash">
-                        <button className="px-2.5 py-1 text-bone hover:text-acid" onClick={() => setQty(i.productId, i.size, i.qty - 1)}>−</button>
-                        <span className="px-2 text-sm text-bone">{i.qty}</span>
-                        <button className="px-2.5 py-1 text-bone hover:text-acid" onClick={() => setQty(i.productId, i.size, i.qty + 1)}>+</button>
+                        <button className="min-w-[38px] px-3 py-2 text-bone hover:text-acid" onClick={() => setQty(i.productId, i.size, i.qty - 1)}>−</button>
+                        <span className="px-2.5 text-sm text-bone">{i.qty}</span>
+                        <button className="min-w-[38px] px-3 py-2 text-bone hover:text-acid" onClick={() => setQty(i.productId, i.size, i.qty + 1)}>+</button>
                       </div>
-                      <button className="text-bone/40 text-xs uppercase tracking-wider hover:text-blood" onClick={() => remove(i.productId, i.size)}>
+                      <button className="py-2.5 px-2 -my-2.5 text-bone/40 text-xs uppercase tracking-wider hover:text-blood" onClick={() => remove(i.productId, i.size)}>
                         Remove
                       </button>
                     </div>
@@ -85,7 +85,9 @@ export default function CartDrawer() {
             </div>
 
             {items.length > 0 && (
-              <div className="border-t border-ash p-5 space-y-4 bg-ink/40">
+              // safe-area: viewport-fit=cover lays the drawer under the iPhone
+              // home indicator — pad the footer past the inset
+              <div className="border-t border-ash p-5 pb-[calc(1.25rem+env(safe-area-inset-bottom))] space-y-4 bg-ink/40">
                 <div className="flex justify-between font-display uppercase text-bone">
                   <span className="text-bone/60 text-sm tracking-widest">Subtotal</span>
                   <span className="text-acid">{money(subtotal)}</span>
