@@ -133,6 +133,26 @@ function moolrePay({ channel, phone, amount, externalref, reference, otpcode }) 
   return moolre("/open/transact/payment", payload, "public");
 }
 
+/** Generate a HOSTED payment link (Moolre Web POS). Moolre's own page
+ *  handles the prompt/OTP/approval UX — the fix for debit prompts that
+ *  never arrive on the payer's phone when we fire charges directly.
+ *  POST /embed/link, public key. Returns {status, code, message, data:
+ *  {authorization_url, reference}}. externalref must be fresh per link. */
+function moolrePaymentLink({ amount, externalref, redirect, callback, metadata }) {
+  return moolre("/embed/link", {
+    type: 1,
+    amount: String(amount),
+    email: env.storeNotify || "ogoffcl@gmail.com",
+    externalref,
+    currency: "GHS",
+    accountnumber: env.moolreAccount,
+    reusable: "0",
+    ...(redirect ? { redirect } : {}),
+    ...(callback ? { callback } : {}),
+    ...(metadata ? { metadata } : {}),
+  }, "public");
+}
+
 /** Check a transaction by external reference. */
 function moolreStatus(externalref) {
   return moolre("/open/transact/status", {
@@ -245,6 +265,6 @@ function orderItemsHtml(items) {
 
 export {
   env, moolreConfigured, sb, getOrder, getOrderByNumber, getOrderItems, updateOrder,
-  appendStatusHistory, moolrePay, moolreStatus, moolreTransfer, PAY_CHANNELS,
+  appendStatusHistory, moolrePay, moolrePaymentLink, moolreStatus, moolreTransfer, PAY_CHANNELS,
   sendEmail, sendEmailBatch, emailShell, orderItemsHtml,
 };

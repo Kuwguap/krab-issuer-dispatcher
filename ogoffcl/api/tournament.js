@@ -6,8 +6,9 @@
 //   bracket         GET   public  — sanitized players + matches for the public page
 //   admin           POST  gated   — list / verify / remove / save-matches / set-result / clear-matches
 import {
-  env, sb, moolrePay, moolreStatus, sendEmail, emailShell,
+  env, sb, moolrePay, moolrePaymentLink, moolreStatus, sendEmail, emailShell,
 } from "./_lib.js";
+import { sendPaidEmails, finalizeTournamentByRef } from "./_tournament.js";
 
 const BASE_FEE = 50;
 const HUB_FEE = 20;
@@ -26,36 +27,8 @@ async function playerForRef(ref) {
   return Array.isArray(data) && data[0] ? data[0] : null;
 }
 
-/** Confirmation emails on a spot locking in — shared by the Moolre status
- *  check AND the admin's manual Mark-paid (cash/direct transfers). */
-function sendPaidEmails(player) {
-  if ((player.email || "").includes("@")) {
-    sendEmail({
-      to: player.email,
-      subject: "You're in the OG OFFCL FC26 Tournament ⚽",
-      html: emailShell("Spot locked in. 🎮", `
-        <p><strong style="color:#C8FF00;">${player.gamertag}</strong> — payment received, your spot in the OG OFFCL FC26 tournament is confirmed.</p>
-        <p style="color:#8b877e;">Entry: GH₵${Number(player.fee)}${player.hub ? " (playing from the OGOFFCL Hub at KNUST, Kumasi — console + 200 Mbps connection covered; be there in person on game day)" : ""}.<br/>
-        Platform: ${String(player.platform).toUpperCase()}.</p>
-        <p>Kickoff: <strong style="color:#C8FF00;">1st August</strong>. The pot: <strong style="color:#C8FF00;">GH₵1,000 cash + 2 merch pieces</strong> from the store.</p>
-        <p style="margin:18px 0;"><a href="${SNAP_GROUP}" style="display:inline-block;background:#C8FF00;color:#0A0A0A;font-weight:900;text-decoration:none;padding:14px 22px;text-transform:uppercase;letter-spacing:1px;">👻 Join the Snapchat group</a></p>
-        <p style="color:#8b877e;">The Snapchat group is where the bracket drops, kickoff times land and winners report scores — <strong style="color:#F5F2EA;">joining it is not optional</strong>. Link: <a href="${SNAP_GROUP}" style="color:#C8FF00;">${SNAP_GROUP}</a></p>
-        <p>On game day: add your opponent via EA ID, invite them from <strong style="color:#F5F2EA;">Ultimate Team → Friendlies → Play a Friend</strong>, screenshot the final score, drop it in the group.</p>
-        <p style="color:#8b877e;">Bring your best squad. Limited spots — no restocks on glory.</p>
-      `),
-    }).catch(() => {});
-  }
-  if (env.storeNotify) {
-    sendEmail({
-      to: env.storeNotify,
-      subject: `🎮 TOURNAMENT ENTRY — ${player.gamertag} paid GH₵${Number(player.fee)}`,
-      html: emailShell("New tournament entry", `
-        <p><strong>${player.full_name}</strong> (${player.gamertag}, ${String(player.platform).toUpperCase()})${player.hub ? " · HUB PLAYER" : ""}</p>
-        <p style="color:#8b877e;">${player.email} · ${player.phone}</p>
-      `),
-    }).catch(() => {});
-  }
-}
+// sendPaidEmails / finalizeTournamentByRef live in ./_tournament.js so the
+// Moolre webhook (api/pay/callback.js) can finalize + email too.
 
 // ── handlers ───────────────────────────────────────────────────────────────
 
@@ -116,18 +89,44 @@ async function register(req, res) {
 }
 
 async function pay(req, res) {
+  // Preferred: hosted Moolre payment link (Web POS) — Moolre's own page runs
+  // the prompt/OTP/approval UX, fixing debit prompts that never arrive.
+  // Fallback: the direct charge flow (works today; hosted link activates the
+  // moment MOOLRE_API_USER on Vercel matches the Moolre account username —
+  // /embed/link verifies it (PL02), the transact endpoints never did).
   const { playerId, phone, channel, otpcode, ref } = req.body || {};
-  const digits = String(phone || "").replace(/\D/g, "");
-  if (!playerId || digits.length < 9) return res.status(400).json({ error: "playerId and a valid MoMo number are required." });
-  if (!["mtn", "telecel", "at"].includes(String(channel))) return res.status(400).json({ error: "channel must be mtn, telecel or at." });
+  if (!playerId) return res.status(400).json({ error: "playerId required." });
 
   const player = await getPlayer(playerId);
   if (!player) return res.status(404).json({ error: "Registration not found." });
   if (player.payment_status === "paid") return res.json({ state: "paid", ref: player.payment_ref });
 
   const amount = Number(player.fee || BASE_FEE);
-  // same externalref continuity rule as checkout: resume the exact ref on OTP submit
   const tag = `TRN-${String(player.id).slice(0, 8).toUpperCase()}`;
+
+  // OTP submits stay on the direct flow — never restart with a link
+  if (!otpcode) {
+    const attempt = `${tag}-${Date.now().toString(36).slice(-5).toUpperCase()}`;
+    const resp = await moolrePaymentLink({
+      amount,
+      externalref: attempt,
+      redirect: `${env.siteUrl}/tournament/pay/${player.id}?ref=${encodeURIComponent(attempt)}`,
+      callback: `${env.siteUrl}/api/pay/callback`,
+      metadata: { kind: "tournament", playerId: player.id, gamertag: player.gamertag },
+    });
+    const url = resp && resp.data && resp.data.authorization_url;
+    if (Number(resp.status) === 1 && url) {
+      await sb("PATCH", `tournament_players?id=eq.${player.id}`, { payment_ref: attempt });
+      return res.json({ state: "link", url, ref: attempt });
+    }
+    // link unavailable (auth/config) — fall through to the direct charge
+  }
+
+  const digits = String(phone || "").replace(/\D/g, "");
+  if (digits.length < 9) return res.status(400).json({ error: "Enter a valid MoMo number." });
+  if (!["mtn", "telecel", "at"].includes(String(channel))) return res.status(400).json({ error: "channel must be mtn, telecel or at." });
+
+  // same externalref continuity rule as checkout: resume the exact ref on OTP submit
   const clientRef = typeof ref === "string" && ref.startsWith(`${tag}-`) ? ref : null;
   const resumeRef = otpcode ? (clientRef || player.payment_ref || null) : null;
   const attempt = resumeRef || `${tag}-${Date.now().toString(36).slice(-5).toUpperCase()}`;
@@ -166,13 +165,8 @@ async function status(req, res) {
   const txstatus = tx ? Number(tx.txstatus) : null;
 
   if (txstatus === 1) {
-    if (player) {
-      await sb("PATCH", `tournament_players?id=eq.${player.id}`, {
-        payment_status: "paid", paid_at: new Date().toISOString(),
-      });
-      sendPaidEmails(player);
-    }
-    return res.json({ state: "paid", gamertag: player ? player.gamertag : null });
+    const done = await finalizeTournamentByRef(ref);
+    return res.json({ state: "paid", gamertag: done ? done.gamertag : (player ? player.gamertag : null) });
   }
   if (txstatus === 0 || /fail|declin|cancel/i.test(String(resp.message || ""))) {
     return res.json({ state: "failed", message: resp.message || "Payment failed." });
@@ -265,6 +259,19 @@ async function admin(req, res) {
   if (act === "clear-matches") {
     await sb("DELETE", "tournament_matches?round=gte.0");
     return res.json({ ok: true });
+  }
+  if (act === "linkdiag") {
+    // probe /embed/link with current credentials (admin-gated, no secrets):
+    // tells you whether hosted payment links are active yet
+    const resp = await moolrePaymentLink({
+      amount: "1.00",
+      externalref: `DIAG-${Date.now().toString(36).toUpperCase()}`,
+    });
+    return res.json({
+      ok: true,
+      linkWorks: Number(resp.status) === 1 && !!(resp.data && resp.data.authorization_url),
+      code: resp.code, message: resp.message,
+    });
   }
   return res.status(400).json({ error: `unknown op ${act}` });
 }

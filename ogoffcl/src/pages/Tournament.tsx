@@ -171,6 +171,9 @@ export default function Tournament() {
     setOtpBusy(false);
     if (j.state === "otp" && otpcode) setOtp("");
     if (j.state === "paid") { setPay({ step: "done", gamertag: form.gamertag }); return; }
+    // hosted Moolre payment page — hand the browser over; Moolre redirects
+    // back to /tournament/pay/:id which confirms the spot
+    if (j.state === "link" && j.url) { window.location.href = j.url; return; }
     if (j.state === "otp") { setPay({ step: "otp", playerId, ref: j.ref, message: j.message }); return; }
     if (j.state === "pending") { startPolling(playerId, j.ref); return; }
     setPay({ step: "failed", playerId, error: j.error || "Could not start the payment." });

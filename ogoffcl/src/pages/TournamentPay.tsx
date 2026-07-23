@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState, FormEvent } from "react";
-import { Link, useParams } from "react-router-dom";
+import { Link, useParams, useSearchParams } from "react-router-dom";
 import { motion } from "framer-motion";
 import { usePageMeta } from "../lib/seo";
 import MomoHelp from "../components/MomoHelp";
@@ -32,6 +32,8 @@ type PayState =
 
 export default function TournamentPay() {
   const { playerId } = useParams();
+  const [params] = useSearchParams();
+  const returnedRef = params.get("ref"); // set by Moolre's post-payment redirect
   usePageMeta({
     title: "Complete your entry — OG OFFCL FC26 Tournament",
     description: "Finish your OG OFFCL FC26 tournament payment and lock your spot on the bracket.",
@@ -58,8 +60,11 @@ export default function TournamentPay() {
         if (!j || !j.id) { setNotFound(true); return; }
         setPlayer(j);
         if (j.paymentStatus === "paid") setPay({ step: "done" });
+        // back from Moolre's hosted page — confirm the payment
+        else if (returnedRef) startPolling(returnedRef);
       })
       .catch(() => setNotFound(true));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [playerId]);
 
   useEffect(() => () => { if (pollRef.current) window.clearInterval(pollRef.current); }, []);
@@ -99,6 +104,8 @@ export default function TournamentPay() {
     setOtpBusy(false);
     if (j.state === "otp" && otpcode) setOtp("");
     if (j.state === "paid") { setPay({ step: "done" }); return; }
+    // hosted Moolre payment page — Moolre redirects back here (?ref=) after
+    if (j.state === "link" && j.url) { window.location.href = j.url; return; }
     if (j.state === "otp") { setPay({ step: "otp", ref: j.ref, message: j.message }); return; }
     if (j.state === "pending") { startPolling(j.ref); return; }
     setPay({ step: "failed", error: j.error || "Could not start the payment." });
@@ -148,7 +155,11 @@ export default function TournamentPay() {
       <div className="max-w-md mx-auto px-4 py-28 text-center">
         <div className="w-20 h-20 mx-auto border-4 border-acid border-t-transparent rounded-full animate-spin mb-8" />
         <h1 className="display-xl text-4xl text-bone">Check your phone</h1>
-        <p className="text-bone/60 mt-4 leading-relaxed">Approve the <strong className="text-bone">GH₵{player.fee}</strong> mobile-money prompt on <strong className="text-acid">{momoPhone}</strong>.</p>
+        <p className="text-bone/60 mt-4 leading-relaxed">
+          {momoPhone
+            ? <>Approve the <strong className="text-bone">GH₵{player.fee}</strong> mobile-money prompt on <strong className="text-acid">{momoPhone}</strong>.</>
+            : <>Confirming your <strong className="text-bone">GH₵{player.fee}</strong> payment — this updates by itself.</>}
+        </p>
         <p className="text-bone/40 text-xs mt-3">Payment is processed by <strong className="text-bone/70">Moolre</strong> — any SMS about this payment comes from Moolre.</p>
         <MomoHelp network={network} />
       </div>
