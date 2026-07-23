@@ -4540,6 +4540,7 @@ async def _finalize_lead_after_notes(
     if not lead:
         await message.reply_text("❌ Error saving lead to database.")
         return ConversationHandler.END
+    await _fu_auto_close_for_lead(context, lead)
 
     reference_id = lead.get("reference_id", "N/A")
 
@@ -4685,6 +4686,7 @@ async def _submit_lead_from_review(message, context, user_id, data):
     if not lead:
         await message.reply_text("❌ Could not save lead.")
         return ConversationHandler.END
+    await _fu_auto_close_for_lead(context, lead)
 
     drivers_list: list = []
     try:
@@ -4858,6 +4860,7 @@ async def handle_group_selection(update: Update, context: ContextTypes.DEFAULT_T
         if not lead:
             await query.message.reply_text("❌ Error saving lead to database.")
             return ConversationHandler.END
+        await _fu_auto_close_for_lead(context, lead)
 
         reference_id = lead.get("reference_id", "N/A")
 
@@ -5058,6 +5061,7 @@ async def handle_group_selection(update: Update, context: ContextTypes.DEFAULT_T
     if not lead:
         await query.message.reply_text("❌ Error saving lead to database.")
         return ConversationHandler.END
+    await _fu_auto_close_for_lead(context, lead)
 
     reference_id = lead.get("reference_id", "N/A")
 
@@ -5274,6 +5278,7 @@ async def handle_driver_selection(update: Update, context: ContextTypes.DEFAULT_
         if not lead:
             await query.message.reply_text("❌ Error saving lead to database.")
             return ConversationHandler.END
+        await _fu_auto_close_for_lead(context, lead)
 
     had_broadcast_offers = bool(db.get_group_lead_offers(lead["id"]))
     if lead_data.get("follow_after_broadcast") and lead.get("group_id"):
@@ -8892,8 +8897,13 @@ _FU_DAY_NAMES = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturd
 _FU_TIME_HOURS = {"morning": 9, "afternoon": 13, "evening": 18}
 _FU_TIME_LABEL = {"morning": "🌅 Morning", "afternoon": "☀️ Afternoon", "evening": "🌙 Evening"}
 # "Stop" choices: how long the bot keeps chasing before auto-stopping.
+# "on_order" (default) = run until a NEW dispatch order arrives with this
+# client's phone/email/name — then the follow-up auto-closes (never deleted).
 _FU_END_DAYS = {"1w": 7, "2w": 14, "1m": 30, "3m": 90}
-_FU_END_LABEL = {"1w": "1 week", "2w": "2 weeks", "1m": "1 month", "3m": "3 months", "forever": "until stopped"}
+_FU_END_LABEL = {
+    "1w": "1 week", "2w": "2 weeks", "1m": "1 month", "3m": "3 months",
+    "forever": "until stopped", "on_order": "🧾 when they order",
+}
 
 # Text-input prompts for the tap-to-fill fields on the /followup menu.
 _FU_TEXT_FIELDS = {
@@ -8969,8 +8979,12 @@ def _fu_menu_keyboard(fu: dict) -> InlineKeyboardMarkup:
         v = (fu.get(key) or "").strip() if fu.get(key) else ""
         return _truncate_btn_val(v) if v else "—"
 
-    day = _FU_DAY_NAMES[fu["day_idx"]] if fu.get("day_idx") is not None else "—"
-    time_lbl = _FU_TIME_LABEL.get(fu.get("time_key"), "—")
+    if fu.get("day_idx") is not None:
+        day = _FU_DAY_NAMES[fu["day_idx"]]
+        time_lbl = _FU_TIME_LABEL.get(fu.get("time_key"), "—")
+    else:
+        day = "⚡ Now"
+        time_lbl = _FU_TIME_LABEL.get(fu.get("time_key"), "⚡ Now")
     freq_lbl = _FU_FREQ_LABEL.get(fu.get("freq"), "—")
     end_lbl = _FU_END_LABEL.get(fu.get("end_key"), "—")
     chase = "ON 🤖" if fu.get("chase") else "OFF"
@@ -9020,7 +9034,7 @@ async def cmd_followup_start(update: Update, context: ContextTypes.DEFAULT_TYPE)
     Client contact defaults to ON: the bot emails/texts the client unless the
     agent taps the 🤖 button to turn it off.
     """
-    context.user_data["fu"] = {"chase": True}
+    context.user_data["fu"] = {"chase": True, "end_key": "on_order"}
     await _fu_render_menu(context.user_data["fu"], reply=update.message.reply_text)
     return STATE_FU_MENU
 
@@ -9080,14 +9094,15 @@ async def handle_fu_menu_callback(update: Update, context: ContextTypes.DEFAULT_
     # Sub-pickers (edit the same message, Back returns to the form).
     if data == "fuf_day":
         await query.answer()
-        rows = [
+        rows = [[InlineKeyboardButton("⚡ Now (start right away)", callback_data="fud_now")]]
+        rows += [
             [InlineKeyboardButton(_FU_DAY_NAMES[i], callback_data=f"fud_{i}"),
              InlineKeyboardButton(_FU_DAY_NAMES[i + 1], callback_data=f"fud_{i + 1}")]
             for i in (0, 2, 4)
         ]
         rows.append([InlineKeyboardButton(_FU_DAY_NAMES[6], callback_data="fud_6"),
                      InlineKeyboardButton("⬅️ Back", callback_data="fuf_back")])
-        await query.message.edit_text("📅 Which day should reminders start?",
+        await query.message.edit_text("📅 When should reminders start?",
                                       reply_markup=InlineKeyboardMarkup(rows))
         return STATE_FU_MENU
 
@@ -9117,6 +9132,7 @@ async def handle_fu_menu_callback(update: Update, context: ContextTypes.DEFAULT_
     if data == "fuf_end":
         await query.answer()
         kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton("🧾 When they order (auto)", callback_data="fue_on_order")],
             [InlineKeyboardButton("1 week", callback_data="fue_1w"),
              InlineKeyboardButton("2 weeks", callback_data="fue_2w")],
             [InlineKeyboardButton("1 month", callback_data="fue_1m"),
@@ -9125,7 +9141,9 @@ async def handle_fu_menu_callback(update: Update, context: ContextTypes.DEFAULT_
              InlineKeyboardButton("⬅️ Back", callback_data="fuf_back")],
         ])
         await query.message.edit_text(
-            "🛑 When should follow-ups stop (if the client never responds)?",
+            "🛑 When should follow-ups stop?\n\n"
+            "🧾 When they order = auto-stops the moment a new dispatch order "
+            "comes in with this client's phone, email, or name.",
             reply_markup=kb,
         )
         return STATE_FU_MENU
@@ -9133,7 +9151,12 @@ async def handle_fu_menu_callback(update: Update, context: ContextTypes.DEFAULT_
     # Picker selections → back to the form.
     if data.startswith("fud_"):
         await query.answer()
-        fu["day_idx"] = int(data[len("fud_"):])
+        sel = data[len("fud_"):]
+        if sel == "now":
+            fu["day_idx"] = None
+            fu.pop("time_key", None)
+        else:
+            fu["day_idx"] = int(sel)
         await _fu_render_menu(fu, query=query)
         return STATE_FU_MENU
     if data.startswith("fut_"):
@@ -9222,11 +9245,21 @@ async def _fu_finish_save(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         return ConversationHandler.END
 
     freq = fu["freq"]
-    day_idx = int(fu.get("day_idx") if fu.get("day_idx") is not None else 0)
-    hour = _FU_TIME_HOURS.get(fu.get("time_key", "morning"), 9)
-    start_local = _fu_compute_start(day_idx, hour)
+    eastern = pytz.timezone("America/New_York")
+    if fu.get("day_idx") is None:
+        # Default: start NOW — first reminder fires on the next job tick.
+        start_local = datetime.now(eastern)
+        first_label = "now"
+    else:
+        day_idx = int(fu["day_idx"])
+        hour = _FU_TIME_HOURS.get(fu.get("time_key", "morning"), 9)
+        start_local = _fu_compute_start(day_idx, hour)
+        first_label = (
+            f"{_FU_DAY_NAMES[day_idx]} {fu.get('time_key', 'morning')} "
+            f"({start_local.strftime('%b %d, %I:%M %p')} ET)"
+        )
     start_utc = start_local.astimezone(pytz.utc)
-    end_key = fu.get("end_key") or "forever"
+    end_key = fu.get("end_key") or "on_order"
     end_iso = None
     if end_key in _FU_END_DAYS:
         end_iso = (start_utc + timedelta(days=_FU_END_DAYS[end_key])).isoformat()
@@ -9249,14 +9282,42 @@ async def _fu_finish_save(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     )
     await query.message.edit_text(
         f"✅ Follow-up set for *{name}*.\n\n"
-        f"First: {_FU_DAY_NAMES[day_idx]} {fu.get('time_key', 'morning')} "
-        f"({start_local.strftime('%b %d, %I:%M %p')} ET), {_FU_FREQ_LABEL.get(freq, freq)}, "
+        f"First: {first_label}, {_FU_FREQ_LABEL.get(freq, freq)}, "
         f"stops: {_FU_END_LABEL.get(end_key, end_key)}.\n\n"
         f"{chase_line}",
         parse_mode="Markdown",
     )
     context.user_data.pop("fu", None)
     return ConversationHandler.END
+
+
+async def _fu_auto_close_for_lead(context: ContextTypes.DEFAULT_TYPE, lead: dict | None) -> None:
+    """A new dispatch order arrived → close (never delete) any open follow-up
+    matching the client's phone, email, or name; DM the owning agent."""
+    if not lead:
+        return
+    try:
+        closed = await asyncio.to_thread(db.auto_close_followups_matching_lead, lead)
+    except Exception as e:
+        logger.warning("Follow-up auto-close on new lead failed: %s", e)
+        return
+    for f in closed:
+        try:
+            chat_id = int(str(f.get("user_id")).strip())
+        except (TypeError, ValueError):
+            chat_id = f.get("user_id")
+        name = f.get("client_name") or "client"
+        try:
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text=(
+                    f"🧾 New order came in for *{name}* — "
+                    "their follow-up was auto-closed (reminders stopped)."
+                ),
+                parse_mode="Markdown",
+            )
+        except Exception as e:
+            logger.warning("Could not notify agent %s of auto-closed follow-up: %s", chat_id, e)
 
 
 async def cmd_followup_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:

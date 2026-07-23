@@ -113,6 +113,14 @@ def ingest_external_lead(
     if not lead:
         return None, ["Failed to save lead to database (run migration_lead_api_ingest.sql?)"]
 
+    # New dispatch order → auto-close any matching client follow-up (never delete).
+    try:
+        closed = db.auto_close_followups_matching_lead(lead)
+        if closed:
+            logger.info("API lead auto-closed %d matching follow-up(s)", len(closed))
+    except Exception as e:
+        logger.warning("API lead follow-up auto-close failed: %s", e)
+
     return {
         "lead_id": str(lead.get("id")),
         "reference_id": lead.get("reference_id") or reference_id,

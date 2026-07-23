@@ -1909,6 +1909,39 @@ class Database:
             logger.error(f"Error fetching all open follow-ups: {e}")
             return []
 
+    def auto_close_followups_matching_lead(self, lead: dict) -> list:
+        """Close open follow-ups whose client matches a new dispatch order.
+
+        Match by phone digits (last 10), email (case-insensitive), or full
+        client name (first line of vehicle_details). Closed — never deleted.
+        Returns the closed rows so the bot can notify the owning agents.
+        """
+        import re as _re
+
+        def digits(s):
+            return _re.sub(r"\D", "", str(s or ""))[-10:]
+
+        lead_phone = digits(lead.get("phone_number"))
+        lead_email = str(lead.get("email") or "").strip().lower()
+        vd = str(lead.get("vehicle_details") or "").strip()
+        lead_name = vd.splitlines()[0].strip().lower() if vd else ""
+
+        if not (lead_phone or lead_email or lead_name):
+            return []
+        closed = []
+        for f in self.get_all_open_followups():
+            fp = digits(f.get("phone_number"))
+            fe = str(f.get("email") or "").strip().lower()
+            fn = str(f.get("client_name") or "").strip().lower()
+            hit = (
+                (lead_phone and fp and fp == lead_phone)
+                or (lead_email and fe and fe == lead_email)
+                or (lead_name and fn and fn == lead_name)
+            )
+            if hit and self.close_client_followup(f.get("id")):
+                closed.append(f)
+        return closed
+
     def delete_client_followup(self, followup_id: str) -> bool:
         """Permanently delete a follow-up record (supervisor backend action)."""
         if not self._check_tables_exist():
