@@ -140,6 +140,7 @@ class State(IntEnum):
     WAITING_FOR_RECIPIENT = auto()
     WAITING_FOR_CONFIRMATION = auto()
     WAITING_FOR_INSURANCE = auto()
+    WAITING_FOR_CLIENT_EMAIL = auto()
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -284,6 +285,12 @@ async def handle_client_details(update: Update, context: ContextTypes.DEFAULT_TY
             )
         keyboard_buttons.append(row)
 
+    # Direct-to-client send: bottom button under the driver list — email the
+    # PDF tag straight to the client, no driver involved.
+    keyboard_buttons.append(
+        [InlineKeyboardButton("📧 Email Client", callback_data="to_client_email")]
+    )
+
     keyboard = InlineKeyboardMarkup(keyboard_buttons)
 
     logger.info("Sending recipient selection keyboard to user %s", user.full_name)
@@ -376,6 +383,53 @@ async def handle_recipient_selection(update: Update, context: ContextTypes.DEFAU
         parse_mode="Markdown"
     )
 
+    return State.WAITING_FOR_CONFIRMATION
+
+
+async def handle_to_client_email_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """User tapped 📧 Email Client under the driver list — ask for the address."""
+    query = update.callback_query
+    await query.answer()
+    pending_doc = context.user_data.get("pending_document")
+    if not pending_doc or not context.user_data.get("client_details"):
+        await query.edit_message_text("❌ Session expired. Please start over.")
+        return ConversationHandler.END
+    await query.edit_message_text("Enter email: 📧")
+    return State.WAITING_FOR_CLIENT_EMAIL
+
+
+async def handle_client_email_input(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Client email typed — review before sending the PDF tag straight to them."""
+    email = (update.message.text or "").strip()
+    if "@" not in email or "." not in email.split("@")[-1] or " " in email:
+        await update.message.reply_text(
+            "⚠️ That doesn't look like a valid email. Enter email: 📧\n(or /cancel)"
+        )
+        return State.WAITING_FOR_CLIENT_EMAIL
+    pending_doc = context.user_data.get("pending_document")
+    if not pending_doc or not context.user_data.get("client_details"):
+        await update.message.reply_text("❌ Session expired. Please start over.")
+        return ConversationHandler.END
+
+    # No driver: the client themself is the recipient (email saved on the
+    # transaction like every other send, so all client emails are kept).
+    context.user_data.pop("selected_recipient_id", None)
+    context.user_data["selected_recipient_email"] = email
+    context.user_data["selected_recipient_name"] = f"Client 📧 {email}"
+
+    confirmation_keyboard = InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("✅ Yes, Send", callback_data="confirm_yes"),
+            InlineKeyboardButton("❌ No, Cancel", callback_data="confirm_no"),
+        ]
+    ])
+    await update.message.reply_text(
+        "⚠️ Review\n\n"
+        f"Are you sure you want to send this PDF tag to client 📧\n{email}\n\n"
+        f"📄 {pending_doc['file_name']}\n\n"
+        "Please confirm:",
+        reply_markup=confirmation_keyboard,
+    )
     return State.WAITING_FOR_CONFIRMATION
 
 
@@ -1495,6 +1549,10 @@ def build_application(config: BotConfig):
             ],
             State.WAITING_FOR_RECIPIENT: [
                 CallbackQueryHandler(handle_recipient_selection, pattern="^recipient_"),
+                CallbackQueryHandler(handle_to_client_email_button, pattern="^to_client_email$"),
+            ],
+            State.WAITING_FOR_CLIENT_EMAIL: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_client_email_input),
             ],
             State.WAITING_FOR_CONFIRMATION: [
                 CallbackQueryHandler(handle_confirmation, pattern="^confirm_(yes|no)$"),

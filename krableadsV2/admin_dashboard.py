@@ -1498,6 +1498,47 @@ def api_receipts_submitted():
         return jsonify({"error": str(e)}), 500
 
 
+@app.route('/api/receipts/image/<lead_id>', methods=['GET'])
+def api_receipt_image(lead_id):
+    """Receipt image resolver — fixes broken images in the dashboard.
+
+    Supabase Storage URLs redirect straight through (permanent). Telegram file
+    URLs EXPIRE after ~1 hour — for those, the bot stores the permanent
+    file_id in a #tgfid= fragment; we call getFile to mint a fresh download
+    URL so old receipts render instead of showing a broken image.
+    """
+    try:
+        row = db.client.table("leads").select("receipt_image_url").eq("id", lead_id).limit(1).execute()
+        url = ((row.data or [{}])[0].get("receipt_image_url") or "").strip()
+        if not url:
+            return jsonify({"error": "no receipt image for this lead"}), 404
+        marker = "https://api.telegram.org/file/bot"
+        if marker not in url:
+            return redirect(url, code=302)
+        base, _, frag = url.partition("#")
+        tgfid = None
+        for part in frag.split("&"):
+            if part.startswith("tgfid="):
+                tgfid = part[len("tgfid="):].strip()
+        token = (os.getenv("TELEGRAM_BOT_TOKEN") or "").strip()
+        if tgfid and token:
+            import requests as _rq
+            r = _rq.get(
+                f"https://api.telegram.org/bot{token}/getFile",
+                params={"file_id": tgfid},
+                timeout=15,
+            )
+            fp = ""
+            if r.ok:
+                fp = str((((r.json() or {}).get("result") or {}).get("file_path") or "")).strip()
+            if fp:
+                return redirect(f"{marker}{token}/{fp}", code=302)
+        # No file_id stored (or getFile failed): try the stored URL as-is.
+        return redirect(base, code=302)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
 @app.route('/api/groups/<group_id>/toggle', methods=['POST'])
 def api_toggle_group(group_id):
     """Toggle group active status."""
