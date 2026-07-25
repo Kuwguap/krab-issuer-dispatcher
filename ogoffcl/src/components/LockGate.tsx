@@ -12,7 +12,7 @@ import { cachedLocked, fetchSiteLocked, subscribe } from "../lib/settings";
  * made the lock look "broken" before: old bypasses lived forever).
  */
 const ENV_FORCED = /^(1|true|yes|on)$/i.test(String(import.meta.env.VITE_SITE_LOCKED ?? "").trim());
-const PASSWORD = String(import.meta.env.VITE_SITE_PASSWORD ?? "OG2026").replace(/\\r|\\n/g, "").trim() || "OG2026";
+const PASSWORD = String(import.meta.env.VITE_SITE_PASSWORD ?? "OGOFFCL11").replace(/\\r|\\n/g, "").trim() || "OGOFFCL11";
 const BYPASS_KEY = "ogoffcl_unlocked_v2";
 
 interface Grant { pw: string; at: number }
