@@ -10,6 +10,26 @@ import { supabase } from "./supabase";
  */
 
 const SID_KEY = "og_sid_v1";
+const GTAG_ID = "AW-18347528486";
+
+declare global {
+  interface Window { gtag?: (...args: unknown[]) => void }
+}
+
+/** Safe wrapper — no-ops if gtag.js is blocked or still loading. */
+export function gtagEvent(name: string, params?: Record<string, unknown>) {
+  try { window.gtag?.("event", name, params || {}); } catch { /* ad-blocked */ }
+}
+
+/** Fire a conversion-style event exactly once per key (per browser session). */
+export function gtagOnce(key: string, name: string, params?: Record<string, unknown>) {
+  try {
+    const k = `og_gtag_${key}`;
+    if (sessionStorage.getItem(k)) return;
+    sessionStorage.setItem(k, "1");
+  } catch { /* still fire */ }
+  gtagEvent(name, params);
+}
 
 function sid(): string {
   try {
@@ -36,6 +56,10 @@ export function usePageTracking() {
 
     if (loc.pathname.startsWith("/admin")) return;
     if (/bot|crawl|spider|preview|lighthouse|headless/i.test(navigator.userAgent)) return;
+
+    // Google tag: SPA route changes don't reload the page, so re-config with
+    // the new path — this is what makes page-based conversion rules work.
+    try { window.gtag?.("config", GTAG_ID, { page_path: loc.pathname + loc.search }); } catch { /* ad-blocked */ }
 
     const q = new URLSearchParams(loc.search);
     let referrer: string | null = null;

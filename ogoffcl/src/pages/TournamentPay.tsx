@@ -3,6 +3,7 @@ import { Link, useParams, useSearchParams } from "react-router-dom";
 import { motion } from "framer-motion";
 import { usePageMeta } from "../lib/seo";
 import MomoHelp from "../components/MomoHelp";
+import { gtagOnce } from "../lib/track";
 
 /**
  * Standalone payment page for an existing tournament registration —
@@ -71,6 +72,13 @@ export default function TournamentPay() {
   }, [playerId]);
 
   useEffect(() => () => { if (pollRef.current) window.clearInterval(pollRef.current); }, []);
+
+  // Google Ads conversion signal — tournament entry paid (pay-link flow).
+  useEffect(() => {
+    if (pay.step !== "done" || !player) return;
+    gtagOnce(`trn_${player.id}`, "tournament_entry", { value: player.fee, currency: "GHS" });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [pay.step]);
 
   const startPolling = (ref: string) => {
     setPay({ step: "waiting", ref });

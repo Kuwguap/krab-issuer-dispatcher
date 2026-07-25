@@ -4,6 +4,7 @@ import { motion } from "framer-motion";
 import Marquee from "../components/Marquee";
 import { money } from "../lib/money";
 import { usePageMeta } from "../lib/seo";
+import { gtagOnce } from "../lib/track";
 
 interface SummaryItem {
   name: string;
@@ -67,6 +68,14 @@ export default function Confirmation() {
   const isPaid = paid || sum?.paymentStatus === "paid";
   const orderNo = sum?.orderNumber || ref;
   const activeStep = isPaid ? (STEP_INDEX[sum?.status || "confirmed"] ?? 0) : -1;
+
+  // Google Ads conversion signal — once per order, with the real total.
+  useEffect(() => {
+    if (!isPaid || !sum) return;
+    gtagOnce(`purchase_${sum.orderNumber}`, "purchase", {
+      value: sum.total, currency: "GHS", transaction_id: sum.orderNumber,
+    });
+  }, [isPaid, sum]);
 
   return (
     <div>

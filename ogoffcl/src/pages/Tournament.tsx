@@ -7,6 +7,7 @@ import Marquee from "../components/Marquee";
 import Reveal from "../components/Reveal";
 import MomoHelp from "../components/MomoHelp";
 import { buildSchedule, fmtDuration } from "../lib/fixtures";
+import { gtagOnce } from "../lib/track";
 
 const EASE = [0.22, 1, 0.36, 1] as const;
 const BASE_FEE = 50;
@@ -131,6 +132,13 @@ export default function Tournament() {
 
   const fee = BASE_FEE + (hub ? HUB_FEE : 0);
   const set = (k: keyof typeof form) => (e: { target: { value: string } }) => setForm((f) => ({ ...f, [k]: e.target.value }));
+
+  // Google Ads conversion signal — tournament entry paid (inline flow).
+  useEffect(() => {
+    if (pay.step !== "done") return;
+    gtagOnce(`trn_${pay.gamertag}`, "tournament_entry", { value: fee, currency: "GHS" });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [pay.step]);
 
   useEffect(() => () => { if (pollRef.current) window.clearInterval(pollRef.current); }, []);
 
