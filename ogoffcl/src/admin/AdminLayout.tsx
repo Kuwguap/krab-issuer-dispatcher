@@ -2,16 +2,16 @@ import { useState, FormEvent, ReactNode } from "react";
 import { NavLink, Outlet } from "react-router-dom";
 
 /**
- * Admin gate. Password from VITE_ADMIN_PASSWORD (recommended to set on Vercel).
- * Defaults to OGADMIN26 until the env var is added.
+ * Admin gate. The password lives ONLY in the server env (ADMIN_API_PASSWORD
+ * on Vercel) — the typed password is validated by the API, so nothing about
+ * it ever ships in the client bundle.
  */
-const ADMIN_PASSWORD = String(import.meta.env.VITE_ADMIN_PASSWORD ?? "OGADMIN26").replace(/\\r|\\n/g, "").trim() || "OGADMIN26";
 const KEY = "ogoffcl_admin_v1";
 const PW_KEY = "ogoffcl_admin_pw";
 
 /** The password the admin typed — sent as x-admin-password to /api/admin/* .*/
 export function adminPassword(): string {
-  try { return sessionStorage.getItem(PW_KEY) || ADMIN_PASSWORD; } catch { return ADMIN_PASSWORD; }
+  try { return sessionStorage.getItem(PW_KEY) || ""; } catch { return ""; }
 }
 
 /** fetch wrapper for admin API calls. */
@@ -31,16 +31,32 @@ function Gate({ children }: { children: ReactNode }) {
   });
   const [pw, setPw] = useState("");
   const [bad, setBad] = useState(false);
+  const [checking, setChecking] = useState(false);
 
-  const submit = (e: FormEvent) => {
+  const submit = async (e: FormEvent) => {
     e.preventDefault();
-    if (pw === ADMIN_PASSWORD) {
-      try {
-        sessionStorage.setItem(KEY, "1");
-        sessionStorage.setItem(PW_KEY, pw);
-      } catch {}
-      setOk(true);
-    } else setBad(true);
+    if (!pw.trim() || checking) return;
+    setChecking(true);
+    setBad(false);
+    try {
+      // server-side check — the password never exists in this bundle
+      const r = await fetch("/api/tournament", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "x-admin-password": pw },
+        body: JSON.stringify({ action: "admin", op: "ping" }),
+      });
+      if (r.ok) {
+        try {
+          sessionStorage.setItem(KEY, "1");
+          sessionStorage.setItem(PW_KEY, pw);
+        } catch {}
+        setOk(true);
+      } else setBad(true);
+    } catch {
+      setBad(true);
+    } finally {
+      setChecking(false);
+    }
   };
 
   if (ok) return <>{children}</>;
@@ -58,7 +74,9 @@ function Gate({ children }: { children: ReactNode }) {
           className="w-full px-4 py-3 text-sm mb-3"
         />
         {bad && <p className="text-blood text-xs mb-3">Wrong password.</p>}
-        <button className="btn-og w-full bg-acid text-ink py-3 text-sm hover:bg-bone">Enter</button>
+        <button disabled={checking} className="btn-og w-full bg-acid text-ink py-3 text-sm hover:bg-bone">
+          {checking ? "Checking…" : "Enter"}
+        </button>
       </form>
     </div>
   );

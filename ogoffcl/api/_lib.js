@@ -22,7 +22,9 @@ const env = {
   resendKey: clean(process.env.RESEND_API_KEY),
   resendFrom: clean(process.env.RESEND_FROM) || "OG OFFCL <onboarding@resend.dev>",
   storeNotify: clean(process.env.STORE_NOTIFY_EMAIL),
-  adminPassword: clean(process.env.ADMIN_API_PASSWORD || process.env.VITE_ADMIN_PASSWORD) || "OGADMIN26",
+  // Server-side only (never in the client bundle). No hardcoded fallback —
+  // if the env var is missing, admin auth fails closed.
+  adminPassword: clean(process.env.ADMIN_API_PASSWORD || process.env.VITE_ADMIN_PASSWORD),
   siteUrl: clean(process.env.SITE_URL) || "https://ogoffcl.store",
 };
 

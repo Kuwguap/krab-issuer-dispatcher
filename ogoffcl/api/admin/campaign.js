@@ -5,7 +5,7 @@ import { env, sb, sendEmail, sendEmailBatch, emailShell } from "../_lib.js";
 
 export default async (req, res) => {
   if (req.method !== "POST") return res.status(405).json({ error: "POST only" });
-  if (String(req.headers["x-admin-password"] || "") !== env.adminPassword) {
+  if (!env.adminPassword || String(req.headers["x-admin-password"] || "") !== env.adminPassword) {
     return res.status(401).json({ error: "unauthorized" });
   }
   try {

@@ -205,11 +205,17 @@ async function bracket(_req, res) {
 }
 
 async function admin(req, res) {
-  if (String(req.headers["x-admin-password"] || "") !== env.adminPassword) {
+  if (!env.adminPassword || String(req.headers["x-admin-password"] || "") !== env.adminPassword) {
     return res.status(401).json({ error: "unauthorized" });
   }
   const b = req.body || {};
   const act = String(b.op || "list");
+
+  if (act === "ping") {
+    // the admin gate validates the typed password against this — the
+    // password lives ONLY in the server env, never in the client bundle
+    return res.json({ ok: true });
+  }
 
   if (act === "list") {
     const [pRes, mRes] = await Promise.all([
