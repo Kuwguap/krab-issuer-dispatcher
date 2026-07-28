@@ -1986,34 +1986,50 @@ class Database:
         lead_id: str | None = None,
         renewal_id: str | None = None,
         reference_id: str | None = None,
+        delivery_address: str | None = None,
     ) -> Optional[Dict[str, Any]]:
-        """Create a pending tracking session. Returns row or None on failure."""
+        """Create a pending tracking session. Returns row or None on failure.
+
+        ``delivery_address`` (v2 column) powers the admin map's destination/ETA;
+        if the v2 migration hasn't run yet, the insert retries without it.
+        """
         if not self._check_tables_exist():
             return None
-        try:
-            row = {
-                "token": token,
-                "kind": kind,
-                "chat_id": str(chat_id),
-                "status": "pending",
-            }
-            if driver_id:
-                row["driver_id"] = str(driver_id)
-            if driver_name:
-                row["driver_name"] = driver_name
-            if lead_id:
-                row["lead_id"] = str(lead_id)
-            if renewal_id:
-                row["renewal_id"] = str(renewal_id)
-            if reference_id:
-                row["reference_id"] = str(reference_id)
-            r = self.client.table("driver_tracking_sessions").insert(row).execute()
-            return r.data[0] if r.data else None
-        except Exception as e:
-            logger.error(
-                "Error creating tracking session (run database/migration_driver_tracking.sql?): %s", e
-            )
-            return None
+        row = {
+            "token": token,
+            "kind": kind,
+            "chat_id": str(chat_id),
+            "status": "pending",
+        }
+        if driver_id:
+            row["driver_id"] = str(driver_id)
+        if driver_name:
+            row["driver_name"] = driver_name
+        if lead_id:
+            row["lead_id"] = str(lead_id)
+        if renewal_id:
+            row["renewal_id"] = str(renewal_id)
+        if reference_id:
+            row["reference_id"] = str(reference_id)
+        if delivery_address:
+            row["delivery_address"] = delivery_address
+        for attempt in (0, 1):
+            try:
+                r = self.client.table("driver_tracking_sessions").insert(row).execute()
+                return r.data[0] if r.data else None
+            except Exception as e:
+                if attempt == 0 and "delivery_address" in row and "delivery_address" in str(e):
+                    logger.warning(
+                        "Tracking insert retrying without delivery_address — "
+                        "run database/migration_driver_tracking_v2.sql: %s", e
+                    )
+                    row.pop("delivery_address", None)
+                    continue
+                logger.error(
+                    "Error creating tracking session (run database/migration_driver_tracking.sql?): %s", e
+                )
+                return None
+        return None
 
     def get_tracking_sessions_located_unsent(self) -> list:
         """Sessions whose location arrived but details haven't been sent yet."""

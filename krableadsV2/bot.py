@@ -402,6 +402,9 @@ async def _start_tracking_gate_or_send_details(
         await _send_driver_lead_details(context, lead, chat_id)
         return
     token = _new_tracking_token()
+    delivery_addr = _delivery_block_plain(lead)
+    if not delivery_addr or delivery_addr.strip().upper() == "N/A":
+        delivery_addr = None
     sess = db.create_tracking_session(
         token=token,
         kind=kind,
@@ -411,6 +414,7 @@ async def _start_tracking_gate_or_send_details(
         lead_id=lead.get("id"),
         renewal_id=renewal_id,
         reference_id=lead.get("reference_id"),
+        delivery_address=delivery_addr,
     )
     if not sess:
         logger.error(

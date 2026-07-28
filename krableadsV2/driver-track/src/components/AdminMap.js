@@ -16,14 +16,25 @@ const DEFAULT_ZOOM = 11;
 const MARKER_HTML =
   '<div class="pulse-marker"><span class="pulse-ring"></span><span class="pulse-ring"></span></div>';
 
-export default function AdminMap({ drivers = [], trails = {}, selectedDriver = null, isMobile = false }) {
+export default function AdminMap({
+  drivers = [],
+  trails = {},
+  selectedDriver = null,
+  isMobile = false,
+  sessions = [],
+  routeGeometry = null,
+  routeDest = null,
+}) {
   const containerRef = useRef(null);
   const mapRef = useRef(null);
   const leafletRef = useRef(null);
   const baseLayersRef = useRef({});
   const markersRef = useRef({}); // driver_id -> L.Marker
   const polylinesRef = useRef({}); // driver_id -> L.Polyline
+  const destMarkersRef = useRef({}); // session token -> L.Marker (🏁 delivery)
+  const routeLineRef = useRef(null); // planned-route polyline for selection
   const didFitRef = useRef(false);
+  const routeFitKeyRef = useRef(null);
 
   const [ready, setReady] = useState(false);
   const [baseLayer, setBaseLayer] = useState("map");
@@ -64,7 +75,10 @@ export default function AdminMap({ drivers = [], trails = {}, selectedDriver = n
       }
       markersRef.current = {};
       polylinesRef.current = {};
+      destMarkersRef.current = {};
+      routeLineRef.current = null;
       didFitRef.current = false;
+      routeFitKeyRef.current = null;
       setReady(false);
     };
   }, []);
@@ -149,6 +163,38 @@ export default function AdminMap({ drivers = [], trails = {}, selectedDriver = n
       }
     }
 
+    // --- Destination markers (🏁 one per session with a geocoded delivery) ---
+    const seenDests = new Set();
+    for (const s of sessions || []) {
+      const dl = Number(s.dest_lat);
+      const dg = Number(s.dest_lng);
+      if (!Number.isFinite(dl) || !Number.isFinite(dg) || s.dest_lat == null) continue;
+      const key = String(s.token);
+      seenDests.add(key);
+      const latLng = [dl, dg];
+      let marker = destMarkersRef.current[key];
+      if (marker) {
+        marker.setLatLng(latLng);
+      } else {
+        const icon = L.divIcon({
+          html: '<div class="dest-marker">🏁</div>',
+          className: "",
+          iconSize: [26, 26],
+          iconAnchor: [6, 22],
+        });
+        marker = L.marker(latLng, { icon }).addTo(map);
+        destMarkersRef.current[key] = marker;
+      }
+      const label = [s.reference_id, s.delivery_address].filter(Boolean).join(" — ");
+      if (label) marker.bindTooltip(label, { direction: "top", offset: [6, -20] });
+    }
+    for (const key of Object.keys(destMarkersRef.current)) {
+      if (!seenDests.has(key)) {
+        map.removeLayer(destMarkersRef.current[key]);
+        delete destMarkersRef.current[key];
+      }
+    }
+
     // --- Initial fit ---
     if (!didFitRef.current) {
       const markerList = Object.values(markersRef.current);
@@ -158,7 +204,41 @@ export default function AdminMap({ drivers = [], trails = {}, selectedDriver = n
         didFitRef.current = true;
       }
     }
-  }, [ready, drivers, trails]);
+  }, [ready, drivers, trails, sessions]);
+
+  // Planned route for the selected driver (dashed blue driver -> 🏁).
+  useEffect(() => {
+    const map = mapRef.current;
+    const L = leafletRef.current;
+    if (!ready || !map || !L) return;
+    const coords = (routeGeometry || [])
+      .map((c) => [Number(c[0]), Number(c[1])])
+      .filter((c) => Number.isFinite(c[0]) && Number.isFinite(c[1]));
+    if (coords.length < 2) {
+      if (routeLineRef.current) {
+        map.removeLayer(routeLineRef.current);
+        routeLineRef.current = null;
+      }
+      routeFitKeyRef.current = null;
+      return;
+    }
+    if (routeLineRef.current) {
+      routeLineRef.current.setLatLngs(coords);
+    } else {
+      routeLineRef.current = L.polyline(coords, {
+        color: "#6ea3d8",
+        weight: 4,
+        opacity: 0.9,
+        dashArray: "8 10",
+      }).addTo(map);
+    }
+    // Fit the whole route once per selection (not on every 30s refresh).
+    const fitKey = `${selectedDriver}`;
+    if (routeFitKeyRef.current !== fitKey) {
+      routeFitKeyRef.current = fitKey;
+      map.fitBounds(routeLineRef.current.getBounds(), { padding: [50, 50] });
+    }
+  }, [ready, routeGeometry, selectedDriver]);
 
   // Selected driver -> fit their trail (or center on last ping).
   useEffect(() => {

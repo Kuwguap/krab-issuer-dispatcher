@@ -48,14 +48,21 @@ export async function GET(request) {
       created_at: s.created_at,
       located_at: s.located_at,
       details_sent_at: s.details_sent_at,
+      delivery_address: s.delivery_address ?? null,
+      dest_lat: s.dest_lat ?? null,
+      dest_lng: s.dest_lng ?? null,
     }));
 
-    // Most recent session per driver -> driver_name lookup.
+    // Most recent session per driver -> driver_name + session token lookup.
     // getRecentSessions is ordered created_at desc, so first hit wins.
     const nameByDriver = new Map();
+    const sessionByDriver = new Map();
     for (const s of sessionRows || []) {
       if (s.driver_id != null && !nameByDriver.has(String(s.driver_id))) {
         nameByDriver.set(String(s.driver_id), s.driver_name || null);
+      }
+      if (s.driver_id != null && !sessionByDriver.has(String(s.driver_id))) {
+        sessionByDriver.set(String(s.driver_id), s.token);
       }
     }
 
@@ -73,6 +80,7 @@ export async function GET(request) {
       drivers.push({
         driver_id: driverId,
         driver_name: nameByDriver.get(driverId) || null,
+        session_token: sessionByDriver.get(driverId) || null,
         last_ping: {
           lat: ping.lat,
           lng: ping.lng,

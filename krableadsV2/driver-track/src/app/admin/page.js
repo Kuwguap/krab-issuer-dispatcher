@@ -189,6 +189,41 @@ export default function AdminPage() {
     }
   }, [isMobile]);
 
+  // Route/ETA for the selected driver (their latest session), refreshed 30s.
+  const [routeInfo, setRouteInfo] = useState(null);
+  const [routeLoading, setRouteLoading] = useState(false);
+  const selectedTokenRef = useRef(null);
+
+  const fetchRoute = useCallback(async (token) => {
+    if (!token) return;
+    try {
+      const res = await fetch(`/api/admin/route?token=${encodeURIComponent(token)}`, {
+        cache: "no-store",
+      });
+      if (!res.ok) return;
+      const json = await res.json();
+      // Ignore late responses for a driver we've deselected.
+      if (selectedTokenRef.current === token) setRouteInfo(json);
+    } catch {
+      // keep last route on transient failures
+    } finally {
+      setRouteLoading(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    const d = (data?.drivers || []).find((x) => x.driver_id === selectedDriver);
+    const token = d?.session_token || null;
+    selectedTokenRef.current = token;
+    setRouteInfo(null);
+    if (!token) return;
+    setRouteLoading(true);
+    fetchRoute(token);
+    const id = setInterval(() => fetchRoute(token), 30 * 1000);
+    return () => clearInterval(id);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [selectedDriver, fetchRoute]);
+
   const fetchOverview = useCallback(async (h) => {
     try {
       const res = await fetch(`/api/admin/overview?hours=${h ?? hoursRef.current}`, {
@@ -247,7 +282,93 @@ export default function AdminPage() {
         trails={trails}
         selectedDriver={selectedDriver}
         isMobile={isMobile}
+        sessions={sessions}
+        routeGeometry={routeInfo?.geometry || null}
+        routeDest={routeInfo?.to && Number.isFinite(Number(routeInfo.to.lat)) ? routeInfo.to : null}
       />
+
+      {/* Route / ETA panel for the selected driver */}
+      {selectedDriver && (routeInfo || routeLoading) ? (
+        <div
+          className="glass-card"
+          style={{
+            position: "absolute",
+            zIndex: 1000,
+            left: isMobile ? 12 : 16,
+            right: isMobile ? 12 : "auto",
+            bottom: isMobile ? 132 : 20,
+            width: isMobile ? "auto" : 340,
+            maxWidth: isMobile ? "none" : "calc(100vw - 32px)",
+            padding: "14px 16px",
+            display: "flex",
+            flexDirection: "column",
+            gap: 8,
+          }}
+        >
+          {routeInfo ? (
+            <>
+              <div style={{ display: "flex", alignItems: "baseline", justifyContent: "space-between", gap: 10 }}>
+                <span style={{ fontFamily: "var(--font-sora)", fontWeight: 700, fontSize: 14 }}>
+                  🚚 {routeInfo.driver_name || "Driver"}
+                  {routeInfo.reference_id ? (
+                    <span style={{ color: "var(--text-muted)", fontWeight: 600 }}>
+                      {" "}· {routeInfo.reference_id}
+                    </span>
+                  ) : null}
+                </span>
+                <StatusBadge status={routeInfo.status} />
+              </div>
+              <div style={{ display: "flex", gap: 8, alignItems: "flex-start" }}>
+                <span style={{ fontSize: 13 }}>🟢</span>
+                <div style={{ minWidth: 0 }}>
+                  <div style={{ fontSize: 11, color: "var(--text-muted)", fontFamily: "var(--font-sora)", fontWeight: 600 }}>FROM (driver)</div>
+                  <div style={{ fontSize: 13, lineHeight: 1.35 }}>
+                    {routeInfo.from?.address || (routeInfo.from ? `${routeInfo.from.lat?.toFixed(4)}, ${routeInfo.from.lng?.toFixed(4)}` : "No location yet")}
+                  </div>
+                </div>
+              </div>
+              <div style={{ display: "flex", gap: 8, alignItems: "flex-start" }}>
+                <span style={{ fontSize: 13 }}>🏁</span>
+                <div style={{ minWidth: 0 }}>
+                  <div style={{ fontSize: 11, color: "var(--text-muted)", fontFamily: "var(--font-sora)", fontWeight: 600 }}>TO (delivery)</div>
+                  <div style={{ fontSize: 13, lineHeight: 1.35 }}>
+                    {routeInfo.to?.address || "No delivery address on this lead"}
+                  </div>
+                </div>
+              </div>
+              <div
+                style={{
+                  display: "flex",
+                  alignItems: "center",
+                  gap: 12,
+                  marginTop: 2,
+                  paddingTop: 8,
+                  borderTop: "1px solid rgba(122, 165, 216, 0.18)",
+                }}
+              >
+                <span style={{ fontFamily: "var(--font-sora)", fontWeight: 800, fontSize: 20, color: "var(--accent-bright)" }}>
+                  {routeInfo.eta_label || "ETA —"}
+                </span>
+                {routeInfo.distance_label ? (
+                  <span style={{ fontSize: 13, color: "var(--text-muted)" }}>
+                    {routeInfo.distance_label} to go
+                  </span>
+                ) : (
+                  <span style={{ fontSize: 12, color: "var(--text-muted)" }}>
+                    {routeInfo.to?.address && !routeInfo.from
+                      ? "waiting for a location ping"
+                      : routeInfo.to
+                        ? "route unavailable"
+                        : "no destination to route to"}
+                  </span>
+                )}
+              </div>
+            </>
+          ) : (
+            <span style={{ fontSize: 13, color: "var(--text-muted)" }}>Calculating route…</span>
+          )}
+        </div>
+      ) : null}
 
       {/* Left overlay: driver list (tap the header chip to collapse/expand) */}
       <div

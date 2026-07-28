@@ -110,6 +110,13 @@ a {
   }
 }
 
+/* Delivery destination marker (🏁 flag inside a Leaflet divIcon) */
+.dest-marker {
+  font-size: 22px;
+  line-height: 1;
+  filter: drop-shadow(0 2px 4px rgba(0, 0, 0, 0.6));
+}
+
 /* Small pulsing "live" dot used in lists */
 .live-dot {
   position: relative;

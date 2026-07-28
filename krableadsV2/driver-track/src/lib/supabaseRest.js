@@ -48,10 +48,45 @@ async function supabaseFetch(path, options = {}) {
 }
 
 export async function getSessionByToken(token) {
-  const query =
-    "select=id,token,kind,driver_id,driver_name,reference_id,status,created_at,located_at,details_sent_at" +
-    `&token=eq.${encodeURIComponent(token)}&limit=1`;
+  // select=* keeps this tolerant of optional v2 columns (delivery_address,
+  // dest_lat/dest_lng) not existing yet. Public routes must still whitelist
+  // what they return to the browser.
+  const query = `select=*&token=eq.${encodeURIComponent(token)}&limit=1`;
   const rows = await supabaseFetch(restUrl("driver_tracking_sessions", query), {
+    method: "GET",
+  });
+  return (rows || [])[0] || null;
+}
+
+// Cache geocoded destination coordinates on the session (v2 columns).
+// Best-effort: throws if the migration hasn't run — callers should catch.
+export async function cacheSessionDest(token, lat, lng) {
+  const query = `token=eq.${encodeURIComponent(token)}`;
+  await supabaseFetch(restUrl("driver_tracking_sessions", query), {
+    method: "PATCH",
+    body: JSON.stringify({ dest_lat: lat, dest_lng: lng }),
+  });
+}
+
+export async function getLatestPingForSession(sessionToken) {
+  const query =
+    "select=lat,lng,accuracy,speed,created_at" +
+    `&session_token=eq.${encodeURIComponent(sessionToken)}` +
+    "&order=created_at.desc&limit=1";
+  const rows = await supabaseFetch(restUrl("driver_location_pings", query), {
+    method: "GET",
+  });
+  return (rows || [])[0] || null;
+}
+
+export async function getLatestPingForDriver(driverId, hours = 24) {
+  const since = new Date(Date.now() - hours * 3600 * 1000).toISOString();
+  const query =
+    "select=lat,lng,accuracy,speed,created_at" +
+    `&driver_id=eq.${encodeURIComponent(driverId)}` +
+    `&created_at=gte.${encodeURIComponent(since)}` +
+    "&order=created_at.desc&limit=1";
+  const rows = await supabaseFetch(restUrl("driver_location_pings", query), {
     method: "GET",
   });
   return (rows || [])[0] || null;
@@ -101,8 +136,9 @@ export async function insertPing({
 
 export async function getRecentSessions(hours = 48) {
   const since = new Date(Date.now() - hours * 3600 * 1000).toISOString();
+  // select=* so optional v2 columns come through when present.
   const query =
-    "select=token,kind,reference_id,driver_id,driver_name,status,created_at,located_at,details_sent_at" +
+    "select=*" +
     `&created_at=gte.${encodeURIComponent(since)}` +
     "&order=created_at.desc&limit=200";
   const rows = await supabaseFetch(restUrl("driver_tracking_sessions", query), {
