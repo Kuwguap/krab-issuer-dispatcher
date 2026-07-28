@@ -88,6 +88,9 @@ class Config:
     # Minutes before a still-pending session triggers a driver reminder +
     # supervisor alert (hard block — details are never auto-sent on timeout).
     TRACKING_TIMEOUT_MINUTES = int(os.getenv("TRACKING_TIMEOUT_MINUTES", "5"))
+    # Arrival geofence: when a driver ping lands within this many meters of the
+    # delivery destination, the bot DMs them to upload the receipt.
+    TRACKING_ARRIVAL_RADIUS_M = int(os.getenv("TRACKING_ARRIVAL_RADIUS_M", "200"))
 
     # Client follow-up outreach (bot texts the client chasing the VIN).
     # Optional — when unset, follow-ups fall back to email-only client contact.

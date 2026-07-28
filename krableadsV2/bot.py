@@ -9914,9 +9914,24 @@ async def handle_cf_delete(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     await _handle_cf_action(update, context, "cf_del_")
 
 
+def _haversine_m(lat1, lng1, lat2, lng2) -> float:
+    """Distance in meters between two WGS84 points."""
+    import math
+    try:
+        p1, p2 = math.radians(float(lat1)), math.radians(float(lat2))
+        dp = p2 - p1
+        dl = math.radians(float(lng2) - float(lng1))
+        a = math.sin(dp / 2) ** 2 + math.cos(p1) * math.cos(p2) * math.sin(dl / 2) ** 2
+        return 6371000.0 * 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
+    except (TypeError, ValueError):
+        return float("inf")
+
+
 # Driver GPS tracking job: every 10s, (a) send deferred details for sessions
 # whose location arrived, (b) remind drivers still pending past the window and
-# alert supervisors with a manual override button (hard block — no auto-send).
+# alert supervisors with a manual override button (hard block — no auto-send),
+# (c) arrival geofence — when a fresh ping lands within TRACKING_ARRIVAL_RADIUS_M
+# of the delivery destination, DM the driver to upload the receipt.
 async def process_tracking_sessions(context: ContextTypes.DEFAULT_TYPE) -> None:
     if not Config.is_tracking_configured():
         return
@@ -9987,6 +10002,48 @@ async def process_tracking_sessions(context: ContextTypes.DEFAULT_TYPE) -> None:
                     )
                 except Exception as e:
                     logger.warning("Tracking supervisor alert to %s failed: %s", sup_id, e)
+
+        # (c) Arrival geofence → receipt reminder (fires once per session).
+        awaiting = await asyncio.to_thread(db.get_tracking_sessions_awaiting_arrival)
+        for s in awaiting:
+            sid = s.get("id")
+            token = s.get("token")
+            if not sid or not token:
+                continue
+            ping = await asyncio.to_thread(db.get_latest_ping_for_session, token)
+            if not ping:
+                continue
+            # Only act on FRESH pings (driver actively tracking) — a stale ping
+            # near the destination must not fire an arrival hours later.
+            ping_dt = _fu_parse_iso(ping.get("created_at"))
+            from datetime import timezone as _tz
+            if not ping_dt or (datetime.now(_tz.utc) - ping_dt).total_seconds() > 15 * 60:
+                continue
+            dist = _haversine_m(ping.get("lat"), ping.get("lng"), s.get("dest_lat"), s.get("dest_lng"))
+            if dist > Config.TRACKING_ARRIVAL_RADIUS_M:
+                continue
+            if not await asyncio.to_thread(db.mark_tracking_arrival_notified, sid):
+                continue  # another tick claimed it
+            ref = (s.get("reference_id") or "").strip()
+            kb = None
+            if ref:
+                kb = InlineKeyboardMarkup([[
+                    InlineKeyboardButton("🧾 Upload Receipt", callback_data=f"receipt_for_{ref}")
+                ]])
+            try:
+                await context.bot.send_message(
+                    chat_id=s.get("chat_id"),
+                    text=(
+                        f"📍 You've arrived at the delivery location{f' for `{ref}`' if ref else ''}!\n\n"
+                        "🚨 Collect payment BEFORE handing over the tag.\n"
+                        "🧾 Then upload the receipt right here."
+                    ),
+                    parse_mode="Markdown",
+                    reply_markup=kb,
+                )
+                logger.info("Arrival receipt reminder sent for session %s (%.0fm)", sid, dist)
+            except Exception as e:
+                logger.warning("Arrival reminder to %s failed: %s", s.get("chat_id"), e)
     except Exception as e:
         logger.error("Tracking session job failed: %s", e)
 

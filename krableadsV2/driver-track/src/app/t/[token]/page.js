@@ -146,8 +146,10 @@ export default function TrackPage({ params }) {
     if (!navigator.geolocation || watchIdRef.current != null) return;
     watchIdRef.current = navigator.geolocation.watchPosition(
       (position) => {
+        // Live trip tracking: post even when the tab is backgrounded (browsers
+        // throttle it, but every fix that fires still lands on the admin map
+        // and feeds the arrival geofence).
         const now = Date.now();
-        if (document.visibilityState !== "visible") return;
         if (now - lastPingAtRef.current < PING_THROTTLE_MS) return;
         lastPingAtRef.current = now;
         postPing(position).catch(() => {});
@@ -286,6 +288,10 @@ export default function TrackPage({ params }) {
         <h1 style={{ fontSize: 26, fontWeight: 800 }}>Location shared ✅</h1>
         <p style={{ color: "var(--text-muted)", margin: 0, fontSize: 16 }}>
           Your delivery details are on the way in Telegram.
+        </p>
+        <p style={{ color: "var(--accent-bright)", margin: 0, fontSize: 14, maxWidth: 320 }}>
+          📍 Keep this page open while you drive — dispatch tracks your trip
+          live, and you&apos;ll get a receipt reminder the moment you arrive.
         </p>
         <div style={{ width: "100%", maxWidth: 320 }}>
           <TelegramButton />

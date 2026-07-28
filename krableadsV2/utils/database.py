@@ -2168,6 +2168,66 @@ class Database:
             logger.error(f"Error marking tracking reminder sent: {e}")
             return False
 
+    def get_tracking_sessions_awaiting_arrival(self) -> list:
+        """Active sessions with a destination whose arrival ping hasn't fired.
+
+        Requires the v2 migration (dest/arrival columns) — returns [] before it.
+        """
+        if not self._check_tables_exist():
+            return []
+        try:
+            from datetime import datetime, timedelta, timezone
+            since = (datetime.now(timezone.utc) - timedelta(hours=24)).isoformat()
+            r = (
+                self.client.table("driver_tracking_sessions")
+                .select("*")
+                .in_("status", ["located", "details_sent", "overridden"])
+                .is_("arrival_notified_at", "null")
+                .not_.is_("dest_lat", "null")
+                .gte("created_at", since)
+                .limit(50)
+                .execute()
+            )
+            return r.data or []
+        except Exception as e:
+            logger.error(f"Error fetching arrival-pending tracking sessions: {e}")
+            return []
+
+    def get_latest_ping_for_session(self, token: str) -> Optional[Dict[str, Any]]:
+        if not self._check_tables_exist():
+            return None
+        try:
+            r = (
+                self.client.table("driver_location_pings")
+                .select("lat,lng,created_at")
+                .eq("session_token", token)
+                .order("created_at", desc=True)
+                .limit(1)
+                .execute()
+            )
+            return r.data[0] if r.data else None
+        except Exception as e:
+            logger.error(f"Error fetching latest ping for session: {e}")
+            return None
+
+    def mark_tracking_arrival_notified(self, session_id: str) -> bool:
+        """Conditionally claim the arrival notification (fires exactly once)."""
+        if not self._check_tables_exist():
+            return False
+        try:
+            from datetime import datetime, timezone
+            r = (
+                self.client.table("driver_tracking_sessions")
+                .update({"arrival_notified_at": datetime.now(timezone.utc).isoformat()})
+                .eq("id", session_id)
+                .is_("arrival_notified_at", "null")
+                .execute()
+            )
+            return bool(r.data)
+        except Exception as e:
+            logger.error(f"Error marking tracking arrival notified: {e}")
+            return False
+
     def get_tracking_session_by_id(self, session_id: str) -> Optional[Dict[str, Any]]:
         if not self._check_tables_exist():
             return None
