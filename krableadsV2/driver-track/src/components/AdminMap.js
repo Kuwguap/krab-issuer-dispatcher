@@ -16,7 +16,7 @@ const DEFAULT_ZOOM = 11;
 const MARKER_HTML =
   '<div class="pulse-marker"><span class="pulse-ring"></span><span class="pulse-ring"></span></div>';
 
-export default function AdminMap({ drivers = [], trails = {}, selectedDriver = null }) {
+export default function AdminMap({ drivers = [], trails = {}, selectedDriver = null, isMobile = false }) {
   const containerRef = useRef(null);
   const mapRef = useRef(null);
   const leafletRef = useRef(null);
@@ -190,45 +190,49 @@ export default function AdminMap({ drivers = [], trails = {}, selectedDriver = n
     }
   }
 
+  const btnSize = isMobile ? 38 : 42;
   const roundBtnStyle = {
-    width: 42,
-    height: 42,
+    width: btnSize,
+    height: btnSize,
     borderRadius: "50%",
     display: "flex",
     alignItems: "center",
     justifyContent: "center",
-    fontSize: 20,
+    fontSize: isMobile ? 18 : 20,
     fontWeight: 700,
     color: "var(--text)",
   };
+
+  // On phones the top edge is taken by the driver list + hours chips, so the
+  // layer toggle moves to the bottom-left (opposite the zoom stack).
+  const toggleStyle = isMobile
+    ? { position: "absolute", left: 12, bottom: 90, zIndex: 1000, display: "flex", padding: 3, gap: 2 }
+    : {
+        position: "absolute",
+        top: 16,
+        left: "50%",
+        transform: "translateX(-50%)",
+        zIndex: 1000,
+        display: "flex",
+        padding: 3,
+        gap: 2,
+      };
 
   return (
     <div style={{ position: "absolute", inset: 0 }}>
       <div ref={containerRef} style={{ position: "absolute", inset: 0 }} />
 
-      {/* Map | Satellite toggle (top center) */}
-      <div
-        className="glass-chip"
-        style={{
-          position: "absolute",
-          top: 16,
-          left: "50%",
-          transform: "translateX(-50%)",
-          zIndex: 1000,
-          display: "flex",
-          padding: 3,
-          gap: 2,
-        }}
-      >
+      {/* Map | Satellite toggle */}
+      <div className="glass-chip" style={toggleStyle}>
         {[
           { key: "map", label: "Map" },
-          { key: "sat", label: "Satellite" },
+          { key: "sat", label: isMobile ? "Sat" : "Satellite" },
         ].map((opt) => (
           <button
             key={opt.key}
             onClick={() => setBaseLayer(opt.key)}
             style={{
-              padding: "6px 14px",
+              padding: isMobile ? "6px 11px" : "6px 14px",
               borderRadius: 7,
               fontSize: 13,
               fontWeight: 700,
@@ -245,7 +249,7 @@ export default function AdminMap({ drivers = [], trails = {}, selectedDriver = n
       <div
         style={{
           position: "absolute",
-          right: 16,
+          right: isMobile ? 12 : 16,
           bottom: 90,
           zIndex: 1000,
           display: "flex",

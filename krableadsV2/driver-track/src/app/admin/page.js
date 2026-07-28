@@ -2,6 +2,7 @@
 
 import dynamic from "next/dynamic";
 import { useCallback, useEffect, useRef, useState } from "react";
+import useIsMobile from "../../lib/useIsMobile";
 
 const AdminMap = dynamic(() => import("../../components/AdminMap"), { ssr: false });
 
@@ -103,8 +104,8 @@ function LoginForm({ onSuccess }) {
 
   return (
     <main
+      className="full-h"
       style={{
-        minHeight: "100vh",
         display: "flex",
         alignItems: "center",
         justifyContent: "center",
@@ -173,8 +174,20 @@ export default function AdminPage() {
   const [hours, setHours] = useState(8);
   const [selectedDriver, setSelectedDriver] = useState(null);
   const [drawerOpen, setDrawerOpen] = useState(true);
+  const [listOpen, setListOpen] = useState(true);
+  const isMobile = useIsMobile();
+  const mobileInitRef = useRef(false);
   const hoursRef = useRef(hours);
   hoursRef.current = hours;
+
+  // On phones, start with the panels collapsed so the map is usable.
+  useEffect(() => {
+    if (isMobile && !mobileInitRef.current) {
+      mobileInitRef.current = true;
+      setDrawerOpen(false);
+      setListOpen(false);
+    }
+  }, [isMobile]);
 
   const fetchOverview = useCallback(async (h) => {
     try {
@@ -211,8 +224,8 @@ export default function AdminPage() {
   if (authed === null || !data) {
     return (
       <main
+        className="full-h"
         style={{
-          minHeight: "100vh",
           display: "flex",
           alignItems: "center",
           justifyContent: "center",
@@ -228,30 +241,39 @@ export default function AdminPage() {
   const trails = data.trails || {};
 
   return (
-    <main style={{ position: "fixed", inset: 0, overflow: "hidden" }}>
-      <AdminMap drivers={drivers} trails={trails} selectedDriver={selectedDriver} />
+    <main className="fixed-viewport" style={{ overflow: "hidden" }}>
+      <AdminMap
+        drivers={drivers}
+        trails={trails}
+        selectedDriver={selectedDriver}
+        isMobile={isMobile}
+      />
 
-      {/* Left overlay: driver list */}
+      {/* Left overlay: driver list (tap the header chip to collapse/expand) */}
       <div
         style={{
           position: "absolute",
-          top: 16,
-          left: 16,
+          top: isMobile ? 12 : 16,
+          left: isMobile ? 12 : 16,
           zIndex: 1000,
           display: "flex",
           flexDirection: "column",
           gap: 8,
-          maxHeight: "60vh",
+          maxHeight: isMobile ? "44vh" : "60vh",
           overflowY: "auto",
-          width: 230,
+          width: isMobile ? "min(200px, 56vw)" : 230,
         }}
       >
-        <div className="glass-chip" style={{ padding: "8px 12px" }}>
+        <button
+          className="glass-chip"
+          onClick={() => setListOpen((o) => !o)}
+          style={{ padding: "8px 12px", textAlign: "left" }}
+        >
           <span style={{ fontFamily: "var(--font-sora)", fontWeight: 700, fontSize: 13 }}>
-            🦀 Drivers ({drivers.length})
+            🦀 Drivers ({drivers.length}) {listOpen ? "▾" : "▸"}
           </span>
-        </div>
-        {drivers.map((d) => {
+        </button>
+        {listOpen && drivers.map((d) => {
           const selected = selectedDriver === d.driver_id;
           return (
             <button
@@ -303,7 +325,7 @@ export default function AdminPage() {
             </button>
           );
         })}
-        {drivers.length === 0 ? (
+        {listOpen && drivers.length === 0 ? (
           <div className="glass-chip" style={{ padding: "10px 12px" }}>
             <span style={{ fontSize: 13, color: "var(--text-muted)" }}>
               No pings in the last {hours}h
@@ -317,8 +339,8 @@ export default function AdminPage() {
         className="glass-chip"
         style={{
           position: "absolute",
-          top: 16,
-          right: 16,
+          top: isMobile ? 12 : 16,
+          right: isMobile ? 12 : 16,
           zIndex: 1000,
           display: "flex",
           padding: 3,
@@ -330,9 +352,9 @@ export default function AdminPage() {
             key={h}
             onClick={() => setHours(h)}
             style={{
-              padding: "6px 12px",
+              padding: isMobile ? "5px 9px" : "6px 12px",
               borderRadius: 7,
-              fontSize: 13,
+              fontSize: isMobile ? 12 : 13,
               fontWeight: 700,
               background: hours === h ? "var(--accent)" : "transparent",
               color: hours === h ? "var(--on-accent)" : "var(--text-muted)",
@@ -377,15 +399,17 @@ export default function AdminPage() {
               pointerEvents: "auto",
               width: "calc(100% - 24px)",
               maxWidth: 1100,
-              maxHeight: "34vh",
+              maxHeight: isMobile ? "42vh" : "34vh",
               overflowY: "auto",
+              overflowX: "auto",
+              WebkitOverflowScrolling: "touch",
               margin: "0 12px 12px",
-              padding: 12,
+              padding: isMobile ? 8 : 12,
               borderBottomLeftRadius: 12,
               borderBottomRightRadius: 12,
             }}
           >
-            <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 13 }}>
+            <table style={{ width: "100%", minWidth: 620, borderCollapse: "collapse", fontSize: 13 }}>
               <thead>
                 <tr style={{ textAlign: "left", color: "var(--text-muted)" }}>
                   <th style={{ padding: "6px 8px", fontFamily: "var(--font-sora)", fontWeight: 600 }}>Reference</th>

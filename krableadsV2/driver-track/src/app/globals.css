@@ -131,6 +131,29 @@ a {
   background: rgba(251, 191, 36, 0.5);
 }
 
+/* Full-viewport height that respects mobile browser toolbars (iOS Safari) */
+.full-h {
+  min-height: 100vh;
+}
+
+@supports (min-height: 100dvh) {
+  .full-h {
+    min-height: 100dvh;
+  }
+}
+
+.fixed-viewport {
+  position: fixed;
+  inset: 0;
+  height: 100vh;
+}
+
+@supports (height: 100dvh) {
+  .fixed-viewport {
+    height: 100dvh;
+  }
+}
+
 /* Leaflet dark base */
 .leaflet-container {
   background: #0d1626;

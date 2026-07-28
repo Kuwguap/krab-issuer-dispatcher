@@ -10,8 +10,8 @@ const PING_THROTTLE_MS = 10 * 1000;
 function Card({ children }) {
   return (
     <main
+      className="full-h"
       style={{
-        minHeight: "100vh",
         display: "flex",
         alignItems: "center",
         justifyContent: "center",
@@ -264,9 +264,8 @@ export default function TrackPage({ params }) {
   if (phase === "success") {
     return (
       <main
+        className="fixed-viewport"
         style={{
-          position: "fixed",
-          inset: 0,
           background: "var(--bg)",
           display: "flex",
           flexDirection: "column",
