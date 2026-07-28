@@ -1,5 +1,6 @@
 import { useEffect, useState, ReactNode, FormEvent } from "react";
-import { AnimatePresence, motion } from "framer-motion";
+import { Link, useLocation } from "react-router-dom";
+import { motion } from "framer-motion";
 import { cachedLocked, fetchSiteLocked, subscribe } from "../lib/settings";
 
 /**
@@ -57,15 +58,22 @@ export default function LockGate({ children }: { children: ReactNode }) {
     return null;
   });
 
+  // when locked, /tournament* can stay live (admin's choice in Site & Mail)
+  const [tournamentOpen, setTournamentOpen] = useState(false);
+  const loc = useLocation();
+
   useEffect(() => {
     if (ENV_FORCED) return;
     let alive = true;
-    fetchSiteLocked().then(({ locked: dbLocked, lockedAt }) => {
+    fetchSiteLocked().then(({ locked: dbLocked, lockedAt, tournamentOpen: tOpen }) => {
       if (!alive) return;
       setLocked(dbLocked && !bypassValid(lockedAt));
+      setTournamentOpen(tOpen);
     });
     return () => { alive = false; };
   }, []);
+
+  const exempt = tournamentOpen && loc.pathname.startsWith("/tournament");
 
   // waitlist form
   const [email, setEmail] = useState("");
@@ -78,9 +86,10 @@ export default function LockGate({ children }: { children: ReactNode }) {
   const [shake, setShake] = useState(0);
 
   useEffect(() => {
-    document.body.style.overflow = locked ? "hidden" : "";
+    const overlayShowing = !!locked && !exempt;
+    document.body.style.overflow = overlayShowing ? "hidden" : "";
     return () => { document.body.style.overflow = ""; };
-  }, [locked]);
+  }, [locked, exempt]);
 
   const join = async (e: FormEvent) => {
     e.preventDefault();
@@ -112,8 +121,10 @@ export default function LockGate({ children }: { children: ReactNode }) {
 
   return (
     <>
-      <AnimatePresence>
-        {locked && (
+      {/* Plain conditional, NOT AnimatePresence: the exit animation could hang
+          on client-side route changes (overlay stayed on top of the exempted
+          /tournament page). Reliability over the slide-away flourish. */}
+      {locked && !exempt && (
           <motion.div
             key="lock"
             // Scrollable overlay (was justify-center + overflow-hidden): on short
@@ -121,7 +132,6 @@ export default function LockGate({ children }: { children: ReactNode }) {
             // at BOTH ends with no scroll path, stranding the waitlist button.
             // my-auto on the content centers when there's room, scrolls when not.
             className="fixed inset-0 z-[100] bg-ink flex flex-col items-center px-6 py-10 overflow-y-auto"
-            exit={{ y: "-100%", transition: { duration: 0.7, ease: [0.76, 0, 0.24, 1] } }}
           >
             {/* moving backdrop type (overflow-hidden here so its nowrap rows
                 can't hand the now-scrollable parent a horizontal scrollbar) */}
@@ -177,6 +187,16 @@ export default function LockGate({ children }: { children: ReactNode }) {
               )}
               {err && <p className="text-blood text-xs uppercase tracking-widest mt-4">{err}</p>}
 
+              {/* the FC26 tournament can stay live while the shop is locked */}
+              {tournamentOpen && (
+                <Link
+                  to="/tournament"
+                  className="btn-og border-2 border-acid text-acid px-6 py-3.5 text-xs mt-8 inline-flex hover:bg-acid hover:text-ink"
+                >
+                  ⚽ The FC26 tournament is LIVE — enter →
+                </Link>
+              )}
+
               {/* staff access */}
               <div className="mt-14">
                 {!staffOpen ? (
@@ -212,9 +232,8 @@ export default function LockGate({ children }: { children: ReactNode }) {
               </div>
             </motion.div>
           </motion.div>
-        )}
-      </AnimatePresence>
-      {!locked && children}
+      )}
+      {(!locked || exempt) && children}
     </>
   );
 }

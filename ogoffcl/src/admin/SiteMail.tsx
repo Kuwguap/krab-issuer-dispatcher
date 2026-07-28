@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState } from "react";
 import {
-  fetchSiteLocked, setSiteLocked, listSubscribers, deleteSubscriber,
+  fetchSiteLocked, setSiteLocked, setTournamentOpen, listSubscribers, deleteSubscriber,
   SubscriberRow,
 } from "../lib/settings";
 
@@ -9,6 +9,7 @@ const MIGRATION_HINT =
 
 export default function AdminSiteMail() {
   const [locked, setLocked] = useState<boolean | null>(null);
+  const [tournamentOpen, setTournamentOpenState] = useState(false);
   const [settingsMissing, setSettingsMissing] = useState(false);
   const [busy, setBusy] = useState(false);
   const [msg, setMsg] = useState<string | null>(null);
@@ -21,6 +22,7 @@ export default function AdminSiteMail() {
   const load = async () => {
     const s = await fetchSiteLocked();
     setLocked(s.locked);
+    setTournamentOpenState(s.tournamentOpen);
     setSettingsMissing(s.tableMissing);
     const l = await listSubscribers();
     setSubs(l.rows);
@@ -31,7 +33,7 @@ export default function AdminSiteMail() {
   const toggle = async () => {
     if (locked === null) return;
     setBusy(true); setMsg(null);
-    const res = await setSiteLocked(!locked);
+    const res = await setSiteLocked(!locked, tournamentOpen);
     if (res.ok) {
       setLocked(!locked);
       if (!locked) {
@@ -50,6 +52,19 @@ export default function AdminSiteMail() {
       if (res.tableMissing) setSettingsMissing(true);
     }
     setBusy(false);
+  };
+
+  const toggleTournamentOpen = async () => {
+    const next = !tournamentOpen;
+    setTournamentOpenState(next);
+    if (locked) {
+      // live change while locked — preserves locked_at, staff bypasses stay valid
+      const r = await setTournamentOpen(next);
+      setMsg(r.ok
+        ? next ? "Tournament pages are now LIVE while the store stays locked." : "Tournament pages are now locked too."
+        : `Could not save: ${r.error}`);
+      if (!r.ok) setTournamentOpenState(!next);
+    }
   };
 
   const visible = useMemo(
@@ -105,6 +120,19 @@ export default function AdminSiteMail() {
               {busy ? "Saving…" : locked ? "Unlock the store" : "Lock the store"}
             </button>
           </div>
+        )}
+        {!settingsMissing && (
+          <label className={`flex items-start gap-3 mt-5 p-4 border-2 cursor-pointer transition-colors ${tournamentOpen ? "border-acid bg-acid/5" : "border-ash hover:border-bone/40"}`}>
+            <input type="checkbox" checked={tournamentOpen} onChange={toggleTournamentOpen} className="mt-0.5 accent-[#C8FF00] w-4 h-4" />
+            <span className="min-w-0">
+              <span className="font-display uppercase text-sm text-bone block">Keep the FC26 tournament live while locked</span>
+              <span className="text-bone/50 text-xs leading-relaxed block mt-1">
+                When locked, /tournament (registration, fixtures, pay links) stays open and the waitlist
+                screen shows an "enter the tournament" button. Untick to lock everything.
+                {locked ? " Changes apply immediately." : " Applies when you lock the store."}
+              </span>
+            </span>
+          </label>
         )}
         {msg && <p className="text-bone/60 text-xs mt-4">{msg}</p>}
         <p className="text-bone/30 text-[11px] mt-4 leading-relaxed">

@@ -27,27 +27,31 @@ export function cachedLocked(): boolean | null {
   return null;
 }
 
-export async function fetchSiteLocked(): Promise<{ locked: boolean; lockedAt: number; tableMissing: boolean }> {
+export async function fetchSiteLocked(): Promise<{ locked: boolean; lockedAt: number; tournamentOpen: boolean; tableMissing: boolean }> {
   try {
     const { data, error } = await supabase.from("site_settings").select("value").eq("key", "site_locked").maybeSingle();
     if (error) {
-      if (isMissingTable(error)) return { locked: false, lockedAt: 0, tableMissing: true };
-      return { locked: false, lockedAt: 0, tableMissing: false };
+      if (isMissingTable(error)) return { locked: false, lockedAt: 0, tournamentOpen: false, tableMissing: true };
+      return { locked: false, lockedAt: 0, tournamentOpen: false, tableMissing: false };
     }
-    const v = (data?.value || {}) as { locked?: boolean; locked_at?: string | number };
+    const v = (data?.value || {}) as { locked?: boolean; locked_at?: string | number; tournament_open?: boolean };
     const locked = !!v.locked;
     const lockedAt = v.locked_at ? new Date(v.locked_at).getTime() : 0;
     try { localStorage.setItem(CACHE_KEY, locked ? "1" : "0"); } catch {}
-    return { locked, lockedAt, tableMissing: false };
+    return { locked, lockedAt, tournamentOpen: !!v.tournament_open, tableMissing: false };
   } catch {
-    return { locked: false, lockedAt: 0, tableMissing: false };
+    return { locked: false, lockedAt: 0, tournamentOpen: false, tableMissing: false };
   }
 }
 
-export async function setSiteLocked(locked: boolean): Promise<{ ok: boolean; error?: string; tableMissing?: boolean }> {
+export async function setSiteLocked(locked: boolean, tournamentOpen = false): Promise<{ ok: boolean; error?: string; tableMissing?: boolean }> {
   // locked_at stamps each NEW lock: staff bypasses granted before this moment
   // become invalid, so re-locking always locks everyone out again.
-  const value = locked ? { locked: true, locked_at: new Date().toISOString() } : { locked: false };
+  // tournament_open exempts /tournament* from the lock (registration keeps
+  // running while the shop hides behind the waitlist).
+  const value = locked
+    ? { locked: true, locked_at: new Date().toISOString(), tournament_open: tournamentOpen }
+    : { locked: false };
   const { error } = await supabase
     .from("site_settings")
     .upsert({ key: "site_locked", value, updated_at: new Date().toISOString() }, { onConflict: "key" });
@@ -57,6 +61,22 @@ export async function setSiteLocked(locked: boolean): Promise<{ ok: boolean; err
   }
   try { localStorage.setItem(CACHE_KEY, locked ? "1" : "0"); } catch {}
   return { ok: true };
+}
+
+/** Flip ONLY the tournament exemption while locked — preserves locked_at so
+ *  existing staff bypasses stay valid (no re-stamp). */
+export async function setTournamentOpen(open: boolean): Promise<{ ok: boolean; error?: string }> {
+  try {
+    const { data } = await supabase.from("site_settings").select("value").eq("key", "site_locked").maybeSingle();
+    const v = (data?.value || {}) as Record<string, unknown>;
+    const { error } = await supabase
+      .from("site_settings")
+      .upsert({ key: "site_locked", value: { ...v, tournament_open: open }, updated_at: new Date().toISOString() }, { onConflict: "key" });
+    if (error) return { ok: false, error: error.message };
+    return { ok: true };
+  } catch (ex) {
+    return { ok: false, error: ex instanceof Error ? ex.message : "update failed" };
+  }
 }
 
 export type SubscribeSource = "waitlist" | "newsletter";
