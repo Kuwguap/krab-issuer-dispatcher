@@ -64,6 +64,7 @@ STATE_WAITING_FILE = 13  # Waiting for user to send file(s)
 STATE_SPECIAL_REQUEST_ISSUERS = 19  # After phone + price: note for group / issuers
 STATE_SPECIAL_REQUEST_DRIVERS = 20  # Then: note only for drivers (before encrypt)
 STATE_EDIT_FIELD_PROMPT = 29   # waiting for text input for editing a field
+STATE_ADJUST_INPUT = 30        # review "adjust from image/text": waiting for media/text
 
 # Phase 1: accumulate photos/PDFs; user taps Done to run vision extraction
 PHASE1_VISION_MAX_FILES = 12
@@ -329,13 +330,17 @@ def _driver_keyboard_lead_and_receipt() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([[_DRIVER_ADD_LEAD_BTN, _DRIVER_ADD_RECEIPT_BTN], [_DRIVER_HELP_BTN]])
 
 
-def _driver_keyboard_after_accept(reference_id: str | None) -> InlineKeyboardMarkup:
+def _driver_keyboard_after_accept(
+    reference_id: str | None, reassign_lead_id: str | None = None
+) -> InlineKeyboardMarkup:
     """Keyboard attached to the LEAD ACCEPTED message.
 
     ➕ Add new lead    → start a new lead
     🧾 Upload Receipt → jumps straight into the receipt-upload flow for
                          THIS specific lead's reference id, so the driver
                          doesn't have to pick from a list.
+    🔄 Reassign        → driver changed their mind — send the lead back out
+                         to the other drivers (only when reassign_lead_id set).
     ❓ Help            → usage guide
     """
     rows: list[list[InlineKeyboardButton]] = [[_DRIVER_ADD_LEAD_BTN]]
@@ -348,6 +353,13 @@ def _driver_keyboard_after_accept(reference_id: str | None) -> InlineKeyboardMar
         # No reference id (shouldn't happen for accepted leads, but stay safe):
         # fall back to the generic owed-receipts opener.
         rows.append([_DRIVER_ADD_RECEIPT_BTN])
+    if reassign_lead_id:
+        rows.append([
+            InlineKeyboardButton(
+                "🔄 Reassign (can't do this one)",
+                callback_data=f"reassign_lead_{reassign_lead_id}",
+            )
+        ])
     rows.append([_DRIVER_HELP_BTN])
     return InlineKeyboardMarkup(rows)
 
@@ -365,10 +377,12 @@ def _tracking_link(token: str) -> str:
     return f"{Config.TRACKING_SITE_BASE_URL}/t/{token}"
 
 
-async def _send_driver_lead_details(context: ContextTypes.DEFAULT_TYPE, lead: dict, chat_id) -> None:
+async def _send_driver_lead_details(
+    context: ContextTypes.DEFAULT_TYPE, lead: dict, chat_id, reassign_lead_id: str | None = None
+) -> None:
     """DM the full accepted-lead details (HTML with plain-text fallback)."""
     confirmation_message = _build_driver_lead_accepted_message_html(lead)
-    add_lead_kb = _driver_keyboard_after_accept(lead.get("reference_id"))
+    add_lead_kb = _driver_keyboard_after_accept(lead.get("reference_id"), reassign_lead_id)
     try:
         await context.bot.send_message(
             chat_id=chat_id,
@@ -398,8 +412,9 @@ async def _start_tracking_gate_or_send_details(
     failure (migration missing / DB down) → fail OPEN with details + loud log:
     the hard block applies to driver behavior, not infrastructure breakage.
     """
+    reassign_id = str(lead.get("id")) if (kind == "lead" and lead.get("id")) else None
     if not Config.is_tracking_configured():
-        await _send_driver_lead_details(context, lead, chat_id)
+        await _send_driver_lead_details(context, lead, chat_id, reassign_lead_id=reassign_id)
         return
     token = _new_tracking_token()
     delivery_addr = _delivery_block_plain(lead)
@@ -421,7 +436,7 @@ async def _start_tracking_gate_or_send_details(
             "Tracking session insert failed — sending details without location gate "
             "(run database/migration_driver_tracking.sql)"
         )
-        await _send_driver_lead_details(context, lead, chat_id)
+        await _send_driver_lead_details(context, lead, chat_id, reassign_lead_id=reassign_id)
         return
     link = _tracking_link(token)
     kb = InlineKeyboardMarkup([[InlineKeyboardButton("📍 Share my location", url=link)]])
@@ -439,7 +454,7 @@ async def _start_tracking_gate_or_send_details(
         )
     except Exception as e:
         logger.error("Could not send tracking link to %s: %s — sending details directly", chat_id, e)
-        await _send_driver_lead_details(context, lead, chat_id)
+        await _send_driver_lead_details(context, lead, chat_id, reassign_lead_id=reassign_id)
 
 
 def _keyboard_lead_accept_decline(lead_id: str) -> InlineKeyboardMarkup:
@@ -1387,16 +1402,42 @@ async def _notify_initiator_lead_accepted_summary(
         f"🙋‍♀️Driver Accepted✅: {dn}\n\n"
         "🏁Automated🏎️Automotive💨"
     )
+    # Dispatcher-side escape hatch: reassign the driver right from the summary.
+    kb = None
+    if lead_row.get("id"):
+        kb = InlineKeyboardMarkup([[
+            InlineKeyboardButton(
+                "🔄 Reassign driver", callback_data=f"reassign_lead_{lead_row.get('id')}"
+            )
+        ]])
     try:
-        await context.bot.send_message(chat_id=cid, text=text, parse_mode=None)
+        await context.bot.send_message(chat_id=cid, text=text, parse_mode=None, reply_markup=kb)
     except Exception as e:
         logger.warning("Could not send initiator lead summary to %s: %s", cid, e)
+
+
+def _driver_offer_message_text(lead: dict) -> str:
+    """The accept/decline offer DM body (shared by dispatch and reassign)."""
+    reference_id = lead.get("reference_id", "N/A")
+    extra_safe = _sanitize_phones_for_send(lead.get("extra_info") or "")
+    spec = _lead_driver_note(lead)
+    msg = (
+        f"👋Hi! New client 💸 available📈❗️\n\n"
+        f"📍 Delivery (City, State, Zip): {lead.get('delivery_details', '')}\n"
+        f"📋 Reference ID: `{reference_id}`\n"
+        f" Delivery Time 🏷️: {extra_safe}\n"
+        f"Please have Car, Driver License, and Laser Printer Ready✅"
+    )
+    if spec:
+        msg += f"\n\n📝 Special request (driver): {_sanitize_phones_for_send(spec)}"
+    return msg
 
 
 async def _send_driver_requests_for_group(
     context: ContextTypes.DEFAULT_TYPE,
     lead: dict,
     group: dict,
+    exclude_driver_id: str | None = None,
 ) -> tuple[int, str, str | None, str]:
     """Send accept/decline requests after a group claims a broadcast lead.
 
@@ -1443,21 +1484,12 @@ async def _send_driver_requests_for_group(
         )
         return (0, names, "missing_telegram", scope)
 
-    reference_id = lead.get("reference_id", "N/A")
-    extra_safe = _sanitize_phones_for_send(lead.get("extra_info") or "")
-    spec = _lead_driver_note(lead)
-    driver_request_message = (
-        f"👋Hi! New client 💸 available📈❗️\n\n"
-        f"📍 Delivery (City, State, Zip): {lead.get('delivery_details', '')}\n"
-        f"📋 Reference ID: `{reference_id}`\n"
-        f" Delivery Time 🏷️: {extra_safe}\n"
-        f"Please have Car, Driver License, and Laser Printer Ready✅"
-    )
-    if spec:
-        driver_request_message += f"\n\n📝 Special request (driver): {_sanitize_phones_for_send(spec)}"
+    driver_request_message = _driver_offer_message_text(lead)
     accept_keyboard = _keyboard_lead_accept_decline(str(lead["id"]))
     assigned_count = 0
     for driver in selected_drivers:
+        if exclude_driver_id and str(driver.get("id")) == str(exclude_driver_id):
+            continue
         cid = _parse_chat_id(driver.get("driver_telegram_id"))
         if not cid:
             continue
@@ -1996,6 +2028,7 @@ def _build_review_keyboard_with_selections(state_data):
             InlineKeyboardButton("🔍 VIN", callback_data=PH1_REVIEW_VIN_CHECK),
             InlineKeyboardButton("✅ Submit", callback_data=PH1_REVIEW_ACCEPT),
         ],
+        [InlineKeyboardButton("🖼 Adjust from image/text", callback_data="ph1_adjust")],
     ])
 
 async def _edit_message_keyboard(context, chat_id, message_id, keyboard):
@@ -2223,14 +2256,39 @@ async def _continue_phase1_after_ai_review(message, context: ContextTypes.DEFAUL
         for k in ("name", "address", "city_state_zip", "delivery_address", "delivery_city_state_zip", "vin", "car", "color", "insurance_company", "insurance_policy_number", "extra_info")
     )
     missing = ai_vision.detect_missing_fields(state_data, blob)
+    # Price / tag info / date-time are optional: no question when unfilled —
+    # they simply show as "-" on the final review.
+    missing = [f for f in missing if f not in PHASE1_OPTIONAL_FIELDS]
     if missing:
         prompts = ai_vision.MISSING_FIELD_PROMPTS
         msg = prompts.get(missing[0], (f"You missed out {missing[0]}. Can you add it?", missing[0]))[0]
         context.user_data["missing_fields"] = missing
         context.user_data["missing_field_state_data"] = state_data.copy()
-        await message.reply_text(msg)
+        sent = await message.reply_text(msg)
+        _track_missing_prompt(context, sent)
         return STATE_MISSING_FIELD
     return await _ensure_phone_price_before_files(message, context, user_id)
+
+
+# Optional Phase 1 fields: never block with a question — blank shows as "-" in review.
+PHASE1_OPTIONAL_FIELDS = {"insurance_company", "insurance_policy_number", "extra_info", "delivery_date"}
+
+
+def _track_missing_prompt(context: ContextTypes.DEFAULT_TYPE, sent_message) -> None:
+    """Remember a missing-field question so it can disappear once answered."""
+    try:
+        context.user_data.setdefault("missing_field_prompt_ids", []).append(
+            (sent_message.chat_id, sent_message.message_id)
+        )
+    except Exception:
+        pass
+
+
+async def _clear_missing_prompts(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Delete every tracked missing-field question message (chat stays clean)."""
+    ids = context.user_data.pop("missing_field_prompt_ids", None) or []
+    for chat_id, message_id in ids:
+        await _safe_delete_chat_message(context, chat_id, message_id)
 
 
 def _apply_single_phase1_edit(state_data: dict, edit_key: str, new_text: str) -> None:
@@ -2300,6 +2358,138 @@ def _clean_vin_and_car(state_data: dict) -> None:
         state_data.get("delivery_city_state_zip"),
     ]
     state_data["delivery_details"] = "\n".join([l for l in delivery_lines if l])
+
+
+_PHASE1_ADJUST_FIELD_ORDER = (
+    "name", "address", "city_state_zip", "delivery_address", "delivery_city_state_zip",
+    "vin", "car", "color", "insurance_company", "insurance_policy_number", "extra_info",
+)
+
+_PHASE1_ADJUST_LABELS = {
+    "name": "name", "address": "reg address", "city_state_zip": "reg city/ST/ZIP",
+    "delivery_address": "delivery address", "delivery_city_state_zip": "delivery city/ST/ZIP",
+    "vin": "VIN", "car": "car", "color": "color", "insurance_company": "insurance",
+    "insurance_policy_number": "policy #", "extra_info": "date/time",
+}
+
+
+def _merge_phase1_adjust(state_data: dict, structured_text: str) -> list[str]:
+    """Merge an AI extraction into state_data — ONLY the fields actually found.
+
+    Empty / "-" / placeholder values never overwrite existing data. Returns the
+    human labels of the fields that changed.
+    """
+    normalized = _normalize_ai_phase1_text(structured_text or "")
+    lines = [l.strip() for l in normalized.splitlines()]
+    parsed = parse_phase1_structured("\n".join(lines[: ai_vision.PHASE1_LINE_COUNT]))
+    placeholders = {"", "-", "n/a", "na", "none", "unknown", "not found"}
+    updated: list[str] = []
+    for key in _PHASE1_ADJUST_FIELD_ORDER:
+        val = str(parsed.get(key) or "").strip()
+        if val.lower() in placeholders:
+            continue
+        if val != str(state_data.get(key) or "").strip():
+            state_data[key] = val
+            updated.append(_PHASE1_ADJUST_LABELS.get(key, key))
+    # Labeled extra lines (12+): Phone / Price / Email / DriverLicenseID.
+    for l in lines[ai_vision.PHASE1_LINE_COUNT:]:
+        if ":" not in l:
+            continue
+        label, _, v = l.partition(":")
+        v = v.strip()
+        low = label.strip().lower()
+        if v.lower() in placeholders:
+            continue
+        if low.startswith("phone"):
+            if len(re.sub(r"\D", "", v)) >= 10:
+                state_data["pending_phone_number"] = v
+                updated.append("phone")
+        elif low.startswith("price"):
+            state_data["pending_price"] = v
+            updated.append("price")
+        elif low.startswith("email"):
+            em = ai_vision.normalize_email(v)
+            if em:
+                state_data["email"] = em
+                updated.append("email")
+        elif low.startswith("driverlicense") or low == "dl":
+            dl = ai_vision.normalize_driver_license_id(v)
+            if dl:
+                state_data["driver_license_id"] = dl
+                updated.append("driver license")
+    if updated:
+        for key in _PHASE1_ADJUST_FIELD_ORDER:
+            if state_data.get(key) is None:
+                state_data[key] = "-"
+        _clean_vin_and_car(state_data)  # rebuilds vehicle/delivery details
+    return updated
+
+
+async def handle_phase1_adjust_input(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Review 'Adjust from image/text': read media/text, merge only found fields."""
+    user_id = update.effective_user.id
+    state = db.get_user_state(user_id)
+    if not state or not state.get("data"):
+        await update.message.reply_text("❌ Data lost. Please start over with /start")
+        return ConversationHandler.END
+    state_data = state["data"]
+    message = update.message
+
+    note = await message.reply_text("🤖 Reading…")
+    structured = None
+    try:
+        if message.photo:
+            f = await context.bot.get_file(message.photo[-1].file_id)
+            bio = io.BytesIO()
+            await f.download_to_memory(out=bio)
+            structured = await asyncio.to_thread(
+                ai_vision.extract_structured_from_media_parts, [(bio.getvalue(), "image/jpeg")]
+            )
+        elif message.document:
+            doc = message.document
+            f = await context.bot.get_file(doc.file_id)
+            bio = io.BytesIO()
+            await f.download_to_memory(out=bio)
+            raw = bio.getvalue()
+            mime = (doc.mime_type or "").lower()
+            if "pdf" in mime or (doc.file_name or "").lower().endswith(".pdf"):
+                png = await asyncio.to_thread(ai_vision.pdf_first_page_to_png_bytes, raw)
+                if png:
+                    structured = await asyncio.to_thread(
+                        ai_vision.extract_structured_from_media_parts, [(png, "image/png")]
+                    )
+            else:
+                structured = await asyncio.to_thread(
+                    ai_vision.extract_structured_from_media_parts, [(raw, mime or "image/jpeg")]
+                )
+        else:
+            text = (message.text or "").strip()
+            if text:
+                structured = await asyncio.to_thread(ai_vision.extract_structured_from_text, text)
+    except ai_vision.AIVisionQuotaError:
+        structured = None
+    except Exception as e:
+        logger.warning("Adjust-input extraction failed: %s", e)
+        structured = None
+    await _safe_delete_chat_message(context, note.chat_id, note.message_id)
+
+    if not structured:
+        await message.reply_text(
+            "⚠️ Couldn't read that. Send a clearer photo/PDF or paste the text — or ❌ Cancel above."
+        )
+        return STATE_ADJUST_INPUT
+
+    updated = _merge_phase1_adjust(state_data, structured)
+    db.set_user_state(user_id, "phase1", state_data)
+    prompt_id = context.user_data.pop("adjust_prompt_msg_id", None)
+    if prompt_id:
+        await _safe_delete_chat_message(context, message.chat_id, prompt_id)
+    if updated:
+        await message.reply_text("✅ Updated: " + ", ".join(dict.fromkeys(updated)))
+    else:
+        await message.reply_text("ℹ️ Nothing new found — the review is unchanged.")
+    await _update_review_message_text(context, state_data)
+    return STATE_AI_REVIEW
 
 
 async def _begin_lead_flow(
@@ -3520,8 +3710,7 @@ async def handle_phase1(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
         await _send_phase1_ai_review(update.message, state_data, context, user_id)
         # VIN decode is opt-in via the review screen's "🔍 VIN" button.
         missing = ai_vision.detect_missing_fields(state_data, message_text)
-        OPTIONAL_FIELDS = {"insurance_company", "insurance_policy_number", "extra_info", "delivery_date"}
-        missing = [f for f in missing if f not in OPTIONAL_FIELDS]
+        missing = [f for f in missing if f not in PHASE1_OPTIONAL_FIELDS]
         if missing:
             prompts = ai_vision.MISSING_FIELD_PROMPTS
             msg = prompts.get(missing[0], (f"You missed out {missing[0]}. Can you add it?", missing[0]))[0]
@@ -3707,12 +3896,14 @@ async def _ensure_phone_price_before_files(message, context: ContextTypes.DEFAUL
         await message.reply_text("❌ Phase 1 data not found. Please start over with /start")
         return ConversationHandler.END
     state_data = state["data"].copy()
-    if _phase1_has_phone_and_price(state_data):
+    # Phone is the only hard requirement; a missing price just shows as "-" on
+    # the review instead of blocking with a question.
+    if _is_valid_pending_phone(state_data.get("pending_phone_number")):
         return await _prompt_issuer_special_request(message, context, user_id)
     context.user_data.pop("phase2_before_files", None)
     db.set_user_state(user_id, "phase1", state_data)
     await message.reply_text(
-        "📞💲 **Phone number and price are required to continue.**\n\n" + PHASE2_INTRO_MESSAGE,
+        "📞 **Phone number is required to continue.**\n\n" + PHASE2_INTRO_MESSAGE,
         parse_mode="Markdown",
     )
     return STATE_PHASE2
@@ -3935,6 +4126,26 @@ async def handle_phase1_ai_review_callback(update, context):
             context.user_data["review_message_id"],
             _phase1_edit_fields_keyboard(state_data)
         )
+        return STATE_AI_REVIEW
+
+    elif data == "ph1_adjust":
+        prompt = await query.message.reply_text(
+            "🖼 Send a photo, PDF, or paste text with the corrected info.\n\n"
+            "Only the fields found in it will be updated — everything else "
+            "on the review stays as-is.",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("❌ Cancel", callback_data="adjust_cancel")
+            ]]),
+        )
+        context.user_data["adjust_prompt_msg_id"] = prompt.message_id
+        return STATE_ADJUST_INPUT
+
+    elif data == "adjust_cancel":
+        try:
+            await query.message.delete()
+        except Exception:
+            pass
+        context.user_data.pop("adjust_prompt_msg_id", None)
         return STATE_AI_REVIEW
 
     elif data.startswith("ph1edit_"):
@@ -4188,7 +4399,8 @@ async def handle_missing_field(update: Update, context: ContextTypes.DEFAULT_TYP
     user_id = update.effective_user.id
     text = (update.message.text or "").strip()
     if not text:
-        await update.message.reply_text("Please send the missing value.")
+        sent = await update.message.reply_text("Please send the missing value.")
+        _track_missing_prompt(context, sent)
         return STATE_MISSING_FIELD
     missing_fields = context.user_data.get("missing_fields") or []
     state_data = context.user_data.get("missing_field_state_data") or {}
@@ -4198,11 +4410,18 @@ async def handle_missing_field(update: Update, context: ContextTypes.DEFAULT_TYP
     missing_fields = missing_fields[1:]
     context.user_data["missing_fields"] = missing_fields
     context.user_data["missing_field_state_data"] = state_data
+    # The question (and the answer) disappear — the value lands on the review.
+    await _clear_missing_prompts(context)
+    try:
+        await update.message.delete()
+    except Exception:
+        pass
     if missing_fields:
         next_field = missing_fields[0]
         prompts = ai_vision.MISSING_FIELD_PROMPTS
         msg = prompts.get(next_field, (f"You missed out {next_field}. Can you add it?", next_field))[0]
-        await update.message.reply_text(msg)
+        sent = await update.message.reply_text(msg)
+        _track_missing_prompt(context, sent)
         return STATE_MISSING_FIELD
 
     # Safety net: re-scan in case initial detection short-circuited on one field
@@ -4224,13 +4443,15 @@ async def handle_missing_field(update: Update, context: ContextTypes.DEFAULT_TYP
         )
     )
     still_missing = ai_vision.detect_missing_fields(state_data, blob)
+    still_missing = [f for f in still_missing if f not in PHASE1_OPTIONAL_FIELDS]
     if still_missing:
         context.user_data["missing_fields"] = still_missing
         context.user_data["missing_field_state_data"] = state_data.copy()
         prompts = ai_vision.MISSING_FIELD_PROMPTS
         first = still_missing[0]
         msg = prompts.get(first, (f"You missed out {first}. Can you add it?", first))[0]
-        await update.message.reply_text(msg)
+        sent = await update.message.reply_text(msg)
+        _track_missing_prompt(context, sent)
         return STATE_MISSING_FIELD
 
     _sanitize_phase1_pending_phone_price(state_data)
@@ -4702,13 +4923,12 @@ async def _finalize_lead_after_notes(
     return ConversationHandler.END
 
 async def _submit_lead_from_review(message, context, user_id, data):
-    if not _is_valid_pending_phone(data.get("pending_phone_number")) or not _is_valid_pending_price(
-        data.get("pending_price")
-    ):
+    # Phone is the only hard requirement at submit; price may be "-".
+    if not _is_valid_pending_phone(data.get("pending_phone_number")):
         _sanitize_phase1_pending_phone_price(data)
         db.set_user_state(user_id, "phase1", data)
         await message.reply_text(
-            "📞💲 **Phone number and price are required** before sending the lead.\n\n" + PHASE2_INTRO_MESSAGE,
+            "📞 **Phone number is required** before sending the lead.\n\n" + PHASE2_INTRO_MESSAGE,
             parse_mode="Markdown",
         )
         return STATE_PHASE2
@@ -7120,6 +7340,121 @@ async def handle_decline_lead(update: Update, context: ContextTypes.DEFAULT_TYPE
         parse_mode="Markdown",
         reply_markup=_EMPTY_INLINE_KB,
     )
+
+
+async def handle_reassign_lead(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Reassign an ACCEPTED lead: driver changed their mind, or dispatch pulls it.
+
+    Allowed: the accepted driver, the lead's issuer (dispatcher), and global
+    supervisors. Releases the assignment, cancels open tracking sessions, and
+    re-offers the lead to the other drivers (issuer alerts fire again when the
+    new driver accepts, via the normal accept flow).
+    """
+    query = update.callback_query
+    await query.answer()
+    lead_id = query.data.replace("reassign_lead_", "")
+    lead = db.get_lead_by_id(lead_id)
+    if not lead:
+        await query.message.reply_text("❌ Lead not found or expired.")
+        return
+    ref = lead.get("reference_id", "N/A")
+
+    assignment = db.get_lead_assignment_status(lead_id)
+    if not assignment:
+        await query.message.reply_text(
+            f"ℹ️ `{ref}` has no accepted driver right now — nothing to reassign.",
+            parse_mode="Markdown",
+        )
+        return
+    old_driver = assignment.get("driver") or {}
+    old_driver_id = assignment.get("driver_id")
+    old_driver_name = old_driver.get("driver_name", "the driver")
+
+    presser_id = update.effective_user.id
+    is_the_driver = str(old_driver.get("driver_telegram_id") or "") == str(presser_id)
+    is_issuer = str(lead.get("user_id") or "") == str(presser_id)
+    if not (is_the_driver or is_issuer or _user_is_global_supervisor(presser_id)):
+        await query.message.reply_text("⛔ Only the assigned driver, the dispatcher, or a supervisor can reassign.")
+        return
+
+    if not db.reopen_lead_for_reassign(lead_id, old_driver_id):
+        await query.message.reply_text("❌ Could not reassign. Please try again.")
+        return
+    db.cancel_open_tracking_sessions_for_lead(lead_id)
+
+    try:
+        await query.edit_message_reply_markup(reply_markup=None)
+    except Exception:
+        pass
+    await query.message.reply_text(
+        f"🔄 **Reassigning** `{ref}` — offering it to the other drivers now.",
+        parse_mode="Markdown",
+    )
+
+    # Tell the old driver if someone else pulled it.
+    if not is_the_driver:
+        old_cid = _parse_chat_id(old_driver.get("driver_telegram_id"))
+        if old_cid:
+            try:
+                await context.bot.send_message(
+                    chat_id=old_cid,
+                    text=(
+                        f"🔄 Delivery `{ref}` was reassigned by dispatch — "
+                        "you're no longer on it."
+                    ),
+                    parse_mode="Markdown",
+                )
+            except Exception as e:
+                logger.warning("Could not notify old driver of reassign: %s", e)
+
+    # Re-offer to the rest of the pool (same machinery as dispatch).
+    group = db.get_group_by_id(lead.get("group_id")) if lead.get("group_id") else None
+    assigned_count = 0
+    if group:
+        assigned_count, _names, reason, _scope = await _send_driver_requests_for_group(
+            context, lead, group, exclude_driver_id=old_driver_id
+        )
+    else:
+        offer_text = _driver_offer_message_text(lead)
+        kb = _keyboard_lead_accept_decline(str(lead_id))
+        suspended = _get_suspended_driver_ids()
+        for d in _get_all_drivers_cached() or []:
+            if not d or not record_is_active(d) or str(d.get("id")) in suspended:
+                continue
+            if old_driver_id and str(d.get("id")) == str(old_driver_id):
+                continue
+            cid = _parse_chat_id(d.get("driver_telegram_id"))
+            if not cid:
+                continue
+            try:
+                db.create_lead_assignment(lead_id, d["id"], lead.get("group_id"))
+                await context.bot.send_message(
+                    chat_id=cid, text=offer_text, parse_mode="Markdown", reply_markup=kb
+                )
+                assigned_count += 1
+            except Exception as e:
+                logger.error("Reassign offer to %s failed: %s", d.get("driver_name"), e)
+
+    # Alert issuer + supervisors.
+    presser_name = update.effective_user.full_name or "someone"
+    note = (
+        f"🔄 Lead `{ref}` was reassigned"
+        + (f" by {old_driver_name}" if is_the_driver else f" by {presser_name}")
+        + f" — re-offered to {assigned_count} driver(s)."
+    )
+    initiator_id = lead.get("user_id")
+    if initiator_id and str(initiator_id) != str(presser_id):
+        try:
+            await context.bot.send_message(chat_id=int(initiator_id), text=note, parse_mode="Markdown")
+        except Exception as e:
+            logger.warning("Could not notify issuer of reassign: %s", e)
+    for sup_id in _global_supervisory_chat_ids():
+        if str(sup_id) == str(presser_id):
+            continue
+        try:
+            await context.bot.send_message(chat_id=sup_id, text=note, parse_mode="Markdown")
+        except Exception as e:
+            logger.warning("Could not notify supervisor of reassign: %s", e)
 
 
 async def handle_accept_group_offer(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -9596,7 +9931,10 @@ async def process_tracking_sessions(context: ContextTypes.DEFAULT_TYPE) -> None:
             lead = await asyncio.to_thread(db.get_lead_by_id, s.get("lead_id")) if s.get("lead_id") else None
             if lead:
                 try:
-                    await _send_driver_lead_details(context, lead, s.get("chat_id"))
+                    await _send_driver_lead_details(
+                        context, lead, s.get("chat_id"),
+                        reassign_lead_id=s.get("lead_id") if s.get("kind") == "lead" else None,
+                    )
                 except Exception as e:
                     logger.error("Deferred details send failed for session %s: %s", sid, e)
             else:
@@ -9677,7 +10015,10 @@ async def handle_tracking_force(update: Update, context: ContextTypes.DEFAULT_TY
         await query.message.reply_text("❌ Could not load the lead for this session.")
         return
     try:
-        await _send_driver_lead_details(context, lead, s.get("chat_id"))
+        await _send_driver_lead_details(
+            context, lead, s.get("chat_id"),
+            reassign_lead_id=s.get("lead_id") if s.get("kind") == "lead" else None,
+        )
     except Exception as e:
         await query.message.reply_text(f"❌ Details send failed: {e}")
         return
@@ -9883,8 +10224,14 @@ def main():
             STATE_AI_REVIEW: [
                 CallbackQueryHandler(
                     handle_phase1_ai_review_callback,
-                    pattern=r"^(ph1_accept|ph1_edit|ph1_vin_check|ph1_back|ph1_pick_group|ph1_pick_driver|ph1_pick_source|selgrp_|seldrv_|selsrc_|ph1_sel_back|driver_suspended_|edit_cancel|ph1edit_)"
+                    pattern=r"^(ph1_accept|ph1_edit|ph1_vin_check|ph1_adjust|adjust_cancel|ph1_back|ph1_pick_group|ph1_pick_driver|ph1_pick_source|selgrp_|seldrv_|selsrc_|ph1_sel_back|driver_suspended_|edit_cancel|ph1edit_)"
                 ),
+            ],
+            STATE_ADJUST_INPUT: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_phase1_adjust_input),
+                MessageHandler(filters.PHOTO, handle_phase1_adjust_input),
+                MessageHandler(filters.Document.ALL, handle_phase1_adjust_input),
+                CallbackQueryHandler(handle_phase1_ai_review_callback, pattern="^adjust_cancel$"),
             ],
             STATE_AI_EDIT_MENU: [
                 CallbackQueryHandler(handle_phase1_edit_menu_callback, pattern=r"^(ph1_back|ph1edit_[a-z]+)$"),
@@ -10028,6 +10375,8 @@ def main():
     # Add accept/decline handlers for driver assignments
     application.add_handler(CallbackQueryHandler(handle_accept_lead, pattern="^accept_lead_"))
     application.add_handler(CallbackQueryHandler(handle_decline_lead, pattern="^decline_lead_"))
+    # Post-accept reassign (driver changed their mind / dispatch pulls it back)
+    application.add_handler(CallbackQueryHandler(handle_reassign_lead, pattern="^reassign_lead_"))
     
     # Add accept/decline handlers for group broadcast offers
     application.add_handler(CallbackQueryHandler(handle_accept_group_offer, pattern="^ag_"))

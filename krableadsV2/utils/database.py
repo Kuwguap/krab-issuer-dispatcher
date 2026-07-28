@@ -979,6 +979,49 @@ class Database:
             logger.error(f"Error declining lead assignment: {e}")
             return False
     
+    def reopen_lead_for_reassign(self, lead_id: str, old_driver_id: str | None) -> bool:
+        """Release an accepted lead so other drivers can take it.
+
+        The accepted row flips to 'declined'; every other declined row goes back
+        to 'pending' so the re-offer reads fresh. The old driver stays declined.
+        """
+        if not self._check_tables_exist():
+            return False
+        try:
+            self.client.table("lead_assignments").update({"status": "declined"}).eq(
+                "lead_id", lead_id
+            ).eq("status", "accepted").execute()
+            q = (
+                self.client.table("lead_assignments")
+                .update({"status": "pending"})
+                .eq("lead_id", lead_id)
+                .eq("status", "declined")
+            )
+            if old_driver_id:
+                q = q.neq("driver_id", str(old_driver_id))
+            q.execute()
+            return True
+        except Exception as e:
+            logger.error(f"Error reopening lead for reassign: {e}")
+            return False
+
+    def cancel_open_tracking_sessions_for_lead(self, lead_id: str) -> int:
+        """Cancel pending/located tracking sessions for a lead (reassign)."""
+        if not self._check_tables_exist():
+            return 0
+        try:
+            r = (
+                self.client.table("driver_tracking_sessions")
+                .update({"status": "cancelled"})
+                .eq("lead_id", lead_id)
+                .in_("status", ["pending", "located"])
+                .execute()
+            )
+            return len(r.data or [])
+        except Exception as e:
+            logger.error(f"Error cancelling tracking sessions for lead: {e}")
+            return 0
+
     def get_lead_assignment_status(self, lead_id: str) -> Optional[Dict[str, Any]]:
         """Get the accepted assignment for a lead."""
         if not self._check_tables_exist():
