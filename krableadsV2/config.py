@@ -82,6 +82,13 @@ class Config:
     ).strip().rstrip("/")
     INTEGRATIONS_API_KEY = (os.getenv("INTEGRATIONS_API_KEY") or "").strip().lstrip("=") or None
 
+    # Driver GPS tracking site (driver-track on Vercel). Feature fully OFF when
+    # base URL unset: accepts send delivery details immediately (old behavior).
+    TRACKING_SITE_BASE_URL = (os.getenv("TRACKING_SITE_BASE_URL") or "").strip().lstrip("=").rstrip("/") or None
+    # Minutes before a still-pending session triggers a driver reminder +
+    # supervisor alert (hard block — details are never auto-sent on timeout).
+    TRACKING_TIMEOUT_MINUTES = int(os.getenv("TRACKING_TIMEOUT_MINUTES", "5"))
+
     # Client follow-up outreach (bot texts the client chasing the VIN).
     # Optional — when unset, follow-ups fall back to email-only client contact.
     TWILIO_ACCOUNT_SID = (os.getenv("TWILIO_ACCOUNT_SID") or "").strip().lstrip("=") or None
@@ -108,6 +115,11 @@ class Config:
     @classmethod
     def is_lead_ingest_configured(cls) -> bool:
         return bool(cls.LEAD_INGEST_API_KEY and cls.API_LEAD_USER_ID)
+
+    @classmethod
+    def is_tracking_configured(cls) -> bool:
+        """True if the driver GPS tracking gate is enabled (site URL set)."""
+        return bool(cls.TRACKING_SITE_BASE_URL)
 
     @classmethod
     def is_twilio_configured(cls) -> bool:

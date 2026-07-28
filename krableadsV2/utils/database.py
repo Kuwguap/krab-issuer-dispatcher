@@ -1971,6 +1971,160 @@ class Database:
             logger.error(f"Error deleting client follow-up: {e}")
             return False
 
+    # ── Driver GPS tracking sessions ───────────────────────────────────
+    # Hard location gate: delivery details are only DM'd after the driver's
+    # tracking session flips pending -> located (or a supervisor overrides).
+
+    def create_tracking_session(
+        self,
+        *,
+        token: str,
+        kind: str,
+        chat_id: str,
+        driver_id: str | None = None,
+        driver_name: str | None = None,
+        lead_id: str | None = None,
+        renewal_id: str | None = None,
+        reference_id: str | None = None,
+    ) -> Optional[Dict[str, Any]]:
+        """Create a pending tracking session. Returns row or None on failure."""
+        if not self._check_tables_exist():
+            return None
+        try:
+            row = {
+                "token": token,
+                "kind": kind,
+                "chat_id": str(chat_id),
+                "status": "pending",
+            }
+            if driver_id:
+                row["driver_id"] = str(driver_id)
+            if driver_name:
+                row["driver_name"] = driver_name
+            if lead_id:
+                row["lead_id"] = str(lead_id)
+            if renewal_id:
+                row["renewal_id"] = str(renewal_id)
+            if reference_id:
+                row["reference_id"] = str(reference_id)
+            r = self.client.table("driver_tracking_sessions").insert(row).execute()
+            return r.data[0] if r.data else None
+        except Exception as e:
+            logger.error(
+                "Error creating tracking session (run database/migration_driver_tracking.sql?): %s", e
+            )
+            return None
+
+    def get_tracking_sessions_located_unsent(self) -> list:
+        """Sessions whose location arrived but details haven't been sent yet."""
+        if not self._check_tables_exist():
+            return []
+        try:
+            r = (
+                self.client.table("driver_tracking_sessions")
+                .select("*")
+                .eq("status", "located")
+                .order("located_at")
+                .limit(50)
+                .execute()
+            )
+            return r.data or []
+        except Exception as e:
+            logger.error(f"Error fetching located tracking sessions: {e}")
+            return []
+
+    def get_tracking_sessions_pending_reminder(self, timeout_minutes: int) -> list:
+        """Still-pending sessions past the reminder window, not yet reminded."""
+        if not self._check_tables_exist():
+            return []
+        try:
+            from datetime import datetime, timedelta, timezone
+            cutoff = (datetime.now(timezone.utc) - timedelta(minutes=timeout_minutes)).isoformat()
+            r = (
+                self.client.table("driver_tracking_sessions")
+                .select("*")
+                .eq("status", "pending")
+                .is_("reminder_sent_at", "null")
+                .lt("created_at", cutoff)
+                .limit(50)
+                .execute()
+            )
+            return r.data or []
+        except Exception as e:
+            logger.error(f"Error fetching pending tracking reminders: {e}")
+            return []
+
+    def claim_tracking_details_sent(self, session_id: str) -> bool:
+        """Conditionally claim located->details_sent. False if already claimed."""
+        if not self._check_tables_exist():
+            return False
+        try:
+            from datetime import datetime, timezone
+            r = (
+                self.client.table("driver_tracking_sessions")
+                .update({
+                    "status": "details_sent",
+                    "details_sent_at": datetime.now(timezone.utc).isoformat(),
+                })
+                .eq("id", session_id)
+                .eq("status", "located")
+                .execute()
+            )
+            return bool(r.data)
+        except Exception as e:
+            logger.error(f"Error claiming tracking details_sent: {e}")
+            return False
+
+    def claim_tracking_override(self, session_id: str) -> bool:
+        """Supervisor override: pending->overridden. False if no longer pending."""
+        if not self._check_tables_exist():
+            return False
+        try:
+            from datetime import datetime, timezone
+            r = (
+                self.client.table("driver_tracking_sessions")
+                .update({
+                    "status": "overridden",
+                    "details_sent_at": datetime.now(timezone.utc).isoformat(),
+                })
+                .eq("id", session_id)
+                .eq("status", "pending")
+                .execute()
+            )
+            return bool(r.data)
+        except Exception as e:
+            logger.error(f"Error claiming tracking override: {e}")
+            return False
+
+    def mark_tracking_reminder_sent(self, session_id: str) -> bool:
+        if not self._check_tables_exist():
+            return False
+        try:
+            from datetime import datetime, timezone
+            self.client.table("driver_tracking_sessions").update(
+                {"reminder_sent_at": datetime.now(timezone.utc).isoformat()}
+            ).eq("id", session_id).execute()
+            return True
+        except Exception as e:
+            logger.error(f"Error marking tracking reminder sent: {e}")
+            return False
+
+    def get_tracking_session_by_id(self, session_id: str) -> Optional[Dict[str, Any]]:
+        if not self._check_tables_exist():
+            return None
+        try:
+            r = (
+                self.client.table("driver_tracking_sessions")
+                .select("*")
+                .eq("id", session_id)
+                .limit(1)
+                .execute()
+            )
+            return r.data[0] if r.data else None
+        except Exception as e:
+            logger.error(f"Error fetching tracking session: {e}")
+            return None
+
     # ── Lead appeals ───────────────────────────────────────────────────
 
     def upload_appeal_proof_to_storage(

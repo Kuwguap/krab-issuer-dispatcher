@@ -352,6 +352,92 @@ def _driver_keyboard_after_accept(reference_id: str | None) -> InlineKeyboardMar
     return InlineKeyboardMarkup(rows)
 
 
+# ── Driver GPS tracking gate ───────────────────────────────────────────────
+# When TRACKING_SITE_BASE_URL is set, accepting a lead/renewal first sends the
+# driver a tracking-site link; the full delivery details are only DM'd after
+# their location ping arrives (hard block — supervisors can override).
+
+def _new_tracking_token() -> str:
+    return secrets.token_urlsafe(24)
+
+
+def _tracking_link(token: str) -> str:
+    return f"{Config.TRACKING_SITE_BASE_URL}/t/{token}"
+
+
+async def _send_driver_lead_details(context: ContextTypes.DEFAULT_TYPE, lead: dict, chat_id) -> None:
+    """DM the full accepted-lead details (HTML with plain-text fallback)."""
+    confirmation_message = _build_driver_lead_accepted_message_html(lead)
+    add_lead_kb = _driver_keyboard_after_accept(lead.get("reference_id"))
+    try:
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=confirmation_message,
+            reply_markup=add_lead_kb,
+            parse_mode="HTML",
+            disable_web_page_preview=True,
+        )
+    except BadRequest:
+        plain = re.sub(r"<[^>]+>", "", confirmation_message)
+        await context.bot.send_message(chat_id=chat_id, text=plain, reply_markup=add_lead_kb)
+
+
+async def _start_tracking_gate_or_send_details(
+    context: ContextTypes.DEFAULT_TYPE,
+    *,
+    kind: str,
+    lead: dict,
+    driver_id: str | None,
+    driver_name: str | None,
+    chat_id,
+    renewal_id: str | None = None,
+) -> None:
+    """Location gate: send the tracking link now, details after the ping.
+
+    Tracking unconfigured → details immediately (old behavior). Session insert
+    failure (migration missing / DB down) → fail OPEN with details + loud log:
+    the hard block applies to driver behavior, not infrastructure breakage.
+    """
+    if not Config.is_tracking_configured():
+        await _send_driver_lead_details(context, lead, chat_id)
+        return
+    token = _new_tracking_token()
+    sess = db.create_tracking_session(
+        token=token,
+        kind=kind,
+        chat_id=str(chat_id),
+        driver_id=driver_id,
+        driver_name=driver_name,
+        lead_id=lead.get("id"),
+        renewal_id=renewal_id,
+        reference_id=lead.get("reference_id"),
+    )
+    if not sess:
+        logger.error(
+            "Tracking session insert failed — sending details without location gate "
+            "(run database/migration_driver_tracking.sql)"
+        )
+        await _send_driver_lead_details(context, lead, chat_id)
+        return
+    link = _tracking_link(token)
+    kb = InlineKeyboardMarkup([[InlineKeyboardButton("📍 Share my location", url=link)]])
+    try:
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=(
+                "📍 One more step!\n\n"
+                "Tap the button below and share your location — the delivery "
+                "details will arrive here right after.\n\n"
+                f"{link}"
+            ),
+            reply_markup=kb,
+            disable_web_page_preview=True,
+        )
+    except Exception as e:
+        logger.error("Could not send tracking link to %s: %s — sending details directly", chat_id, e)
+        await _send_driver_lead_details(context, lead, chat_id)
+
+
 def _keyboard_lead_accept_decline(lead_id: str) -> InlineKeyboardMarkup:
     """New-lead offer: Accept / Different Driver (decline callback)."""
     return InlineKeyboardMarkup([
@@ -6881,26 +6967,21 @@ async def handle_accept_lead(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
             asyncio.create_task(_monday_driver_update())
 
-    # Send confirmation to driver (plain text — long template with payment lines from Config)
-    confirmation_message = _build_driver_lead_accepted_message_html(lead)
-
-    add_lead_kb = _driver_keyboard_after_accept(lead.get("reference_id"))
-
     await query.message.edit_text(
         "✅ **You accepted this lead!**",
         parse_mode="Markdown",
         reply_markup=_EMPTY_INLINE_KB,
     )
-    try:
-        await query.message.reply_text(
-            confirmation_message,
-            reply_markup=add_lead_kb,
-            parse_mode="HTML",
-            disable_web_page_preview=True,
-        )
-    except BadRequest:
-        plain = re.sub(r"<[^>]+>", "", confirmation_message)
-        await query.message.reply_text(plain, reply_markup=add_lead_kb)
+    # Location gate: with tracking configured, the driver gets the tracking
+    # link now and the full details only after their location ping arrives.
+    await _start_tracking_gate_or_send_details(
+        context,
+        kind="lead",
+        lead=lead,
+        driver_id=str(driver.get("id")) if driver.get("id") else None,
+        driver_name=driver.get("driver_name"),
+        chat_id=query.message.chat_id,
+    )
 
     # Issuer summary + supervisory "new lead" — before optional receipt strike / group posts so they always run
     lead = db.get_lead_by_id(lead_id) or lead
@@ -8785,23 +8866,18 @@ async def handle_renewal_driver_accept(update: Update, context: ContextTypes.DEF
     except Exception:
         pass
 
-    # Send the full accepted lead details to the driver
+    # Full lead details for the driver — behind the location gate when configured.
     lead_full = db.get_lead_by_id(renewal.get("lead_id")) or lead
-    confirmation = _build_driver_lead_accepted_message_html(lead_full)
-    receipt_kb = _driver_keyboard_after_accept(lead_full.get("reference_id"))
     try:
-        await query.message.reply_text(
-            confirmation,
-            reply_markup=receipt_kb,
-            parse_mode="HTML",
-            disable_web_page_preview=True,
+        await _start_tracking_gate_or_send_details(
+            context,
+            kind="renewal",
+            lead=lead_full,
+            driver_id=str(driver_id) if driver_id else None,
+            driver_name=dname,
+            chat_id=query.message.chat_id,
+            renewal_id=str(renewal_id),
         )
-    except BadRequest:
-        plain = re.sub(r"<[^>]+>", "", confirmation)
-        try:
-            await query.message.reply_text(plain, reply_markup=receipt_kb)
-        except Exception as e:
-            logger.warning("Could not send renewal confirmation to driver: %s", e)
     except Exception as e:
         logger.warning("Could not send renewal confirmation to driver: %s", e)
 
@@ -9499,6 +9575,118 @@ async def handle_cf_delete(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     await _handle_cf_action(update, context, "cf_del_")
 
 
+# Driver GPS tracking job: every 10s, (a) send deferred details for sessions
+# whose location arrived, (b) remind drivers still pending past the window and
+# alert supervisors with a manual override button (hard block — no auto-send).
+async def process_tracking_sessions(context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not Config.is_tracking_configured():
+        return
+    try:
+        located = await asyncio.to_thread(db.get_tracking_sessions_located_unsent)
+        for s in located:
+            sid = s.get("id")
+            if not sid:
+                continue
+            if not await asyncio.to_thread(db.claim_tracking_details_sent, sid):
+                continue  # another tick claimed it
+            lead = await asyncio.to_thread(db.get_lead_by_id, s.get("lead_id")) if s.get("lead_id") else None
+            if lead:
+                try:
+                    await _send_driver_lead_details(context, lead, s.get("chat_id"))
+                except Exception as e:
+                    logger.error("Deferred details send failed for session %s: %s", sid, e)
+            else:
+                logger.error("Tracking session %s has no resolvable lead", sid)
+
+        overdue = await asyncio.to_thread(
+            db.get_tracking_sessions_pending_reminder, Config.TRACKING_TIMEOUT_MINUTES
+        )
+        for s in overdue:
+            sid = s.get("id")
+            if not sid or not await asyncio.to_thread(db.mark_tracking_reminder_sent, sid):
+                continue
+            token = s.get("token") or ""
+            link = _tracking_link(token)
+            # Remind the driver (details stay blocked).
+            try:
+                await context.bot.send_message(
+                    chat_id=s.get("chat_id"),
+                    text=(
+                        "⏳ Still waiting on your location!\n\n"
+                        "Your delivery details are ready but can only be sent "
+                        "after you share your location:\n"
+                        f"{link}"
+                    ),
+                    reply_markup=InlineKeyboardMarkup([[
+                        InlineKeyboardButton("📍 Share my location", url=link)
+                    ]]),
+                    disable_web_page_preview=True,
+                )
+            except Exception as e:
+                logger.warning("Tracking reminder to %s failed: %s", s.get("chat_id"), e)
+            # Alert supervisors with a manual override.
+            short = _short_uuid(sid)
+            sup_kb = InlineKeyboardMarkup([[
+                InlineKeyboardButton("📤 Send details anyway", callback_data=f"trk_force_{short}")
+            ]])
+            dname = s.get("driver_name") or "driver"
+            ref = s.get("reference_id") or "N/A"
+            for sup_id in _global_supervisory_chat_ids():
+                try:
+                    await context.bot.send_message(
+                        chat_id=sup_id,
+                        text=(
+                            f"⚠️ {dname} has NOT shared their location for lead {ref} "
+                            f"({Config.TRACKING_TIMEOUT_MINUTES}+ min).\n\n"
+                            "Delivery details are blocked until they do. "
+                            "Use the button to send the details anyway."
+                        ),
+                        reply_markup=sup_kb,
+                    )
+                except Exception as e:
+                    logger.warning("Tracking supervisor alert to %s failed: %s", sup_id, e)
+    except Exception as e:
+        logger.error("Tracking session job failed: %s", e)
+
+
+async def handle_tracking_force(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Supervisor override: send delivery details without a location ping."""
+    query = update.callback_query
+    await query.answer()
+    if not _user_is_global_supervisor(update.effective_user.id):
+        await query.message.reply_text("⛔ Only supervisors can override the location gate.")
+        return
+    try:
+        sid = _long_uuid(query.data[len("trk_force_"):])
+    except (ValueError, Exception):
+        await query.message.reply_text("❌ Invalid request.")
+        return
+    if not db.claim_tracking_override(sid):
+        await query.message.reply_text(
+            "ℹ️ Nothing to override — the driver already shared their location "
+            "or the details were already sent."
+        )
+        return
+    s = db.get_tracking_session_by_id(sid)
+    lead = db.get_lead_by_id(s.get("lead_id")) if s and s.get("lead_id") else None
+    if not (s and lead):
+        await query.message.reply_text("❌ Could not load the lead for this session.")
+        return
+    try:
+        await _send_driver_lead_details(context, lead, s.get("chat_id"))
+    except Exception as e:
+        await query.message.reply_text(f"❌ Details send failed: {e}")
+        return
+    try:
+        await query.edit_message_reply_markup(reply_markup=None)
+    except Exception:
+        pass
+    await query.message.reply_text(
+        f"📤 Details sent to {s.get('driver_name') or 'driver'} WITHOUT a location "
+        f"(lead {s.get('reference_id') or 'N/A'})."
+    )
+
+
 async def handle_cf_info(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """📝 View full info — everything on the record, incl. complete notes
     (the AI paste-parse stores all unparsed data there)."""
@@ -9870,6 +10058,8 @@ def main():
     application.add_handler(CallbackQueryHandler(handle_cf_done, pattern="^cf_done_"))
     application.add_handler(CallbackQueryHandler(handle_cf_delete, pattern="^cf_del_"))
     application.add_handler(CallbackQueryHandler(handle_cf_info, pattern="^cf_info_"))
+    # Driver tracking: supervisor override of the location gate
+    application.add_handler(CallbackQueryHandler(handle_tracking_force, pattern="^trk_force_"))
 
     # Driver timeout: every minute, check for leads where no driver accepted within 10 min
     async def check_driver_timeout(context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -9929,6 +10119,12 @@ def main():
     if application.job_queue:
         application.job_queue.run_repeating(check_driver_timeout, interval=60, first=120)
         logger.info("Driver timeout job scheduled (every 60s, first in 120s)")
+
+    if application.job_queue:
+        application.job_queue.run_repeating(
+            process_tracking_sessions, interval=10, first=20, name="driver_tracking_dispatch"
+        )
+        logger.info("Driver tracking job scheduled (every 10s, first in 20s)")
 
     if application.job_queue:
         application.job_queue.run_repeating(
