@@ -143,7 +143,7 @@ def _resolve_receipt_detection_mode() -> str:
     return "lax"
 
 
-SUSPENSION_THRESHOLD = 3  # 3+ pending receipts = suspended
+SUSPENSION_THRESHOLD = 5  # 5+ pending receipts = suspended
 # Lead source picker: auto-complete without source if issuer does not tap within this window
 CONTACT_SOURCE_TIMEOUT_SEC = 180
 
@@ -10134,6 +10134,65 @@ async def handle_cf_info(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     await query.message.reply_text("\n".join(lines))
 
 
+async def cmd_announce(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Supervisor broadcast: /announce <message> → every group chat + every
+    driver DM + every lead-sender DM (deduped)."""
+    if not _user_is_global_supervisor(update.effective_user.id):
+        await update.message.reply_text("⛔ Supervisors only.")
+        return
+    raw = update.message.text or ""
+    payload = raw.split(" ", 1)[1].strip() if " " in raw else ""
+    if not payload:
+        await update.message.reply_text(
+            "Usage: /announce <message>\n\n"
+            "Sends your message to every group chat, driver, and lead sender."
+        )
+        return
+    msg = f"📢 ANNOUNCEMENT\n\n{payload}\n\n🏁Automated🏎Automotive"
+
+    targets: dict = {}
+    try:
+        for g in db.get_all_groups() or []:
+            if not record_is_active(g):
+                continue
+            cid = _parse_chat_id(g.get("group_telegram_id"))
+            if cid is not None:
+                targets[_norm_chat_id(cid)] = cid
+    except Exception as e:
+        logger.warning("Announce: groups lookup failed: %s", e)
+    try:
+        for d in _get_all_drivers_cached() or []:
+            if not record_is_active(d):
+                continue
+            cid = _parse_chat_id(d.get("driver_telegram_id"))
+            if cid is not None:
+                targets.setdefault(_norm_chat_id(cid), cid)
+    except Exception as e:
+        logger.warning("Announce: drivers lookup failed: %s", e)
+    try:
+        for uid in db.get_lead_sender_telegram_ids() or []:
+            cid = _parse_chat_id(uid)
+            if cid is not None:
+                targets.setdefault(_norm_chat_id(cid), cid)
+    except Exception as e:
+        logger.warning("Announce: lead senders lookup failed: %s", e)
+    # Don't echo back to the announcer.
+    targets.pop(_norm_chat_id(update.effective_user.id), None)
+
+    sent_n, failed_n = 0, 0
+    for cid in targets.values():
+        try:
+            await context.bot.send_message(chat_id=cid, text=msg)
+            sent_n += 1
+        except Exception as e:
+            failed_n += 1
+            logger.warning("Announce to %s failed: %s", cid, e)
+    await update.message.reply_text(
+        f"📢 Announcement delivered to {sent_n} chat(s)"
+        + (f" — {failed_n} failed (blocked bot / bad id)." if failed_n else ".")
+    )
+
+
 async def cmd_all_followups(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Supervisor backend: view ALL open follow-ups with stop/delete controls."""
     if not _user_is_global_supervisor(update.effective_user.id):
@@ -10428,6 +10487,8 @@ def main():
     # Secret supervisory-only commands: status (/test) + toggle (/driverblock).
     application.add_handler(CommandHandler("test", cmd_test))
     application.add_handler(CommandHandler("driverblock", cmd_driverblock))
+    # Supervisor broadcast to all groups + drivers + lead senders.
+    application.add_handler(CommandHandler("announce", cmd_announce))
 
     # Add accept/decline handlers for driver assignments
     application.add_handler(CallbackQueryHandler(handle_accept_lead, pattern="^accept_lead_"))

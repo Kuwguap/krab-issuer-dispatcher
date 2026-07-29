@@ -1498,31 +1498,265 @@ def api_receipts_submitted():
         return jsonify({"error": str(e)}), 500
 
 
+# ── Driver Track (live map tab) ────────────────────────────────────────────
+# Native port of the driver-track site's admin data endpoints so the dashboard
+# renders the map itself (no iframe). Free services: Nominatim + OSRM.
+
+_TRACK_GEO_CACHE = {"geocode": {}, "reverse": {}, "route": {}}
+_TRACK_ROUTE_TTL_S = 45
+_NOMINATIM_HEADERS = {"User-Agent": "krab-issuer-admin/1.0 (driver track tab)"}
+
+
+def _track_round3(v):
+    try:
+        return round(float(v), 3)
+    except (TypeError, ValueError):
+        return None
+
+
+@app.route('/api/tracking/overview', methods=['GET'])
+def api_tracking_overview():
+    """Sessions + last-known driver positions + movement trails."""
+    try:
+        from datetime import datetime, timedelta, timezone
+        try:
+            hours = max(1, min(48, int(request.args.get("hours", "8"))))
+        except ValueError:
+            hours = 8
+        now = datetime.now(timezone.utc)
+        s_since = (now - timedelta(hours=48)).isoformat()
+        p_since = (now - timedelta(hours=hours)).isoformat()
+
+        srows = (
+            db.client.table("driver_tracking_sessions").select("*")
+            .gte("created_at", s_since).order("created_at", desc=True).limit(200).execute()
+        ).data or []
+        prows = (
+            db.client.table("driver_location_pings")
+            .select("driver_id,lat,lng,accuracy,created_at")
+            .gte("created_at", p_since).order("created_at").limit(4000).execute()
+        ).data or []
+
+        sessions = [{
+            "token": s.get("token"), "kind": s.get("kind"),
+            "reference_id": s.get("reference_id"), "driver_name": s.get("driver_name"),
+            "status": s.get("status"), "created_at": s.get("created_at"),
+            "located_at": s.get("located_at"), "details_sent_at": s.get("details_sent_at"),
+            "delivery_address": s.get("delivery_address"),
+            "dest_lat": s.get("dest_lat"), "dest_lng": s.get("dest_lng"),
+        } for s in srows]
+
+        name_by, sess_by = {}, {}
+        for s in srows:
+            did = s.get("driver_id")
+            if did is not None and str(did) not in name_by:
+                name_by[str(did)] = s.get("driver_name")
+                sess_by[str(did)] = s.get("token")
+
+        latest = {}
+        trails = {}
+        for p in prows:
+            key = "unknown" if p.get("driver_id") is None else str(p.get("driver_id"))
+            trails.setdefault(key, []).append([p.get("lat"), p.get("lng"), p.get("created_at")])
+            if p.get("driver_id") is not None:
+                latest[key] = p
+        for k in trails:
+            trails[k] = trails[k][-500:]
+
+        drivers = []
+        for did, ping in latest.items():
+            try:
+                age = (now - datetime.fromisoformat(str(ping.get("created_at")).replace("Z", "+00:00"))).total_seconds()
+            except Exception:
+                age = 1e9
+            drivers.append({
+                "driver_id": did,
+                "driver_name": name_by.get(did),
+                "session_token": sess_by.get(did),
+                "last_ping": {"lat": ping.get("lat"), "lng": ping.get("lng"),
+                              "accuracy": ping.get("accuracy"), "created_at": ping.get("created_at")},
+                "live": age < 120,
+            })
+        return jsonify({"sessions": sessions, "drivers": drivers, "trails": trails})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route('/api/tracking/route', methods=['GET'])
+def api_tracking_route():
+    """From/To addresses + driving route + ETA for one tracking session."""
+    import time as _time
+    import requests as _rq
+    try:
+        token = (request.args.get("token") or "").strip()
+        if not token:
+            return jsonify({"error": "token required"}), 400
+        srows = (
+            db.client.table("driver_tracking_sessions").select("*")
+            .eq("token", token).limit(1).execute()
+        ).data or []
+        if not srows:
+            return jsonify({"error": "session not found"}), 404
+        s = srows[0]
+
+        prow = (
+            db.client.table("driver_location_pings").select("lat,lng,created_at")
+            .eq("session_token", token).order("created_at", desc=True).limit(1).execute()
+        ).data or []
+        if not prow and s.get("driver_id"):
+            prow = (
+                db.client.table("driver_location_pings").select("lat,lng,created_at")
+                .eq("driver_id", str(s.get("driver_id"))).order("created_at", desc=True).limit(1).execute()
+            ).data or []
+        frm = None
+        if prow:
+            frm = {"lat": prow[0].get("lat"), "lng": prow[0].get("lng"), "at": prow[0].get("created_at")}
+
+        addr = (s.get("delivery_address") or "").strip() or None
+        to = None
+        if s.get("dest_lat") is not None and s.get("dest_lng") is not None:
+            to = {"lat": s.get("dest_lat"), "lng": s.get("dest_lng"), "address": addr}
+        elif addr:
+            hit = _TRACK_GEO_CACHE["geocode"].get(addr)
+            if hit is None and addr not in _TRACK_GEO_CACHE["geocode"]:
+                try:
+                    g = _rq.get(
+                        "https://nominatim.openstreetmap.org/search",
+                        params={"format": "json", "limit": 1, "countrycodes": "us", "q": addr},
+                        headers=_NOMINATIM_HEADERS, timeout=15,
+                    ).json()
+                    hit = {"lat": float(g[0]["lat"]), "lng": float(g[0]["lon"])} if g else None
+                except Exception:
+                    hit = None
+                _TRACK_GEO_CACHE["geocode"][addr] = hit
+            if hit:
+                to = {"lat": hit["lat"], "lng": hit["lng"], "address": addr}
+                try:
+                    db.client.table("driver_tracking_sessions").update(
+                        {"dest_lat": hit["lat"], "dest_lng": hit["lng"]}
+                    ).eq("token", token).execute()
+                except Exception:
+                    pass
+
+        if frm:
+            rkey = (_track_round3(frm["lat"]), _track_round3(frm["lng"]))
+            cached = _TRACK_GEO_CACHE["reverse"].get(rkey)
+            if cached is None and rkey not in _TRACK_GEO_CACHE["reverse"]:
+                try:
+                    rv = _rq.get(
+                        "https://nominatim.openstreetmap.org/reverse",
+                        params={"format": "json", "zoom": 16, "lat": frm["lat"], "lon": frm["lng"]},
+                        headers=_NOMINATIM_HEADERS, timeout=15,
+                    ).json()
+                    a = rv.get("address") or {}
+                    parts = [
+                        " ".join(x for x in (a.get("house_number"), a.get("road")) if x),
+                        a.get("city") or a.get("town") or a.get("village") or a.get("county"),
+                        (f"{a.get('state')} {a.get('postcode') or ''}".strip() if a.get("state") else a.get("postcode")),
+                    ]
+                    cached = ", ".join(p for p in parts if p) or rv.get("display_name")
+                except Exception:
+                    cached = None
+                _TRACK_GEO_CACHE["reverse"][rkey] = cached
+            frm["address"] = cached
+
+        route = None
+        if frm and to:
+            key = (_track_round3(frm["lat"]), _track_round3(frm["lng"]),
+                   _track_round3(to["lat"]), _track_round3(to["lng"]))
+            hit = _TRACK_GEO_CACHE["route"].get(key)
+            if hit and _time.time() - hit[0] < _TRACK_ROUTE_TTL_S:
+                route = hit[1]
+            else:
+                try:
+                    rj = _rq.get(
+                        f"https://router.project-osrm.org/route/v1/driving/"
+                        f"{frm['lng']},{frm['lat']};{to['lng']},{to['lat']}",
+                        params={"overview": "full", "geometries": "geojson"},
+                        timeout=20,
+                    ).json()
+                    r0 = (rj.get("routes") or [None])[0]
+                    if r0:
+                        route = {
+                            "duration": r0.get("duration") or 0,
+                            "distance": r0.get("distance") or 0,
+                            "coords": [[c[1], c[0]] for c in (r0.get("geometry") or {}).get("coordinates", [])],
+                        }
+                except Exception:
+                    route = None
+                _TRACK_GEO_CACHE["route"][key] = (_time.time(), route)
+
+        def _eta(sec):
+            m = int(round((sec or 0) / 60))
+            if m < 1:
+                return "under 1 min"
+            if m < 60:
+                return f"{m} min"
+            return f"{m // 60}h {m % 60}m" if m % 60 else f"{m // 60}h"
+
+        return jsonify({
+            "ok": True, "token": token,
+            "reference_id": s.get("reference_id"), "driver_name": s.get("driver_name"),
+            "status": s.get("status"),
+            "from": frm,
+            "to": to or ({"address": addr} if addr else None),
+            "eta_seconds": route and route["duration"],
+            "eta_label": _eta(route["duration"]) if route else None,
+            "distance_meters": route and route["distance"],
+            "distance_label": (f"{route['distance'] / 1609.344:.1f} mi" if route else None),
+            "geometry": route and route["coords"],
+        })
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
 @app.route('/api/receipts/image/<lead_id>', methods=['GET'])
 def api_receipt_image(lead_id):
-    """Receipt image resolver — fixes broken images in the dashboard.
+    """Receipt image resolver — STREAMS the image bytes (no redirects).
 
-    Supabase Storage URLs redirect straight through (permanent). Telegram file
-    URLs EXPIRE after ~1 hour — for those, the bot stores the permanent
-    file_id in a #tgfid= fragment; we call getFile to mint a fresh download
-    URL so old receipts render instead of showing a broken image.
+    Redirects break behind the Vercel /api/backend proxy (it drops the
+    Location header), so we fetch the image server-side and return the bytes.
+    Storage URLs are fetched directly; expired Telegram file URLs are
+    re-signed first via getFile using the #tgfid= fragment the bot stores.
     """
+    import requests as _rq
+    from flask import Response
+
+    def _fetch(u):
+        try:
+            r = _rq.get(u, timeout=25)
+            if r.ok and r.content:
+                ct = r.headers.get("content-type") or "image/jpeg"
+                if "text/html" in ct.lower():
+                    return None
+                return Response(
+                    r.content,
+                    mimetype=ct,
+                    headers={"Cache-Control": "private, max-age=300"},
+                )
+        except Exception as fe:
+            logger.warning("receipt image fetch failed for %s: %s", lead_id, fe)
+        return None
+
     try:
         row = db.client.table("leads").select("receipt_image_url").eq("id", lead_id).limit(1).execute()
         url = ((row.data or [{}])[0].get("receipt_image_url") or "").strip()
         if not url:
             return jsonify({"error": "no receipt image for this lead"}), 404
         marker = "https://api.telegram.org/file/bot"
-        if marker not in url:
-            return redirect(url, code=302)
         base, _, frag = url.partition("#")
+        if marker not in url:
+            resp = _fetch(base)
+            if resp:
+                return resp
+            return jsonify({"error": "image not reachable"}), 502
+        # Telegram-hosted: re-sign first (stored URLs expire after ~1h).
         tgfid = None
         for part in frag.split("&"):
             if part.startswith("tgfid="):
                 tgfid = part[len("tgfid="):].strip()
         token = (os.getenv("TELEGRAM_BOT_TOKEN") or "").strip()
         if tgfid and token:
-            import requests as _rq
             r = _rq.get(
                 f"https://api.telegram.org/bot{token}/getFile",
                 params={"file_id": tgfid},
@@ -1532,9 +1766,14 @@ def api_receipt_image(lead_id):
             if r.ok:
                 fp = str((((r.json() or {}).get("result") or {}).get("file_path") or "")).strip()
             if fp:
-                return redirect(f"{marker}{token}/{fp}", code=302)
-        # No file_id stored (or getFile failed): try the stored URL as-is.
-        return redirect(base, code=302)
+                resp = _fetch(f"{marker}{token}/{fp}")
+                if resp:
+                    return resp
+        # Last resort: the stored URL as-is (works within the first hour).
+        resp = _fetch(base)
+        if resp:
+            return resp
+        return jsonify({"error": "image expired and could not be re-signed"}), 502
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
