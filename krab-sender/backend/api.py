@@ -21,6 +21,7 @@ from .repository import (
     list_recipients,
     get_recipient_by_id,
     create_recipient,
+    update_recipient,
     delete_recipient,
 )
 from .issuer_supabase import (
@@ -557,6 +558,17 @@ def recipients_create(recipient: RecipientCreate):
     return create_recipient(name=recipient.name, email=recipient.email)
 
 
+@app.patch("/recipients/{recipient_id}", dependencies=[Depends(require_admin)])
+def recipients_update(recipient_id: str, recipient: RecipientCreate):
+    """
+    Admin endpoint: update a recipient's name/email.
+    """
+    updated = update_recipient(recipient_id, recipient.name, recipient.email)
+    if not updated:
+        raise HTTPException(status_code=404, detail="Recipient not found")
+    return updated
+
+
 @app.delete("/recipients/{recipient_id}", dependencies=[Depends(require_admin)])
 def recipients_delete(recipient_id: str):
     """
@@ -583,6 +595,15 @@ def recipients_ui_list():
 def recipients_ui_create(recipient: RecipientCreate):
     """Create recipient — open auth path paired with GET /recipients/ui."""
     return create_recipient(name=recipient.name, email=recipient.email)
+
+
+@app.patch("/recipients/ui/{recipient_id}")
+def recipients_ui_update(recipient_id: str, recipient: RecipientCreate):
+    """Update recipient — open auth path paired with the other /recipients/ui routes."""
+    updated = update_recipient(recipient_id, recipient.name, recipient.email)
+    if not updated:
+        raise HTTPException(status_code=404, detail="Recipient not found")
+    return updated
 
 
 @app.delete("/recipients/ui/{recipient_id}")

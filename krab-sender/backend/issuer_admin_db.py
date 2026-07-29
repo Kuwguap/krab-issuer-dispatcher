@@ -70,7 +70,13 @@ class IssuerAdminDatabase:
         except Exception:
             return False
 
-    def create_driver(self, driver_name: str, driver_telegram_id: str, phone_number: Optional[str] = None) -> bool:
+    def create_driver(
+        self,
+        driver_name: str,
+        driver_telegram_id: str,
+        phone_number: Optional[str] = None,
+        email: Optional[str] = None,
+    ) -> bool:
         if not self._check_tables_exist():
             raise ValueError("Database tables not found. Run the schema migrations in Supabase SQL Editor.")
         payload: dict[str, Any] = {
@@ -79,8 +85,53 @@ class IssuerAdminDatabase:
         }
         if phone_number is not None and str(phone_number).strip():
             payload["phone_number"] = str(phone_number).strip()
-        self.client.table("drivers").insert(payload).execute()
+        if email is not None and str(email).strip():
+            payload["email"] = str(email).strip()
+        try:
+            self.client.table("drivers").insert(payload).execute()
+        except Exception as e:
+            # drivers.email may not exist yet (migration only landed on the
+            # leads side) — retry the insert without it so driver creation
+            # still succeeds on older schemas.
+            err = str(e).lower()
+            if "email" in payload and "email" in err and any(
+                x in err for x in ("column", "schema", "pgrst204")
+            ):
+                payload.pop("email", None)
+                self.client.table("drivers").insert(payload).execute()
+            else:
+                raise
         return True
+
+    def update_driver(
+        self,
+        driver_id: str,
+        driver_name: Optional[str] = None,
+        driver_telegram_id: Optional[str] = None,
+        phone_number: Optional[str] = None,
+    ) -> bool:
+        """Update provided fields on a driver row. Returns False when not found."""
+        if not self._check_tables_exist():
+            return False
+        payload: dict[str, Any] = {}
+        if driver_name is not None and str(driver_name).strip():
+            payload["driver_name"] = str(driver_name).strip()
+        if driver_telegram_id is not None and str(driver_telegram_id).strip():
+            payload["driver_telegram_id"] = str(driver_telegram_id).strip()
+        if phone_number is not None:
+            payload["phone_number"] = str(phone_number).strip() or None
+        if not payload:
+            existing = self.client.table("drivers").select("id").eq("id", driver_id).limit(1).execute()
+            return bool(existing.data)
+        r = self.client.table("drivers").update(payload).eq("id", driver_id).execute()
+        return bool(r.data)
+
+    def delete_driver(self, driver_id: str) -> bool:
+        """Delete a driver row. FK errors (lead history) propagate to the caller."""
+        if not self._check_tables_exist():
+            return False
+        r = self.client.table("drivers").delete().eq("id", driver_id).execute()
+        return bool(r.data)
 
     def get_group_by_id(self, group_id: str):
         if not self._check_tables_exist():

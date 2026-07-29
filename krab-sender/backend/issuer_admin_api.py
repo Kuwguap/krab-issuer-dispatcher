@@ -8,9 +8,17 @@ from __future__ import annotations
 import logging
 import os
 import re
+import time
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 import httpx
+
+try:  # Prefer requests (in requirements); httpx is the guaranteed fallback.
+    import requests as _requests
+except Exception:  # pragma: no cover - requests should exist, httpx covers us
+    _requests = None
+
 from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
@@ -46,6 +54,15 @@ class GroupCreate(BaseModel):
 class DriverCreate(BaseModel):
     driver_name: str
     driver_telegram_id: str
+    phone_number: Optional[str] = None
+    # Optional: drivers.email may not exist yet in prod; the DB layer retries
+    # the insert without it when Supabase rejects the column.
+    email: Optional[str] = None
+
+
+class DriverUpdate(BaseModel):
+    driver_name: Optional[str] = None
+    driver_telegram_id: Optional[str] = None
     phone_number: Optional[str] = None
 
 
@@ -96,7 +113,12 @@ def issuer_drivers_list(db: IssuerAdminDatabase = Depends(get_issuer_db)):
 @router.post("/drivers")
 def issuer_drivers_create(body: DriverCreate, db: IssuerAdminDatabase = Depends(get_issuer_db)):
     try:
-        if db.create_driver(body.driver_name, body.driver_telegram_id, body.phone_number):
+        if db.create_driver(
+            body.driver_name,
+            body.driver_telegram_id,
+            body.phone_number,
+            email=body.email,
+        ):
             return {"success": True, "message": "Driver added"}
     except Exception as e:
         err = str(e).lower()
@@ -105,6 +127,44 @@ def issuer_drivers_create(body: DriverCreate, db: IssuerAdminDatabase = Depends(
             raise HTTPException(status_code=409, detail="A driver with this Telegram ID already exists.") from e
         raise HTTPException(status_code=500, detail=str(e)) from e
     raise HTTPException(status_code=500, detail="Could not add driver")
+
+
+@router.put("/drivers/{driver_id}")
+def issuer_drivers_update(driver_id: str, body: DriverUpdate, db: IssuerAdminDatabase = Depends(get_issuer_db)):
+    try:
+        ok = db.update_driver(
+            driver_id,
+            driver_name=body.driver_name,
+            driver_telegram_id=body.driver_telegram_id,
+            phone_number=body.phone_number,
+        )
+    except Exception as e:
+        err = str(e).lower()
+        logger.exception("update_driver")
+        if any(x in err for x in ("unique", "duplicate", "23505")):
+            raise HTTPException(status_code=409, detail="A driver with this Telegram ID already exists.") from e
+        raise HTTPException(status_code=500, detail=str(e)) from e
+    if not ok:
+        raise HTTPException(status_code=404, detail="Driver not found")
+    return {"success": True, "message": "Driver updated"}
+
+
+@router.delete("/drivers/{driver_id}")
+def issuer_drivers_delete(driver_id: str, db: IssuerAdminDatabase = Depends(get_issuer_db)):
+    try:
+        ok = db.delete_driver(driver_id)
+    except Exception as e:
+        err = str(e).lower()
+        logger.exception("delete_driver")
+        if any(x in err for x in ("foreign key", "23503", "violates")):
+            raise HTTPException(
+                status_code=409,
+                detail="Driver has history (assigned leads) — deactivate instead.",
+            ) from e
+        raise HTTPException(status_code=500, detail=str(e)) from e
+    if not ok:
+        raise HTTPException(status_code=404, detail="Driver not found")
+    return {"success": True, "message": "Driver deleted"}
 
 
 @router.post("/drivers/{driver_id}/toggle")
@@ -406,3 +466,252 @@ def issuer_receipt_view(
 @router.get("/renewals/upcoming")
 def issuer_renewals(db: IssuerAdminDatabase = Depends(get_issuer_db)):
     return db.get_upcoming_renewals()
+
+
+# ── Driver Track (live map tab) ────────────────────────────────────────────
+# Native port of krableadsV2 admin_dashboard.py tracking endpoints so the
+# unified admin renders the live map itself (no iframe).
+# Free services: Nominatim (geocode) + OSRM (routing).
+
+_TRACK_GEO_CACHE: dict = {"geocode": {}, "reverse": {}, "route": {}}
+_TRACK_ROUTE_TTL_S = 45
+_NOMINATIM_HEADERS = {"User-Agent": "krab-dispatch-admin/1.0 (driver track tab)"}
+
+
+def _track_round3(v):
+    try:
+        return round(float(v), 3)
+    except (TypeError, ValueError):
+        return None
+
+
+def _track_get_json(url: str, params: dict, timeout: float = 15.0, headers: Optional[dict] = None):
+    """GET a JSON payload using requests when available, httpx otherwise."""
+    if _requests is not None:
+        resp = _requests.get(url, params=params, headers=headers or {}, timeout=timeout)
+        return resp.json()
+    with httpx.Client(timeout=timeout, follow_redirects=True) as client:
+        resp = client.get(url, params=params, headers=headers or {})
+        return resp.json()
+
+
+@router.get("/tracking/overview")
+def issuer_tracking_overview(
+    hours: int = Query(8),
+    db: IssuerAdminDatabase = Depends(get_issuer_db),
+):
+    """Sessions + last-known driver positions + movement trails (admin only)."""
+    try:
+        hours_clamped = max(1, min(48, int(hours)))
+    except (TypeError, ValueError):
+        hours_clamped = 8
+    now = datetime.now(timezone.utc)
+    s_since = (now - timedelta(hours=48)).isoformat()
+    p_since = (now - timedelta(hours=hours_clamped)).isoformat()
+
+    try:
+        srows = (
+            db.client.table("driver_tracking_sessions").select("*")
+            .gte("created_at", s_since).order("created_at", desc=True).limit(200).execute()
+        ).data or []
+    except Exception as e:
+        logger.warning("tracking overview sessions: %s", e)
+        srows = []
+    try:
+        prows = (
+            db.client.table("driver_location_pings")
+            .select("driver_id,lat,lng,accuracy,created_at")
+            .gte("created_at", p_since).order("created_at").limit(4000).execute()
+        ).data or []
+    except Exception as e:
+        logger.warning("tracking overview pings: %s", e)
+        prows = []
+
+    # select("*") + .get(): tolerate v2 columns (delivery_address/dest_lat/…)
+    # that may not exist in prod yet.
+    sessions = [{
+        "token": s.get("token"), "kind": s.get("kind"),
+        "reference_id": s.get("reference_id"), "driver_name": s.get("driver_name"),
+        "status": s.get("status"), "created_at": s.get("created_at"),
+        "located_at": s.get("located_at"), "details_sent_at": s.get("details_sent_at"),
+        "delivery_address": s.get("delivery_address"),
+        "dest_lat": s.get("dest_lat"), "dest_lng": s.get("dest_lng"),
+    } for s in srows]
+
+    name_by: dict = {}
+    sess_by: dict = {}
+    for s in srows:
+        did = s.get("driver_id")
+        if did is not None and str(did) not in name_by:
+            name_by[str(did)] = s.get("driver_name")
+            sess_by[str(did)] = s.get("token")
+
+    latest: dict = {}
+    trails: dict = {}
+    for p in prows:
+        key = "unknown" if p.get("driver_id") is None else str(p.get("driver_id"))
+        trails.setdefault(key, []).append([p.get("lat"), p.get("lng"), p.get("created_at")])
+        if p.get("driver_id") is not None:
+            latest[key] = p
+    for k in trails:
+        trails[k] = trails[k][-500:]
+
+    drivers = []
+    for did, ping in latest.items():
+        try:
+            age = (
+                now
+                - datetime.fromisoformat(str(ping.get("created_at")).replace("Z", "+00:00"))
+            ).total_seconds()
+        except Exception:
+            age = 1e9
+        drivers.append({
+            "driver_id": did,
+            "driver_name": name_by.get(did),
+            "session_token": sess_by.get(did),
+            "last_ping": {"lat": ping.get("lat"), "lng": ping.get("lng"),
+                          "accuracy": ping.get("accuracy"), "created_at": ping.get("created_at")},
+            "live": age < 120,
+        })
+    return {"sessions": sessions, "drivers": drivers, "trails": trails}
+
+
+@router.get("/tracking/route")
+def issuer_tracking_route(
+    token: str = Query(..., min_length=1),
+    db: IssuerAdminDatabase = Depends(get_issuer_db),
+):
+    """From/To addresses + driving route + ETA for one tracking session (admin only)."""
+    token_key = token.strip()
+    if not token_key:
+        raise HTTPException(status_code=400, detail="token required")
+    try:
+        srows = (
+            db.client.table("driver_tracking_sessions").select("*")
+            .eq("token", token_key).limit(1).execute()
+        ).data or []
+    except Exception as e:
+        logger.warning("tracking route session lookup: %s", e)
+        srows = []
+    if not srows:
+        raise HTTPException(status_code=404, detail="session not found")
+    s = srows[0]
+
+    prow = []
+    try:
+        prow = (
+            db.client.table("driver_location_pings").select("lat,lng,created_at")
+            .eq("session_token", token_key).order("created_at", desc=True).limit(1).execute()
+        ).data or []
+    except Exception:
+        prow = []
+    if not prow and s.get("driver_id"):
+        try:
+            prow = (
+                db.client.table("driver_location_pings").select("lat,lng,created_at")
+                .eq("driver_id", str(s.get("driver_id"))).order("created_at", desc=True).limit(1).execute()
+            ).data or []
+        except Exception:
+            prow = []
+    frm = None
+    if prow:
+        frm = {"lat": prow[0].get("lat"), "lng": prow[0].get("lng"), "at": prow[0].get("created_at")}
+
+    addr = (s.get("delivery_address") or "").strip() or None
+    to = None
+    if s.get("dest_lat") is not None and s.get("dest_lng") is not None:
+        to = {"lat": s.get("dest_lat"), "lng": s.get("dest_lng"), "address": addr}
+    elif addr:
+        hit = _TRACK_GEO_CACHE["geocode"].get(addr)
+        if hit is None and addr not in _TRACK_GEO_CACHE["geocode"]:
+            try:
+                g = _track_get_json(
+                    "https://nominatim.openstreetmap.org/search",
+                    params={"format": "json", "limit": 1, "countrycodes": "us", "q": addr},
+                    headers=_NOMINATIM_HEADERS,
+                    timeout=15,
+                )
+                hit = {"lat": float(g[0]["lat"]), "lng": float(g[0]["lon"])} if g else None
+            except Exception:
+                hit = None
+            _TRACK_GEO_CACHE["geocode"][addr] = hit
+        if hit:
+            to = {"lat": hit["lat"], "lng": hit["lng"], "address": addr}
+            try:
+                # PATCH resolved coordinates back onto the session; the column
+                # may not exist yet in prod, so failures are non-fatal.
+                db.client.table("driver_tracking_sessions").update(
+                    {"dest_lat": hit["lat"], "dest_lng": hit["lng"]}
+                ).eq("token", token_key).execute()
+            except Exception:
+                pass
+
+    if frm:
+        rkey = (_track_round3(frm["lat"]), _track_round3(frm["lng"]))
+        cached = _TRACK_GEO_CACHE["reverse"].get(rkey)
+        if cached is None and rkey not in _TRACK_GEO_CACHE["reverse"]:
+            try:
+                rv = _track_get_json(
+                    "https://nominatim.openstreetmap.org/reverse",
+                    params={"format": "json", "zoom": 16, "lat": frm["lat"], "lon": frm["lng"]},
+                    headers=_NOMINATIM_HEADERS,
+                    timeout=15,
+                )
+                a = rv.get("address") or {}
+                parts = [
+                    " ".join(x for x in (a.get("house_number"), a.get("road")) if x),
+                    a.get("city") or a.get("town") or a.get("village") or a.get("county"),
+                    (f"{a.get('state')} {a.get('postcode') or ''}".strip() if a.get("state") else a.get("postcode")),
+                ]
+                cached = ", ".join(p for p in parts if p) or rv.get("display_name")
+            except Exception:
+                cached = None
+            _TRACK_GEO_CACHE["reverse"][rkey] = cached
+        frm["address"] = cached
+
+    route = None
+    if frm and to:
+        key = (_track_round3(frm["lat"]), _track_round3(frm["lng"]),
+               _track_round3(to["lat"]), _track_round3(to["lng"]))
+        hit = _TRACK_GEO_CACHE["route"].get(key)
+        if hit and time.time() - hit[0] < _TRACK_ROUTE_TTL_S:
+            route = hit[1]
+        else:
+            try:
+                rj = _track_get_json(
+                    "https://router.project-osrm.org/route/v1/driving/"
+                    f"{frm['lng']},{frm['lat']};{to['lng']},{to['lat']}",
+                    params={"overview": "full", "geometries": "geojson"},
+                    timeout=20,
+                )
+                r0 = (rj.get("routes") or [None])[0]
+                if r0:
+                    route = {
+                        "duration": r0.get("duration") or 0,
+                        "distance": r0.get("distance") or 0,
+                        "coords": [[c[1], c[0]] for c in (r0.get("geometry") or {}).get("coordinates", [])],
+                    }
+            except Exception:
+                route = None
+            _TRACK_GEO_CACHE["route"][key] = (time.time(), route)
+
+    def _eta(sec):
+        m = int(round((sec or 0) / 60))
+        if m < 1:
+            return "under 1 min"
+        if m < 60:
+            return f"{m} min"
+        return f"{m // 60}h {m % 60}m" if m % 60 else f"{m // 60}h"
+
+    return {
+        "ok": True, "token": token_key,
+        "reference_id": s.get("reference_id"), "driver_name": s.get("driver_name"),
+        "status": s.get("status"),
+        "from": frm,
+        "to": to or ({"address": addr} if addr else None),
+        "eta_seconds": route and route["duration"],
+        "eta_label": _eta(route["duration"]) if route else None,
+        "distance_meters": route and route["distance"],
+        "distance_label": (f"{route['distance'] / 1609.344:.1f} mi" if route else None),
+        "geometry": route and route["coords"],
+    }

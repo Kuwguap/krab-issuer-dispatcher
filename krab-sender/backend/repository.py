@@ -287,6 +287,22 @@ def create_recipient(name: str, email: str) -> dict:
             "email": orm.email,
             "created_at_utc": orm.created_at_utc.isoformat(),
         }
+def update_recipient(recipient_id: str, name: str, email: str) -> Optional[dict]:
+    """
+    Update a recipient's name/email. Returns the updated dict or None if not found.
+    """
+    with get_session() as session:
+        row = session.query(RecipientORM).filter(RecipientORM.id == recipient_id).first()
+        if not row:
+            return None
+        row.name = name
+        row.email = email
+        return {
+            "id": row.id,
+            "name": row.name,
+            "email": row.email,
+            "created_at_utc": row.created_at_utc.isoformat(),
+        }
 def delete_recipient(recipient_id: str) -> bool:
     """
     Delete a recipient by ID. Returns True if deleted, False if not found.

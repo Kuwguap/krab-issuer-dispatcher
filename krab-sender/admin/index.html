@@ -7,6 +7,10 @@
       name="viewport"
       content="width=device-width, initial-scale=1, maximum-scale=5, user-scalable=yes"
     />
+    <link
+      rel="stylesheet"
+      href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"
+    />
     <style>
       :root {
         color-scheme: dark;
@@ -1015,6 +1019,97 @@
         font-size: 0.75rem;
         color: var(--text-muted);
       }
+
+      /* ── Driver Track (live map tab) ─────────────────────────────── */
+      #track-map {
+        background: #0d1626;
+      }
+
+      .trk-pulse-icon {
+        background: transparent;
+        border: none;
+      }
+
+      .trk-pulse {
+        position: relative;
+        width: 14px;
+        height: 14px;
+        border-radius: 50%;
+        background: #f59e0b;
+        border: 2px solid #fff;
+        box-shadow: 0 0 8px rgba(245, 158, 11, 0.85);
+      }
+
+      .trk-pulse::after {
+        content: "";
+        position: absolute;
+        left: 50%;
+        top: 50%;
+        width: 14px;
+        height: 14px;
+        margin: -9px 0 0 -9px;
+        border-radius: 50%;
+        border: 2px solid #f59e0b;
+        animation: trk-pulse-ring 1.6s ease-out infinite;
+      }
+
+      @keyframes trk-pulse-ring {
+        0% {
+          transform: scale(1);
+          opacity: 0.9;
+        }
+        100% {
+          transform: scale(3.2);
+          opacity: 0;
+        }
+      }
+
+      .trk-flag-icon {
+        background: transparent;
+        border: none;
+      }
+
+      .trk-flag {
+        font-size: 18px;
+        line-height: 18px;
+        text-shadow: 0 1px 2px rgba(0, 0, 0, 0.8);
+      }
+
+      .track-chip {
+        display: inline-flex;
+        align-items: center;
+        gap: 0.4rem;
+        padding: 0.35rem 0.7rem;
+        border-radius: 999px;
+        border: 1px solid var(--border-subtle);
+        background: rgba(15, 23, 42, 0.85);
+        color: var(--text-main);
+        font-size: 0.8rem;
+        cursor: pointer;
+      }
+
+      .track-chip.track-chip-active {
+        border-color: #6ea3d8;
+        box-shadow: 0 0 0 1px #6ea3d8 inset;
+      }
+
+      .track-chip .trk-live-dot {
+        width: 8px;
+        height: 8px;
+        border-radius: 50%;
+        background: #4b5563;
+        flex-shrink: 0;
+      }
+
+      .track-chip .trk-live-dot.live {
+        background: var(--success);
+        box-shadow: 0 0 6px rgba(74, 222, 128, 0.9);
+      }
+
+      .track-hours-btn.track-hours-active {
+        color: var(--accent);
+        border-color: var(--accent);
+      }
     </style>
   </head>
   <body>
@@ -1049,6 +1144,16 @@
           data-tab="issuer"
         >
           Krab Dispatch
+        </button>
+        <button
+          type="button"
+          id="tab-track"
+          class="tab"
+          role="tab"
+          aria-selected="false"
+          data-tab="track"
+        >
+          Driver Track
         </button>
       </nav>
       <div class="tab-panels">
@@ -1241,53 +1346,50 @@
                 </div>
               </div>
 
-              <div id="dispatch-recipient-card" class="panel" style="margin-top: 0.9rem">
+              <div id="dispatch-combined-driver-card" class="panel" style="margin-top: 0.9rem">
                 <div class="panel-header" style="margin-bottom: 0.35rem">
-                  <div class="panel-title">Add driver</div>
-                  <button id="add-recipient-btn" type="button">
-                    ➕
-                    <span>Add</span>
-                  </button>
+                  <div class="panel-title">Add driver (Krab Issuer + Krab Dispatch)</div>
                 </div>
-                <div id="recipient-form" style="display: none; margin-bottom: 0.6rem">
-                  <div class="dispatch-recipient-fields">
-                    <input
-                      type="text"
-                      id="recipient-name-input"
-                      class="dispatch-recipient-input"
-                      placeholder="Driver name"
-                      autocomplete="name"
-                    />
-                    <input
-                      type="email"
-                      id="recipient-email-input"
-                      class="dispatch-recipient-input"
-                      placeholder="Email address"
-                      autocomplete="email"
-                    />
-                  </div>
-                  <div class="field-row dispatch-recipient-actions">
-                    <button id="save-recipient-btn">Save</button>
-                    <button id="cancel-recipient-btn" class="secondary">Cancel</button>
-                  </div>
-                  <div id="recipient-error" class="error-text" style="display: none"></div>
+                <div class="issuer-muted-block" style="margin-bottom: 0.5rem">
+                  One form, both systems: email is stored as a Krab Dispatch recipient,
+                  Telegram ID as a Krab Issuer driver.
                 </div>
-                <div id="recipient-list-wrap" class="table-wrap" style="max-height: 200px">
-                  <table>
-                    <thead>
-                      <tr>
-                        <th>Name</th>
-                        <th>Email</th>
-                        <th>Actions</th>
-                      </tr>
-                    </thead>
-                    <tbody id="recipients-body">
-                      <tr>
-                        <td colspan="3" class="muted">Loading drivers…</td>
-                      </tr>
-                    </tbody>
-                  </table>
+                <div class="field-row">
+                  <input
+                    type="text"
+                    id="combined-driver-name"
+                    placeholder="Driver name"
+                    autocomplete="name"
+                  />
                 </div>
+                <div class="field-row">
+                  <input
+                    type="email"
+                    id="combined-driver-email"
+                    placeholder="Email address"
+                    autocomplete="email"
+                  />
+                </div>
+                <div class="field-row">
+                  <input
+                    type="text"
+                    id="combined-driver-tg-id"
+                    placeholder="Telegram chat/user ID"
+                  />
+                </div>
+                <div class="field-row">
+                  <input
+                    type="text"
+                    id="combined-driver-phone"
+                    placeholder="Phone (optional)"
+                  />
+                </div>
+                <button id="combined-driver-add-btn" type="button">Add driver</button>
+                <div
+                  id="combined-driver-status"
+                  class="small"
+                  style="display: none; margin-top: 0.45rem"
+                ></div>
               </div>
             </div>
 
@@ -1438,6 +1540,7 @@
                           <th>Success</th>
                           <th>Status</th>
                           <th>Count</th>
+                          <th>Live Count</th>
                           <th>Issuer @Username</th>
                           <th>Driver Email</th>
                           <th>Reference</th>
@@ -1448,7 +1551,7 @@
                       </thead>
                       <tbody id="summary-tbody">
                         <tr>
-                          <td colspan="13" class="muted">
+                          <td colspan="15" class="muted">
                             Generate a summary to see grouped results by sender.
                           </td>
                         </tr>
@@ -1535,6 +1638,55 @@
               </div>
             </div>
           </section>
+        </div>
+
+        <div id="dispatch-recipient-card" class="panel" style="margin-top: 0.9rem">
+          <div class="panel-header" style="margin-bottom: 0.35rem">
+            <div class="panel-title">Email recipients (Krab Dispatch)</div>
+            <button id="add-recipient-btn" type="button">
+              ➕
+              <span>Add</span>
+            </button>
+          </div>
+          <div id="recipient-form" style="display: none; margin-bottom: 0.6rem">
+            <div class="dispatch-recipient-fields">
+              <input
+                type="text"
+                id="recipient-name-input"
+                class="dispatch-recipient-input"
+                placeholder="Driver name"
+                autocomplete="name"
+              />
+              <input
+                type="email"
+                id="recipient-email-input"
+                class="dispatch-recipient-input"
+                placeholder="Email address"
+                autocomplete="email"
+              />
+            </div>
+            <div class="field-row dispatch-recipient-actions">
+              <button id="save-recipient-btn">Save</button>
+              <button id="cancel-recipient-btn" class="secondary">Cancel</button>
+            </div>
+            <div id="recipient-error" class="error-text" style="display: none"></div>
+          </div>
+          <div id="recipient-list-wrap" class="table-wrap" style="max-height: 200px">
+            <table>
+              <thead>
+                <tr>
+                  <th>Name</th>
+                  <th>Email</th>
+                  <th>Actions</th>
+                </tr>
+              </thead>
+              <tbody id="recipients-body">
+                <tr>
+                  <td colspan="3" class="muted">Loading drivers…</td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
         </div>
       </div>
     </div>
@@ -1898,9 +2050,67 @@
             </div>
           </div>
         </div>
+        <div
+          id="panel-track"
+          class="tab-panel"
+          role="tabpanel"
+          aria-labelledby="tab-track"
+        >
+          <div class="shell" style="max-width: 1320px">
+            <div class="card">
+              <div class="panel-header" style="margin-bottom: 0.75rem">
+                <div class="panel-title">Driver Track — live map</div>
+                <div style="display:flex;align-items:center;gap:0.4rem;flex-wrap:wrap;justify-content:flex-end">
+                  <span id="track-status" class="small" style="margin-right:0.4rem"></span>
+                  <button type="button" class="secondary track-hours-btn" data-track-hours="2">2h</button>
+                  <button type="button" class="secondary track-hours-btn track-hours-active" data-track-hours="8">8h</button>
+                  <button type="button" class="secondary track-hours-btn" data-track-hours="24">24h</button>
+                  <button type="button" id="track-refresh-btn" class="secondary">
+                    ⟳
+                    <span>Refresh</span>
+                  </button>
+                </div>
+              </div>
+              <div id="track-map" style="height:60vh;border-radius:12px;border:1px solid var(--border-subtle)"></div>
+              <div
+                id="track-driver-list"
+                class="field-row"
+                style="flex-wrap:wrap;gap:8px;margin-top:0.7rem"
+              ></div>
+              <div
+                id="track-route-card"
+                class="panel"
+                style="display:none;margin-top:0.7rem;text-align:left"
+              ></div>
+              <div class="panel" style="margin-top:0.9rem">
+                <div class="panel-title" style="margin-bottom:0.5rem">Tracking sessions (48h)</div>
+                <div class="table-wrap" style="max-height:280px">
+                  <table>
+                    <thead>
+                      <tr>
+                        <th>Reference</th>
+                        <th>Driver</th>
+                        <th>Kind</th>
+                        <th>Status</th>
+                        <th>Created</th>
+                        <th>Located</th>
+                      </tr>
+                    </thead>
+                    <tbody id="track-sessions-tbody">
+                      <tr>
+                        <td colspan="6" class="muted">Open this tab to load tracking sessions.</td>
+                      </tr>
+                    </tbody>
+                  </table>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
       </div>
     </div>
 
+    <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
     <script src="app.js"></script>
   </body>
   </html>
