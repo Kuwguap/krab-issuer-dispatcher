@@ -255,6 +255,25 @@ async function admin(req, res) {
     }
     return res.json({ ok: true });
   }
+  if (act === "add-matches") {
+    // append ONE round's ties (fresh-draw-per-round format); bye rows carry
+    // player2 = null and a pre-set winner
+    if (!Array.isArray(b.matches) || !b.matches.length) return res.status(400).json({ error: "matches array required" });
+    const rows = b.matches.map((m) => ({
+      round: Number(m.round), slot: Number(m.slot),
+      player1: m.player1 || null, player2: m.player2 || null,
+      winner: m.winner || null,
+    }));
+    const ins = await sb("POST", "tournament_matches", rows, { Prefer: "return=minimal" });
+    if (!ins.ok) return res.status(500).json({ error: "Could not save the round", detail: JSON.stringify(ins.data).slice(0, 160) });
+    return res.json({ ok: true });
+  }
+  if (act === "clear-round") {
+    const rn = Number(b.round);
+    if (!Number.isFinite(rn)) return res.status(400).json({ error: "round required" });
+    await sb("DELETE", `tournament_matches?round=eq.${rn}`);
+    return res.json({ ok: true });
+  }
   if (act === "set-result") {
     // two-legged ties: score1/score2 = leg 1, leg2_* = leg 2, pens_* = shootout
     const { matchId, score1, score2, leg2_score1, leg2_score2, pens1, pens2, winner, player1, player2 } = b;

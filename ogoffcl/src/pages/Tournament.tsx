@@ -6,7 +6,7 @@ import { usePageMeta, useJsonLd, SITE_URL } from "../lib/seo";
 import Marquee from "../components/Marquee";
 import Reveal from "../components/Reveal";
 import MomoHelp from "../components/MomoHelp";
-import { buildSchedule, fmtDuration } from "../lib/fixtures";
+import { buildSchedule, roundNameFor, fmtDuration } from "../lib/fixtures";
 import { gtagOnce } from "../lib/track";
 
 const EASE = [0.22, 1, 0.36, 1] as const;
@@ -431,7 +431,7 @@ export default function Tournament() {
                 {roundsForDisplay.map(([round, ms]) => (
                   <div key={round} className="w-56 shrink-0">
                     <p className="font-display uppercase text-[10px] tracking-[0.25em] text-acid mb-3">
-                      {round === 0 ? "Prelims" : ms.length === 1 ? "Final" : ms.length === 2 ? "Semi-finals" : ms.length === 4 ? "Quarter-finals" : `Round of ${ms.length * 2}`}
+                      {roundNameFor(ms.reduce((a, m) => a + (m.player1 ? 1 : 0) + (m.player2 ? 1 : 0), 0), round)}
                     </p>
                     <div className="space-y-3">
                       {ms.map((m) => (
@@ -444,8 +444,8 @@ export default function Tournament() {
                             const won = m.winner && side.id === m.winner;
                             return (
                               <div key={si} className={`flex items-center gap-2 px-3 py-2 ${si === 0 ? "border-b border-ash/60" : ""} ${won ? "bg-acid/10" : ""}`}>
-                                <span className={`flex-1 min-w-0 truncate font-display uppercase text-xs ${won ? "text-acid" : "text-bone/80"}`}>
-                                  {pl ? pl.gamertag : "TBD"}
+                                <span className={`flex-1 min-w-0 truncate font-display uppercase text-xs ${won ? "text-acid" : pl ? "text-bone/80" : "text-bone/25"}`}>
+                                  {pl ? pl.gamertag : (m.player1 && !m.player2 ? "BYE" : "TBD")}
                                 </span>
                                 {side.aggr !== null && (
                                   <span className="text-bone/35 text-[10px]">{side.l1 ?? "–"}·{side.l2 ?? "–"}</span>
@@ -474,7 +474,7 @@ export default function Tournament() {
         <div className="grid sm:grid-cols-2 lg:grid-cols-4 gap-px bg-ash border border-ash">
           {[
             ["01", "Register & pay", `GH₵${BASE_FEE} locks your spot. Name, PSN / EA ID, platform and your player photo — it goes on your official match card.`],
-            ["02", "Random draw", "The bracket is a fully random draw — no seeds, no favours. It goes live at ogoffcl.store/tournament/fixtures plus the official Snapchat group. You'll know exactly who you face and when."],
+            ["02", "Fresh draw, every round", "No seeds, no favours — every round is a brand-new random draw from the players still standing. Fixtures go live at ogoffcl.store/tournament/fixtures plus the official Snapchat group."],
             ["03", "Play BOTH legs", "Every tie is TWO games vs the same opponent — Ultimate Team → Friendlies → Play a Friend, 6-minute halves, back to back. Total goals across both games decide the tie."],
             ["04", "Report the scores", "Screenshot BOTH full-time screens and drop them in the group. Level on aggregate? Play one decider with Extra Time & Penalties ON — the shootout settles it. Bracket updates live."],
           ].map(([n, t, d]) => (
@@ -638,6 +638,7 @@ export default function Tournament() {
               "Matches are FC26 Ultimate Team — Play a Friend, 6-minute halves. Bring your best squad.",
               "Every tie is TWO legs vs the same opponent. Aggregate goals decide — win both, split, doesn't matter: total goals across the two games.",
               "Level on aggregate after both legs → ONE decider game with Extra Time & Penalties enabled in the match settings. Shootout result settles the tie.",
+              "Every round is a fresh random draw from the winners. Odd number of players left = one random bye straight into the next round.",
               "Winner reports BOTH full-time screenshots in the official group within 10 minutes.",
               "No-show after 15 minutes past your kickoff time = walkover to your opponent.",
               "Disconnects: leading player takes that game if past 60'; otherwise replay that game.",

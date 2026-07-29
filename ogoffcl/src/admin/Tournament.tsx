@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState } from "react";
 import { adminApi } from "./AdminLayout";
-import { buildSchedule, bracketShape, fmtDuration } from "../lib/fixtures";
+import { buildSchedule, roundNameFor, fmtDuration } from "../lib/fixtures";
 
 /**
  * Tournament HQ: signups + revenue, fixture simulator (any player count),
@@ -365,41 +365,56 @@ export default function AdminTournament() {
     say("Removed."); load();
   };
 
-  const generateBracket = async () => {
-    const n = paid.length;
-    if (n < 2) { say("Need at least 2 paid players."); return; }
-    if (matches.length && !confirm("Regenerate? The current bracket and all recorded results will be wiped.")) return;
-    const shape = bracketShape(n);
+  // ── fresh-draw-per-round knockout ──────────────────────────────
+  const roundsGrouped = useMemo(() => {
+    const map = new Map<number, Match[]>();
+    for (const m of matches) { if (!map.has(m.round)) map.set(m.round, []); map.get(m.round)!.push(m); }
+    return [...map.entries()].sort((x, y) => x[0] - y[0]);
+  }, [matches]);
+  const lastRoundEntry = roundsGrouped.length ? roundsGrouped[roundsGrouped.length - 1] : null;
+  const lastRoundDecided = lastRoundEntry ? lastRoundEntry[1].every((m) => m.winner) : false;
+  const lastRoundWinners = lastRoundEntry ? lastRoundEntry[1].map((m) => m.winner).filter(Boolean) as string[] : [];
+  const champion = lastRoundEntry && lastRoundDecided && lastRoundWinners.length === 1 ? byId[lastRoundWinners[0]] : null;
+
+  const drawRound = async () => {
+    let pool: string[];
+    let nextRound: number;
+    if (!lastRoundEntry) {
+      if (paid.length < 2) { say("Need at least 2 paid players."); return; }
+      pool = paid.map((p) => p.id);
+      nextRound = 1;
+    } else {
+      if (!lastRoundDecided) { say("Score every tie in the current round first."); return; }
+      if (lastRoundWinners.length < 2) { say("The champion is already decided."); return; }
+      pool = [...lastRoundWinners];
+      nextRound = lastRoundEntry[0] + 1;
+    }
     // Fisher–Yates: a genuinely random draw (sort(random) is biased)
-    const shuffled = [...paid];
-    for (let i = shuffled.length - 1; i > 0; i--) {
+    for (let i = pool.length - 1; i > 0; i--) {
       const j = Math.floor(Math.random() * (i + 1));
-      [shuffled[i], shuffled[j]] = [shuffled[j], shuffled[i]];
+      [pool[i], pool[j]] = [pool[j], pool[i]];
     }
-    const byePlayers = shuffled.slice(0, shape.byes);
-    const prelimPlayers = shuffled.slice(shape.byes);
-    const rows: { round: number; slot: number; player1: string | null; player2: string | null }[] = [];
-    for (let s = 0; s < shape.prelimMatches; s++) {
-      rows.push({ round: 0, slot: s, player1: prelimPlayers[2 * s]?.id || null, player2: prelimPlayers[2 * s + 1]?.id || null });
+    const ties = Math.floor(pool.length / 2);
+    const rows: { round: number; slot: number; player1: string | null; player2: string | null; winner?: string }[] = [];
+    for (let s = 0; s < ties; s++) {
+      rows.push({ round: nextRound, slot: s, player1: pool[2 * s], player2: pool[2 * s + 1] });
     }
-    // main bracket seats: byes first, prelim winners fill the rest later
-    const seats: (string | null)[] = Array(shape.bracketSize).fill(null);
-    byePlayers.forEach((p, i) => { seats[i] = p.id; });
-    const totalRounds = Math.log2(shape.bracketSize);
-    for (let r = 1; r <= totalRounds; r++) {
-      const count = shape.bracketSize / Math.pow(2, r);
-      for (let s = 0; s < count; s++) {
-        rows.push({
-          round: r, slot: s,
-          player1: r === 1 ? seats[2 * s] : null,
-          player2: r === 1 ? seats[2 * s + 1] : null,
-        });
-      }
-    }
+    const bye = pool.length % 2 === 1 ? pool[pool.length - 1] : null;
+    if (bye) rows.push({ round: nextRound, slot: ties, player1: bye, player2: null, winner: bye });
     setBusy("bracket");
-    const r = await adminApi("/api/tournament", { action: "admin", op: "save-matches", matches: rows });
+    const r = await adminApi("/api/tournament", { action: "admin", op: "add-matches", matches: rows });
     setBusy(null);
-    say(r.ok ? `Bracket generated — ${n} players, ${shape.prelimMatches} prelim matches, ${shape.byes} byes ✓` : `Failed: ${r.error}`);
+    say(r.ok
+      ? `${roundNameFor(pool.length, nextRound)} drawn — ${ties} tie${ties === 1 ? "" : "s"}${bye ? ` + 1 bye (${byId[bye]?.gamertag || "?"})` : ""} ✓`
+      : `Failed: ${r.error}`);
+    load();
+  };
+
+  const redrawRound = async () => {
+    if (!lastRoundEntry) return;
+    if (!confirm(`Redraw round ${lastRoundEntry[0]}? Its pairings and any scores in it are wiped, then draw again.`)) return;
+    await adminApi("/api/tournament", { action: "admin", op: "clear-round", round: lastRoundEntry[0] });
+    say(`Round ${lastRoundEntry[0]} cleared — tap Draw to re-shuffle.`);
     load();
   };
 
@@ -431,21 +446,13 @@ export default function AdminTournament() {
       pens1 = pa; pens2 = pb;
       winner = pa > pb ? m.player1 : m.player2;
     }
-    await adminApi("/api/tournament", {
+    const r = await adminApi("/api/tournament", {
       action: "admin", op: "set-result", matchId: m.id,
       score1: l1a, score2: l1b, leg2_score1: l2a, leg2_score2: l2b,
       pens1, pens2, winner,
     });
-    // advance the winner into the next round's seat
-    const shape = bracketShape(paid.length);
-    let nextRound: number, seat: number;
-    if (m.round === 0) { nextRound = 1; seat = shape.byes + m.slot; }
-    else { nextRound = m.round + 1; seat = m.slot; }
-    const nextSlot = Math.floor(seat / 2);
-    const side = seat % 2 === 0 ? "player1" : "player2";
-    const next = matches.find((x) => x.round === nextRound && x.slot === nextSlot);
-    if (next) await adminApi("/api/tournament", { action: "admin", op: "set-result", matchId: next.id, [side]: winner });
-    say("Result saved — winner advanced ✓");
+    // no seat-advancement here — winners enter the NEXT round's fresh draw
+    say(r.ok ? `Tie saved — ${byId[winner]?.gamertag || "winner"} goes into the next draw ✓` : `Failed: ${r.error}`);
     load();
   };
 
@@ -464,12 +471,6 @@ export default function AdminTournament() {
     catch { say("Render failed."); }
     setBusy(null);
   };
-
-  const roundsGrouped = useMemo(() => {
-    const map = new Map<number, Match[]>();
-    for (const m of matches) { if (!map.has(m.round)) map.set(m.round, []); map.get(m.round)!.push(m); }
-    return [...map.entries()].sort((x, y) => x[0] - y[0]);
-  }, [matches]);
 
   if (tablesMissing) {
     return (
@@ -601,21 +602,32 @@ export default function AdminTournament() {
           <p className="text-bone/60">Concurrent total: <span className="text-acid font-display">{fmtDuration(plan.totalMinutes)}</span></p>
           <p className="text-bone/60">Every game on one stream: <span className="text-bone font-display">{fmtDuration(plan.streamEveryMatchMinutes)}</span></p>
           <p className="text-bone/40">Each tie = 2 games (two legs, back to back) — timings include both.</p>
-          <p className="text-bone/40">{plan.prelimMatches > 0 ? `${plan.prelimMatches} prelim matches trim ${plan.players} → ${plan.bracketSize}; ${plan.byes} byes.` : `Clean ${plan.players}-player bracket — no prelims.`}</p>
+          <p className="text-bone/40">Fresh random draw every round · {plan.totalTies} ties total · odd counts hand one random player a bye.</p>
         </div>
       </section>
 
       {/* bracket */}
       <section>
         <div className="flex flex-wrap items-center gap-3 mb-4">
-          <p className="font-display uppercase text-xs tracking-[0.3em] text-bone/50">Bracket</p>
-          <button onClick={generateBracket} disabled={busy === "bracket"} className="btn-og bg-bone text-ink px-4 py-2.5 text-[10px] hover:bg-acid">
-            {busy === "bracket" ? "Saving…" : matches.length ? "Regenerate from paid players" : "Generate from paid players"}
-          </button>
+          <p className="font-display uppercase text-xs tracking-[0.3em] text-bone/50">Fixtures</p>
+          {!champion && (
+            <button onClick={drawRound} disabled={busy === "bracket" || (!!lastRoundEntry && !lastRoundDecided)}
+              className="btn-og bg-acid text-ink px-4 py-2.5 text-[10px] hover:bg-bone">
+              {busy === "bracket" ? "Drawing…"
+                : !lastRoundEntry ? `Draw round 1 (${paid.length} paid players)`
+                : lastRoundDecided ? `Draw ${roundNameFor(lastRoundWinners.length, lastRoundEntry[0] + 1).toLowerCase()} (${lastRoundWinners.length} players)`
+                : "Score the current round first"}
+            </button>
+          )}
+          {lastRoundEntry && (
+            <button onClick={redrawRound} className="btn-og border-2 border-ash text-bone/70 px-4 py-2.5 text-[10px] hover:border-bone">
+              Redraw round {lastRoundEntry[0]}
+            </button>
+          )}
           {matches.length > 0 && (
-            <button onClick={async () => { if (confirm("Clear the whole bracket?")) { await adminApi("/api/tournament", { action: "admin", op: "clear-matches" }); load(); } }}
+            <button onClick={async () => { if (confirm("Clear ALL rounds and results?")) { await adminApi("/api/tournament", { action: "admin", op: "clear-matches" }); load(); } }}
               className="btn-og border-2 border-blood/40 text-blood px-4 py-2.5 text-[10px] hover:bg-blood hover:text-bone">
-              Clear
+              Clear all
             </button>
           )}
           <button
@@ -624,19 +636,27 @@ export default function AdminTournament() {
             {copied ? "✓ Copied" : "Copy live fixtures link"}
           </button>
           <span className="text-bone/35 text-xs">
-            Random draw. Fixtures are live at <span className="text-acid">ogoffcl.store/tournament/fixtures</span> the moment you generate — share that link in the match group. Tap Score to record a result; winners advance automatically.
+            Fresh random draw every round — score all ties, then draw the next round from the winners. Odd count = one random bye. Live at <span className="text-acid">ogoffcl.store/tournament/fixtures</span>.
           </span>
         </div>
 
+        {champion && (
+          <div className="border-2 border-acid bg-acid/10 px-5 py-4 mb-4 flex flex-wrap items-center gap-3">
+            <span className="font-display uppercase text-[10px] tracking-[0.3em] text-acid">Champion</span>
+            <span className="display-xl text-2xl text-bone">{champion.gamertag}</span>
+            <span className="text-bone/50 text-xs">GH₵1,000 + 2 merch pieces — settle up 🏆</span>
+          </div>
+        )}
+
         {roundsGrouped.length === 0 ? (
-          <p className="border border-ash px-4 py-6 text-sm text-bone/40">No bracket yet — generate one when registrations close.</p>
+          <p className="border border-ash px-4 py-6 text-sm text-bone/40">No fixtures yet — draw round 1 when registrations close.</p>
         ) : (
           <div className="overflow-x-auto pb-2">
             <div className="flex gap-5 min-w-max">
               {roundsGrouped.map(([round, ms]) => (
                 <div key={round} className="w-60 shrink-0">
                   <p className="font-display uppercase text-[10px] tracking-[0.25em] text-acid mb-2">
-                    {round === 0 ? "Prelims" : ms.length === 1 ? "Final" : ms.length === 2 ? "Semis" : ms.length === 4 ? "Quarters" : `Round of ${ms.length * 2}`}
+                    {roundNameFor(ms.reduce((a, m) => a + (m.player1 ? 1 : 0) + (m.player2 ? 1 : 0), 0), round)}
                   </p>
                   <div className="space-y-2.5">
                     {ms.map((m) => (
@@ -648,8 +668,8 @@ export default function AdminTournament() {
                           const won = m.winner && side.id === m.winner;
                           return (
                             <div key={si} className={`flex items-center gap-2 px-3 py-2 ${si === 0 ? "border-b border-ash/60" : ""} ${won ? "bg-acid/10" : ""}`}>
-                              <span className={`flex-1 min-w-0 truncate font-display uppercase text-xs ${won ? "text-acid" : "text-bone/80"}`}>
-                                {side.id ? byId[side.id]?.gamertag || "?" : "TBD"}
+                              <span className={`flex-1 min-w-0 truncate font-display uppercase text-xs ${won ? "text-acid" : side.id ? "text-bone/80" : "text-bone/25"}`}>
+                                {side.id ? byId[side.id]?.gamertag || "?" : (m.player1 && !m.player2 ? "BYE — sits this round out" : "TBD")}
                               </span>
                               {(side.l1 !== null || side.l2 !== null) && (
                                 <span className="text-bone/35 text-[10px]">{side.l1 ?? "–"}·{side.l2 ?? "–"}</span>

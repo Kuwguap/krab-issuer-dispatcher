@@ -3,6 +3,7 @@ import { Link } from "react-router-dom";
 import Marquee from "../components/Marquee";
 import Reveal from "../components/Reveal";
 import { usePageMeta } from "../lib/seo";
+import { roundNameFor } from "../lib/fixtures";
 
 /**
  * Live fixtures — the shareable link for the match group. Polls the bracket
@@ -72,7 +73,7 @@ export default function Fixtures() {
         <Reveal>
           <p className="font-display uppercase text-acid tracking-[0.45em] text-[11px] mb-4">
             <span className="inline-block w-2 h-2 bg-blood rounded-full animate-pulseSoft mr-2 align-middle" />
-            Live · random draw · updates automatically
+            Live · fresh random draw every round · updates automatically
           </p>
           <h1 className="display-xl text-5xl sm:text-7xl text-bone">
             The <span className="text-stroke-acid">fixtures</span>
@@ -110,7 +111,7 @@ export default function Fixtures() {
               {rounds.map(([round, ms]) => (
                 <div key={round} className="w-60 shrink-0">
                   <p className="font-display uppercase text-[10px] tracking-[0.25em] text-acid mb-3">
-                    {round === 0 ? "Prelims" : ms.length === 1 ? "Final" : ms.length === 2 ? "Semi-finals" : ms.length === 4 ? "Quarter-finals" : `Round of ${ms.length * 2}`}
+                    {roundNameFor(ms.reduce((a, m) => a + (m.player1 ? 1 : 0) + (m.player2 ? 1 : 0), 0), round)}
                   </p>
                   <div className="space-y-3">
                     {ms.map((m) => (
@@ -126,8 +127,8 @@ export default function Fixtures() {
                               <div className="w-7 h-8 bg-smoke overflow-hidden shrink-0">
                                 {pl?.photo && <img src={pl.photo} alt="" loading="lazy" className="w-full h-full object-cover" />}
                               </div>
-                              <span className={`flex-1 min-w-0 truncate font-display uppercase text-xs ${won ? "text-acid" : "text-bone/80"}`}>
-                                {pl ? pl.gamertag : "TBD"}
+                              <span className={`flex-1 min-w-0 truncate font-display uppercase text-xs ${won ? "text-acid" : pl ? "text-bone/80" : "text-bone/25"}`}>
+                                {pl ? pl.gamertag : (m.player1 && !m.player2 ? "BYE" : "TBD")}
                               </span>
                               {side.aggr !== null && (
                                 <span className="text-bone/35 text-[10px]">{side.l1 ?? "–"}·{side.l2 ?? "–"}</span>
