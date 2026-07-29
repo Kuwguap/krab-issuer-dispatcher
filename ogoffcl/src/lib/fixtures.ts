@@ -2,7 +2,11 @@
  * Tournament fixture math — shared by the public page and the admin
  * dashboard's simulator. Single-elimination with a preliminary round that
  * trims any player count down to a clean power-of-two bracket.
+ *
+ * Every tie is TWO-LEGGED (two games vs the same opponent, aggregate goals,
+ * decider with ET+pens if level) — so one tie costs 2 × matchMinutes.
  */
+export const LEGS_PER_TIE = 2;
 
 export interface RoundPlan {
   round: number;        // 0 = prelims, then 1..k
@@ -74,10 +78,10 @@ export function buildSchedule(players: number, opts: ScheduleOpts = {}): Schedul
   let streamAll = 0;
   rounds.forEach((rd, i) => {
     rd.waves = Math.ceil(rd.matches / concurrent);
-    rd.minutes = rd.waves * matchMinutes;
+    rd.minutes = rd.waves * matchMinutes * LEGS_PER_TIE; // both legs, back to back
     rd.breakAfter = i === rounds.length - 1 ? 0 : i === midpoint ? longBreakMinutes : breakMinutes;
     total += rd.minutes + rd.breakAfter;
-    streamAll += rd.matches * matchMinutes + rd.breakAfter;
+    streamAll += rd.matches * matchMinutes * LEGS_PER_TIE + rd.breakAfter;
   });
 
   return {

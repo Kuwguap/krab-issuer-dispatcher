@@ -9,7 +9,20 @@ import { usePageMeta } from "../lib/seo";
  * every 30s so scores and advancing winners appear without a refresh.
  */
 interface BPlayer { id: string; gamertag: string; platform: string; photo: string | null; }
-interface BMatch { id: string; round: number; slot: number; player1: string | null; player2: string | null; score1: number | null; score2: number | null; winner: string | null; }
+interface BMatch {
+  id: string; round: number; slot: number;
+  player1: string | null; player2: string | null;
+  score1: number | null; score2: number | null;
+  leg2_score1?: number | null; leg2_score2?: number | null;
+  pens1?: number | null; pens2?: number | null;
+  winner: string | null;
+}
+
+/** Aggregate across both legs of a tie; null until any score exists. */
+function tieAgg(l1: number | null | undefined, l2: number | null | undefined): number | null {
+  if ((l1 ?? null) === null && (l2 ?? null) === null) return null;
+  return Number(l1 || 0) + Number(l2 || 0);
+}
 
 export default function Fixtures() {
   usePageMeta({
@@ -65,7 +78,7 @@ export default function Fixtures() {
             The <span className="text-stroke-acid">fixtures</span>
           </h1>
           <p className="text-bone/50 text-sm uppercase tracking-[0.25em] mt-5">
-            FC26 Ultimate Team knockout · 1st August · {players.length} players{updated ? ` · updated ${updated}` : ""}
+            FC26 Ultimate Team knockout · two-legged ties · 1st August · {players.length} players{updated ? ` · updated ${updated}` : ""}
           </p>
         </Reveal>
       </div>
@@ -102,7 +115,10 @@ export default function Fixtures() {
                   <div className="space-y-3">
                     {ms.map((m) => (
                       <div key={m.id} className="border border-ash bg-ink">
-                        {[{ id: m.player1, sc: m.score1 }, { id: m.player2, sc: m.score2 }].map((side, si) => {
+                        {[
+                          { id: m.player1, l1: m.score1, l2: m.leg2_score1, pens: m.pens1, aggr: tieAgg(m.score1, m.leg2_score1) },
+                          { id: m.player2, l1: m.score2, l2: m.leg2_score2, pens: m.pens2, aggr: tieAgg(m.score2, m.leg2_score2) },
+                        ].map((side, si) => {
                           const pl = side.id ? byId[side.id] : null;
                           const won = m.winner && side.id === m.winner;
                           return (
@@ -113,7 +129,11 @@ export default function Fixtures() {
                               <span className={`flex-1 min-w-0 truncate font-display uppercase text-xs ${won ? "text-acid" : "text-bone/80"}`}>
                                 {pl ? pl.gamertag : "TBD"}
                               </span>
-                              <span className={`font-display text-sm ${won ? "text-acid" : "text-bone/40"}`}>{side.sc ?? "–"}</span>
+                              {side.aggr !== null && (
+                                <span className="text-bone/35 text-[10px]">{side.l1 ?? "–"}·{side.l2 ?? "–"}</span>
+                              )}
+                              {(side.pens ?? null) !== null && <span className="text-bone/45 text-[10px]">(p{side.pens})</span>}
+                              <span className={`font-display text-sm ${won ? "text-acid" : "text-bone/40"}`}>{side.aggr ?? "–"}</span>
                             </div>
                           );
                         })}

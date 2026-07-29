@@ -15,7 +15,18 @@ interface Player {
 interface Match {
   id: string; round: number; slot: number;
   player1: string | null; player2: string | null;
-  score1: number | null; score2: number | null; winner: string | null;
+  score1: number | null; score2: number | null;            // leg 1
+  leg2_score1: number | null; leg2_score2: number | null;  // leg 2
+  pens1: number | null; pens2: number | null;              // shootout (decider)
+  winner: string | null;
+}
+
+/** Aggregate over both legs, null until any score exists. */
+function agg(m: Match, side: 1 | 2): number | null {
+  const a = side === 1 ? m.score1 : m.score2;
+  const b = side === 1 ? m.leg2_score1 : m.leg2_score2;
+  if (a === null && b === null) return null;
+  return Number(a || 0) + Number(b || 0);
 }
 
 const MIGRATION_HINT = "Run supabase/migration_tournament.sql in the Supabase SQL editor (new tables only — deadlock-safe), then reload.";
@@ -393,15 +404,38 @@ export default function AdminTournament() {
   };
 
   const recordResult = async (m: Match) => {
-    const s1 = prompt(`Score for ${byId[m.player1 || ""]?.gamertag || "P1"}:`);
-    if (s1 === null) return;
-    const s2 = prompt(`Score for ${byId[m.player2 || ""]?.gamertag || "P2"}:`);
-    if (s2 === null) return;
-    const a = parseInt(s1, 10) || 0, b = parseInt(s2, 10) || 0;
-    if (a === b) { say("No draws in a knockout — replay or settle on pens, then enter the deciding score."); return; }
-    const winner = a > b ? m.player1 : m.player2;
-    if (!winner) { say("Both players must be set first."); return; }
-    await adminApi("/api/tournament", { action: "admin", op: "set-result", matchId: m.id, score1: a, score2: b, winner });
+    // two-legged tie: leg 1 + leg 2 → aggregate → pens if level
+    const n1 = byId[m.player1 || ""]?.gamertag || "P1";
+    const n2 = byId[m.player2 || ""]?.gamertag || "P2";
+    if (!m.player1 || !m.player2) { say("Both players must be set first."); return; }
+    const ask = (label: string): number | null => {
+      const v = prompt(label);
+      if (v === null) return null;
+      const n = parseInt(v, 10);
+      return Number.isFinite(n) && n >= 0 ? n : 0;
+    };
+    const l1a = ask(`LEG 1 — goals for ${n1}:`); if (l1a === null) return;
+    const l1b = ask(`LEG 1 — goals for ${n2}:`); if (l1b === null) return;
+    const l2a = ask(`LEG 2 — goals for ${n1}:`); if (l2a === null) return;
+    const l2b = ask(`LEG 2 — goals for ${n2}:`); if (l2b === null) return;
+    const aggA = l1a + l2a, aggB = l1b + l2b;
+    let pens1: number | null = null, pens2: number | null = null;
+    let winner: string;
+    if (aggA !== aggB) {
+      winner = aggA > aggB ? m.player1 : m.player2;
+    } else {
+      say(`Level ${aggA}–${aggB} on aggregate — enter the shootout result.`);
+      const pa = ask(`PENALTIES — ${n1}:`); if (pa === null) return;
+      const pb = ask(`PENALTIES — ${n2}:`); if (pb === null) return;
+      if (pa === pb) { say("A shootout can't end level — enter the final scores."); return; }
+      pens1 = pa; pens2 = pb;
+      winner = pa > pb ? m.player1 : m.player2;
+    }
+    await adminApi("/api/tournament", {
+      action: "admin", op: "set-result", matchId: m.id,
+      score1: l1a, score2: l1b, leg2_score1: l2a, leg2_score2: l2b,
+      pens1, pens2, winner,
+    });
     // advance the winner into the next round's seat
     const shape = bracketShape(paid.length);
     let nextRound: number, seat: number;
@@ -526,7 +560,7 @@ export default function AdminTournament() {
           {[
             ["Players", simN, setSimN, 2, 256],
             ["Concurrent matches", simConc, setSimConc, 1, 32],
-            ["Mins / match", simLen, setSimLen, 5, 60],
+            ["Mins / game", simLen, setSimLen, 5, 60],
             ["Break (mins)", simBreak, setSimBreak, 0, 60],
           ].map(([label, val, setter, min, max]) => (
             <label key={label as string} className="block">
@@ -565,7 +599,8 @@ export default function AdminTournament() {
         </div>
         <div className="flex flex-wrap gap-6 mt-4 text-sm">
           <p className="text-bone/60">Concurrent total: <span className="text-acid font-display">{fmtDuration(plan.totalMinutes)}</span></p>
-          <p className="text-bone/60">Every match on one stream: <span className="text-bone font-display">{fmtDuration(plan.streamEveryMatchMinutes)}</span></p>
+          <p className="text-bone/60">Every game on one stream: <span className="text-bone font-display">{fmtDuration(plan.streamEveryMatchMinutes)}</span></p>
+          <p className="text-bone/40">Each tie = 2 games (two legs, back to back) — timings include both.</p>
           <p className="text-bone/40">{plan.prelimMatches > 0 ? `${plan.prelimMatches} prelim matches trim ${plan.players} → ${plan.bracketSize}; ${plan.byes} byes.` : `Clean ${plan.players}-player bracket — no prelims.`}</p>
         </div>
       </section>
@@ -606,14 +641,24 @@ export default function AdminTournament() {
                   <div className="space-y-2.5">
                     {ms.map((m) => (
                       <div key={m.id} className="border border-ash bg-smoke/40">
-                        {[{ id: m.player1, sc: m.score1 }, { id: m.player2, sc: m.score2 }].map((side, si) => (
-                          <div key={si} className={`flex items-center gap-2 px-3 py-2 ${si === 0 ? "border-b border-ash/60" : ""} ${m.winner && side.id === m.winner ? "bg-acid/10" : ""}`}>
-                            <span className={`flex-1 min-w-0 truncate font-display uppercase text-xs ${m.winner && side.id === m.winner ? "text-acid" : "text-bone/80"}`}>
-                              {side.id ? byId[side.id]?.gamertag || "?" : "TBD"}
-                            </span>
-                            <span className="font-display text-sm text-bone/50">{side.sc ?? "–"}</span>
-                          </div>
-                        ))}
+                        {[
+                          { id: m.player1, l1: m.score1, l2: m.leg2_score1, pens: m.pens1, aggr: agg(m, 1) },
+                          { id: m.player2, l1: m.score2, l2: m.leg2_score2, pens: m.pens2, aggr: agg(m, 2) },
+                        ].map((side, si) => {
+                          const won = m.winner && side.id === m.winner;
+                          return (
+                            <div key={si} className={`flex items-center gap-2 px-3 py-2 ${si === 0 ? "border-b border-ash/60" : ""} ${won ? "bg-acid/10" : ""}`}>
+                              <span className={`flex-1 min-w-0 truncate font-display uppercase text-xs ${won ? "text-acid" : "text-bone/80"}`}>
+                                {side.id ? byId[side.id]?.gamertag || "?" : "TBD"}
+                              </span>
+                              {(side.l1 !== null || side.l2 !== null) && (
+                                <span className="text-bone/35 text-[10px]">{side.l1 ?? "–"}·{side.l2 ?? "–"}</span>
+                              )}
+                              {side.pens !== null && <span className="text-bone/45 text-[10px]">(p{side.pens})</span>}
+                              <span className={`font-display text-sm ${won ? "text-acid" : "text-bone/50"}`}>{side.aggr ?? "–"}</span>
+                            </div>
+                          );
+                        })}
                         <div className="flex divide-x divide-ash/60 border-t border-ash/60">
                           <button onClick={() => recordResult(m)} className="flex-1 py-2 text-[10px] uppercase tracking-widest text-bone/50 hover:text-acid hover:bg-bone/5">Score</button>
                           <button onClick={() => vsFor(m)} disabled={busy === m.id} className="flex-1 py-2 text-[10px] uppercase tracking-widest text-bone/50 hover:text-acid hover:bg-bone/5">

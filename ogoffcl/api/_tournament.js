@@ -19,7 +19,7 @@ function sendPaidEmails(player) {
         <p>Kickoff: <strong style="color:#C8FF00;">1st August</strong>. The pot: <strong style="color:#C8FF00;">GH₵1,000 cash + 2 merch pieces</strong> from the store.</p>
         <p style="margin:18px 0;"><a href="${SNAP_GROUP}" style="display:inline-block;background:#C8FF00;color:#0A0A0A;font-weight:900;text-decoration:none;padding:14px 22px;text-transform:uppercase;letter-spacing:1px;">👻 Join the Snapchat group</a></p>
         <p style="color:#8b877e;">The Snapchat group is where the bracket drops, kickoff times land and winners report scores — <strong style="color:#F5F2EA;">joining it is not optional</strong>. Link: <a href="${SNAP_GROUP}" style="color:#C8FF00;">${SNAP_GROUP}</a></p>
-        <p>On game day: add your opponent via EA ID, invite them from <strong style="color:#F5F2EA;">Ultimate Team → Friendlies → Play a Friend</strong>, screenshot the final score, drop it in the group.</p>
+        <p>On game day: add your opponent via EA ID and play your tie in <strong style="color:#F5F2EA;">Ultimate Team → Friendlies → Play a Friend</strong>. Every tie is <strong style="color:#C8FF00;">TWO games</strong> vs the same opponent — total goals across both decide. Level on aggregate? One decider with <strong style="color:#F5F2EA;">Extra Time &amp; Penalties ON</strong>. Screenshot BOTH full-time screens and drop them in the group.</p>
         <p style="color:#8b877e;">Bring your best squad. Limited spots — no restocks on glory.</p>
       `),
     }).catch(() => {});

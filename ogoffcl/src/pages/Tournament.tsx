@@ -56,7 +56,20 @@ type PayState =
   | { step: "failed"; playerId: string; error: string };
 
 interface BracketPlayer { id: string; gamertag: string; platform: string; photo: string | null; }
-interface BracketMatch { id: string; round: number; slot: number; player1: string | null; player2: string | null; score1: number | null; score2: number | null; winner: string | null; }
+interface BracketMatch {
+  id: string; round: number; slot: number;
+  player1: string | null; player2: string | null;
+  score1: number | null; score2: number | null;
+  leg2_score1?: number | null; leg2_score2?: number | null;
+  pens1?: number | null; pens2?: number | null;
+  winner: string | null;
+}
+
+/** Aggregate across both legs of a tie; null until any score exists. */
+function tieAgg(l1: number | null | undefined, l2: number | null | undefined): number | null {
+  if ((l1 ?? null) === null && (l2 ?? null) === null) return null;
+  return Number(l1 || 0) + Number(l2 || 0);
+}
 
 /** Animated count-up for the stat tiles. */
 function Stat({ value, label, suffix = "" }: { value: number; label: string; suffix?: string }) {
@@ -340,7 +353,7 @@ export default function Tournament() {
 
           {/* scoreboard chips */}
           <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} transition={{ delay: 1.25, duration: 0.6 }} className="flex flex-wrap gap-2 mt-10">
-            {[EVENT_DATE_LABEL.toUpperCase(), "LIMITED SPOTS", "1V1 KNOCKOUT", "ULTIMATE TEAM", "6-MIN HALVES", "PS5 · XBOX · PC", "STREAMED LIVE", `GH₵${PRIZE_CASH.toLocaleString()} + MERCH POT`].map((t) => (
+            {[EVENT_DATE_LABEL.toUpperCase(), "LIMITED SPOTS", "1V1 KNOCKOUT", "2-LEG TIES", "ULTIMATE TEAM", "6-MIN HALVES", "PS5 · XBOX · PC", "STREAMED LIVE", `GH₵${PRIZE_CASH.toLocaleString()} + MERCH POT`].map((t) => (
               <span key={t} className="border border-ash bg-smoke/60 text-bone/70 font-display text-[10px] uppercase tracking-[0.2em] px-3 py-2">{t}</span>
             ))}
           </motion.div>
@@ -423,7 +436,10 @@ export default function Tournament() {
                     <div className="space-y-3">
                       {ms.map((m) => (
                         <div key={m.id} className="border border-ash bg-ink">
-                          {[{ id: m.player1, score: m.score1 }, { id: m.player2, score: m.score2 }].map((side, si) => {
+                          {[
+                            { id: m.player1, l1: m.score1, l2: m.leg2_score1, pens: m.pens1, aggr: tieAgg(m.score1, m.leg2_score1) },
+                            { id: m.player2, l1: m.score2, l2: m.leg2_score2, pens: m.pens2, aggr: tieAgg(m.score2, m.leg2_score2) },
+                          ].map((side, si) => {
                             const pl = side.id ? byId[side.id] : null;
                             const won = m.winner && side.id === m.winner;
                             return (
@@ -431,7 +447,11 @@ export default function Tournament() {
                                 <span className={`flex-1 min-w-0 truncate font-display uppercase text-xs ${won ? "text-acid" : "text-bone/80"}`}>
                                   {pl ? pl.gamertag : "TBD"}
                                 </span>
-                                <span className={`font-display text-sm ${won ? "text-acid" : "text-bone/40"}`}>{side.score ?? "–"}</span>
+                                {side.aggr !== null && (
+                                  <span className="text-bone/35 text-[10px]">{side.l1 ?? "–"}·{side.l2 ?? "–"}</span>
+                                )}
+                                {(side.pens ?? null) !== null && <span className="text-bone/45 text-[10px]">(p{side.pens})</span>}
+                                <span className={`font-display text-sm ${won ? "text-acid" : "text-bone/40"}`}>{side.aggr ?? "–"}</span>
                               </div>
                             );
                           })}
@@ -455,8 +475,8 @@ export default function Tournament() {
           {[
             ["01", "Register & pay", `GH₵${BASE_FEE} locks your spot. Name, PSN / EA ID, platform and your player photo — it goes on your official match card.`],
             ["02", "Random draw", "The bracket is a fully random draw — no seeds, no favours. It goes live at ogoffcl.store/tournament/fixtures plus the official Snapchat group. You'll know exactly who you face and when."],
-            ["03", "Play your tie", "Add your opponent via EA ID → invite them from Ultimate Team → Friendlies → Play a Friend. 6-minute halves. Bring your best squad — UT is the battleground."],
-            ["04", "Report the score", "Winner screenshots the full-time screen and drops it in the group. Bracket updates live on this page. Win out. Take the crown."],
+            ["03", "Play BOTH legs", "Every tie is TWO games vs the same opponent — Ultimate Team → Friendlies → Play a Friend, 6-minute halves, back to back. Total goals across both games decide the tie."],
+            ["04", "Report the scores", "Screenshot BOTH full-time screens and drop them in the group. Level on aggregate? Play one decider with Extra Time & Penalties ON — the shootout settles it. Bracket updates live."],
           ].map(([n, t, d]) => (
             <Reveal key={n}>
               <div className="bg-ink p-6 h-full">
@@ -502,7 +522,7 @@ export default function Tournament() {
               </div>
             ))}
           </div>
-          <p className="text-bone/35 text-xs mt-4">Based on 20 players, 4 concurrent matches, 20 minutes per tie. Final bracket timing drops with the fixtures.</p>
+          <p className="text-bone/35 text-xs mt-4">Based on 20 players, 4 concurrent ties, 20 minutes per game — every tie is two legs. Final bracket timing drops with the fixtures.</p>
         </div>
       </section>
 
@@ -616,9 +636,11 @@ export default function Tournament() {
           <div className="grid sm:grid-cols-2 lg:grid-cols-3 gap-x-10 gap-y-3 text-sm text-bone/60">
             {[
               "Matches are FC26 Ultimate Team — Play a Friend, 6-minute halves. Bring your best squad.",
-              "Winner reports the full-time screenshot in the official group within 10 minutes.",
+              "Every tie is TWO legs vs the same opponent. Aggregate goals decide — win both, split, doesn't matter: total goals across the two games.",
+              "Level on aggregate after both legs → ONE decider game with Extra Time & Penalties enabled in the match settings. Shootout result settles the tie.",
+              "Winner reports BOTH full-time screenshots in the official group within 10 minutes.",
               "No-show after 15 minutes past your kickoff time = walkover to your opponent.",
-              "Disconnects: leading player takes the win if past 60'; otherwise replay the tie.",
+              "Disconnects: leading player takes that game if past 60'; otherwise replay that game.",
               "Hub seats are KNUST (Kumasi) only, with consoles + 200 Mbps internet provided — limited, first paid, first seated.",
               "Playing remotely? Your own console and a stable connection are on you — test before game day.",
               "Entry fees are non-refundable once the bracket drops.",

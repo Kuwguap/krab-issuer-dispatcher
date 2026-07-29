@@ -256,14 +256,21 @@ async function admin(req, res) {
     return res.json({ ok: true });
   }
   if (act === "set-result") {
-    const { matchId, score1, score2, winner, player1, player2 } = b;
+    // two-legged ties: score1/score2 = leg 1, leg2_* = leg 2, pens_* = shootout
+    const { matchId, score1, score2, leg2_score1, leg2_score2, pens1, pens2, winner, player1, player2 } = b;
     const patch = {};
-    if (score1 !== undefined) patch.score1 = score1 === null ? null : Number(score1);
-    if (score2 !== undefined) patch.score2 = score2 === null ? null : Number(score2);
+    const num = (v) => (v === null ? null : Number(v));
+    if (score1 !== undefined) patch.score1 = num(score1);
+    if (score2 !== undefined) patch.score2 = num(score2);
+    if (leg2_score1 !== undefined) patch.leg2_score1 = num(leg2_score1);
+    if (leg2_score2 !== undefined) patch.leg2_score2 = num(leg2_score2);
+    if (pens1 !== undefined) patch.pens1 = num(pens1);
+    if (pens2 !== undefined) patch.pens2 = num(pens2);
     if (winner !== undefined) patch.winner = winner || null;
     if (player1 !== undefined) patch.player1 = player1 || null;
     if (player2 !== undefined) patch.player2 = player2 || null;
-    await sb("PATCH", `tournament_matches?id=eq.${encodeURIComponent(matchId)}`, patch);
+    const r = await sb("PATCH", `tournament_matches?id=eq.${encodeURIComponent(matchId)}`, patch);
+    if (!r.ok) return res.status(500).json({ error: "Could not save the result — run migration_tournament_legs.sql?", detail: JSON.stringify(r.data).slice(0, 160) });
     return res.json({ ok: true });
   }
   if (act === "clear-matches") {
