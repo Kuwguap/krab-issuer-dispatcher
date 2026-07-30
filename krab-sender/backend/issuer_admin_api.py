@@ -368,12 +368,31 @@ def _stream_receipt_image(
 
 
 def _telegram_bot_token() -> str:
+    # Issuer-specific vars first: this resolver serves issuer-uploaded files,
+    # and TELEGRAM_BOT_TOKEN on this service is the (wrong) sender bot.
     return (
-        os.getenv("TELEGRAM_BOT_TOKEN")
-        or os.getenv("ISSUER_TELEGRAM_BOT_TOKEN")
+        os.getenv("ISSUER_TELEGRAM_BOT_TOKEN")
         or os.getenv("KRAB_ISSUER_BOT_TOKEN")
+        or os.getenv("TELEGRAM_BOT_TOKEN")
         or ""
     ).strip()
+
+
+def _token_embedded_in_url(stored: str) -> str:
+    """Bot token embedded in a stored Telegram file URL.
+
+    Telegram file_ids and file_paths are BOT-SCOPED: only the bot that
+    received the file can getFile/download it. Several bots write receipts,
+    so the token baked into the stored URL is preferred; the env token is a
+    fallback (bare file paths, or an embedded token that stopped working —
+    e.g. after a BotFather token rotation).
+
+    Anchored to the real Telegram host, and using the LAST occurrence to
+    agree with _normalize_receipt_image_url, which treats the last chunk of
+    a legacy doubled-prefix URL as the authoritative one.
+    """
+    hits = re.findall(r"https://api\.telegram\.org/file/bot([^/]+)/", stored or "")
+    return hits[-1].strip() if hits else ""
 
 
 def _resolve_receipt_fetch_url(stored: str, bot_token: str) -> Optional[str]:
@@ -434,7 +453,9 @@ def issuer_receipt_view(
         raise HTTPException(status_code=404, detail="Receipt not found for this reference")
     stored, _, frag = stored_full.partition("#")
     file_id = frag[6:].strip() if frag.startswith("tgfid=") else None
-    bot_token = _telegram_bot_token()
+    # Prefer the token embedded in the stored URL (the uploading bot's) —
+    # re-signing with a different bot's token always fails.
+    bot_token = _token_embedded_in_url(stored) or _telegram_bot_token()
     fetch_url = _resolve_receipt_fetch_url(stored, bot_token)
     if not fetch_url and not (file_id and bot_token):
         raise HTTPException(status_code=502, detail="Cannot resolve receipt URL")
@@ -443,6 +464,18 @@ def issuer_receipt_view(
             resp = client.get(fetch_url) if fetch_url else None
             if (resp is None or resp.status_code != 200) and file_id and bot_token:
                 fresh = _telegram_refetch_by_file_id(client, bot_token, file_id)
+                if fresh is not None:
+                    resp = fresh
+            # Embedded token can be dead (token rotation): cascade to the env
+            # token when it differs and the first re-sign didn't succeed.
+            env_token = _telegram_bot_token()
+            if (
+                (resp is None or resp.status_code != 200)
+                and file_id
+                and env_token
+                and env_token != bot_token
+            ):
+                fresh = _telegram_refetch_by_file_id(client, env_token, file_id)
                 if fresh is not None:
                     resp = fresh
         if resp is None or resp.status_code != 200:

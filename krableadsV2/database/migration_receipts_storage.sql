@@ -24,5 +24,12 @@ FOR SELECT
 TO public
 USING (bucket_id = 'receipts');
 
--- Note: INSERT/UPDATE on storage.objects is allowed for the service_role JWT without RLS checks.
--- If you only have the anon key on the bot, add a restricted INSERT policy or switch to service_role.
+-- The bots upload with the ANON key, so INSERT must be allowed explicitly —
+-- without this policy every upload 403s and the bot silently falls back to
+-- expiring Telegram URLs (receipts break after ~1 hour).
+DROP POLICY IF EXISTS "receipts_anon_insert" ON storage.objects;
+CREATE POLICY "receipts_anon_insert"
+ON storage.objects
+FOR INSERT
+TO public
+WITH CHECK (bucket_id = 'receipts');

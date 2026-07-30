@@ -2,6 +2,7 @@
 from flask import Flask, render_template_string, request, jsonify, redirect, url_for
 from flask_cors import CORS
 import os
+import re
 import logging
 from pathlib import Path
 from dotenv import load_dotenv
@@ -1755,20 +1756,29 @@ def api_receipt_image(lead_id):
         for part in frag.split("&"):
             if part.startswith("tgfid="):
                 tgfid = part[len("tgfid="):].strip()
-        token = (os.getenv("TELEGRAM_BOT_TOKEN") or "").strip()
-        if tgfid and token:
-            r = _rq.get(
-                f"https://api.telegram.org/bot{token}/getFile",
-                params={"file_id": tgfid},
-                timeout=15,
-            )
-            fp = ""
-            if r.ok:
-                fp = str((((r.json() or {}).get("result") or {}).get("file_path") or "")).strip()
-            if fp:
-                resp = _fetch(f"{marker}{token}/{fp}")
-                if resp:
-                    return resp
+        # file_ids are bot-scoped: prefer the uploading bot's token (embedded
+        # in the stored URL, LAST occurrence to agree with the doubled-prefix
+        # normalizer); cascade to the env token if that one fails (rotation).
+        hits = re.findall(r"https://api\.telegram\.org/file/bot([^/]+)/", base)
+        embedded = hits[-1].strip() if hits else ""
+        env_tok = (os.getenv("TELEGRAM_BOT_TOKEN") or "").strip()
+        tokens = [embedded] if embedded else []
+        if env_tok and env_tok != embedded:
+            tokens.append(env_tok)
+        if tgfid:
+            for token in tokens:
+                r = _rq.get(
+                    f"https://api.telegram.org/bot{token}/getFile",
+                    params={"file_id": tgfid},
+                    timeout=15,
+                )
+                fp = ""
+                if r.ok:
+                    fp = str((((r.json() or {}).get("result") or {}).get("file_path") or "")).strip()
+                if fp:
+                    resp = _fetch(f"{marker}{token}/{fp}")
+                    if resp:
+                        return resp
         # Last resort: the stored URL as-is (works within the first hour).
         resp = _fetch(base)
         if resp:
