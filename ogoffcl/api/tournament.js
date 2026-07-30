@@ -268,6 +268,64 @@ async function admin(req, res) {
     if (!ins.ok) return res.status(500).json({ error: "Could not save the round", detail: JSON.stringify(ins.data).slice(0, 160) });
     return res.json({ ok: true });
   }
+  if (act === "notify-round") {
+    // email every player in a drawn round: opponent, match number, fixtures
+    // link (byes get their own email). Awaited so serverless doesn't cut off.
+    const rn = Number(b.round);
+    if (!Number.isFinite(rn)) return res.status(400).json({ error: "round required" });
+    const [mRes, pRes] = await Promise.all([
+      sb("GET", `tournament_matches?round=eq.${rn}&select=*&order=slot.asc`),
+      sb("GET", "tournament_players?select=*"),
+    ]);
+    const ms = Array.isArray(mRes.data) ? mRes.data : [];
+    if (!ms.length) return res.status(400).json({ error: "No matches in that round yet." });
+    const byId = Object.fromEntries((Array.isArray(pRes.data) ? pRes.data : []).map((p) => [p.id, p]));
+    const participants = ms.reduce((a, m) => a + (m.player1 ? 1 : 0) + (m.player2 ? 1 : 0), 0);
+    const roundName = participants === 2 ? "the Final" : participants === 4 ? "the Semi-finals" : participants === 8 ? "the Quarter-finals" : `Round ${rn}`;
+    const fixturesUrl = `${env.siteUrl}/tournament/fixtures`;
+
+    const jobs = [];
+    for (const m of ms) {
+      const matchNo = m.slot + 1;
+      const p1 = m.player1 ? byId[m.player1] : null;
+      const p2 = m.player2 ? byId[m.player2] : null;
+      if (p1 && p2) {
+        for (const [me, opp] of [[p1, p2], [p2, p1]]) {
+          if (!(me.email || "").includes("@")) continue;
+          jobs.push(sendEmail({
+            to: me.email,
+            subject: `Your ${roundName === `Round ${rn}` ? `Round ${rn}` : roundName} fixture — OG OFFCL FC26 ⚽`,
+            html: emailShell("The draw is out. 🎲", `
+              <p><strong style="color:#C8FF00;">${me.gamertag}</strong> — you're drawn. You face
+              <strong style="color:#F5F2EA;">${opp.gamertag}</strong> (${String(opp.platform).toUpperCase()})
+              in <strong style="color:#C8FF00;">Match ${matchNo}</strong> of ${roundName}.</p>
+              <p>Two legs vs the same opponent — Ultimate Team → Friendlies → Play a Friend, 6-minute halves,
+              back to back. <strong style="color:#F5F2EA;">Total goals across both games</strong> decide the tie.
+              Level on aggregate? One decider with <strong style="color:#F5F2EA;">Extra Time &amp; Penalties ON</strong>.</p>
+              <p style="margin:18px 0;"><a href="${fixturesUrl}" style="display:inline-block;background:#C8FF00;color:#0A0A0A;font-weight:900;text-decoration:none;padding:14px 22px;text-transform:uppercase;letter-spacing:1px;">📋 View the live fixtures</a></p>
+              <p style="color:#8b877e;">Coordinate kickoff with your opponent in the Snapchat group: <a href="${SNAP_GROUP}" style="color:#C8FF00;">${SNAP_GROUP}</a><br/>
+              Screenshot BOTH full-time screens and drop them there. No-show 15 minutes past kickoff = walkover.</p>
+            `),
+          }));
+        }
+      } else if (p1 && !p2 && (p1.email || "").includes("@")) {
+        jobs.push(sendEmail({
+          to: p1.email,
+          subject: `Bye this round — OG OFFCL FC26 ⚽`,
+          html: emailShell("The draw smiled on you. 🎲", `
+            <p><strong style="color:#C8FF00;">${p1.gamertag}</strong> — odd number of players this round, and the
+            random draw handed <strong style="color:#F5F2EA;">you the bye</strong>. You sit ${roundName} out and go
+            straight into the next draw.</p>
+            <p style="margin:18px 0;"><a href="${fixturesUrl}" style="display:inline-block;background:#C8FF00;color:#0A0A0A;font-weight:900;text-decoration:none;padding:14px 22px;text-transform:uppercase;letter-spacing:1px;">📋 Watch the round live</a></p>
+            <p style="color:#8b877e;">Stay in the Snapchat group — the next draw drops there: <a href="${SNAP_GROUP}" style="color:#C8FF00;">${SNAP_GROUP}</a></p>
+          `),
+        }));
+      }
+    }
+    const results = await Promise.allSettled(jobs);
+    const sent = results.filter((r) => r.status === "fulfilled" && r.value && r.value.ok).length;
+    return res.json({ ok: true, sent, attempted: jobs.length, matches: ms.length, roundName });
+  }
   if (act === "clear-round") {
     const rn = Number(b.round);
     if (!Number.isFinite(rn)) return res.status(400).json({ error: "round required" });

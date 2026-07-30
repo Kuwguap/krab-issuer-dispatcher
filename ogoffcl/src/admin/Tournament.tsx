@@ -762,6 +762,21 @@ export default function AdminTournament() {
             </button>
           )}
           {lastRoundEntry && (
+            <button
+              onClick={async () => {
+                const rn = lastRoundEntry[0];
+                if (!confirm(`Email every player in round ${rn} their fixture (opponent, match number, fixtures link)? Byes get a bye email.`)) return;
+                setBusy("notify");
+                const r = await adminApi("/api/tournament", { action: "admin", op: "notify-round", round: rn });
+                setBusy(null);
+                say(r.ok ? `Fixture emails sent — ${r.sent}/${r.attempted} ✓` : `Failed: ${r.error}`);
+              }}
+              disabled={busy === "notify"}
+              className="btn-og bg-bone text-ink px-4 py-2.5 text-[10px] hover:bg-acid">
+              {busy === "notify" ? "Sending…" : `📧 Email round ${lastRoundEntry[0]} fixtures`}
+            </button>
+          )}
+          {lastRoundEntry && (
             <button onClick={redrawRound} className="btn-og border-2 border-ash text-bone/70 px-4 py-2.5 text-[10px] hover:border-bone">
               Redraw round {lastRoundEntry[0]}
             </button>
