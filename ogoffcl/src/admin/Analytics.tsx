@@ -47,24 +47,48 @@ function topCounts(values: string[], limit = 8): [string, number][] {
 
 export default function AdminAnalytics() {
   const [rows, setRows] = useState<Row[]>([]);
+  const [totalViews, setTotalViews] = useState<number | null>(null);
   const [days, setDays] = useState<(typeof RANGES)[number]>(30);
   const [missing, setMissing] = useState(false);
   const [loading, setLoading] = useState(true);
 
   useEffect(() => {
-    setLoading(true);
-    const since = new Date(Date.now() - days * 86400_000).toISOString();
-    supabase
-      .from("page_views")
-      .select("path,referrer,source,campaign,session_id,screen_w,created_at")
-      .gte("created_at", since)
-      .order("created_at", { ascending: false })
-      .limit(20000)
-      .then(({ data, error }) => {
-        if (error) { setMissing(isMissingTable(error)); setRows([]); }
-        else { setMissing(false); setRows((data || []) as Row[]); }
-        setLoading(false);
-      });
+    let alive = true;
+    (async () => {
+      setLoading(true);
+      const since = new Date(Date.now() - days * 86400_000).toISOString();
+
+      // Supabase caps every query at 1,000 rows server-side regardless of
+      // .limit() — the Views tile was pinning at exactly 1000. Get the TRUE
+      // total via an exact head-count, and page the rows for the breakdowns.
+      const { count, error: cErr } = await supabase
+        .from("page_views")
+        .select("*", { count: "exact", head: true })
+        .gte("created_at", since);
+      if (!alive) return;
+      if (cErr) { setMissing(isMissingTable(cErr)); setRows([]); setTotalViews(null); setLoading(false); return; }
+      setMissing(false);
+      setTotalViews(count ?? null);
+
+      const PAGE = 1000, MAX = 20000;
+      let all: Row[] = [];
+      for (let from = 0; from < MAX; from += PAGE) {
+        const { data, error } = await supabase
+          .from("page_views")
+          .select("path,referrer,source,campaign,session_id,screen_w,created_at")
+          .gte("created_at", since)
+          .order("created_at", { ascending: false })
+          .range(from, from + PAGE - 1);
+        if (!alive) return;
+        if (error || !data || data.length === 0) break;
+        all = all.concat(data as Row[]);
+        if (data.length < PAGE) break;
+      }
+      if (!alive) return;
+      setRows(all);
+      setLoading(false);
+    })();
+    return () => { alive = false; };
   }, [days]);
 
   const stats = useMemo(() => {
@@ -84,7 +108,7 @@ export default function AdminAnalytics() {
     const max = Math.max(1, ...series.map(([, n]) => n));
 
     return {
-      views: rows.length,
+      views: rows.length, // fallback only — the tile prefers the exact server count
       sessions,
       mobilePct: rows.length ? Math.round((mobile / rows.length) * 100) : 0,
       series,
@@ -122,7 +146,7 @@ export default function AdminAnalytics() {
 
       <div className="grid grid-cols-3 gap-px bg-ash border border-ash max-w-2xl">
         {[
-          ["Views", String(stats.views)],
+          ["Views", String(totalViews ?? stats.views)],
           ["Visits", String(stats.sessions)],
           ["Mobile", `${stats.mobilePct}%`],
         ].map(([label, value]) => (
