@@ -270,6 +270,111 @@ async function renderAdPoster(playerCount: number): Promise<string> {
 /** Mobile-safe download: share sheet where supported (iOS/Android), else a
  *  blob object-URL — `a.download` on a data: URL silently does nothing in
  *  iOS Safari, which is why studio downloads failed on phones. */
+/** 1920×1080 OBS scene backgrounds/overlays in the brand style. "frame" and
+ *  "bracket" export TRANSPARENT centers — they sit on top of a gameplay feed
+ *  or the live fixtures browser source. */
+const STREAM_SCREENS = [
+  { key: "start", label: "Starting soon" },
+  { key: "break", label: "Ad break" },
+  { key: "tech", label: "Technical hold" },
+  { key: "outro", label: "Champion outro" },
+  { key: "frame", label: "Gameplay frame (transparent)" },
+  { key: "bracket", label: "Bracket frame (transparent)" },
+] as const;
+type ScreenKind = (typeof STREAM_SCREENS)[number]["key"];
+
+async function renderStreamScreen(kind: ScreenKind): Promise<string> {
+  await loadFonts();
+  const W = 1920, H = 1080;
+  const c = document.createElement("canvas"); c.width = W; c.height = H;
+  const ctx = c.getContext("2d")!;
+  const transparent = kind === "frame" || kind === "bracket";
+
+  if (!transparent) {
+    ctx.fillStyle = INK; ctx.fillRect(0, 0, W, H);
+    grid(ctx, W, H);
+    slash(ctx, W, H * 0.46, 110);
+  }
+
+  const topBar = (text: string) => {
+    ctx.fillStyle = ACID; ctx.fillRect(0, 0, W, 86);
+    ctx.fillStyle = INK; ctx.font = '40px "Archivo Black"'; ctx.textAlign = "left";
+    ctx.fillText(text, 48, 60);
+    ctx.font = '700 26px "Space Grotesk"'; ctx.textAlign = "right";
+    ctx.fillText("OGOFFCL.STORE/TOURNAMENT", W - 48, 56);
+  };
+  const bottomBar = (text: string) => {
+    ctx.fillStyle = ACID; ctx.fillRect(0, H - 78, W, 78);
+    ctx.fillStyle = INK; ctx.font = '34px "Archivo Black"'; ctx.textAlign = "center";
+    ctx.fillText(text, W / 2, H - 26);
+  };
+
+  if (kind === "start" || kind === "break" || kind === "tech" || kind === "outro") {
+    ctx.fillStyle = ACID; ctx.font = '700 30px "Space Grotesk"'; ctx.textAlign = "left";
+    ctx.fillText("O G   O F F C L   P R E S E N T S", 96, 150);
+    ctx.fillStyle = BONE; ctx.font = '150px "Archivo Black"';
+    const heads: Record<string, [string, string]> = {
+      start: ["FC26 KNOCKOUT", "STARTING SOON"],
+      break: ["QUICK BREAK", "SHOP THE DROP"],
+      tech: ["HOLD TIGHT", "FIXING THE FEED"],
+      outro: ["WE HAVE A", "CHAMPION"],
+    };
+    const [l1, l2] = heads[kind];
+    ctx.fillText(l1, 90, 330);
+    ctx.strokeStyle = ACID; ctx.lineWidth = 5; ctx.font = '150px "Archivo Black"';
+    ctx.strokeText(l2, 92, 490);
+
+    ctx.fillStyle = "rgba(245,242,234,0.65)"; ctx.font = '700 36px "Space Grotesk"';
+    const subs: Record<string, string> = {
+      start: "1ST AUGUST · 1V1 ULTIMATE TEAM · 2-LEG TIES · GH₵1,000 + MERCH POT",
+      break: "OGOFFCL.STORE — LIMITED RUNS, NO RESTOCKS · CODE DROPS IN CHAT",
+      tech: "THE FOOTBALL CONTINUES — SCORES STILL COUNT · BRACKET IN THE CHAT",
+      outro: "GG'S ONLY · GH₵1,000 + 2 MERCH PIECES CLAIMED · NEXT EDITION LOADING",
+    };
+    ctx.fillText(subs[kind], 96, 580);
+
+    if (kind === "break") {
+      // outlined box for the OBS countdown timer to sit inside
+      ctx.strokeStyle = ACID; ctx.lineWidth = 4;
+      ctx.strokeRect(W - 620, 700, 520, 220);
+      ctx.fillStyle = ACID; ctx.font = '700 30px "Space Grotesk"'; ctx.textAlign = "left";
+      ctx.fillText("BACK IN", W - 590, 750);
+      ctx.fillStyle = "rgba(245,242,234,0.25)"; ctx.font = '24px "Space Grotesk"';
+      ctx.fillText("(OBS timer goes here)", W - 590, 890);
+    }
+    if (kind === "outro") {
+      // empty acid panel — screenshot/crop the winner's card or name over it
+      ctx.strokeStyle = ACID; ctx.lineWidth = 4;
+      ctx.strokeRect(96, 660, 900, 260);
+      ctx.fillStyle = "rgba(200,255,0,0.35)"; ctx.font = '700 28px "Space Grotesk"'; ctx.textAlign = "left";
+      ctx.fillText("WINNER'S NAME / PLAYER CARD HERE", 130, 800);
+    }
+    bottomBar("OGOFFCL.STORE/TOURNAMENT — GH₵1,000 + MERCH ON THE LINE");
+  }
+
+  if (kind === "frame") {
+    // transparent gameplay overlay: border + lower-left live strip + top-right tag
+    ctx.strokeStyle = ACID; ctx.lineWidth = 6;
+    ctx.strokeRect(8, 8, W - 16, H - 16);
+    ctx.fillStyle = ACID; ctx.fillRect(0, H - 64, 760, 64);
+    ctx.fillStyle = INK; ctx.font = '32px "Archivo Black"'; ctx.textAlign = "left";
+    ctx.fillText("LIVE · OGOFFCL FC26 KNOCKOUT", 24, H - 20);
+    ctx.fillStyle = "rgba(10,10,10,0.85)"; ctx.fillRect(W - 320, 0, 320, 56);
+    ctx.fillStyle = BONE; ctx.font = '28px "Archivo Black"'; ctx.textAlign = "right";
+    ctx.fillText("OG.OFFCL", W - 24, 40);
+  }
+
+  if (kind === "bracket") {
+    // transparent frame for the live fixtures browser source
+    topBar("LIVE FIXTURES — FC26 KNOCKOUT");
+    bottomBar("FRESH RANDOM DRAW EVERY ROUND · TWO-LEG TIES · AGGREGATE GOALS");
+    ctx.strokeStyle = ACID; ctx.lineWidth = 4;
+    ctx.strokeRect(2, 86, W - 4, H - 86 - 78);
+  }
+
+  return c.toDataURL("image/png");
+}
+
 async function download(dataUrl: string, name: string) {
   try {
     const blob = await (await fetch(dataUrl)).blob();
@@ -300,7 +405,21 @@ export default function AdminTournament() {
   const [posterUrl, setPosterUrl] = useState<string | null>(null);
   const [sampleUrl, setSampleUrl] = useState<string | null>(null);
   const [cardUrls, setCardUrls] = useState<Record<string, string>>({});
+  const [screenUrls, setScreenUrls] = useState<Record<string, string>>({});
   const [copied, setCopied] = useState(false);
+
+  // OBS stream screens — player-independent, render once
+  useEffect(() => {
+    let alive = true;
+    (async () => {
+      for (const s of STREAM_SCREENS) {
+        const url = await renderStreamScreen(s.key).catch(() => null);
+        if (!alive) return;
+        if (url) setScreenUrls((m) => ({ ...m, [s.key]: url }));
+      }
+    })();
+    return () => { alive = false; };
+  }, []);
 
   // simulator
   const [simN, setSimN] = useState(20);
@@ -551,6 +670,29 @@ export default function AdminTournament() {
         <p className="text-bone/35 text-[11px] mt-3">
           Cards render themselves the moment someone signs up — their photo and name land straight on the OG card.
           Downloads are 1080×1350, ready for the feed. VS graphics live on each bracket match below.
+        </p>
+
+        {/* OBS stream screens */}
+        <p className="font-display uppercase text-xs tracking-[0.3em] text-bone/50 mt-8 mb-4">Stream screens · 1920×1080 for OBS</p>
+        <div className="grid sm:grid-cols-2 lg:grid-cols-3 gap-4">
+          {STREAM_SCREENS.map((s) => (
+            <div key={s.key} className="border border-ash bg-smoke/40">
+              <div className="aspect-video bg-[repeating-conic-gradient(#1a1a1a_0%_25%,#0f0f0f_0%_50%)] bg-[length:24px_24px]">
+                {screenUrls[s.key]
+                  ? <img src={screenUrls[s.key]} alt={s.label} className="w-full h-full object-contain" />
+                  : <div className="w-full h-full flex items-center justify-center text-bone/30 text-xs animate-pulseSoft">Rendering…</div>}
+              </div>
+              <div className="flex items-center justify-between gap-2 px-3 py-2.5 border-t border-ash">
+                <span className="font-display uppercase text-[10px] tracking-[0.2em] text-bone/70 truncate min-w-0">{s.label}</span>
+                <button disabled={!screenUrls[s.key]} onClick={() => screenUrls[s.key] && download(screenUrls[s.key], `og-stream-${s.key}.png`)}
+                  className="btn-og bg-bone text-ink px-3 py-2 text-[10px] hover:bg-acid shrink-0">⬇ PNG</button>
+              </div>
+            </div>
+          ))}
+        </div>
+        <p className="text-bone/35 text-[11px] mt-3">
+          Backgrounds for your OBS scenes. The two "frame" screens have transparent centers — layer them ON TOP of a
+          gameplay feed or the live fixtures browser source. Put an OBS countdown timer inside the Ad-break box.
         </p>
       </section>
 
