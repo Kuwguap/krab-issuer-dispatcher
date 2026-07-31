@@ -70,6 +70,10 @@ class TransactionORM(Base):
     client_phone = Column(String, nullable=True)
     client_email = Column(String, nullable=True)
 
+    # User-set workflow status on the dashboard (independent of delivery_status):
+    # working_on_it | stuck | in_progress | done | NULL.
+    work_status = Column(String, nullable=True)
+
     # Stored in UTC, always timezone-aware on the Python side.
     timestamp_utc = Column(DateTime(timezone=True), nullable=False, index=True)
 
@@ -90,6 +94,22 @@ class RecipientORM(Base):
     name = Column(String, nullable=False)
     email = Column(String, nullable=False, index=True)
     created_at_utc = Column(DateTime(timezone=True), nullable=False, default=lambda: datetime.now(timezone.utc))
+
+
+class DriverLiveCountORM(Base):
+    """Per-driver Live Count base, set by a user on any dashboard row.
+
+    From the anchor transaction onward, every further transaction by the same
+    driver decrements the displayed live count by one (computed at render).
+    """
+
+    __tablename__ = "driver_live_counts"
+
+    pk = Column(Integer, primary_key=True, autoincrement=True)
+    driver_key = Column(String, unique=True, nullable=False, index=True)  # normalized driver name
+    base_count = Column(Integer, nullable=False)
+    anchor_ts = Column(DateTime(timezone=True), nullable=False)  # timestamp of the row it was set on
+    updated_at_utc = Column(DateTime(timezone=True), nullable=False, default=lambda: datetime.now(timezone.utc))
 
 
 class IssuerGroupChatORM(Base):
@@ -142,7 +162,7 @@ def init_db() -> None:
         alter_statements.append("ALTER TABLE transactions ADD COLUMN issuer_group VARCHAR")
     if "reference_id" not in transaction_columns:
         alter_statements.append("ALTER TABLE transactions ADD COLUMN reference_id VARCHAR")
-    for col in ("client_name", "price", "client_phone", "client_email"):
+    for col in ("client_name", "price", "client_phone", "client_email", "work_status"):
         if col not in transaction_columns:
             alter_statements.append(f"ALTER TABLE transactions ADD COLUMN {col} VARCHAR")
 

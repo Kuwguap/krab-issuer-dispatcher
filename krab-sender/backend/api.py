@@ -18,6 +18,10 @@ from .repository import (
     get_latest_transaction,
     list_transactions,
     get_rolling_summary_ny,
+    set_transaction_work_status,
+    upsert_driver_live_count,
+    delete_driver_live_count,
+    list_driver_live_counts,
     list_recipients,
     get_recipient_by_id,
     create_recipient,
@@ -222,9 +226,58 @@ def transactions_public(
                 "price": tx.price,
                 "client_phone": tx.client_phone,
                 "client_email": tx.client_email,
+                "work_status": tx.work_status,
             }
         )
     return _enrich_tx_rows_with_lead_meta(config, result)
+
+
+class WorkStatusBody(BaseModel):
+    status: Optional[str] = None
+
+
+@app.patch("/transactions/{tx_id}/work-status", dependencies=[Depends(require_admin)])
+def transactions_set_work_status(tx_id: str, body: WorkStatusBody):
+    """User-set workflow status: working_on_it | stuck | in_progress | done | null."""
+    ok = set_transaction_work_status(tx_id, body.status)
+    if not ok:
+        raise HTTPException(status_code=400, detail="Unknown transaction or invalid status")
+    return {"ok": True, "id": tx_id, "work_status": (body.status or None)}
+
+
+class LiveCountBody(BaseModel):
+    driver: str
+    base_count: Optional[int] = None
+    anchor_ts: Optional[str] = None
+
+
+@app.get("/live-counts", dependencies=[Depends(require_admin)])
+def live_counts_list():
+    """Per-driver Live Count bases: {driver_key: {base_count, anchor_ts}}."""
+    return list_driver_live_counts()
+
+
+@app.put("/live-counts", dependencies=[Depends(require_admin)])
+def live_counts_set(body: LiveCountBody):
+    """Set (or clear, with base_count=null) a driver's Live Count base.
+
+    anchor_ts = timestamp of the row it was set on; every later transaction
+    by the same driver decrements the displayed live count by one.
+    """
+    driver = (body.driver or "").strip()
+    if not driver:
+        raise HTTPException(status_code=400, detail="driver required")
+    if body.base_count is None:
+        removed = delete_driver_live_count(driver)
+        return {"ok": True, "removed": removed}
+    try:
+        anchor = datetime.fromisoformat(str(body.anchor_ts).replace("Z", "+00:00")) if body.anchor_ts else datetime.now(timezone.utc)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="bad anchor_ts")
+    saved = upsert_driver_live_count(driver, int(body.base_count), anchor)
+    if not saved:
+        raise HTTPException(status_code=400, detail="could not save live count")
+    return {"ok": True, **saved}
 
 
 # Public endpoint: bot needs to fetch recipients
@@ -286,6 +339,7 @@ def transactions_latest(config: ApiConfig = Depends(get_api_config)):
         "price": tx.price,
         "client_phone": tx.client_phone,
         "client_email": tx.client_email,
+        "work_status": tx.work_status,
     }
     enriched = _enrich_tx_rows_with_lead_meta(config, [row])
     return enriched[0] if enriched else row
@@ -323,6 +377,7 @@ def transactions(
                 "price": tx.price,
                 "client_phone": tx.client_phone,
                 "client_email": tx.client_email,
+                "work_status": tx.work_status,
             }
         )
 
@@ -397,6 +452,7 @@ def transactions_full(
                 "timestamp_ny": ts_ny.isoformat(),
                 "filename": tx.filename,
                 "delivery_status": tx.delivery_status,
+                "work_status": tx.work_status,
                 # Persisted send-time fields win; lead ctx fills blanks only.
                 "tag_name": (tx.client_name or "").strip() or (ctx or {}).get("tag_name"),
                 "price": (tx.price or "").strip() or (ctx or {}).get("price"),

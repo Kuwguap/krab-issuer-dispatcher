@@ -35,6 +35,7 @@ class Transaction:
     price: Optional[str] = None
     client_phone: Optional[str] = None
     client_email: Optional[str] = None
+    work_status: Optional[str] = None
 
     @classmethod
     def new(

@@ -8,7 +8,14 @@ from typing import Iterable, List, Optional
 from sqlalchemy import func
 from zoneinfo import ZoneInfo
 
-from .db import SessionLocal, TransactionORM, RecipientORM, IssuerGroupChatORM, UserGroupLinkORM
+from .db import (
+    SessionLocal,
+    TransactionORM,
+    RecipientORM,
+    IssuerGroupChatORM,
+    UserGroupLinkORM,
+    DriverLiveCountORM,
+)
 from bot.models import Transaction
 
 
@@ -61,6 +68,7 @@ def save_transaction(tx: Transaction) -> None:
         price=tx.price,
         client_phone=tx.client_phone,
         client_email=tx.client_email,
+        work_status=tx.work_status,
     )
     with get_session() as session:
         session.add(orm)
@@ -102,6 +110,7 @@ def list_transactions(
                 price=row.price,
                 client_phone=row.client_phone,
                 client_email=row.client_email,
+                work_status=row.work_status,
             )
             for row in rows
         ]
@@ -135,6 +144,7 @@ def get_latest_transaction() -> Optional[Transaction]:
             price=row.price,
             client_phone=row.client_phone,
             client_email=row.client_email,
+            work_status=row.work_status,
         )
 
     return tx
@@ -233,6 +243,7 @@ def get_rolling_summary_ny(
                 "price": r.price,
                 "client_phone": r.client_phone,
                 "client_email": r.client_email,
+                "work_status": r.work_status,
             }
             for r in rows
         ]
@@ -329,6 +340,72 @@ def delete_recipient(recipient_id: str) -> bool:
             return False
         session.delete(row)
         return True
+
+
+_WORK_STATUSES = {"working_on_it", "stuck", "in_progress", "done"}
+
+
+def set_transaction_work_status(tx_id: str, status: str | None) -> bool:
+    """Set/clear the user-facing workflow status on a transaction."""
+    st = (status or "").strip().lower() or None
+    if st is not None and st not in _WORK_STATUSES:
+        return False
+    with get_session() as session:
+        row = session.query(TransactionORM).filter(TransactionORM.id == tx_id).first()
+        if not row:
+            return False
+        row.work_status = st
+        return True
+
+
+def _live_count_key(driver_name: str) -> str:
+    return " ".join(str(driver_name or "").split()).lower()
+
+
+def upsert_driver_live_count(driver_name: str, base_count: int, anchor_ts: datetime) -> Optional[dict]:
+    """Set a driver's Live Count base, anchored at the row it was set on."""
+    key = _live_count_key(driver_name)
+    if not key:
+        return None
+    if anchor_ts.tzinfo is None:
+        anchor_ts = anchor_ts.replace(tzinfo=timezone.utc)
+    with get_session() as session:
+        row = session.query(DriverLiveCountORM).filter(DriverLiveCountORM.driver_key == key).first()
+        if row:
+            row.base_count = int(base_count)
+            row.anchor_ts = anchor_ts
+            row.updated_at_utc = datetime.now(timezone.utc)
+        else:
+            row = DriverLiveCountORM(
+                driver_key=key,
+                base_count=int(base_count),
+                anchor_ts=anchor_ts,
+                updated_at_utc=datetime.now(timezone.utc),
+            )
+            session.add(row)
+        return {"driver_key": key, "base_count": int(base_count), "anchor_ts": anchor_ts.isoformat()}
+
+
+def delete_driver_live_count(driver_name: str) -> bool:
+    key = _live_count_key(driver_name)
+    with get_session() as session:
+        n = session.query(DriverLiveCountORM).filter(DriverLiveCountORM.driver_key == key).delete()
+        return n > 0
+
+
+def list_driver_live_counts() -> dict:
+    """{driver_key: {base_count, anchor_ts}} for all drivers with a set base."""
+    with get_session() as session:
+        out = {}
+        for r in session.query(DriverLiveCountORM).all():
+            ts = r.anchor_ts
+            if ts is not None and ts.tzinfo is None:
+                ts = ts.replace(tzinfo=timezone.utc)
+            out[r.driver_key] = {
+                "base_count": r.base_count,
+                "anchor_ts": ts.isoformat() if ts else None,
+            }
+        return out
 
 
 # Group-attach module (/groupattach): registered group chats + user→group links

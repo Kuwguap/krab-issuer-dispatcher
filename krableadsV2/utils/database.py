@@ -1953,6 +1953,27 @@ class Database:
             logger.error(f"Error fetching open follow-ups for user: {e}")
             return []
 
+    def list_recent_telegram_receipts(self, hours: int = 3, limit: int = 25) -> list:
+        """Recently-updated leads whose receipt still points at Telegram."""
+        if not self._check_tables_exist():
+            return []
+        try:
+            from datetime import datetime, timedelta, timezone
+            since = (datetime.now(timezone.utc) - timedelta(hours=hours)).isoformat()
+            r = (
+                self.client.table("leads")
+                .select("id, reference_id, receipt_image_url")
+                .like("receipt_image_url", "*api.telegram.org*")
+                .gte("updated_at", since)
+                .order("updated_at", desc=True)
+                .limit(limit)
+                .execute()
+            )
+            return r.data or []
+        except Exception as e:
+            logger.error(f"Error listing telegram receipts: {e}")
+            return []
+
     def get_all_open_followups(self) -> list:
         """All open follow-ups across every agent (supervisor backend view)."""
         if not self._check_tables_exist():

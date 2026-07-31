@@ -463,6 +463,36 @@ def _telegram_refetch_by_file_id(client: httpx.Client, bot_token: str, file_id: 
         return None
 
 
+def _persist_receipt_to_storage(config: ApiConfig, ref: str, data: bytes) -> None:
+    """Upload receipt bytes to the public receipts bucket + repoint the lead."""
+    import secrets as _secrets
+
+    base = (config.supabase_url or "").rstrip("/")
+    key = config.supabase_service_role_key or ""
+    if not (base and key and data):
+        return
+    safe_ref = re.sub(r"[^A-Za-z0-9_-]+", "_", str(ref))[:36]
+    path = f"viewheal/{safe_ref}_{_secrets.token_hex(4)}.jpg"
+    headers = {"apikey": key, "Authorization": f"Bearer {key}"}
+    with httpx.Client(timeout=30.0) as client:
+        up = client.post(
+            f"{base}/storage/v1/object/receipts/{path}",
+            headers={**headers, "Content-Type": "image/jpeg"},
+            content=data,
+        )
+        if up.status_code >= 400:
+            logger.warning("receipt self-heal upload failed %s: %s", ref, up.status_code)
+            return
+        public = f"{base}/storage/v1/object/public/receipts/{path}"
+        client.patch(
+            f"{base}/rest/v1/leads",
+            params={"reference_id": f"eq.{ref}"},
+            headers={**headers, "Content-Type": "application/json"},
+            json={"receipt_image_url": public},
+        )
+        logger.info("receipt self-heal: %s re-hosted to storage", ref)
+
+
 @router.get("/receipts/view")
 def issuer_receipt_view(
     ref: str = Query(..., min_length=1),
@@ -518,6 +548,14 @@ def issuer_receipt_view(
                 status_code=502,
                 detail=f"Receipt file fetch failed ({resp.status_code if resp is not None else 'unreachable'})",
             )
+        # Self-heal: a telegram-hosted receipt we just fetched successfully is
+        # re-hosted in the public storage bucket and the lead repointed, so it
+        # can be reached any time — Telegram links die after ~1 hour.
+        if _TELEGRAM_FILE_PREFIX in (stored or ""):
+            try:
+                _persist_receipt_to_storage(config, ref_key, resp.content)
+            except Exception as heal_err:  # never break the view
+                logger.warning("receipt self-heal %s: %s", ref_key, heal_err)
         return _stream_receipt_image(
             resp.content,
             resp.headers.get("content-type"),

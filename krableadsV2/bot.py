@@ -10647,6 +10647,31 @@ def main():
         )
         logger.info("Driver tracking job scheduled (every 10s, first in 20s)")
 
+    # Receipt permanence sweeper: any receipt still pointing at Telegram
+    # (written by this bot's fallback OR a legacy deployment) is re-hosted in
+    # the public storage bucket before the 1-hour Telegram link dies.
+    async def rescue_telegram_receipts_job(context: ContextTypes.DEFAULT_TYPE) -> None:
+        try:
+            from utils import receipt_rescue
+            rows = await asyncio.to_thread(db.list_recent_telegram_receipts, 3, 25)
+            rescued = 0
+            for lead in rows:
+                try:
+                    if await asyncio.to_thread(receipt_rescue.rescue_lead_receipt, db, lead):
+                        rescued += 1
+                except Exception as e:
+                    logger.warning("Receipt rescue failed for %s: %s", lead.get("reference_id"), e)
+            if rescued:
+                logger.info("Receipt sweeper: re-hosted %d telegram receipt(s) to storage", rescued)
+        except Exception as e:
+            logger.error("Receipt sweeper job failed: %s", e)
+
+    if application.job_queue:
+        application.job_queue.run_repeating(
+            rescue_telegram_receipts_job, interval=600, first=60, name="receipt_rescue"
+        )
+        logger.info("Receipt rescue sweeper scheduled (every 10 min)")
+
     if application.job_queue:
         application.job_queue.run_repeating(
             process_pending_api_lead_dispatches,
