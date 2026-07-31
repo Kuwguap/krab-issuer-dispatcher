@@ -9,11 +9,14 @@ from typing import Any, Dict, List, Optional, Tuple
 from config import Config
 from utils.database import Database, record_is_active
 from utils.external_lead_parser import (
+    _normalize_field_key,
+    _parse_labeled_fields,
     build_vehicle_details_11,
     build_delivery_details,
     parse_external_lead_fields,
     parse_external_lead_message,
 )
+from utils.ingest_files import extract_fields_from_files, normalize_ingest_files
 from utils.lead_validation import is_valid_pending_phone, is_valid_pending_price
 from utils.onetimesecret import OneTimeSecret
 from utils.api_lead_user import resolve_api_lead_user_sync
@@ -31,12 +34,40 @@ def ingest_external_lead(
     *,
     message: Optional[str] = None,
     fields: Optional[Dict[str, Any]] = None,
+    files: Optional[list] = None,
 ) -> Tuple[Optional[Dict[str, Any]], List[str]]:
     """
     Parse, validate, optionally encrypt phone, and create a lead with ingest_dispatch_pending=true.
+    ``files`` is an optional list of ``{"url": <https>, "label": <caption>}`` checkout
+    documents — they are attached to the lead for group delivery and AI-read to fill
+    any fields the customer left blank (VIN, insurance, policy #, email, license ID).
     Returns ({lead_id, reference_id, external_order_id}, []) or (None, errors).
     """
-    if fields:
+    attached_files = normalize_ingest_files(files) if files else []
+    ai_driver_license_id: Optional[str] = None
+
+    if attached_files:
+        # Gap-fill BEFORE parsing so a document-supplied VIN can rescue a lead
+        # the parser would otherwise reject as "VIN is required".
+        work_fields = dict(fields) if fields else _parse_labeled_fields(message or "")
+        present = {
+            _normalize_field_key(str(k))
+            for k, v in work_fields.items()
+            if v is not None and str(v).strip()
+        }
+        missing = [
+            k
+            for k in ("vin", "insurance_company", "insurance_policy_number", "email")
+            if k not in present
+        ]
+        extracted = extract_fields_from_files(
+            attached_files, wanted_keys=missing + ["driver_license_id"]
+        )
+        ai_driver_license_id = extracted.pop("driver_license_id", None)
+        for k, v in extracted.items():
+            work_fields[k] = v
+        state, parse_errors = parse_external_lead_fields(work_fields)
+    elif fields:
         state, parse_errors = parse_external_lead_fields(fields)
     elif message:
         state, parse_errors = parse_external_lead_message(message)
@@ -101,9 +132,9 @@ def ingest_external_lead(
         "special_request_drivers": "",
         "special_request_note": "",
         "email": state.get("email") or None,
-        "driver_license_id": None,
+        "driver_license_id": ai_driver_license_id,
         "contact_info_source": source_label,
-        "phase1_attached_files": [],
+        "phase1_attached_files": attached_files,
         "ingest_dispatch_pending": True,
         "external_order_id": state.get("external_order_id"),
         "awaiting_group_accept": False,

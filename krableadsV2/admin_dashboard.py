@@ -1893,7 +1893,9 @@ def api_v1_leads_ingest():
     """
     Accept external 'New Lead' messages and create krableadsV2 leads.
     Authorization: Bearer <LEAD_INGEST_API_KEY>
-    Body: text/plain message or JSON { "message": "..." } or { "fields": { ... } }
+    Body: text/plain message or JSON { "message": "..." } or { "fields": { ... } }.
+    JSON bodies may also carry "files": [{"url": <https>, "label": <caption>}] —
+    checkout documents attached to the lead and AI-read to fill blank fields.
     """
     ok, err_resp = _require_lead_ingest_auth()
     if not ok:
@@ -1906,6 +1908,7 @@ def api_v1_leads_ingest():
     content_type = (request.content_type or "").lower()
     message = None
     fields = None
+    files = None
 
     if "application/json" in content_type:
         body = request.get_json(silent=True) or {}
@@ -1916,6 +1919,8 @@ def api_v1_leads_ingest():
                 fields = body["fields"]
             else:
                 return jsonify({"ok": False, "errors": ["JSON body needs message or fields"]}), 422
+            if isinstance(body.get("files"), list):
+                files = body["files"]
         else:
             return jsonify({"ok": False, "errors": ["Invalid JSON body"]}), 422
     else:
@@ -1923,13 +1928,159 @@ def api_v1_leads_ingest():
         if not message.strip():
             return jsonify({"ok": False, "errors": ["Empty message body"]}), 422
 
-    result, errors = ingest_external_lead(ingest_db, message=message, fields=fields)
+    result, errors = ingest_external_lead(ingest_db, message=message, fields=fields, files=files)
     if errors:
         return jsonify({"ok": False, "errors": errors}), 422
     if not result:
         return jsonify({"ok": False, "errors": ["Ingest failed"]}), 500
 
     return jsonify({"ok": True, **result}), 201
+
+
+def _send_attachment_via_bot_api(chat_id, entry: dict) -> bool:
+    """Send one URL attachment straight through the Telegram HTTP API.
+
+    Used by the attach endpoint when the lead's group already accepted —
+    the bot process isn't involved, so we deliver late-arriving checkout
+    documents ourselves. Photo failures fall back to sendDocument (covers
+    PDFs mislabeled as photos and oversized images).
+    """
+    import requests as _rq
+    from config import Config
+
+    token = (Config.TELEGRAM_BOT_TOKEN or "").strip()
+    url = str(entry.get("file_id") or "").strip()
+    if not token or not chat_id or not url:
+        return False
+    caption = (entry.get("caption") or "").strip() or None
+    ftype = (entry.get("type") or "photo").lower()
+    methods = ["sendDocument"] if ftype == "document" else ["sendPhoto", "sendDocument"]
+    for method in methods:
+        payload = {"chat_id": chat_id, ("document" if method == "sendDocument" else "photo"): url}
+        if caption:
+            payload["caption"] = caption
+        try:
+            r = _rq.post(
+                f"https://api.telegram.org/bot{token}/{method}",
+                json=payload,
+                timeout=30,
+            )
+            if r.ok and (r.json() or {}).get("ok"):
+                return True
+            logger.warning("Attach %s failed (%s): %s", method, r.status_code, r.text[:160])
+        except Exception as e:
+            logger.warning("Attach %s error: %s", method, e)
+    return False
+
+
+@app.route("/api/v1/leads/attach", methods=["POST"])
+def api_v1_leads_attach():
+    """
+    Attach checkout documents to an existing lead (documents upload after the
+    order ingest on tristatetags.com, so they arrive as a second call).
+    Authorization: Bearer <LEAD_INGEST_API_KEY>
+    JSON body: { "reference_id" and/or "external_order_id",
+                 "files": [{"url": <https>, "label": <caption>}] }
+
+    If a group already accepted the lead the files are sent to that group
+    chat immediately; otherwise they are stored on the lead and the existing
+    accept flow forwards them. Blank lead fields (VIN, insurance, policy #,
+    email, license ID) are best-effort filled by AI-reading the documents.
+    """
+    ok, err_resp = _require_lead_ingest_auth()
+    if not ok:
+        return err_resp
+
+    from utils.database import Database
+    from utils.ingest_files import extract_fields_from_files, normalize_ingest_files
+
+    body = request.get_json(silent=True) or {}
+    if not isinstance(body, dict):
+        return jsonify({"ok": False, "errors": ["Invalid JSON body"]}), 422
+    attachments = normalize_ingest_files(body.get("files"))
+    if not attachments:
+        return jsonify({"ok": False, "errors": ["files must contain at least one valid https url"]}), 422
+
+    attach_db = Database()
+    lead = None
+    ref = str(body.get("reference_id") or "").strip()
+    ext = str(body.get("external_order_id") or "").strip()
+    if ref:
+        lead = attach_db.get_lead_by_reference_id(ref)
+    if not lead and ext:
+        lead = attach_db.get_lead_by_external_order_id(ext)
+    if not lead:
+        return jsonify({"ok": False, "errors": ["Lead not found for reference_id/external_order_id"]}), 404
+    lead_id = str(lead.get("id"))
+
+    # AI gap-fill for fields the customer never typed. The VIN lives on line 6
+    # of the 11-line vehicle_details block; insurance and policy are lines 9-10.
+    ai_filled = []
+    try:
+        vd_lines = (lead.get("vehicle_details") or "").split("\n")
+        while len(vd_lines) < 11:
+            vd_lines.append("-")
+        wanted = []
+        if (vd_lines[5] or "-").strip() in ("", "-"):
+            wanted.append("vin")
+        if (vd_lines[8] or "-").strip() in ("", "-"):
+            wanted.append("insurance_company")
+        if (vd_lines[9] or "-").strip() in ("", "-"):
+            wanted.append("insurance_policy_number")
+        if not (lead.get("email") or "").strip():
+            wanted.append("email")
+        if not (lead.get("driver_license_id") or "").strip():
+            wanted.append("driver_license_id")
+        if wanted:
+            extracted = extract_fields_from_files(attachments, wanted_keys=wanted)
+            updates = {}
+            if extracted.get("vin"):
+                vd_lines[5] = extracted["vin"]
+            if extracted.get("insurance_company"):
+                vd_lines[8] = extracted["insurance_company"]
+            if extracted.get("insurance_policy_number"):
+                vd_lines[9] = extracted["insurance_policy_number"]
+            if any(k in extracted for k in ("vin", "insurance_company", "insurance_policy_number")):
+                updates["vehicle_details"] = "\n".join(vd_lines)
+            if extracted.get("email"):
+                updates["email"] = extracted["email"]
+            if extracted.get("driver_license_id"):
+                updates["driver_license_id"] = extracted["driver_license_id"]
+            if updates:
+                attach_db.update_lead(lead_id, updates)
+                ai_filled = sorted(extracted.keys())
+    except Exception as e:
+        logger.warning("Attach AI gap-fill failed for lead %s: %s", lead_id, e)
+
+    # Deliver: straight to the accepting group if one exists, else queue on the
+    # lead so handle_accept_group_offer forwards them on accept.
+    delivered = "queued"
+    acc = attach_db.get_accepted_group_for_lead(lead_id)
+    group = attach_db.get_group_by_id(str(acc.get("group_id"))) if acc else None
+    group_chat = (group or {}).get("group_telegram_id")
+    if group_chat:
+        sent = sum(1 for entry in attachments if _send_attachment_via_bot_api(group_chat, entry))
+        if sent:
+            delivered = f"sent_to_group:{sent}/{len(attachments)}"
+        if sent < len(attachments):
+            logger.warning(
+                "Attach: only %d/%d files delivered to group for lead %s",
+                sent, len(attachments), lead_id,
+            )
+    else:
+        existing = lead.get("phase1_attached_files")
+        existing = existing if isinstance(existing, list) else []
+        known = {str(e.get("file_id")) for e in existing if isinstance(e, dict)}
+        merged = existing + [a for a in attachments if a["file_id"] not in known]
+        attach_db.update_lead(lead_id, {"phase1_attached_files": merged})
+
+    return jsonify({
+        "ok": True,
+        "lead_id": lead_id,
+        "reference_id": lead.get("reference_id"),
+        "delivered": delivered,
+        "ai_filled": ai_filled,
+    }), 200
 
 
 if __name__ == '__main__':

@@ -862,6 +862,7 @@ async def _forward_phase1_attached_files_to_targets(
             continue
         ftype = (f.get("type") or "").lower()
         data_b64 = f.get("data_b64")
+        caption = (f.get("caption") or "").strip()[:1024] or None
         try:
             if data_b64:
                 try:
@@ -876,9 +877,13 @@ async def _forward_phase1_attached_files_to_targets(
                 )
                 upload = InputFile(io.BytesIO(blob), filename=filename)
                 if ftype == "photo":
-                    await context.bot.send_photo(chat_id=_group_cid, photo=upload)
+                    await context.bot.send_photo(
+                        chat_id=_group_cid, photo=upload, caption=caption
+                    )
                 else:
-                    await context.bot.send_document(chat_id=_group_cid, document=upload)
+                    await context.bot.send_document(
+                        chat_id=_group_cid, document=upload, caption=caption
+                    )
                 continue
             fid = f.get("file_id")
             if not fid:
@@ -887,9 +892,11 @@ async def _forward_phase1_attached_files_to_targets(
                 # Prefer censored inline bytes; skip raw historical photo file_id.
                 continue
             if ftype == "photo":
-                await context.bot.send_photo(chat_id=_group_cid, photo=fid)
+                await context.bot.send_photo(chat_id=_group_cid, photo=fid, caption=caption)
             else:
-                await context.bot.send_document(chat_id=_group_cid, document=fid)
+                await context.bot.send_document(
+                    chat_id=_group_cid, document=fid, caption=caption
+                )
         except Exception as e:
             logger.warning("Could not forward attached file to group: %s", e)
 

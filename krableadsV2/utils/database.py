@@ -314,7 +314,27 @@ class Database:
             if "Could not find the table" not in error_msg and "PGRST205" not in error_msg:
                 logger.error(f"Error getting lead by reference ID: {e}")
             return None
-    
+
+    def get_lead_by_external_order_id(self, external_order_id: str) -> Optional[Dict[str, Any]]:
+        """Get the newest lead created for a website order id."""
+        if not self._check_tables_exist():
+            return None
+        try:
+            response = (
+                self.client.table("leads")
+                .select("*")
+                .eq("external_order_id", external_order_id)
+                .order("created_at", desc=True)
+                .limit(1)
+                .execute()
+            )
+            return response.data[0] if response.data else None
+        except Exception as e:
+            error_msg = str(e)
+            if "Could not find the table" not in error_msg and "PGRST205" not in error_msg:
+                logger.error(f"Error getting lead by external order ID: {e}")
+            return None
+
     def upload_receipt_to_storage(
         self,
         lead_id: str,
