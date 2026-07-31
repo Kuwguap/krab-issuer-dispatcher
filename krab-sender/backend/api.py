@@ -19,6 +19,8 @@ from .repository import (
     list_transactions,
     get_rolling_summary_ny,
     set_transaction_work_status,
+    create_preregistered_transaction,
+    find_adoptable_tx_id,
     upsert_driver_live_count,
     delete_driver_live_count,
     list_driver_live_counts,
@@ -230,6 +232,43 @@ def transactions_public(
             }
         )
     return _enrich_tx_rows_with_lead_meta(config, result)
+
+
+class PreRegisterBody(BaseModel):
+    reference_id: Optional[str] = None
+    client_name: Optional[str] = None
+    price: Optional[str] = None
+    client_phone: Optional[str] = None
+    client_email: Optional[str] = None
+    issuer_name: Optional[str] = None
+    issuer_handle: Optional[str] = None
+    filename: Optional[str] = None
+    client_details: Optional[str] = None
+
+
+@app.post("/transactions/pre-register", dependencies=[Depends(require_admin)])
+def transactions_pre_register(body: PreRegisterBody):
+    """Immediate ledger registration: EITHER bot posts a PENDING row the moment
+    it first touches a job; the eventual send adopts the row and fills the
+    remaining columns. Idempotent per reference: an existing adoptable row is
+    returned instead of creating a duplicate."""
+    ref = (body.reference_id or "").strip() or None
+    if ref:
+        existing = find_adoptable_tx_id(ref)
+        if existing:
+            return {"ok": True, "id": existing, "existing": True}
+    tx_id = create_preregistered_transaction(
+        reference_id=ref,
+        client_name=body.client_name,
+        price=body.price,
+        client_phone=body.client_phone,
+        client_email=body.client_email,
+        issuer_name=body.issuer_name,
+        issuer_handle=body.issuer_handle,
+        filename=body.filename or "",
+        client_details=body.client_details or "",
+    )
+    return {"ok": True, "id": tx_id, "existing": False}
 
 
 class WorkStatusBody(BaseModel):

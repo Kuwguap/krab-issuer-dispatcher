@@ -342,6 +342,103 @@ def delete_recipient(recipient_id: str) -> bool:
         return True
 
 
+# ── Immediate ledger registration ──────────────────────────────────────────
+# Rows are posted the moment EITHER bot first touches a job (lead created in
+# krableadsV2, or PDF uploaded to krab-sender) as PENDING with whatever
+# columns are known; the send later ADOPTS the row and fills the rest.
+
+
+def create_preregistered_transaction(
+    *,
+    reference_id: str | None = None,
+    client_name: str | None = None,
+    price: str | None = None,
+    client_phone: str | None = None,
+    client_email: str | None = None,
+    issuer_name: str | None = None,
+    issuer_handle: str | None = None,
+    filename: str = "",
+    client_details: str = "",
+) -> str:
+    """Create a PENDING ledger row immediately. Returns the new row id."""
+    import uuid as _uuid
+
+    tx_id = str(_uuid.uuid4())
+    orm = TransactionORM(
+        id=tx_id,
+        telegram_name=issuer_name or "(pending)",
+        telegram_handle=issuer_handle,
+        filename=filename or "",
+        client_details=client_details or "",
+        recipient_name=None,
+        recipient_email=None,
+        issuer_group=None,
+        reference_id=(reference_id or "").strip() or None,
+        timestamp_utc=datetime.now(timezone.utc),
+        delivery_status="PENDING",
+        client_name=(client_name or "").strip() or None,
+        price=(price or "").strip() or None,
+        client_phone=(client_phone or "").strip() or None,
+        client_email=(client_email or "").strip() or None,
+    )
+    with get_session() as session:
+        session.add(orm)
+        session.flush()
+    return tx_id
+
+
+def find_adoptable_tx_id(reference_id: str | None) -> Optional[str]:
+    """Most recent PENDING pre-registered row (no recipient yet) for a ref."""
+    ref = (reference_id or "").strip()
+    if not ref:
+        return None
+    with get_session() as session:
+        row = (
+            session.query(TransactionORM)
+            .filter(
+                TransactionORM.reference_id == ref,
+                func.upper(func.coalesce(TransactionORM.delivery_status, "")) == "PENDING",
+                TransactionORM.recipient_email.is_(None),
+                TransactionORM.recipient_name.is_(None),
+            )
+            .order_by(TransactionORM.timestamp_utc.desc())
+            .first()
+        )
+        return row.id if row else None
+
+
+def persist_send_transaction(tx: Transaction, adopt_id: Optional[str] = None) -> str:
+    """Record a send: adopt a pre-registered row when one exists, else insert.
+
+    Send-time values win; pre-registered client fields survive when the send
+    didn't capture that field. Returns the ledger row id actually used.
+    """
+    target_id = adopt_id or find_adoptable_tx_id(tx.reference_id)
+    if not target_id:
+        save_transaction(tx)
+        return tx.id
+    with get_session() as session:
+        row = session.query(TransactionORM).filter(TransactionORM.id == target_id).first()
+        if not row:
+            save_transaction(tx)
+            return tx.id
+        row.telegram_name = tx.telegram_name or row.telegram_name
+        row.telegram_handle = tx.telegram_handle or row.telegram_handle
+        row.filename = tx.filename or row.filename
+        row.client_details = tx.client_details or row.client_details
+        row.recipient_name = tx.recipient_name
+        row.recipient_email = tx.recipient_email
+        row.issuer_group = tx.issuer_group or row.issuer_group
+        row.reference_id = tx.reference_id or row.reference_id
+        row.timestamp_utc = tx.timestamp
+        row.delivery_status = tx.delivery_status
+        row.client_name = tx.client_name or row.client_name
+        row.price = tx.price or row.price
+        row.client_phone = tx.client_phone or row.client_phone
+        row.client_email = tx.client_email or row.client_email
+        return target_id
+
+
 _WORK_STATUSES = {"working_on_it", "stuck", "in_progress", "done"}
 
 

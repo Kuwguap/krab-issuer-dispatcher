@@ -121,6 +121,15 @@ def ingest_external_lead(
     except Exception as e:
         logger.warning("API lead follow-up auto-close failed: %s", e)
 
+    # Immediate ledger registration on the dispatch backend (PENDING row now;
+    # the tag send adopts it and fills the remaining columns later).
+    try:
+        from utils import ledger as _ledger
+        if _ledger.is_configured():
+            _ledger.preregister_lead(lead)
+    except Exception as e:
+        logger.warning("API lead ledger pre-register failed: %s", e)
+
     return {
         "lead_id": str(lead.get("id")),
         "reference_id": lead.get("reference_id") or reference_id,

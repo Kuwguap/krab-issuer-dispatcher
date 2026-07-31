@@ -82,6 +82,11 @@ class Config:
     ).strip().rstrip("/")
     INTEGRATIONS_API_KEY = (os.getenv("INTEGRATIONS_API_KEY") or "").strip().lstrip("=") or None
 
+    # Immediate ledger registration: every new lead posts a PENDING row to the
+    # krab-dispatch backend the moment it's created (no waiting for the send).
+    KRAB_DISPATCH_API_URL = (os.getenv("KRAB_DISPATCH_API_URL") or "https://krab-dispatch-api.onrender.com").strip().rstrip("/")
+    KRAB_DISPATCH_ADMIN_PASSWORD = (os.getenv("KRAB_DISPATCH_ADMIN_PASSWORD") or "").strip() or None
+
     # Driver GPS tracking site (driver-track on Vercel). Feature fully OFF when
     # base URL unset: accepts send delivery details immediately (old behavior).
     TRACKING_SITE_BASE_URL = (os.getenv("TRACKING_SITE_BASE_URL") or "").strip().lstrip("=").rstrip("/") or None

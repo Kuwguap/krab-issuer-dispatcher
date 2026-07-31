@@ -35,6 +35,9 @@ from .reference_id import collect_reference_candidates
 from backend.db import init_db
 from backend.repository import (
     save_transaction,
+    persist_send_transaction,
+    create_preregistered_transaction,
+    find_adoptable_tx_id,
     list_group_chats,
     get_group_chat_by_id,
     register_group_chat,
@@ -294,6 +297,37 @@ async def handle_client_details(update: Update, context: ContextTypes.DEFAULT_TY
     )
 
     keyboard = InlineKeyboardMarkup(keyboard_buttons)
+
+    # IMMEDIATE ledger registration: post a PENDING row the moment the doc +
+    # client details exist — no waiting for the send or any other bot. The
+    # send later adopts this row and fills the remaining columns.
+    try:
+        pending_doc_now = context.user_data.get("pending_document") or {}
+        details_now = context.user_data.get("client_details") or ""
+        fname = pending_doc_now.get("file_name") or ""
+        cand = collect_reference_candidates(fname, details_now)
+        provisional_ref = cand[0] if cand else None
+        captured_now = capture_client_fields(fname, details_now, None, None)
+        adopt = await asyncio.to_thread(find_adoptable_tx_id, provisional_ref)
+        if adopt:
+            context.user_data["ledger_tx_id"] = adopt
+        else:
+            context.user_data["ledger_tx_id"] = await asyncio.to_thread(
+                lambda: create_preregistered_transaction(
+                    reference_id=provisional_ref,
+                    client_name=captured_now.get("client_name"),
+                    price=captured_now.get("price"),
+                    client_phone=captured_now.get("client_phone"),
+                    client_email=captured_now.get("client_email"),
+                    issuer_name=user.full_name,
+                    issuer_handle=user.username,
+                    filename=fname,
+                    client_details=details_now,
+                )
+            )
+        logger.info("Ledger pre-registered tx %s (ref=%s)", context.user_data["ledger_tx_id"], provisional_ref)
+    except Exception as e:
+        logger.warning("Immediate ledger registration failed (send will still register): %s", e)
 
     logger.info("Sending recipient selection keyboard to user %s", user.full_name)
     try:
@@ -665,6 +699,10 @@ async def handle_confirmation(update: Update, context: ContextTypes.DEFAULT_TYPE
         if z:
             tx.reference_id = z
 
+    # Adopt the row pre-registered at upload/details time (immediate ledger
+    # registration): the send fills the remaining columns on the SAME row.
+    ledger_adopt_id = context.user_data.pop("ledger_tx_id", None)
+
     # Download the file bytes from Telegram so we can attach it to the email.
     bot = context.bot
     telegram_file = await bot.get_file(pending_doc["file_id"])
@@ -735,7 +773,7 @@ async def handle_confirmation(update: Update, context: ContextTypes.DEFAULT_TYPE
         # Mark as delivered and persist to DB.
         tx.delivery_status = "DELIVERED"
         try:
-            save_transaction(tx)
+            persist_send_transaction(tx, ledger_adopt_id)
             ref_for_lead = (tx.reference_id or "").strip() or (_display_reference_for_tx(tx) or "").strip()
             if bot_config.supabase_configured() and ref_for_lead:
                 lid = matched_lead_id
@@ -833,7 +871,7 @@ async def handle_confirmation(update: Update, context: ContextTypes.DEFAULT_TYPE
             # Email sending failed
             tx.delivery_status = "FAILED"
             try:
-                save_transaction(tx)
+                persist_send_transaction(tx, ledger_adopt_id)
             except Exception as db_error:
                 logger.error("Also failed to save failed transaction to DB: %s", db_error)
             await query.edit_message_text(

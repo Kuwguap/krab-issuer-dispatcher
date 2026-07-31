@@ -4891,7 +4891,7 @@ async def _finalize_lead_after_notes(
     if not lead:
         await message.reply_text("❌ Error saving lead to database.")
         return ConversationHandler.END
-    await _fu_auto_close_for_lead(context, lead)
+    await _on_lead_created(context, lead)
 
     reference_id = lead.get("reference_id", "N/A")
 
@@ -5036,7 +5036,7 @@ async def _submit_lead_from_review(message, context, user_id, data):
     if not lead:
         await message.reply_text("❌ Could not save lead.")
         return ConversationHandler.END
-    await _fu_auto_close_for_lead(context, lead)
+    await _on_lead_created(context, lead)
 
     drivers_list: list = []
     try:
@@ -5210,7 +5210,7 @@ async def handle_group_selection(update: Update, context: ContextTypes.DEFAULT_T
         if not lead:
             await query.message.reply_text("❌ Error saving lead to database.")
             return ConversationHandler.END
-        await _fu_auto_close_for_lead(context, lead)
+        await _on_lead_created(context, lead)
 
         reference_id = lead.get("reference_id", "N/A")
 
@@ -5411,7 +5411,7 @@ async def handle_group_selection(update: Update, context: ContextTypes.DEFAULT_T
     if not lead:
         await query.message.reply_text("❌ Error saving lead to database.")
         return ConversationHandler.END
-    await _fu_auto_close_for_lead(context, lead)
+    await _on_lead_created(context, lead)
 
     reference_id = lead.get("reference_id", "N/A")
 
@@ -5628,7 +5628,7 @@ async def handle_driver_selection(update: Update, context: ContextTypes.DEFAULT_
         if not lead:
             await query.message.reply_text("❌ Error saving lead to database.")
             return ConversationHandler.END
-        await _fu_auto_close_for_lead(context, lead)
+        await _on_lead_created(context, lead)
 
     had_broadcast_offers = bool(db.get_group_lead_offers(lead["id"]))
     if lead_data.get("follow_after_broadcast") and lead.get("group_id"):
@@ -9805,6 +9805,21 @@ async def _fu_auto_close_for_lead(context: ContextTypes.DEFAULT_TYPE, lead: dict
             )
         except Exception as e:
             logger.warning("Could not notify agent %s of auto-closed follow-up: %s", chat_id, e)
+
+
+async def _on_lead_created(context: ContextTypes.DEFAULT_TYPE, lead: dict | None) -> None:
+    """Everything that fires the moment a lead exists: auto-close matching
+    follow-ups AND immediately register the lead on the dispatch ledger
+    (PENDING row now; the tag send fills the remaining columns later)."""
+    if not lead:
+        return
+    await _fu_auto_close_for_lead(context, lead)
+    try:
+        from utils import ledger
+        if ledger.is_configured():
+            await asyncio.to_thread(ledger.preregister_lead, lead)
+    except Exception as e:
+        logger.warning("Ledger pre-register hook failed: %s", e)
 
 
 async def cmd_followup_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
