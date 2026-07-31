@@ -997,6 +997,48 @@ async def _post_lead_to_all_groups_for_approval(
             logger.warning("All-groups approval send failed for %s: %s", g.get("group_name"), e)
 
 
+async def _api_lead_auto_dispatch_after_group_accept(
+    context: ContextTypes.DEFAULT_TYPE,
+    lead: dict,
+    winner_group: dict,
+) -> None:
+    """Website (API-ingested) lead: a team accepted — dispatch drivers now.
+
+    There is no human issuer to hand-pick drivers, so the winning group gets
+    the full tag and every eligible driver gets Accept/Decline immediately.
+    """
+    reference_id = lead.get("reference_id", "N/A")
+    try:
+        await _send_full_group_lead_to_chat(
+            context,
+            winner_group,
+            lead,
+            html_prefix="<b>✅ Your group claimed this website client</b>\n\n",
+            mirror_supervisory=False,
+        )
+    except Exception as e:
+        logger.warning("API lead: could not post full lead to winner group: %s", e)
+    count, driver_names, fail_reason, driver_scope = await _send_driver_requests_for_group(
+        context, lead, winner_group,
+    )
+    gcid = _parse_chat_id(winner_group.get("group_telegram_id"))
+    try:
+        if count > 0:
+            await context.bot.send_message(
+                chat_id=gcid,
+                text=f"🚗 Sent to driver(s): **{driver_names}**\nReference: `{reference_id}`",
+                parse_mode="Markdown",
+            )
+        else:
+            await context.bot.send_message(
+                chat_id=gcid,
+                text=_group_accept_notify_fail_text(reference_id, fail_reason, driver_scope),
+                parse_mode="Markdown",
+            )
+    except Exception as e:
+        logger.warning("API lead: could not notify winner group about driver dispatch: %s", e)
+
+
 def _resolve_all_active_driver_ids() -> list[str]:
     try:
         suspended = _get_suspended_driver_ids()
@@ -1033,8 +1075,8 @@ async def process_pending_api_lead_dispatches(context: ContextTypes.DEFAULT_TYPE
         if not lead_id:
             continue
         try:
-            # Primary group (owns the lead row) = the one assigned at ingest, or
-            # the first active group. The tag itself is posted to EVERY group.
+            # Primary group (owns the lead row until a team accepts) = the one
+            # assigned at ingest, or the first active group.
             main_group = db.get_group_by_id(lead.get("group_id")) if lead.get("group_id") else None
             if not main_group or not record_is_active(main_group):
                 main_group = active_groups[0]
@@ -1042,40 +1084,25 @@ async def process_pending_api_lead_dispatches(context: ContextTypes.DEFAULT_TYPE
             # Claim the lead BEFORE sending so the 10s poller can't re-dispatch it.
             db.update_lead(lead_id, {
                 "ingest_dispatch_pending": False,
-                "awaiting_group_accept": False,
+                "awaiting_group_accept": True,
                 "group_id": main_group.get("id"),
             })
 
-            # 1) Post the full tag to EVERY active group.
-            posted = 0
-            for g in active_groups:
-                try:
-                    await _send_full_group_lead_to_chat(
-                        context, g, lead, header_text="🏷NEW WEBSITE CLIENT❗️",
-                    )
-                    posted += 1
-                except Exception as e:
-                    logger.warning(
-                        "API ingest: could not post lead %s to group %s (%s): %s",
-                        lead_id, g.get("group_name"), g.get("group_telegram_id"), e,
-                    )
-            if posted == 0:
+            # Same flow as issuer broadcast leads: Accept offers to EVERY active
+            # group — first team to Accept wins the lead (the other groups'
+            # offers flip to "taken"), then drivers are dispatched automatically
+            # (see the website-lead branch in handle_accept_group_offer).
+            await _post_lead_to_all_groups_for_approval(context, lead, active_groups)
+            offers = db.get_group_lead_offers(lead_id) or []
+            logger.info(
+                "API ingest: lead %s ref %s offered to %d/%d group(s) for first-accept",
+                lead_id, lead.get("reference_id"), len(offers), len(active_groups),
+            )
+            if not offers:
                 logger.error(
                     "API ingest: lead %s ref %s reached NO groups — check group chat ids / bot membership",
                     lead_id, lead.get("reference_id"),
                 )
-
-            # 2) DM every active driver individually with Accept/Decline. With no
-            #    group-linked drivers this falls back to the global pool ("drivers work
-            #    for all groups"), i.e. all active drivers.
-            assigned, names, reason, scope = await _send_driver_requests_for_group(
-                context, lead, main_group,
-            )
-            logger.info(
-                "API ingest: lead %s ref %s posted to %d/%d group(s), dispatched to %d driver(s) [%s]%s",
-                lead_id, lead.get("reference_id"), posted, len(active_groups), assigned, scope,
-                f" reason={reason}" if reason else "",
-            )
         except Exception as e:
             logger.error("process_pending_api_lead_dispatches failed for %s: %s", lead_id, e)
 
@@ -7653,6 +7680,13 @@ async def handle_accept_group_offer(update: Update, context: ContextTypes.DEFAUL
     else:
         # Multi-group broadcast: offers exist; issuer picks drivers only after a team accepts.
         if offers:
+            lead_fresh = db.get_lead_by_id(lead_id) or lead
+            if lead_fresh.get("external_order_id"):
+                # Website lead — no human issuer: auto-dispatch drivers now.
+                await _api_lead_auto_dispatch_after_group_accept(
+                    context, lead_fresh, winner_group
+                )
+                return
             try:
                 await _issuer_open_driver_selection_after_group_accept(
                     context, str(lead_id), lead_for_files
@@ -7660,11 +7694,10 @@ async def handle_accept_group_offer(update: Update, context: ContextTypes.DEFAUL
             except Exception as e:
                 logger.warning("Could not notify issuer after group accept: %s", e)
             try:
-                lead_for_group = db.get_lead_by_id(lead_id) or lead
                 await _send_full_group_lead_to_chat(
                     context,
                     winner_group,
-                    lead_for_group,
+                    lead_fresh,
                     html_prefix="<b>✅ Your group claimed this client</b>\n\n",
                     mirror_supervisory=False,
                 )
