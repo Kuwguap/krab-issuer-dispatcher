@@ -45,11 +45,13 @@ from backend.repository import (
     list_group_members,
 )
 from backend.issuer_supabase import (
+    fetch_lead_row_by_reference,
     get_lead_id_by_reference,
     get_pending_tag_lead_id_by_reference,
     mark_krab_tag_pdf_sent,
     resolve_reference_from_filename as resolve_issuer_ref_from_supabase,
 )
+from .client_capture import capture_client_fields
 
 
 logging.basicConfig(
@@ -531,7 +533,16 @@ async def handle_confirmation(update: Update, context: ContextTypes.DEFAULT_TYPE
     ref: str | None = None
     matched_lead_id: str | None = None
 
-    if bot_config.supabase_configured():
+    # INDEPENDENT REGISTRATION: capture client fields from purely local data
+    # (filename + typed notes) BEFORE any Supabase involvement — the ledger
+    # must register this send fully even if the Issuer system never matches.
+    captured = capture_client_fields(
+        file_name, client_details_text, recipient_name, recipient_email
+    )
+
+    async def _resolve_ref_via_supabase() -> tuple[str | None, str | None, dict | None]:
+        r: str | None = None
+        mid: str | None = None
         # Try explicit 8-char tokens in file/client text first (fast, exact match).
         for cand in candidates:
             lid = await asyncio.to_thread(
@@ -541,13 +552,11 @@ async def handle_confirmation(update: Update, context: ContextTypes.DEFAULT_TYPE
                 cand,
             )
             if lid:
-                ref = cand
-                matched_lead_id = lid
+                r = cand
+                mid = lid
                 logger.info(
                     "Krab Issuer ref (pending tag): ref=%s lead_id=%s file=%s",
-                    ref,
-                    matched_lead_id,
-                    file_name,
+                    r, mid, file_name,
                 )
                 break
 
@@ -563,20 +572,59 @@ async def handle_confirmation(update: Update, context: ContextTypes.DEFAULT_TYPE
         if fuzzy_lid:
             logger.info(
                 "Krab Issuer fuzzy name match: ref=%s lead_id=%s file=%s",
-                fuzzy_ref,
-                fuzzy_lid,
-                file_name,
+                fuzzy_ref, fuzzy_lid, file_name,
             )
-            if not matched_lead_id:
-                ref = fuzzy_ref
-                matched_lead_id = fuzzy_lid
+            if not mid:
+                r = fuzzy_ref
+                mid = fuzzy_lid
 
+        # Fetch the lead row only when local capture left gaps to fill.
+        row: dict | None = None
+        if mid and r and not all(captured.values()):
+            try:
+                row = await asyncio.to_thread(
+                    fetch_lead_row_by_reference,
+                    bot_config.supabase_url,
+                    bot_config.supabase_service_role_key,
+                    r,
+                )
+            except Exception:
+                row = None
+        return r, mid, row
+
+    lead_row: dict | None = None
+    if bot_config.supabase_configured():
+        try:
+            # One bounded budget for ALL pre-send Supabase lookups: a hung
+            # Issuer DB must never stall the send (registration is local-first).
+            ref, matched_lead_id, lead_row = await asyncio.wait_for(
+                _resolve_ref_via_supabase(), timeout=8.0
+            )
+        except (asyncio.TimeoutError, Exception) as e:
+            logger.warning(
+                "Issuer lead match skipped (%s: %s) — registering independently",
+                type(e).__name__, e,
+            )
+            ref, matched_lead_id, lead_row = None, None, None
         # Non-DB fallback to any 8-char token if still nothing resolved.
         if not ref and candidates:
             ref = candidates[0]
     else:
         ref = candidates[0] if candidates else None
         logger.info("Supabase not configured: skipping Issuer lead match.")
+
+    # Gap-fill ONLY missing captured fields from the matched lead (if any).
+    if lead_row:
+        vd_lines = [l.strip() for l in str(lead_row.get("vehicle_details") or "").splitlines() if l.strip()]
+        lead_vals = {
+            "client_name": vd_lines[0] if vd_lines else None,
+            "price": (str(lead_row.get("price")).strip() or None) if lead_row.get("price") is not None else None,
+            "client_phone": (str(lead_row.get("phone_number") or "").strip() or None),
+            "client_email": (str(lead_row.get("email") or "").strip() or None),
+        }
+        for k, v in lead_vals.items():
+            if not captured.get(k) and v:
+                captured[k] = v
 
     # Final pass: filename/client extraction only (no DB). Fixes lowercase filenames & pasted Issuer lines.
     if not (ref or "").strip():
@@ -607,6 +655,10 @@ async def handle_confirmation(update: Update, context: ContextTypes.DEFAULT_TYPE
             bot_config,
         ),
         reference_id=ref,
+        client_name=captured.get("client_name"),
+        price=captured.get("price"),
+        client_phone=captured.get("client_phone"),
+        client_email=captured.get("client_email"),
     )
     if not (tx.reference_id or "").strip():
         z = _display_reference_for_tx(tx)

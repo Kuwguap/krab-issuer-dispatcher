@@ -29,6 +29,12 @@ class Transaction:
     reference_id: Optional[str]
     timestamp: datetime
     delivery_status: str
+    # Independent registration: client fields captured locally at send time
+    # (filename + typed notes) — never dependent on the Issuer Supabase.
+    client_name: Optional[str] = None
+    price: Optional[str] = None
+    client_phone: Optional[str] = None
+    client_email: Optional[str] = None
 
     @classmethod
     def new(
@@ -43,6 +49,10 @@ class Transaction:
         issuer_group: Optional[str] = None,
         reference_id: Optional[str] = None,
         delivery_status: str = "PENDING",
+        client_name: Optional[str] = None,
+        price: Optional[str] = None,
+        client_phone: Optional[str] = None,
+        client_email: Optional[str] = None,
     ) -> "Transaction":
         return cls(
             id=id,
@@ -56,6 +66,10 @@ class Transaction:
             reference_id=reference_id,
             timestamp=datetime.now(timezone.utc),
             delivery_status=delivery_status,
+            client_name=client_name,
+            price=price,
+            client_phone=client_phone,
+            client_email=client_email,
         )
 
 

@@ -61,16 +61,31 @@ def _transactions_since_utc_for_period(period: Optional[str]) -> Optional[dateti
     return datetime.now(timezone.utc) - timedelta(days=days)
 
 
+def _merge_lead_fields(row: dict, meta: dict | None) -> None:
+    """Independent registration: persisted send-time columns win; the Issuer
+    lead join fills only blanks. Receipt fields are join-only (the receipt is
+    uploaded to the Issuer bot after the send)."""
+    m = meta or {}
+
+    def persisted(key: str):
+        v = row.get(key)
+        return str(v).strip() if v is not None and str(v).strip() else None
+
+    row["lead_client_name"] = persisted("client_name") or m.get("lead_client_name")
+    row["price"] = persisted("price") or m.get("price")
+    row["lead_client_phone"] = persisted("client_phone") or m.get("lead_client_phone")
+    row["lead_client_email"] = persisted("client_email") or m.get("lead_client_email")
+    row["receipt_image_url"] = m.get("receipt_image_url")
+    row["receipt_price"] = m.get("receipt_price")
+
+
 def _enrich_tx_rows_with_lead_meta(config: ApiConfig, rows: list[dict]) -> list[dict]:
-    """Attach Krab Issuer lead client name + receipt URL when Supabase is configured."""
+    """Merge persisted send-time client fields with optional Issuer lead join."""
     if not config.supabase_configured() or not rows:
+        # Self-sufficiency guarantee: rows render fully from persisted columns
+        # even with no Supabase at all.
         for r in rows:
-            r.setdefault("lead_client_name", None)
-            r.setdefault("receipt_image_url", None)
-            r.setdefault("price", None)
-            r.setdefault("receipt_price", None)
-            r.setdefault("lead_client_phone", None)
-            r.setdefault("lead_client_email", None)
+            _merge_lead_fields(r, None)
         return rows
     refs = [(r.get("reference_id") or "").strip() for r in rows if (r.get("reference_id") or "").strip()]
     meta = (
@@ -80,29 +95,7 @@ def _enrich_tx_rows_with_lead_meta(config: ApiConfig, rows: list[dict]) -> list[
     )
     for r in rows:
         ref = (r.get("reference_id") or "").strip()
-        if not ref:
-            r["lead_client_name"] = None
-            r["receipt_image_url"] = None
-            r["price"] = None
-            r["receipt_price"] = None
-            r["lead_client_phone"] = None
-            r["lead_client_email"] = None
-            continue
-        m = meta.get(ref)
-        if not m:
-            r["lead_client_name"] = None
-            r["receipt_image_url"] = None
-            r["price"] = None
-            r["receipt_price"] = None
-            r["lead_client_phone"] = None
-            r["lead_client_email"] = None
-        else:
-            r["lead_client_name"] = m.get("lead_client_name")
-            r["receipt_image_url"] = m.get("receipt_image_url")
-            r["price"] = m.get("price")
-            r["receipt_price"] = m.get("receipt_price")
-            r["lead_client_phone"] = m.get("lead_client_phone")
-            r["lead_client_email"] = m.get("lead_client_email")
+        _merge_lead_fields(r, meta.get(ref) if ref else None)
     return rows
 
 
@@ -225,6 +218,10 @@ def transactions_public(
                 "reference_id": tx.reference_id,
                 "timestamp_ny": ts_ny.isoformat(),
                 "delivery_status": tx.delivery_status,
+                "client_name": tx.client_name,
+                "price": tx.price,
+                "client_phone": tx.client_phone,
+                "client_email": tx.client_email,
             }
         )
     return _enrich_tx_rows_with_lead_meta(config, result)
@@ -285,6 +282,10 @@ def transactions_latest(config: ApiConfig = Depends(get_api_config)):
         "reference_id": tx.reference_id,
         "timestamp_ny": ts_ny.isoformat(),
         "delivery_status": tx.delivery_status,
+        "client_name": tx.client_name,
+        "price": tx.price,
+        "client_phone": tx.client_phone,
+        "client_email": tx.client_email,
     }
     enriched = _enrich_tx_rows_with_lead_meta(config, [row])
     return enriched[0] if enriched else row
@@ -318,6 +319,10 @@ def transactions(
                 "reference_id": tx.reference_id,
                 "timestamp_ny": ts_ny.isoformat(),
                 "delivery_status": tx.delivery_status,
+                "client_name": tx.client_name,
+                "price": tx.price,
+                "client_phone": tx.client_phone,
+                "client_email": tx.client_email,
             }
         )
 
@@ -392,8 +397,11 @@ def transactions_full(
                 "timestamp_ny": ts_ny.isoformat(),
                 "filename": tx.filename,
                 "delivery_status": tx.delivery_status,
-                "tag_name": (ctx or {}).get("tag_name"),
-                "price": (ctx or {}).get("price"),
+                # Persisted send-time fields win; lead ctx fills blanks only.
+                "tag_name": (tx.client_name or "").strip() or (ctx or {}).get("tag_name"),
+                "price": (tx.price or "").strip() or (ctx or {}).get("price"),
+                "client_phone": (tx.client_phone or "").strip() or (ctx or {}).get("client_phone"),
+                "client_email": (tx.client_email or "").strip() or (ctx or {}).get("client_email"),
                 "receipt_price": (ctx or {}).get("receipt_price"),
                 "receipt_image_url": (ctx or {}).get("receipt_image_url"),
                 "issuer_group": (ctx or {}).get("group_name") or tx.issuer_group,

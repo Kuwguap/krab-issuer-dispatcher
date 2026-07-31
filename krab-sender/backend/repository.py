@@ -57,6 +57,10 @@ def save_transaction(tx: Transaction) -> None:
         reference_id=tx.reference_id,
         timestamp_utc=tx.timestamp,
         delivery_status=tx.delivery_status,
+        client_name=tx.client_name,
+        price=tx.price,
+        client_phone=tx.client_phone,
+        client_email=tx.client_email,
     )
     with get_session() as session:
         session.add(orm)
@@ -94,6 +98,10 @@ def list_transactions(
                 reference_id=row.reference_id,
                 timestamp=row.timestamp_utc,
                 delivery_status=row.delivery_status,
+                client_name=row.client_name,
+                price=row.price,
+                client_phone=row.client_phone,
+                client_email=row.client_email,
             )
             for row in rows
         ]
@@ -123,6 +131,10 @@ def get_latest_transaction() -> Optional[Transaction]:
             reference_id=row.reference_id,
             timestamp=row.timestamp_utc,
             delivery_status=row.delivery_status,
+            client_name=row.client_name,
+            price=row.price,
+            client_phone=row.client_phone,
+            client_email=row.client_email,
         )
 
     return tx
@@ -217,6 +229,10 @@ def get_rolling_summary_ny(
                 "client_details": r.client_details,
                 "timestamp_ny": r.timestamp_utc.astimezone(NY_TZ).isoformat(),
                 "delivery_status": r.delivery_status,
+                "client_name": r.client_name,
+                "price": r.price,
+                "client_phone": r.client_phone,
+                "client_email": r.client_email,
             }
             for r in rows
         ]

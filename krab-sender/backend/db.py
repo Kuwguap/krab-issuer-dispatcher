@@ -62,6 +62,14 @@ class TransactionORM(Base):
     # Krab Issuer lead reference (8-char prefix from PDF filename); nullable for legacy rows.
     reference_id = Column(String, nullable=True, index=True)
 
+    # Independent registration: client fields captured AT SEND TIME from local
+    # data (filename + typed notes), so the ledger never depends on a matching
+    # lead in the Issuer Supabase. The read-time lead join fills only blanks.
+    client_name = Column(String, nullable=True)
+    price = Column(String, nullable=True)  # TEXT — matches the join's stringified price
+    client_phone = Column(String, nullable=True)
+    client_email = Column(String, nullable=True)
+
     # Stored in UTC, always timezone-aware on the Python side.
     timestamp_utc = Column(DateTime(timezone=True), nullable=False, index=True)
 
@@ -134,6 +142,9 @@ def init_db() -> None:
         alter_statements.append("ALTER TABLE transactions ADD COLUMN issuer_group VARCHAR")
     if "reference_id" not in transaction_columns:
         alter_statements.append("ALTER TABLE transactions ADD COLUMN reference_id VARCHAR")
+    for col in ("client_name", "price", "client_phone", "client_email"):
+        if col not in transaction_columns:
+            alter_statements.append(f"ALTER TABLE transactions ADD COLUMN {col} VARCHAR")
 
     if alter_statements:
         with engine.begin() as conn:
