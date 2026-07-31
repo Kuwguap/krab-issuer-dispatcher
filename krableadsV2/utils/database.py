@@ -2030,11 +2030,14 @@ class Database:
         renewal_id: str | None = None,
         reference_id: str | None = None,
         delivery_address: str | None = None,
+        details_sent_at: str | None = None,
     ) -> Optional[Dict[str, Any]]:
         """Create a pending tracking session. Returns row or None on failure.
 
         ``delivery_address`` (v2 column) powers the admin map's destination/ETA;
         if the v2 migration hasn't run yet, the insert retries without it.
+        ``details_sent_at`` marks sessions whose details were already delivered
+        (optional-location mode) so the job neither re-sends nor nags.
         """
         if not self._check_tables_exist():
             return None
@@ -2044,6 +2047,8 @@ class Database:
             "chat_id": str(chat_id),
             "status": "pending",
         }
+        if details_sent_at:
+            row["details_sent_at"] = details_sent_at
         if driver_id:
             row["driver_id"] = str(driver_id)
         if driver_name:

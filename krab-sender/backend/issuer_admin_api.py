@@ -367,6 +367,41 @@ def _stream_receipt_image(
     )
 
 
+_TRACK_STREET_RE = re.compile(
+    r"(\d{1,6}[ ][0-9A-Za-z .'\-]{2,40}?\b(?:St|Street|Ave|Avenue|Rd|Road|Blvd|Boulevard|"
+    r"Dr|Drive|Ln|Lane|Ct|Court|Pl|Place|Way|Ter|Terrace|Pkwy|Parkway|Hwy|Highway)\b)",
+    re.IGNORECASE,
+)
+_TRACK_ZIP_RE = re.compile(r"\b(\d{5})(?:-\d{4})?\b")
+
+
+def _track_geocode_candidates(addr: str) -> list:
+    """Geocode fallback ladder for messy delivery addresses.
+
+    Real-world addresses carry newlines, floor markers ("1st"), and local
+    abbreviations ("Springfield GAR") that Nominatim can't resolve as-is.
+    Ladder: full collapsed address → "house# street, zip" → bare zip centroid.
+    """
+    collapsed = " ".join(str(addr or "").split())
+    out = []
+    if collapsed:
+        out.append(collapsed)
+    zips = _TRACK_ZIP_RE.findall(collapsed)
+    zip_code = zips[-1] if zips else ""
+    m = _TRACK_STREET_RE.search(collapsed)
+    if m and zip_code:
+        out.append(f"{m.group(1)}, {zip_code}")
+    if zip_code:
+        out.append(zip_code)
+    seen = set()
+    result = []
+    for q in out:
+        if q.lower() not in seen:
+            seen.add(q.lower())
+            result.append(q)
+    return result
+
+
 def _telegram_bot_token() -> str:
     # Issuer-specific vars first: this resolver serves issuer-uploaded files,
     # and TELEGRAM_BOT_TOKEN on this service is the (wrong) sender bot.
@@ -657,16 +692,22 @@ def issuer_tracking_route(
     elif addr:
         hit = _TRACK_GEO_CACHE["geocode"].get(addr)
         if hit is None and addr not in _TRACK_GEO_CACHE["geocode"]:
-            try:
-                g = _track_get_json(
-                    "https://nominatim.openstreetmap.org/search",
-                    params={"format": "json", "limit": 1, "countrycodes": "us", "q": addr},
-                    headers=_NOMINATIM_HEADERS,
-                    timeout=15,
-                )
-                hit = {"lat": float(g[0]["lat"]), "lng": float(g[0]["lon"])} if g else None
-            except Exception:
-                hit = None
+            hit = None
+            for i, q in enumerate(_track_geocode_candidates(addr)):
+                if i:
+                    time.sleep(1.05)  # Nominatim: max 1 req/s
+                try:
+                    g = _track_get_json(
+                        "https://nominatim.openstreetmap.org/search",
+                        params={"format": "json", "limit": 1, "countrycodes": "us", "q": q},
+                        headers=_NOMINATIM_HEADERS,
+                        timeout=15,
+                    )
+                    if g:
+                        hit = {"lat": float(g[0]["lat"]), "lng": float(g[0]["lon"])}
+                        break
+                except Exception:
+                    continue
             _TRACK_GEO_CACHE["geocode"][addr] = hit
         if hit:
             to = {"lat": hit["lat"], "lng": hit["lng"], "address": addr}

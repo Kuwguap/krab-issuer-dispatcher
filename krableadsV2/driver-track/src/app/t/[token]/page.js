@@ -256,8 +256,8 @@ export default function TrackPage({ params }) {
         ) : null}
         <AmberButton onClick={shareLocation}>Try again</AmberButton>
         <p style={{ color: "var(--text-muted)", margin: 0, fontSize: 13 }}>
-          Location is required to receive the details. If you can&apos;t enable it, contact
-          your supervisor.
+          Sharing is optional — your delivery details are already in Telegram.
+          It just lets dispatch follow your trip and remind you about the receipt.
         </p>
       </Card>
     );
@@ -287,7 +287,7 @@ export default function TrackPage({ params }) {
         </div>
         <h1 style={{ fontSize: 26, fontWeight: 800 }}>Location shared ✅</h1>
         <p style={{ color: "var(--text-muted)", margin: 0, fontSize: 16 }}>
-          Your delivery details are on the way in Telegram.
+          Dispatch can now follow your delivery. Your details are in Telegram.
         </p>
         <p style={{ color: "var(--accent-bright)", margin: 0, fontSize: 14, maxWidth: 320 }}>
           📍 Keep this page open while you drive — dispatch tracks your trip
@@ -305,7 +305,8 @@ export default function TrackPage({ params }) {
     <Card>
       <h1 style={{ fontSize: 24, fontWeight: 700 }}>📍 Location check</h1>
       <p style={{ color: "var(--text-muted)", margin: 0, fontSize: 16 }}>
-        Hi {firstName || "there"} — share your location to receive the delivery details.
+        Hi {firstName || "there"} — share your location so dispatch can follow
+        your delivery and remind you to upload the receipt when you arrive.
       </p>
       <AmberButton onClick={phase === "locating" ? undefined : shareLocation}>
         {phase === "locating" ? "Getting your location…" : "Share my location"}

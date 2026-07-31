@@ -406,20 +406,22 @@ async def _start_tracking_gate_or_send_details(
     chat_id,
     renewal_id: str | None = None,
 ) -> None:
-    """Location gate: send the tracking link now, details after the ping.
+    """Send the delivery details immediately; location sharing is OPTIONAL.
 
-    Tracking unconfigured → details immediately (old behavior). Session insert
-    failure (migration missing / DB down) → fail OPEN with details + loud log:
-    the hard block applies to driver behavior, not infrastructure breakage.
+    The driver gets the full details right away, then a tracking link they can
+    tap so dispatch sees their trip live (and they get the automatic arrival
+    receipt reminder). The session is created with details_sent_at already set
+    so the tracking job never re-sends details or nags about a missing ping.
     """
     reassign_id = str(lead.get("id")) if (kind == "lead" and lead.get("id")) else None
+    await _send_driver_lead_details(context, lead, chat_id, reassign_lead_id=reassign_id)
     if not Config.is_tracking_configured():
-        await _send_driver_lead_details(context, lead, chat_id, reassign_lead_id=reassign_id)
         return
     token = _new_tracking_token()
     delivery_addr = _delivery_block_plain(lead)
     if not delivery_addr or delivery_addr.strip().upper() == "N/A":
         delivery_addr = None
+    from datetime import timezone as _tz
     sess = db.create_tracking_session(
         token=token,
         kind=kind,
@@ -430,13 +432,13 @@ async def _start_tracking_gate_or_send_details(
         renewal_id=renewal_id,
         reference_id=lead.get("reference_id"),
         delivery_address=delivery_addr,
+        details_sent_at=datetime.now(_tz.utc).isoformat(),
     )
     if not sess:
         logger.error(
-            "Tracking session insert failed — sending details without location gate "
+            "Tracking session insert failed — details were sent; no tracking link "
             "(run database/migration_driver_tracking.sql)"
         )
-        await _send_driver_lead_details(context, lead, chat_id, reassign_lead_id=reassign_id)
         return
     link = _tracking_link(token)
     kb = InlineKeyboardMarkup([[InlineKeyboardButton("📍 Share my location", url=link)]])
@@ -444,17 +446,17 @@ async def _start_tracking_gate_or_send_details(
         await context.bot.send_message(
             chat_id=chat_id,
             text=(
-                "📍 One more step!\n\n"
-                "Tap the button below and share your location — the delivery "
-                "details will arrive here right after.\n\n"
+                "📍 Optional — but it helps!\n\n"
+                "Tap below to share your location: dispatch can follow your "
+                "delivery live, and you'll get an automatic receipt reminder "
+                "the moment you arrive.\n\n"
                 f"{link}"
             ),
             reply_markup=kb,
             disable_web_page_preview=True,
         )
     except Exception as e:
-        logger.error("Could not send tracking link to %s: %s — sending details directly", chat_id, e)
-        await _send_driver_lead_details(context, lead, chat_id, reassign_lead_id=reassign_id)
+        logger.warning("Could not send optional tracking link to %s: %s", chat_id, e)
 
 
 def _keyboard_lead_accept_decline(lead_id: str) -> InlineKeyboardMarkup:
@@ -9954,6 +9956,8 @@ async def process_tracking_sessions(context: ContextTypes.DEFAULT_TYPE) -> None:
                 continue
             if not await asyncio.to_thread(db.claim_tracking_details_sent, sid):
                 continue  # another tick claimed it
+            if s.get("details_sent_at"):
+                continue  # optional-location mode: details went out at accept
             lead = await asyncio.to_thread(db.get_lead_by_id, s.get("lead_id")) if s.get("lead_id") else None
             if lead:
                 try:
@@ -9973,6 +9977,8 @@ async def process_tracking_sessions(context: ContextTypes.DEFAULT_TYPE) -> None:
             sid = s.get("id")
             if not sid or not await asyncio.to_thread(db.mark_tracking_reminder_sent, sid):
                 continue
+            if s.get("details_sent_at"):
+                continue  # optional-location mode: nothing is blocked, no nag
             token = s.get("token") or ""
             link = _tracking_link(token)
             # Remind the driver (details stay blocked).
