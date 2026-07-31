@@ -1009,13 +1009,13 @@ def _resolve_all_active_driver_ids() -> list[str]:
 
 
 async def process_pending_api_lead_dispatches(context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Poll Supabase for HTTP-ingested (website) leads and dispatch each straight to
-    ALL active drivers (individual Accept/Decline requests) plus the main group.
+    """Poll Supabase for HTTP-ingested (website) leads and dispatch each to
+    ALL active groups (full tag post) plus ALL active drivers (Accept/Decline).
 
-    Website leads skip the group-accept step: drivers are asked directly whether they
-    can deliver, exactly like the issuer driver flow. The lead is claimed
-    (ingest_dispatch_pending -> False) before sending so a slow send can't double-fire
-    on the next poll — no lead goes out twice.
+    Website leads skip the group-accept step: drivers are asked directly whether
+    they can deliver, exactly like the issuer driver flow. The lead is claimed
+    (ingest_dispatch_pending -> False) before sending so a slow send can't
+    double-fire on the next poll — no lead goes out twice.
     """
     rows = db.list_leads_pending_ingest_dispatch(limit=10)
     if not rows:
@@ -1031,8 +1031,8 @@ async def process_pending_api_lead_dispatches(context: ContextTypes.DEFAULT_TYPE
         if not lead_id:
             continue
         try:
-            # Main "Tri State Tag team" group = the one assigned at ingest (first active
-            # group), or the first active group if that is missing/inactive.
+            # Primary group (owns the lead row) = the one assigned at ingest, or
+            # the first active group. The tag itself is posted to EVERY group.
             main_group = db.get_group_by_id(lead.get("group_id")) if lead.get("group_id") else None
             if not main_group or not record_is_active(main_group):
                 main_group = active_groups[0]
@@ -1044,13 +1044,24 @@ async def process_pending_api_lead_dispatches(context: ContextTypes.DEFAULT_TYPE
                 "group_id": main_group.get("id"),
             })
 
-            # 1) Post the full lead to the main group for visibility.
-            try:
-                await _send_full_group_lead_to_chat(
-                    context, main_group, lead, header_text="🏷NEW WEBSITE CLIENT❗️",
+            # 1) Post the full tag to EVERY active group.
+            posted = 0
+            for g in active_groups:
+                try:
+                    await _send_full_group_lead_to_chat(
+                        context, g, lead, header_text="🏷NEW WEBSITE CLIENT❗️",
+                    )
+                    posted += 1
+                except Exception as e:
+                    logger.warning(
+                        "API ingest: could not post lead %s to group %s (%s): %s",
+                        lead_id, g.get("group_name"), g.get("group_telegram_id"), e,
+                    )
+            if posted == 0:
+                logger.error(
+                    "API ingest: lead %s ref %s reached NO groups — check group chat ids / bot membership",
+                    lead_id, lead.get("reference_id"),
                 )
-            except Exception as e:
-                logger.warning("API ingest: could not post lead %s to main group: %s", lead_id, e)
 
             # 2) DM every active driver individually with Accept/Decline. With no
             #    group-linked drivers this falls back to the global pool ("drivers work
@@ -1059,8 +1070,8 @@ async def process_pending_api_lead_dispatches(context: ContextTypes.DEFAULT_TYPE
                 context, lead, main_group,
             )
             logger.info(
-                "API ingest: lead %s ref %s dispatched to %d driver(s) [%s]%s",
-                lead_id, lead.get("reference_id"), assigned, scope,
+                "API ingest: lead %s ref %s posted to %d/%d group(s), dispatched to %d driver(s) [%s]%s",
+                lead_id, lead.get("reference_id"), posted, len(active_groups), assigned, scope,
                 f" reason={reason}" if reason else "",
             )
         except Exception as e:
