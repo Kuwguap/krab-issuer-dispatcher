@@ -460,12 +460,15 @@ def _live_count_key(driver_name: str) -> str:
 
 
 def upsert_driver_live_count(driver_name: str, base_count: int, anchor_ts: datetime) -> Optional[dict]:
-    """Set a driver's Live Count base, anchored at the row it was set on."""
+    """Set a driver's Live Count base, anchored at the moment it was set."""
     key = _live_count_key(driver_name)
     if not key:
         return None
     if anchor_ts.tzinfo is None:
         anchor_ts = anchor_ts.replace(tzinfo=timezone.utc)
+    # Normalize to UTC before storing: SQLite's DateTime drops tzinfo without
+    # converting, so a non-UTC offset would silently shift the anchor on read.
+    anchor_ts = anchor_ts.astimezone(timezone.utc)
     with get_session() as session:
         row = session.query(DriverLiveCountORM).filter(DriverLiveCountORM.driver_key == key).first()
         if row:
@@ -491,17 +494,47 @@ def delete_driver_live_count(driver_name: str) -> bool:
 
 
 def list_driver_live_counts() -> dict:
-    """{driver_key: {base_count, anchor_ts}} for all drivers with a set base."""
+    """{driver_key: {base_count, anchor_ts, post_anchor_ts}} for all drivers
+    with a set base.
+
+    ``post_anchor_ts`` lists (NY-time ISO, ascending) every transaction the
+    driver made AFTER the anchor. The dashboard counts down from this list, so
+    the numbers stay right even when its current time-window or row cap hides
+    some of those transactions.
+    """
     with get_session() as session:
         out = {}
+        anchors = {}
         for r in session.query(DriverLiveCountORM).all():
             ts = r.anchor_ts
             if ts is not None and ts.tzinfo is None:
                 ts = ts.replace(tzinfo=timezone.utc)
+            anchors[r.driver_key] = ts
             out[r.driver_key] = {
                 "base_count": r.base_count,
                 "anchor_ts": ts.isoformat() if ts else None,
+                "post_anchor_ts": [],
             }
+        valid_anchors = [t for t in anchors.values() if t is not None]
+        if not valid_anchors:
+            return out
+        q = (
+            session.query(TransactionORM.recipient_name, TransactionORM.timestamp_utc)
+            .filter(TransactionORM.timestamp_utc > min(valid_anchors))
+            .order_by(TransactionORM.timestamp_utc.asc())
+            .limit(5000)
+        )
+        for name, ts_utc in q:
+            key = _live_count_key(name)
+            entry = out.get(key)
+            anchor = anchors.get(key)
+            if entry is None or anchor is None or ts_utc is None:
+                continue
+            if ts_utc.tzinfo is None:
+                ts_utc = ts_utc.replace(tzinfo=timezone.utc)
+            if ts_utc <= anchor:
+                continue
+            entry["post_anchor_ts"].append(ts_utc.astimezone(NY_TZ).isoformat())
         return out
 
 

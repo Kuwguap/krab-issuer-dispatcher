@@ -300,8 +300,9 @@ def live_counts_list():
 def live_counts_set(body: LiveCountBody):
     """Set (or clear, with base_count=null) a driver's Live Count base.
 
-    anchor_ts = timestamp of the row it was set on; every later transaction
-    by the same driver decrements the displayed live count by one.
+    anchor_ts = the moment the user set the count; every transaction the
+    driver makes AFTER that moment decrements the displayed live count by
+    one, while all existing transactions show the full base.
     """
     driver = (body.driver or "").strip()
     if not driver:
