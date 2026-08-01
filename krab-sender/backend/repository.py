@@ -5,7 +5,7 @@ from datetime import datetime, timedelta, timezone
 import os
 from typing import Iterable, List, Optional
 
-from sqlalchemy import func
+from sqlalchemy import case, func, or_
 from zoneinfo import ZoneInfo
 
 from .db import (
@@ -406,34 +406,59 @@ def update_preregistered_transaction(
     Client/issuer/filename fields only fill blanks (the "(pending)" issuer
     placeholder counts as blank). Driver fields OVERWRITE when provided —
     a reassignment in krableadsV2 must replace the previous driver.
+
+    Executed as ONE guarded UPDATE ... WHERE delivery_status='PENDING' so a
+    send committing DELIVERED from another process can never be partially
+    overwritten by this write (check-then-act race).
     """
-    def _blank(v) -> bool:
-        return not str(v or "").strip() or str(v).strip() == "(pending)"
+    def _fill_blank_expr(col, val):
+        blank = or_(col.is_(None), func.trim(col) == "", col == "(pending)")
+        return case((blank, str(val).strip()), else_=col)
+
+    values = {}
+    for col, val in (
+        (TransactionORM.client_name, client_name),
+        (TransactionORM.price, price),
+        (TransactionORM.client_phone, client_phone),
+        (TransactionORM.client_email, client_email),
+        (TransactionORM.telegram_name, issuer_name),
+        (TransactionORM.telegram_handle, issuer_handle),
+        (TransactionORM.filename, filename),
+        (TransactionORM.client_details, client_details),
+    ):
+        if str(val or "").strip():
+            values[col] = _fill_blank_expr(col, val)
+    if str(driver_name or "").strip():
+        values[TransactionORM.recipient_name] = str(driver_name).strip()
+    if str(driver_email or "").strip():
+        values[TransactionORM.recipient_email] = str(driver_email).strip()
+    if not values:
+        return False
 
     with get_session() as session:
-        row = session.query(TransactionORM).filter(TransactionORM.id == tx_id).first()
-        if not row:
-            return False
-        if str(row.delivery_status or "").upper() != "PENDING":
-            return False
-        for attr, val in (
-            ("client_name", client_name),
-            ("price", price),
-            ("client_phone", client_phone),
-            ("client_email", client_email),
-            ("telegram_name", issuer_name),
-            ("telegram_handle", issuer_handle),
-            ("filename", filename),
-            ("client_details", client_details),
-        ):
-            v = str(val or "").strip()
-            if v and _blank(getattr(row, attr)):
-                setattr(row, attr, v)
-        if str(driver_name or "").strip():
-            row.recipient_name = str(driver_name).strip()
-        if str(driver_email or "").strip():
-            row.recipient_email = str(driver_email).strip()
-        return True
+        n = (
+            session.query(TransactionORM)
+            .filter(
+                TransactionORM.id == tx_id,
+                func.upper(func.coalesce(TransactionORM.delivery_status, "")) == "PENDING",
+            )
+            .update(values, synchronize_session=False)
+        )
+        return n > 0
+
+
+def reference_has_any_tx(reference_id: str | None) -> bool:
+    """Whether ANY ledger row (any status) exists for this reference."""
+    ref = (reference_id or "").strip()
+    if not ref:
+        return False
+    with get_session() as session:
+        return (
+            session.query(TransactionORM.pk)
+            .filter(TransactionORM.reference_id == ref)
+            .first()
+            is not None
+        )
 
 
 def find_adoptable_tx_id(reference_id: str | None) -> Optional[str]:

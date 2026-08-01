@@ -37,7 +37,8 @@ def _client_name_from_lead(lead: dict) -> str:
 def _pdf_filename(client_name: str) -> str:
     """CAPITAL letters ending in .pdf — matches the krab-sender ledger rows,
     where the Client PDF Name column is the actual sent-file name."""
-    name = " ".join(str(client_name or "").split()).upper()
+    # Trailing punctuation would double up against the extension ("JR..pdf").
+    name = " ".join(str(client_name or "").split()).upper().rstrip(" .,")
     return f"{name}.pdf" if name else ""
 
 
@@ -95,4 +96,7 @@ def record_driver_for_lead(lead: dict, driver_name: str, driver_email: str | Non
     payload["driver_name"] = str(driver_name).strip()
     if str(driver_email or "").strip():
         payload["driver_email"] = str(driver_email).strip()
+    # Never mint a fresh PENDING row for a job whose ledger row the send
+    # already closed (late accept / reassignment after delivery).
+    payload["update_only"] = True
     return _post_pre_register(payload, "driver recorded")

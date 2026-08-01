@@ -60,7 +60,12 @@ def fetch_receipt_bytes(stored_url: str) -> Optional[bytes]:
 
 
 def rescue_lead_receipt(db, lead: dict) -> bool:
-    """Re-host one lead's telegram receipt into storage. True on success."""
+    """Re-host one lead's telegram receipt into storage. True on success.
+
+    The final write is compare-and-swap on the URL we snapshotted: receipts
+    can be RE-UPLOADED while this sweep is fetching (slow Telegram HTTP), and
+    blindly writing would revert the driver's replacement to the old image.
+    """
     lead_id = str(lead.get("id") or "")
     stored = str(lead.get("receipt_image_url") or "")
     if not lead_id or _TG_MARK not in stored:
@@ -73,4 +78,9 @@ def rescue_lead_receipt(db, lead: dict) -> bool:
     )
     if not storage_url:
         return False
-    return db.update_lead(lead_id, {"receipt_image_url": storage_url})
+    swapped = db.update_lead_receipt_url_if_unchanged(lead_id, stored, storage_url)
+    if not swapped:
+        logger.info(
+            "Receipt rescue skipped for lead %s — receipt was replaced mid-sweep", lead_id
+        )
+    return swapped

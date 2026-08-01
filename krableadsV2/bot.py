@@ -8441,6 +8441,7 @@ async def _notify_supervisory_receipt_submission(
     *,
     uploaded_by_supervisor: bool = False,
     supervisor_display_name: str | None = None,
+    replacing_existing: bool = False,
 ) -> None:
     """Plain receipt summary + same image as caption (no SUPERVISORY prefix); fallback text + forward."""
     gn = (group.get("group_name") or "—") if group else "—"
@@ -8448,13 +8449,15 @@ async def _notify_supervisory_receipt_submission(
     ref_plain = str(reference_id or "N/A")
     issuer_line = _lead_issuer_display_from_lead(lead)
     caption = (
-        "🧾 New receipt sent\n"
-        f"Reference: {ref_plain}\n"
+        ("🧾 Receipt REPLACED\n" if replacing_existing else "🧾 New receipt sent\n")
+        + f"Reference: {ref_plain}\n"
         f"Group: {gn}\n"
         f"Driver(s): {driver_display_name}\n"
         f"Client name: {client_name}\n"
         f"Lead issued by: {issuer_line}"
     )
+    if replacing_existing:
+        caption += "\n♻️ Replaces the previous receipt for this reference."
     if uploaded_by_supervisor and supervisor_display_name:
         caption += f"\nUploaded by supervisor: {supervisor_display_name}"
 
@@ -8720,12 +8723,11 @@ async def handle_receipt_image(update: Update, context: ContextTypes.DEFAULT_TYP
     
     if success:
         ref_show = html.escape(str(reference_id or "N/A"), quote=False)
-        replaced_html = (
-            "\n♻️ Previous receipt was replaced with this one."
-            if context.user_data.get("receipt_replacing_existing")
-            else ""
-        )
+        replacing_existing = bool(context.user_data.get("receipt_replacing_existing"))
         context.user_data.pop("receipt_replacing_existing", None)
+        replaced_html = (
+            "\n♻️ Previous receipt was replaced with this one." if replacing_existing else ""
+        )
         if uploaded_by_supervisor:
             dn_esc = html.escape(driver_name, quote=False)
             supervisor_confirm_html = (
@@ -8787,6 +8789,7 @@ async def handle_receipt_image(update: Update, context: ContextTypes.DEFAULT_TYP
                 driver_name,
                 uploaded_by_supervisor=uploaded_by_supervisor,
                 supervisor_display_name=sup_name if uploaded_by_supervisor else None,
+                replacing_existing=replacing_existing,
             )
         except Exception as e:
             logger.error("Supervisory receipt notification failed: %s", e, exc_info=True)

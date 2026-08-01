@@ -398,7 +398,28 @@ class Database:
                 return False
         self.update_lead(lead_id, {"monday_status": "Paid"})
         return True
-    
+
+    def update_lead_receipt_url_if_unchanged(
+        self, lead_id: str, expected_url: str, new_url: str
+    ) -> bool:
+        """Compare-and-swap the receipt URL: only write if the row still holds
+        ``expected_url``. Returns False when someone (e.g. a re-upload) changed
+        it in the meantime — the caller must NOT clobber the newer receipt."""
+        if not self._check_tables_exist():
+            return False
+        try:
+            response = (
+                self.client.table("leads")
+                .update({"receipt_image_url": new_url})
+                .eq("id", lead_id)
+                .eq("receipt_image_url", expected_url)
+                .execute()
+            )
+            return bool(response.data)
+        except Exception as e:
+            logger.error(f"CAS receipt URL update failed for lead {lead_id}: {e}")
+            return False
+
     # Group management methods
     def create_group(self, group_name: str, group_telegram_id: str, supervisory_telegram_id: str) -> bool:
         """Create a new group."""

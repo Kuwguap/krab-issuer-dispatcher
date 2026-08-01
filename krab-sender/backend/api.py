@@ -21,6 +21,7 @@ from .repository import (
     set_transaction_work_status,
     create_preregistered_transaction,
     find_adoptable_tx_id,
+    reference_has_any_tx,
     update_preregistered_transaction,
     upsert_driver_live_count,
     delete_driver_live_count,
@@ -247,6 +248,10 @@ class PreRegisterBody(BaseModel):
     client_details: Optional[str] = None
     driver_name: Optional[str] = None
     driver_email: Optional[str] = None
+    # True = only update an existing PENDING row, never create one. Used by
+    # driver-accept posts: after the send already adopted (and closed) the
+    # row, a late accept/reassign must not mint a phantom PENDING duplicate.
+    update_only: Optional[bool] = None
 
 
 @app.post("/transactions/pre-register", dependencies=[Depends(require_admin)])
@@ -275,6 +280,10 @@ def transactions_pre_register(body: PreRegisterBody):
                 driver_email=body.driver_email,
             )
             return {"ok": True, "id": existing, "existing": True}
+    if body.update_only and (not ref or reference_has_any_tx(ref)):
+        # A row for this job exists but is no longer PENDING (the send already
+        # closed it) — do NOT mint a phantom duplicate for a late accept.
+        return {"ok": True, "id": None, "existing": False, "updated": False}
     tx_id = create_preregistered_transaction(
         reference_id=ref,
         client_name=body.client_name,
