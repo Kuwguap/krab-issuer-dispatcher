@@ -7864,9 +7864,16 @@ def _receipt_upload_allowed_for_user(
     lead: dict,
     context: ContextTypes.DEFAULT_TYPE,
 ) -> tuple[bool, str | None, dict | None]:
-    """Whether this user may upload a receipt for the lead; sets on-behalf driver in context."""
+    """Whether this user may upload a receipt for the lead; sets on-behalf driver in context.
+
+    A lead that already has a receipt on file stays uploadable — receipts
+    sometimes have to be corrected, so a new upload REPLACES the old one
+    (flagged in context so the flow can say so).
+    """
     if (lead.get("receipt_image_url") or "").strip():
-        return False, "❌ This lead already has a receipt on file.", None
+        context.user_data["receipt_replacing_existing"] = True
+    else:
+        context.user_data.pop("receipt_replacing_existing", None)
 
     st = db.get_lead_assignment_status(lead_id)
     if not st or (st.get("status") or "").lower() != "accepted":
@@ -7927,6 +7934,7 @@ def _merge_receipt_context_from_db(user_id: int, context: ContextTypes.DEFAULT_T
         "receipt_monday_item_id",
         "receipt_on_behalf_driver_id",
         "receipt_uploaded_by_supervisor",
+        "receipt_replacing_existing",
     ):
         if data.get(key) is not None and context.user_data.get(key) is None:
             context.user_data[key] = data[key]
@@ -8263,10 +8271,16 @@ async def handle_receipt_for_ref_callback(update: Update, context: ContextTypes.
         drow = _driver_row_by_id(context.user_data.get("receipt_on_behalf_driver_id"))
         dname = (drow.get("driver_name") or "Driver") if drow else "Driver"
         driver_line = f"\n🚗 Driver: **{dname}**"
+    replace_line = (
+        "\n♻️ This lead already has a receipt — the new upload will **replace** it.\n"
+        if context.user_data.get("receipt_replacing_existing")
+        else ""
+    )
     msg = (
         f"📋 **Reference ID:** `{ref}`{driver_line}\n\n"
         f"📍 Delivery: {delivery_safe or 'N/A'}\n"
-        f"🚗 Vehicle: {lead.get('vehicle_details', 'N/A')[:300]}\n\n"
+        f"🚗 Vehicle: {lead.get('vehicle_details', 'N/A')[:300]}\n"
+        f"{replace_line}\n"
         "Upload receipt for this lead:"
     )
     kb = InlineKeyboardMarkup([
@@ -8346,11 +8360,17 @@ async def handle_reference_id_input(update: Update, context: ContextTypes.DEFAUL
         drow = _driver_row_by_id(context.user_data.get("receipt_on_behalf_driver_id"))
         dname = (drow.get("driver_name") or "Driver") if drow else "Driver"
         driver_line = f"\n🚗 Driver: **{dname}**"
+    replace_line = (
+        "♻️ This lead already has a receipt — the new upload will **replace** it.\n\n"
+        if context.user_data.get("receipt_replacing_existing")
+        else ""
+    )
     confirmation_message = (
         f"✅ **Lead Found**{driver_line}\n\n"
         f"📍 Delivery Address: {delivery_safe or 'N/A'}\n"
         f"{phone_label}: {phone_display}\n"
         f"📋 Reference ID: `{reference_id}`\n\n"
+        f"{replace_line}"
         f"Please confirm this is the correct lead, then upload the receipt image."
     )
     
@@ -8700,12 +8720,19 @@ async def handle_receipt_image(update: Update, context: ContextTypes.DEFAULT_TYP
     
     if success:
         ref_show = html.escape(str(reference_id or "N/A"), quote=False)
+        replaced_html = (
+            "\n♻️ Previous receipt was replaced with this one."
+            if context.user_data.get("receipt_replacing_existing")
+            else ""
+        )
+        context.user_data.pop("receipt_replacing_existing", None)
         if uploaded_by_supervisor:
             dn_esc = html.escape(driver_name, quote=False)
             supervisor_confirm_html = (
                 "✅ <b>Receipt saved for driver</b>\n"
                 f"🚗 Driver: {dn_esc}\n"
                 f"Reference ID: <code>{ref_show}</code>"
+                f"{replaced_html}"
             )
             try:
                 await update.message.reply_text(supervisor_confirm_html, parse_mode="HTML")
@@ -8719,7 +8746,8 @@ async def handle_receipt_image(update: Update, context: ContextTypes.DEFAULT_TYP
             driver_confirm_html = (
                 "✅ <b>Receipt received successfully!</b>\n"
                 "📂 Your Receipt🧾 is on file.\n"
-                "🚗💨 Thank you &amp; 💪Great job — keep up the excellent work!\n\n"
+                "🚗💨 Thank you &amp; 💪Great job — keep up the excellent work!\n"
+                f"{replaced_html}\n"
                 f"Reference ID: <code>{ref_show}</code>\n\n"
                 f"💪 <i>{dq}</i>"
             )
