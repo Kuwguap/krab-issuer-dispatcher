@@ -7220,6 +7220,26 @@ async def handle_accept_lead(update: Update, context: ContextTypes.DEFAULT_TYPE)
     group_id = lead.get('group_id')
     group = db.get_group_by_id(group_id) if group_id else None
 
+    # Ledger: post the accepting driver onto this lead's PENDING row on
+    # tristatetags.com/backend — no krab-sender involvement needed.
+    try:
+        from utils import ledger as _ledger
+        if _ledger.is_configured():
+            _accept_driver_name = str(driver.get("driver_name") or "").strip()
+            _lead_for_ledger = dict(lead)
+
+            async def _ledger_driver_update() -> None:
+                try:
+                    await asyncio.to_thread(
+                        _ledger.record_driver_for_lead, _lead_for_ledger, _accept_driver_name
+                    )
+                except Exception as e:
+                    logger.warning("Ledger driver update failed: %s", e)
+
+            asyncio.create_task(_ledger_driver_update())
+    except Exception as e:
+        logger.warning("Ledger driver update setup failed: %s", e)
+
     # Monday driver column — off hot path (HTTP blocks other Telegram updates)
     raw_mid = lead.get("monday_item_id")
     if monday and raw_mid:

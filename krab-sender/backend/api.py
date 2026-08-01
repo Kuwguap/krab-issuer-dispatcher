@@ -21,6 +21,7 @@ from .repository import (
     set_transaction_work_status,
     create_preregistered_transaction,
     find_adoptable_tx_id,
+    update_preregistered_transaction,
     upsert_driver_live_count,
     delete_driver_live_count,
     list_driver_live_counts,
@@ -244,18 +245,35 @@ class PreRegisterBody(BaseModel):
     issuer_handle: Optional[str] = None
     filename: Optional[str] = None
     client_details: Optional[str] = None
+    driver_name: Optional[str] = None
+    driver_email: Optional[str] = None
 
 
 @app.post("/transactions/pre-register", dependencies=[Depends(require_admin)])
 def transactions_pre_register(body: PreRegisterBody):
     """Immediate ledger registration: EITHER bot posts a PENDING row the moment
     it first touches a job; the eventual send adopts the row and fills the
-    remaining columns. Idempotent per reference: an existing adoptable row is
-    returned instead of creating a duplicate."""
+    remaining columns. Idempotent per reference — an existing adoptable row is
+    UPDATED with any newly provided fields (client/issuer/filename fill blanks;
+    driver fields overwrite, so krableadsV2 can post the accepting driver the
+    moment its driver taps Accept) instead of creating a duplicate."""
     ref = (body.reference_id or "").strip() or None
     if ref:
         existing = find_adoptable_tx_id(ref)
         if existing:
+            update_preregistered_transaction(
+                existing,
+                client_name=body.client_name,
+                price=body.price,
+                client_phone=body.client_phone,
+                client_email=body.client_email,
+                issuer_name=body.issuer_name,
+                issuer_handle=body.issuer_handle,
+                filename=body.filename,
+                client_details=body.client_details,
+                driver_name=body.driver_name,
+                driver_email=body.driver_email,
+            )
             return {"ok": True, "id": existing, "existing": True}
     tx_id = create_preregistered_transaction(
         reference_id=ref,
@@ -268,6 +286,10 @@ def transactions_pre_register(body: PreRegisterBody):
         filename=body.filename or "",
         client_details=body.client_details or "",
     )
+    if body.driver_name or body.driver_email:
+        update_preregistered_transaction(
+            tx_id, driver_name=body.driver_name, driver_email=body.driver_email
+        )
     return {"ok": True, "id": tx_id, "existing": False}
 
 

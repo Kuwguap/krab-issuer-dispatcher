@@ -387,8 +387,63 @@ def create_preregistered_transaction(
     return tx_id
 
 
+def update_preregistered_transaction(
+    tx_id: str,
+    *,
+    client_name: str | None = None,
+    price: str | None = None,
+    client_phone: str | None = None,
+    client_email: str | None = None,
+    issuer_name: str | None = None,
+    issuer_handle: str | None = None,
+    filename: str | None = None,
+    client_details: str | None = None,
+    driver_name: str | None = None,
+    driver_email: str | None = None,
+) -> bool:
+    """Fill more columns on an existing PENDING pre-registered row.
+
+    Client/issuer/filename fields only fill blanks (the "(pending)" issuer
+    placeholder counts as blank). Driver fields OVERWRITE when provided —
+    a reassignment in krableadsV2 must replace the previous driver.
+    """
+    def _blank(v) -> bool:
+        return not str(v or "").strip() or str(v).strip() == "(pending)"
+
+    with get_session() as session:
+        row = session.query(TransactionORM).filter(TransactionORM.id == tx_id).first()
+        if not row:
+            return False
+        if str(row.delivery_status or "").upper() != "PENDING":
+            return False
+        for attr, val in (
+            ("client_name", client_name),
+            ("price", price),
+            ("client_phone", client_phone),
+            ("client_email", client_email),
+            ("telegram_name", issuer_name),
+            ("telegram_handle", issuer_handle),
+            ("filename", filename),
+            ("client_details", client_details),
+        ):
+            v = str(val or "").strip()
+            if v and _blank(getattr(row, attr)):
+                setattr(row, attr, v)
+        if str(driver_name or "").strip():
+            row.recipient_name = str(driver_name).strip()
+        if str(driver_email or "").strip():
+            row.recipient_email = str(driver_email).strip()
+        return True
+
+
 def find_adoptable_tx_id(reference_id: str | None) -> Optional[str]:
-    """Most recent PENDING pre-registered row (no recipient yet) for a ref."""
+    """Most recent PENDING pre-registered row for a ref.
+
+    A pre-registered row may already carry a driver (recipient_name) posted by
+    krableadsV2 when its driver accepted — that must not block adoption, so
+    only the PENDING status gates here; completed sends change the status and
+    naturally fall out of scope.
+    """
     ref = (reference_id or "").strip()
     if not ref:
         return None
@@ -398,8 +453,6 @@ def find_adoptable_tx_id(reference_id: str | None) -> Optional[str]:
             .filter(
                 TransactionORM.reference_id == ref,
                 func.upper(func.coalesce(TransactionORM.delivery_status, "")) == "PENDING",
-                TransactionORM.recipient_email.is_(None),
-                TransactionORM.recipient_name.is_(None),
             )
             .order_by(TransactionORM.timestamp_utc.desc())
             .first()
@@ -426,8 +479,10 @@ def persist_send_transaction(tx: Transaction, adopt_id: Optional[str] = None) ->
         row.telegram_handle = tx.telegram_handle or row.telegram_handle
         row.filename = tx.filename or row.filename
         row.client_details = tx.client_details or row.client_details
-        row.recipient_name = tx.recipient_name
-        row.recipient_email = tx.recipient_email
+        # Send values win; a krableads-posted driver survives only when the
+        # send itself has no recipient captured.
+        row.recipient_name = tx.recipient_name or row.recipient_name
+        row.recipient_email = tx.recipient_email or row.recipient_email
         row.issuer_group = tx.issuer_group or row.issuer_group
         row.reference_id = tx.reference_id or row.reference_id
         row.timestamp_utc = tx.timestamp
