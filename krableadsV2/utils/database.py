@@ -1314,10 +1314,15 @@ class Database:
             return []
 
     def get_drivers_owed_receipts_over_24h(self) -> list:
-        """All owed receipts (accepted 24h+ ago, no receipt), grouped per driver.
+        """Owed receipts per driver, for the daily 10 AM digest.
 
-        For the daily 10 AM digest. Returns
-        [{driver_id, driver_name, driver_telegram_id, email, refs: [ref, ...]}].
+        A driver is included only when at least ONE receipt has been owed for
+        24h+ (that's the alert trigger), but ``refs`` lists the driver's FULL
+        receipt debt — the message must agree with the suspension counter,
+        which has no time window. Appeal-waived leads (exclude_from_count) are
+        dropped via a tolerant second query so un-migrated DBs still work.
+
+        Returns [{driver_id, driver_name, driver_telegram_id, email, refs}].
         Driver emails come from get_all_drivers() (select *) instead of the
         embed — a missing drivers.email column then degrades to no-email
         rather than 42703-killing the whole query.
@@ -1325,15 +1330,13 @@ class Database:
         if not self._check_tables_exist():
             return []
         try:
-            from datetime import datetime, timedelta
-            import pytz
-            cutoff_dt = (datetime.now(pytz.UTC) - timedelta(hours=24))
-            cutoff = cutoff_dt.strftime("%Y-%m-%dT%H:%M:%S") + "Z"
+            from datetime import datetime, timedelta, timezone
+            cutoff_dt = datetime.now(timezone.utc) - timedelta(hours=24)
             r = self.client.table("lead_assignments").select(
-                "driver_id, accepted_at, "
+                "driver_id, accepted_at, lead_id, "
                 "lead:leads(reference_id, receipt_image_url), "
                 "driver:drivers(driver_telegram_id, driver_name)"
-            ).eq("status", "accepted").lt("accepted_at", cutoff).execute()
+            ).eq("status", "accepted").execute()
 
             emails_by_id = {}
             try:
@@ -1342,12 +1345,23 @@ class Database:
             except Exception:
                 pass
 
+            def _is_overdue(accepted_at) -> bool:
+                raw = str(accepted_at or "").strip()
+                if not raw:
+                    return True  # legacy row without a timestamp counts as old
+                try:
+                    dt = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+                    if dt.tzinfo is None:
+                        dt = dt.replace(tzinfo=timezone.utc)
+                    return dt <= cutoff_dt
+                except ValueError:
+                    return True
+
             by_driver: Dict[str, Dict[str, Any]] = {}
+            pending_lead_ids: set = set()
             for row in r.data or []:
                 lead = row.get("lead") or {}
                 if lead.get("receipt_image_url"):
-                    continue
-                if self._lead_excluded_from_receipt_count(lead):
                     continue
                 ref = (lead.get("reference_id") or "").strip()
                 if not ref or ref.upper() == "N/A":
@@ -1363,10 +1377,47 @@ class Database:
                     "driver_telegram_id": tg,
                     "email": emails_by_id.get(did, ""),
                     "refs": [],
+                    "_lead_ids": {},
+                    "_overdue_refs": set(),
                 })
                 if ref not in entry["refs"]:
                     entry["refs"].append(ref)
-            return list(by_driver.values())
+                    if row.get("lead_id"):
+                        entry["_lead_ids"][ref] = str(row.get("lead_id"))
+                        pending_lead_ids.add(str(row.get("lead_id")))
+                if _is_overdue(row.get("accepted_at")):
+                    entry["_overdue_refs"].add(ref)
+
+            # Appeal-waived leads: tolerant lookup (column may not exist on
+            # un-migrated DBs — any error just skips the exclusion).
+            excluded_lead_ids: set = set()
+            if pending_lead_ids:
+                try:
+                    ex = self.client.table("leads").select(
+                        "id, exclude_from_count"
+                    ).in_("id", list(pending_lead_ids)).execute()
+                    excluded_lead_ids = {
+                        str(row["id"]) for row in (ex.data or [])
+                        if row.get("exclude_from_count")
+                    }
+                except Exception:
+                    pass
+
+            out = []
+            for entry in by_driver.values():
+                lead_ids = entry.pop("_lead_ids")
+                overdue_refs = entry.pop("_overdue_refs")
+                if excluded_lead_ids:
+                    entry["refs"] = [
+                        ref for ref in entry["refs"]
+                        if lead_ids.get(ref) not in excluded_lead_ids
+                    ]
+                # Trigger on overdue receipts that actually survived the
+                # waiver filter — a driver whose only old debt was waived
+                # shouldn't be alerted about fresh (<24h) ones yet.
+                if entry["refs"] and any(r in overdue_refs for r in entry["refs"]):
+                    out.append(entry)
+            return out
         except Exception as e:
             logger.error("get_drivers_owed_receipts_over_24h: %s", e)
             return []
@@ -1783,7 +1834,7 @@ class Database:
             now = datetime.now(timezone.utc)
             r = (
                 self.client.table("lead_renewals")
-                .select("id, original_group_id, original_driver_id, renewal_due_at, "
+                .select("id, lead_id, original_group_id, original_driver_id, renewal_due_at, "
                         "lead:leads(reference_id)")
                 .eq("status", "pending")
                 .is_("alert_27_sent_at", "null")
@@ -1841,6 +1892,32 @@ class Database:
             return True
         except Exception as e:
             logger.error(f"Error updating renewal: {e}")
+            return False
+
+    def claim_renewal_driver_escalation(self, renewal_id: str) -> bool:
+        """Atomically flip driver_status → 'escalated' for the all-drivers fan-out.
+
+        False when the renewal was already accepted (a concurrent Accept must
+        never be overwritten — that would reopen a completed renewal) or
+        already escalated (timer + Reassign double-fire must not re-broadcast).
+        """
+        if not self._check_tables_exist():
+            return False
+        try:
+            from datetime import datetime, timezone
+            r = (
+                self.client.table("lead_renewals")
+                .update({
+                    "driver_status": "escalated",
+                    "driver_escalated_at": datetime.now(timezone.utc).isoformat(),
+                })
+                .eq("id", renewal_id)
+                .not_.in_("driver_status", ["accepted", "escalated"])
+                .execute()
+            )
+            return bool(r.data)
+        except Exception as e:
+            logger.error(f"Error claiming renewal escalation: {e}")
             return False
 
     def accept_renewal_group(self, renewal_id: str, group_id: str) -> str:

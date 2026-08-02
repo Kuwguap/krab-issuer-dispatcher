@@ -1841,7 +1841,9 @@ def _extract_phone_price_notes_from_text(text: str) -> tuple[Optional[str], Opti
         val = label_price.group(1).strip()
         m = re.search(r'\d+(?:\.\d{2})?', val)
         if m:
-            price = m.group() if '$' in val else '$' + m.group()
+            # m matches digits only — always prepend "$" (a "Price: $450" line
+            # used to come back as bare "450", which validation then rejected).
+            price = '$' + m.group()
     else:
         m = re.search(r'\$\s*\d+(?:\.\d{2})?', text)
         if m:
@@ -9137,17 +9139,18 @@ async def _escalate_renewal_driver_all(
     exclude_driver_id: str | None = None,
 ) -> None:
     """Fallback: the original driver couldn't take the renewal — offer it to ALL active drivers everywhere (FCFS)."""
-    renewal = db.get_renewal_by_id(renewal_id)
-    if not renewal:
+    # Atomic claim: never overwrite a concurrent Accept (reopening a completed
+    # renewal), never re-broadcast when timer + Reassign both fire.
+    if not db.claim_renewal_driver_escalation(renewal_id):
+        logger.info(
+            "Renewal %s: all-drivers escalation skipped (already accepted or escalated)",
+            renewal_id,
+        )
         return
-    if renewal.get("driver_status") == "accepted":
-        return  # already handled
     logger.info("Renewal %s: escalating to all drivers", renewal_id)
-    db.update_renewal(renewal_id, {
-        "driver_status": "escalated",
-        "driver_escalated_at": datetime.utcnow().isoformat(),
-    })
-    refreshed = db.get_renewal_by_id(renewal_id) or renewal
+    refreshed = db.get_renewal_by_id(renewal_id)
+    if not refreshed:
+        return
     suspended = _get_suspended_driver_ids()
     sent_any = False
     for d in _get_all_drivers_cached() or []:
@@ -10852,7 +10855,9 @@ def main():
                      if str(d.get("id")) == str(rn.get("original_driver_id"))),
                     None,
                 )
-                dname27 = (drv27 or {}).get("driver_name") or "the original driver"
+                dname27 = _telegram_md1_escape(
+                    (drv27 or {}).get("driver_name") or "the original driver"
+                )
                 gid27 = rn.get("original_group_id")
                 if gid27:
                     try:
@@ -10936,7 +10941,9 @@ def main():
                             grp = db.get_group_by_id(original_gid)
                             gchat = _parse_chat_id((grp or {}).get("group_telegram_id"))
                             if gchat:
-                                dname = (original_driver or {}).get("driver_name") or "the original driver"
+                                dname = _telegram_md1_escape(
+                                    (original_driver or {}).get("driver_name") or "the original driver"
+                                )
                                 await context.bot.send_message(
                                     chat_id=gchat,
                                     text=(
