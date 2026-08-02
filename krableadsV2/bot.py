@@ -11149,6 +11149,13 @@ def main():
         if not owed:
             return
         from utils import client_outreach
+        # Banner truth comes from the ACTUAL suspension set (the one lead
+        # dispatch enforces), not from our filtered ref count — the counter
+        # includes rows the digest can't render (blank refs, waived leads).
+        try:
+            suspended_ids = _get_suspended_driver_ids()
+        except Exception:
+            suspended_ids = set()
         max_show = 90
         for drv in owed:
             refs = drv.get("refs") or []
@@ -11164,7 +11171,7 @@ def main():
                 for ref in shown
             ]
             parts = []
-            if n_total >= SUSPENSION_THRESHOLD:
+            if str(drv.get("driver_id")) in suspended_ids or n_total >= SUSPENSION_THRESHOLD:
                 parts.append(
                     "⛔ <b>You are suspended</b>\n\n"
                     f"Reason: You owe <b>{n_total}</b> receipt(s). "
