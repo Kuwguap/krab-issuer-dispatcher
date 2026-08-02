@@ -2484,13 +2484,17 @@ async def handle_phase1_adjust_input(update: Update, context: ContextTypes.DEFAU
 
     note = await message.reply_text("🤖 Reading…")
     structured = None
+    adjust_caption = (message.caption or "").strip() or None
     try:
         if message.photo:
             f = await context.bot.get_file(message.photo[-1].file_id)
             bio = io.BytesIO()
             await f.download_to_memory(out=bio)
+            _img = bio.getvalue()
             structured = await asyncio.to_thread(
-                ai_vision.extract_structured_from_media_parts, [(bio.getvalue(), "image/jpeg")]
+                lambda: ai_vision.extract_structured_from_media_parts(
+                    [(_img, "image/jpeg")], typed_text=adjust_caption
+                )
             )
         elif message.document:
             doc = message.document
@@ -2503,11 +2507,15 @@ async def handle_phase1_adjust_input(update: Update, context: ContextTypes.DEFAU
                 png = await asyncio.to_thread(ai_vision.pdf_first_page_to_png_bytes, raw)
                 if png:
                     structured = await asyncio.to_thread(
-                        ai_vision.extract_structured_from_media_parts, [(png, "image/png")]
+                        lambda: ai_vision.extract_structured_from_media_parts(
+                            [(png, "image/png")], typed_text=adjust_caption
+                        )
                     )
             else:
                 structured = await asyncio.to_thread(
-                    ai_vision.extract_structured_from_media_parts, [(raw, mime or "image/jpeg")]
+                    lambda: ai_vision.extract_structured_from_media_parts(
+                        [(raw, mime or "image/jpeg")], typed_text=adjust_caption
+                    )
                 )
         else:
             text = (message.text or "").strip()
@@ -3260,8 +3268,14 @@ async def _phase1_finish_vision_extraction(
     msg,
     *,
     source_label: str = "image",
+    typed_text: Optional[str] = None,
 ) -> int:
-    """Normalize AI vision output, validate, then AI review — shared by photo and PDF."""
+    """Normalize AI vision output, validate, then AI review — shared by photo and PDF.
+
+    ``typed_text`` is the text the user typed alongside the files (photo
+    captions) — it gets the same fill-missing regex fallbacks the pure-text
+    path applies to the raw message.
+    """
     if not msg:
         return STATE_PHASE1
     if not raw_text or not raw_text.strip():
@@ -3331,6 +3345,22 @@ async def _phase1_finish_vision_extraction(
     if dl_val:
         state_data["driver_license_id"] = dl_val
 
+    # Fallbacks against the typed caption text — fill-missing only, mirroring
+    # the pure-text path's raw-message fallbacks.
+    if typed_text:
+        if not state_data.get("pending_phone_number") or not state_data.get("pending_price"):
+            phone_fb, price_fb, _, _ = _extract_phone_price_notes_from_text(typed_text)
+            if not state_data.get("pending_phone_number") and phone_fb:
+                state_data["pending_phone_number"] = phone_fb
+            if not state_data.get("pending_price") and price_fb:
+                state_data["pending_price"] = price_fb
+        if not (state_data.get("email") or "").strip() or not (state_data.get("driver_license_id") or "").strip():
+            raw_email, raw_dl = _extract_email_and_dl_from_text(typed_text)
+            if raw_email and not (state_data.get("email") or "").strip():
+                state_data["email"] = raw_email
+            if raw_dl and not (state_data.get("driver_license_id") or "").strip():
+                state_data["driver_license_id"] = raw_dl
+
     # Robust VIN extraction from whole raw output
     vin_from_raw = _extract_vin_17(raw_text)
     if vin_from_raw:
@@ -3351,6 +3381,7 @@ async def _phase1_finish_vision_extraction(
         state_data.get("extra_info", "-"),
     ])
 
+    _sanitize_phase1_pending_phone_price(state_data)
     db.set_user_state(user_id, "phase1", state_data)
     await _send_phase1_ai_review(msg, state_data, context, user_id)
     return STATE_AI_REVIEW
@@ -3495,6 +3526,10 @@ async def _execute_phase1_vision_batch_extraction(
 
     context.user_data["phase1_vision_extracting"] = True
     try:
+        # Photo captions typed alongside the files feed the extraction too.
+        typed_text = "\n".join(
+            (it.get("caption") or "").strip() for it in batch if (it.get("caption") or "").strip()
+        ) or None
         parts: list[tuple[bytes, str]] = []
         pending_media: list[dict] = []
         for item in batch:
@@ -3529,7 +3564,9 @@ async def _execute_phase1_vision_batch_extraction(
             parse_mode="Markdown",
         )
         try:
-            raw_text = await asyncio.to_thread(ai_vision.extract_structured_from_media_parts, parts)
+            raw_text = await asyncio.to_thread(
+                lambda: ai_vision.extract_structured_from_media_parts(parts, typed_text=typed_text)
+            )
         except ai_vision.AIVisionQuotaError:
             await context.bot.send_message(
                 chat_id=chat_id,
@@ -3542,7 +3579,7 @@ async def _execute_phase1_vision_batch_extraction(
 
         label = "files" if n > 1 else "photo"
         return await _phase1_finish_vision_extraction(
-            context, user_id, raw_text, status, source_label=label
+            context, user_id, raw_text, status, source_label=label, typed_text=typed_text
         )
     finally:
         if context.user_data:
@@ -3574,7 +3611,13 @@ async def handle_phase1_photo(update: Update, context: ContextTypes.DEFAULT_TYPE
     mime = "image/jpeg"
     if file.file_path and file.file_path.lower().endswith(".png"):
         mime = "image/png"
-    batch.append({"kind": "image", "bytes": image_bytes, "mime": mime})
+    # Photo + text in one message: the caption feeds the AI extraction too.
+    batch.append({
+        "kind": "image",
+        "bytes": image_bytes,
+        "mime": mime,
+        "caption": (msg.caption or "").strip() or None,
+    })
     context.user_data["phase1_vision_reply_chat_id"] = msg.chat_id
     await _refresh_phase1_batch_status_message(context, msg.chat_id, batch)
     return STATE_PHASE1
@@ -3620,7 +3663,7 @@ async def handle_phase1_document(update: Update, context: ContextTypes.DEFAULT_T
     bio = io.BytesIO()
     await file.download_to_memory(out=bio)
     pdf_bytes = bio.getvalue()
-    batch.append({"kind": "pdf", "bytes": pdf_bytes})
+    batch.append({"kind": "pdf", "bytes": pdf_bytes, "caption": (msg.caption or "").strip() or None})
     context.user_data["phase1_vision_reply_chat_id"] = msg.chat_id
     await _refresh_phase1_batch_status_message(context, msg.chat_id, batch)
     return STATE_PHASE1
@@ -9375,7 +9418,7 @@ async def handle_renewal_driver_reassign(update: Update, context: ContextTypes.D
     short_r, short_d = pair
     try:
         renewal_id = _long_uuid(short_r)
-        _long_uuid(short_d)  # validate second token (driver id in button payload)
+        driver_id = _long_uuid(short_d)  # driver id in button payload
     except (ValueError, Exception):
         await query.message.reply_text("❌ Invalid request.")
         return
@@ -9393,12 +9436,12 @@ async def handle_renewal_driver_reassign(update: Update, context: ContextTypes.D
     ref = (renewal.get("lead") or {}).get("reference_id", "N/A")
     try:
         await query.message.edit_text(
-            f"🔄 **Reassigned** — this renewal delivery (`{ref}`) has been sent to the rest of the team.",
+            f"🔄 **Reassigned** — this renewal delivery (`{ref}`) is now open to ALL drivers. First accept wins.",
             parse_mode="Markdown",
         )
     except Exception:
         pass
-    await _escalate_renewal_driver(context, renewal_id, exclude_driver_id=driver_id)
+    await _escalate_renewal_driver_all(context, renewal_id, exclude_driver_id=driver_id)
 
 
 # ── Client follow-ups ──────────────────────────────────────────────────────
@@ -10791,6 +10834,57 @@ def main():
 
     # Renewal checker: every 5 minutes, find leads whose 28-day renewal is due
     async def check_renewals(context: ContextTypes.DEFAULT_TYPE) -> None:
+        # Day-27 heads-up: one day before the renewal dispatches, 🔔 the
+        # original group chat + the original driver. Atomic claim per row so
+        # multi-worker deployments never double-send.
+        try:
+            for rn in await asyncio.to_thread(db.get_renewals_needing_day27_alert):
+                rid = rn.get("id")
+                if not rid:
+                    continue
+                if not await asyncio.to_thread(db.mark_renewal_day27_alert_sent, rid):
+                    continue
+                rn = db.ensure_renewal_original_group(rn)
+                lead27 = rn.get("lead") or {}
+                ref27 = lead27.get("reference_id", "N/A")
+                drv27 = next(
+                    (d for d in (_get_all_drivers_cached() or [])
+                     if str(d.get("id")) == str(rn.get("original_driver_id"))),
+                    None,
+                )
+                dname27 = (drv27 or {}).get("driver_name") or "the original driver"
+                gid27 = rn.get("original_group_id")
+                if gid27:
+                    try:
+                        grp27 = db.get_group_by_id(gid27)
+                        gchat27 = _parse_chat_id((grp27 or {}).get("group_telegram_id"))
+                        if gchat27:
+                            await context.bot.send_message(
+                                chat_id=gchat27,
+                                text=(
+                                    f"🔔 Renewal reminder — `{ref27}` is due tomorrow.\n"
+                                    f"The offer goes to {dname27} first, then opens to all drivers."
+                                ),
+                                parse_mode="Markdown",
+                            )
+                    except Exception as e:
+                        logger.warning("Day-27 group alert failed for renewal %s: %s", rid, e)
+                drv_chat27 = _parse_chat_id((drv27 or {}).get("driver_telegram_id"))
+                if drv_chat27:
+                    try:
+                        await context.bot.send_message(
+                            chat_id=drv_chat27,
+                            text=(
+                                f"🔔 Heads up — renewal `{ref27}` is due tomorrow.\n"
+                                "You'll get the offer first when it drops."
+                            ),
+                            parse_mode="Markdown",
+                        )
+                    except Exception as e:
+                        logger.warning("Day-27 driver alert failed for renewal %s: %s", rid, e)
+        except Exception as e:
+            logger.error("Day-27 renewal alert pass failed: %s", e)
+
         try:
             due = await asyncio.to_thread(db.get_due_renewals)
             for renewal in due:
@@ -10822,30 +10916,49 @@ def main():
                 if original_driver and record_is_active(original_driver):
                     sent = await _send_renewal_to_driver(context, renewal, original_driver)
 
+                lead = renewal.get("lead") or {}
+                ref = lead.get("reference_id", "?")
+
                 if sent:
                     esc_seconds = Config.RENEWAL_ESCALATION_MINUTES * 60
                     if context.application.job_queue:
                         async def _driver_esc_job(ctx, _rid=renewal_id, _did=original_did):
-                            await _escalate_renewal_driver(ctx, _rid, exclude_driver_id=_did)
+                            await _escalate_renewal_driver_all(ctx, _rid, exclude_driver_id=_did)
                         context.application.job_queue.run_once(
                             _driver_esc_job,
                             when=esc_seconds,
                             name=f"renewal_driver_esc_{renewal_id}",
                         )
-                    lead = renewal.get("lead") or {}
-                    ref = lead.get("reference_id", "?")
+                    # Same-issuer-group notice (informational — the claim already
+                    # auto-accepted this group; no buttons needed).
+                    if original_gid:
+                        try:
+                            grp = db.get_group_by_id(original_gid)
+                            gchat = _parse_chat_id((grp or {}).get("group_telegram_id"))
+                            if gchat:
+                                dname = (original_driver or {}).get("driver_name") or "the original driver"
+                                await context.bot.send_message(
+                                    chat_id=gchat,
+                                    text=(
+                                        f"🔄 Renewal `{ref}` sent to {dname}.\n"
+                                        f"If they don't respond in {Config.RENEWAL_ESCALATION_MINUTES} min, "
+                                        "it opens to ALL drivers — first accept wins."
+                                    ),
+                                    parse_mode="Markdown",
+                                )
+                        except Exception as e:
+                            logger.warning("Renewal %s: could not notify original group: %s", renewal_id, e)
                     logger.info(
-                        "Renewal %s (ref %s) sent to original driver, escalation in %d min",
+                        "Renewal %s (ref %s) sent to original driver, all-drivers escalation in %d min",
                         renewal_id, ref, Config.RENEWAL_ESCALATION_MINUTES,
                     )
                 else:
-                    # No original driver reachable — offer to the rest of the group that
-                    # accepted the original lead (renewals stay in that group).
+                    # No original driver reachable — open to ALL drivers right away.
                     logger.info(
-                        "Renewal %s: no reachable original driver — escalating to the accepting group",
+                        "Renewal %s: no reachable original driver — escalating to ALL drivers",
                         renewal_id,
                     )
-                    await _escalate_renewal_driver(
+                    await _escalate_renewal_driver_all(
                         context, renewal_id, exclude_driver_id=original_did
                     )
         except Exception as e:
@@ -11017,11 +11130,101 @@ def main():
         except Exception as e:
             logger.error("Evening motivation job failed: %s", e)
 
+    async def send_daily_receipt_digest(context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Once a day: DM every driver owing receipts (accepted 24h+ ago) one
+        digest with per-reference Upload buttons, and email them when the
+        driver has an email on file."""
+        try:
+            owed = await asyncio.to_thread(db.get_drivers_owed_receipts_over_24h)
+        except Exception as e:
+            logger.error("Daily receipt digest: query failed: %s", e)
+            return
+        if not owed:
+            return
+        from utils import client_outreach
+        max_show = 90
+        for drv in owed:
+            refs = drv.get("refs") or []
+            if not refs:
+                continue
+            n_total = len(refs)
+            shown = refs[:max_show]
+            chat_id = _parse_chat_id(drv.get("driver_telegram_id"))
+            if not chat_id:
+                continue
+            rows = [
+                [InlineKeyboardButton(f"📤 Upload {ref}", callback_data=f"receipt_for_{ref}")]
+                for ref in shown
+            ]
+            parts = []
+            if n_total >= SUSPENSION_THRESHOLD:
+                parts.append(
+                    "⛔ <b>You are suspended</b>\n\n"
+                    f"Reason: You owe <b>{n_total}</b> receipt(s). "
+                    "You will not receive new leads until all outstanding receipts are uploaded."
+                )
+            else:
+                parts.append(
+                    f"🧾 <b>Daily receipt reminder</b>\n\n"
+                    f"You owe <b>{n_total}</b> receipt(s). At <b>{SUSPENSION_THRESHOLD}</b> unpaid you will be "
+                    "<b>temporarily suspended</b> from new leads."
+                )
+            if n_total > max_show:
+                parts.append(f"Showing the first {max_show} — upload those, then send /receipts again.")
+            parts.append("Tap a reference below to upload, or send /receipts.")
+            body = "\n\n".join(parts)
+            kb = _keyboard_receipt_plus_rows(rows)
+            try:
+                try:
+                    await context.bot.send_message(
+                        chat_id=chat_id, text=body, parse_mode="HTML", reply_markup=kb
+                    )
+                except BadRequest:
+                    await context.bot.send_message(
+                        chat_id=chat_id,
+                        text=body.replace("<b>", "").replace("</b>", ""),
+                        reply_markup=kb,
+                    )
+            except Exception as e:
+                logger.warning("Daily receipt digest to driver %s failed: %s", drv.get("driver_id"), e)
+                continue
+
+            email = (drv.get("email") or "").strip()
+            if email and "@" in email:
+                dname = drv.get("driver_name", "Driver")
+                subject = f"Receipts owed — {n_total} outstanding"
+                mail_lines = [
+                    f"Hi {dname},",
+                    "",
+                    f"You currently owe {n_total} delivery receipt(s) for these references:",
+                    "",
+                ]
+                mail_lines += [f"- {ref}" for ref in shown]
+                mail_lines += [
+                    "",
+                    "To upload: open the Telegram bot and send /receipts, then tap the reference.",
+                    "",
+                    "Thank you!",
+                ]
+                try:
+                    ok, err = await asyncio.to_thread(
+                        client_outreach.send_client_email,
+                        email,
+                        subject,
+                        "\n".join(mail_lines),
+                        Config.FOLLOWUP_EMAIL_COPY,
+                    )
+                    if not ok:
+                        logger.warning("Daily receipt email to %s failed: %s", email, err)
+                except Exception as e:
+                    logger.warning("Daily receipt email to %s errored: %s", email, e)
+
     if application.job_queue:
         eastern = pytz.timezone("America/New_York")
         application.job_queue.run_daily(send_morning_motivation, time=dt_time(hour=8, minute=0, tzinfo=eastern))
         application.job_queue.run_daily(send_evening_motivation, time=dt_time(hour=18, minute=0, tzinfo=eastern))
-        logger.info("Daily motivation jobs scheduled (8 AM ET, 6 PM ET)")
+        application.job_queue.run_daily(send_daily_receipt_digest, time=dt_time(hour=10, minute=0, tzinfo=eastern))
+        logger.info("Daily motivation jobs scheduled (8 AM ET, 6 PM ET); receipt digest at 10 AM ET")
 
     logger.info("Starting polling — bot is live.")
 

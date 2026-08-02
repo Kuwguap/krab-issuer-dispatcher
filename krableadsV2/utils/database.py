@@ -1313,6 +1313,64 @@ class Database:
             logger.error("get_driver_pending_receipts: %s", e)
             return []
 
+    def get_drivers_owed_receipts_over_24h(self) -> list:
+        """All owed receipts (accepted 24h+ ago, no receipt), grouped per driver.
+
+        For the daily 10 AM digest. Returns
+        [{driver_id, driver_name, driver_telegram_id, email, refs: [ref, ...]}].
+        Driver emails come from get_all_drivers() (select *) instead of the
+        embed — a missing drivers.email column then degrades to no-email
+        rather than 42703-killing the whole query.
+        """
+        if not self._check_tables_exist():
+            return []
+        try:
+            from datetime import datetime, timedelta
+            import pytz
+            cutoff_dt = (datetime.now(pytz.UTC) - timedelta(hours=24))
+            cutoff = cutoff_dt.strftime("%Y-%m-%dT%H:%M:%S") + "Z"
+            r = self.client.table("lead_assignments").select(
+                "driver_id, accepted_at, "
+                "lead:leads(reference_id, receipt_image_url), "
+                "driver:drivers(driver_telegram_id, driver_name)"
+            ).eq("status", "accepted").lt("accepted_at", cutoff).execute()
+
+            emails_by_id = {}
+            try:
+                for d in self.get_all_drivers() or []:
+                    emails_by_id[str(d.get("id"))] = (d.get("email") or "").strip()
+            except Exception:
+                pass
+
+            by_driver: Dict[str, Dict[str, Any]] = {}
+            for row in r.data or []:
+                lead = row.get("lead") or {}
+                if lead.get("receipt_image_url"):
+                    continue
+                if self._lead_excluded_from_receipt_count(lead):
+                    continue
+                ref = (lead.get("reference_id") or "").strip()
+                if not ref or ref.upper() == "N/A":
+                    continue
+                driver = row.get("driver") or {}
+                tg = driver.get("driver_telegram_id")
+                did = str(row.get("driver_id") or "")
+                if not tg or not did:
+                    continue
+                entry = by_driver.setdefault(did, {
+                    "driver_id": did,
+                    "driver_name": driver.get("driver_name", "Driver"),
+                    "driver_telegram_id": tg,
+                    "email": emails_by_id.get(did, ""),
+                    "refs": [],
+                })
+                if ref not in entry["refs"]:
+                    entry["refs"].append(ref)
+            return list(by_driver.values())
+        except Exception as e:
+            logger.error("get_drivers_owed_receipts_over_24h: %s", e)
+            return []
+
     def _fetch_rows_by_id(
         self,
         table: str,
@@ -1710,6 +1768,51 @@ class Database:
         except Exception as e:
             logger.error(f"Error fetching due renewals: {e}")
             return []
+
+    def get_renewals_needing_day27_alert(self) -> list:
+        """Pending renewals due within the next 24h whose day-27 alert hasn't sent.
+
+        The ``> now`` bound keeps already-due rows out — those dispatch in the
+        same job tick, and a "due tomorrow" ping alongside the actual offer
+        would just be noise. Requires migration_renewal_day27_alert.sql.
+        """
+        if not self._check_tables_exist():
+            return []
+        try:
+            from datetime import datetime, timedelta, timezone
+            now = datetime.now(timezone.utc)
+            r = (
+                self.client.table("lead_renewals")
+                .select("id, original_group_id, original_driver_id, renewal_due_at, "
+                        "lead:leads(reference_id)")
+                .eq("status", "pending")
+                .is_("alert_27_sent_at", "null")
+                .gt("renewal_due_at", now.isoformat())
+                .lte("renewal_due_at", (now + timedelta(hours=24)).isoformat())
+                .execute()
+            )
+            return r.data or []
+        except Exception as e:
+            logger.error(f"Error fetching day-27 renewal alerts: {e}")
+            return []
+
+    def mark_renewal_day27_alert_sent(self, renewal_id: str) -> bool:
+        """Atomically claim the day-27 alert. True only for the winning worker."""
+        if not self._check_tables_exist():
+            return False
+        try:
+            from datetime import datetime, timezone
+            r = (
+                self.client.table("lead_renewals")
+                .update({"alert_27_sent_at": datetime.now(timezone.utc).isoformat()})
+                .eq("id", renewal_id)
+                .is_("alert_27_sent_at", "null")
+                .execute()
+            )
+            return bool(r.data)
+        except Exception as e:
+            logger.error(f"Error marking day-27 alert sent: {e}")
+            return False
 
     def get_renewal_by_id(self, renewal_id: str) -> Optional[Dict[str, Any]]:
         if not self._check_tables_exist():

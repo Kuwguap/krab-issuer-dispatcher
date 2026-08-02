@@ -278,9 +278,24 @@ def extract_followup_fields(user_message: str) -> Optional[dict]:
     return out
 
 
-def extract_structured_from_image(image_bytes: bytes, mime_type: str = "image/jpeg") -> Optional[str]:
+# Appended to the vision request when the sender typed a message alongside the
+# file(s) (photo caption). Typed text is authoritative for phone/price; images
+# stay authoritative for the VIN (people mistype VINs far more than cameras).
+TYPED_TEXT_NOTE = (
+    "The sender also typed this message alongside the file(s). Use it as "
+    "additional context when filling the lines. For Phone and Price, prefer "
+    "the typed text over the images. For VIN, prefer the images:\n\n"
+)
+
+
+def extract_structured_from_image(
+    image_bytes: bytes,
+    mime_type: str = "image/jpeg",
+    typed_text: str | None = None,
+) -> Optional[str]:
     """
     Send image to OpenAI Vision and get back 11-line structured text suitable for parse_phase1_structured.
+    ``typed_text`` (e.g. the photo's caption) is passed to the model as extra context.
     Returns None if API is not configured or request fails.
     """
     from config import Config
@@ -292,21 +307,20 @@ def extract_structured_from_image(image_bytes: bytes, mime_type: str = "image/jp
     b64 = base64.standard_b64encode(image_bytes).decode("ascii")
     data_url = f"data:{mime_type};base64,{b64}"
 
+    content: list[dict[str, Any]] = [
+        {"type": "text", "text": STRUCTURE_PROMPT},
+        {"type": "image_url", "image_url": {"url": data_url}},
+    ]
+    if typed_text and typed_text.strip():
+        content.append({"type": "text", "text": TYPED_TEXT_NOTE + typed_text.strip()[:4000]})
+
     try:
         from openai import OpenAI
         client = OpenAI(api_key=api_key.strip(), max_retries=0)
         model = getattr(Config, "OPENAI_VISION_MODEL", None) or "gpt-4o"
         response = client.chat.completions.create(
             model=model,
-            messages=[
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "text", "text": STRUCTURE_PROMPT},
-                        {"type": "image_url", "image_url": {"url": data_url}},
-                    ],
-                }
-            ],
+            messages=[{"role": "user", "content": content}],
             max_tokens=1024,
         )
         text = (response.choices[0].message.content or "").strip()
@@ -324,12 +338,16 @@ def extract_structured_from_image(image_bytes: bytes, mime_type: str = "image/jp
         return None
 
 
-def extract_structured_from_media_parts(parts: list[tuple[bytes, str]]) -> Optional[str]:
+def extract_structured_from_media_parts(
+    parts: list[tuple[bytes, str]],
+    typed_text: str | None = None,
+) -> Optional[str]:
     """
     Run Phase 1 vision extraction over one or more images (PNG/JPEG bytes + MIME).
 
     PDFs should be converted to PNG (e.g. ``pdf_first_page_to_png_bytes``) before calling.
     Multiple parts are sent in a single multimodal request so the model can merge fields.
+    ``typed_text`` (joined photo captions) rides along as extra model context.
     """
     if not parts:
         return None
@@ -337,7 +355,9 @@ def extract_structured_from_media_parts(parts: list[tuple[bytes, str]]) -> Optio
     if not cleaned:
         return None
     if len(cleaned) == 1:
-        return extract_structured_from_image(cleaned[0][0], mime_type=cleaned[0][1] or "image/jpeg")
+        return extract_structured_from_image(
+            cleaned[0][0], mime_type=cleaned[0][1] or "image/jpeg", typed_text=typed_text
+        )
 
     from config import Config
 
@@ -357,6 +377,8 @@ def extract_structured_from_media_parts(parts: list[tuple[bytes, str]]) -> Optio
         b64 = base64.standard_b64encode(image_bytes).decode("ascii")
         data_url = f"data:{mt};base64,{b64}"
         content.append({"type": "image_url", "image_url": {"url": data_url}})
+    if typed_text and typed_text.strip():
+        content.append({"type": "text", "text": TYPED_TEXT_NOTE + typed_text.strip()[:4000]})
 
     try:
         from openai import OpenAI
