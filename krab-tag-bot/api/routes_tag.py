@@ -10,7 +10,7 @@ import asyncio
 import logging
 from typing import Any, Dict, Optional
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query
 from fastapi.responses import JSONResponse, Response
 from pydantic import BaseModel
 
@@ -52,7 +52,7 @@ class TagRequest(BaseModel):
 
 
 @router.post("/api/tag/generate", dependencies=[Depends(require_tag_api_key)])
-async def generate_tag(body: TagRequest, store: int = Query(default=0)):
+async def generate_tag(body: TagRequest, background: BackgroundTasks, store: int = Query(default=0)):
     db = get_db()
     dumped = body.model_dump()
     message = dumped.pop("message", None)
@@ -73,11 +73,12 @@ async def generate_tag(body: TagRequest, store: int = Query(default=0)):
         raise HTTPException(status_code=500, detail=f"Tag generation failed: {e}")
     plate, control = fields["plate"], fields["control_number"]
 
-    # Reference # + log to tristatetags.com/backend (same as the bot).
+    # Reference # + log to tristatetags.com/backend (same as the bot). Runs
+    # AFTER the response is sent so the PDF isn't delayed by the ledger call.
     import ledger
     reference = ledger.generate_reference_id()
     client_name = f"{fields.get('first', '')} {fields.get('last', '')}".strip()
-    await asyncio.to_thread(
+    background.add_task(
         ledger.log_tag, reference_id=reference, client_name=client_name,
         issuer_name=issuer, issuer_handle=issuer,
     )
