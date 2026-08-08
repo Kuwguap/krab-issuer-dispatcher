@@ -146,6 +146,15 @@ services:
       # Allow the new unified admin page to embed the Flask admin in an iframe.
       - key: ADMIN_FRAME_ANCESTORS
         sync: false
+      # Checkout-document AI gap-fill (VIN/insurance/DL) on the ingest + attach
+      # endpoints. Without it, images still deliver — only auto-fill is skipped.
+      - key: OPENAI_API_KEY
+        sync: false
+      # Immediate ledger registration for website leads (same as the bot).
+      - key: KRAB_DISPATCH_API_URL
+        value: https://krab-dispatch-api.onrender.com
+      - key: KRAB_DISPATCH_ADMIN_PASSWORD
+        sync: false
 
   # --------------------------------------------------------------------------
   # 4) Krab Issuer Telegram bot (background worker)
@@ -209,6 +218,48 @@ services:
         sync: false
       - key: TRISTATECOVERAGE_API_BASE
         value: https://tristatecoverage.com
+      # Immediate ledger registration on tristatetags.com/backend (krab-dispatch-api).
+      # KRAB_DISPATCH_ADMIN_PASSWORD must equal krab-dispatch-api's ADMIN_PASSWORD.
+      - key: KRAB_DISPATCH_API_URL
+        value: https://krab-dispatch-api.onrender.com
+      - key: KRAB_DISPATCH_ADMIN_PASSWORD
+        sync: false
+      # Client follow-up + daily receipt digest email (Resend already above; SendGrid
+      # is the fallback sender). FOLLOWUP_* also seed the receipt-owed email copy.
+      - key: SENDGRID_API_KEY
+        sync: false
+      - key: SENDGRID_FROM
+        sync: false
+      - key: FOLLOWUP_AGENCY_NAME
+        value: Tri State Coverage
+      - key: FOLLOWUP_WEBSITE
+        value: Www.tristatetags.com
+      - key: FOLLOWUP_PHONE
+        value: 551-301-3737
+      - key: FOLLOWUP_EMAIL_COPY
+        value: SendReceiptToday@gmail.com
+      # Optional follow-up SMS (Twilio). Leave blank to email-only.
+      - key: TWILIO_ACCOUNT_SID
+        sync: false
+      - key: TWILIO_AUTH_TOKEN
+        sync: false
+      - key: TWILIO_FROM_NUMBER
+        sync: false
+      # Driver GPS tracking site (Vercel). Location sharing is optional.
+      - key: TRACKING_SITE_BASE_URL
+        sync: false
+      - key: TRACKING_TIMEOUT_MINUTES
+        value: "5"
+      - key: TRACKING_ARRIVAL_RADIUS_M
+        value: "200"
+      # Renewals (optional — sensible defaults if unset).
+      - key: RENEWAL_DAYS
+        value: "28"
+      - key: RENEWAL_ESCALATION_MINUTES
+        value: "5"
+      # NOTE: the NJ temp-tag PDF generator needs NO new env — it uses the
+      # existing Supabase (allocate_temp_plate RPC + migration_tag_plates.sql)
+      # and bundled templates/fonts; VIN decode is the keyless NHTSA vPIC API.
 
   # --------------------------------------------------------------------------
   # 5) Paper Investigator Telegram bot (background worker)

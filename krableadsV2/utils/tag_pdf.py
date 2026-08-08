@@ -120,20 +120,47 @@ _VALID_COLOR_CODES = set(_COLOR_MAP.values())
 
 
 def color_code(raw: str) -> str:
-    """3-letter uppercase color code (BLK, WHI, TAN…) matching the samples."""
+    """3-letter uppercase color code (BLK, WHI, TAN…) matching the samples.
+
+    Matches by whole word first (so "navy blue" → NVY, not BLU), only accepts a
+    3-letter input if it is a known valid code, and never emits an obviously
+    wrong substring match ("Titanium" must not become TAN)."""
     s = str(raw or "").strip()
     if not s:
         return ""
     up = re.sub(r"[^A-Z]", "", s.upper())
-    if re.fullmatch(r"[A-Z]{3}", up):  # already a code (valid or not)
+    if re.fullmatch(r"[A-Z]{3}", up) and up in _VALID_COLOR_CODES:
         return up
-    key = re.sub(r"[^a-z]", "", s.lower())
-    if key in _COLOR_MAP:
-        return _COLOR_MAP[key]
-    for name, code in _COLOR_MAP.items():
-        if name in key or key in name:
-            return code
-    return (up[:3]).ljust(3, "X")
+    words = re.findall(r"[a-z]+", s.lower())
+    # First color word that maps wins (word-level, not substring).
+    for w in words:
+        if w in _COLOR_MAP:
+            return _COLOR_MAP[w]
+    # Then any word that starts with / contains a known color name.
+    for w in words:
+        for name, code in _COLOR_MAP.items():
+            if len(name) >= 4 and (w.startswith(name) or name.startswith(w)):
+                return code
+    # Last resort: first 3 letters of the first word, uppercased.
+    return (words[0][:3].upper().ljust(3, "X")) if words else ""
+
+
+_US_STATES = {
+    "alabama": "AL", "alaska": "AK", "arizona": "AZ", "arkansas": "AR",
+    "california": "CA", "colorado": "CO", "connecticut": "CT", "delaware": "DE",
+    "florida": "FL", "georgia": "GA", "hawaii": "HI", "idaho": "ID",
+    "illinois": "IL", "indiana": "IN", "iowa": "IA", "kansas": "KS",
+    "kentucky": "KY", "louisiana": "LA", "maine": "ME", "maryland": "MD",
+    "massachusetts": "MA", "michigan": "MI", "minnesota": "MN", "mississippi": "MS",
+    "missouri": "MO", "montana": "MT", "nebraska": "NE", "nevada": "NV",
+    "new hampshire": "NH", "new jersey": "NJ", "new mexico": "NM", "new york": "NY",
+    "north carolina": "NC", "north dakota": "ND", "ohio": "OH", "oklahoma": "OK",
+    "oregon": "OR", "pennsylvania": "PA", "rhode island": "RI", "south carolina": "SC",
+    "south dakota": "SD", "tennessee": "TN", "texas": "TX", "utah": "UT",
+    "vermont": "VT", "virginia": "VA", "washington": "WA", "west virginia": "WV",
+    "wisconsin": "WI", "wyoming": "WY", "district of columbia": "DC",
+}
+_STATE_ABBRS = set(_US_STATES.values())
 
 
 def body_label(raw_body_class: str) -> str:
@@ -232,42 +259,83 @@ def parse_city_zip(city_state_zip: str, state: str = "") -> tuple[str, str]:
     zip_m = re.search(r"(\d{5})(?:-\d{4})?\s*$", s)
     zipc = zip_m.group(1) if zip_m else ""
     body = s[: zip_m.start()] if zip_m else s
+    # Strip a trailing state — 2-letter abbreviation or spelled-out name.
     if state:
         body = re.sub(rf"[, ]+{re.escape(state)}\s*$", "", body, flags=re.IGNORECASE)
+    for name in sorted(_US_STATES, key=len, reverse=True):
+        body2 = re.sub(rf"[, ]+{re.escape(name)}\s*$", "", body, flags=re.IGNORECASE)
+        if body2 != body:
+            body = body2
+            break
+    body = re.sub(r"[, ]+[A-Za-z]{2}\s*$", lambda m: "" if m.group(0).strip(", ").upper() in _STATE_ABBRS else m.group(0), body)
     city = body.strip().rstrip(",").strip()
     return city, zipc
 
 
+_TWO_WORD_MAKES = {
+    "mercedes benz", "land rover", "aston martin", "alfa romeo", "rolls royce",
+    "general motors",
+}
+
+
 def parse_car_line(car: str) -> tuple[str, str, str]:
     """"2013 Infiniti JX35" → ("2013", "Infiniti", "JX35"). Fallback when VIN
-    decode is unavailable; make title-cased, model kept verbatim."""
+    decode is unavailable; make title-cased (two-word makes kept whole), model
+    kept verbatim."""
     parts = [p for p in str(car or "").split() if p]
     year = ""
     if parts and re.fullmatch(r"(19|20)\d{2}", parts[0]):
         year = parts[0]
         parts = parts[1:]
-    make = title_case(parts[0]) if parts else ""
-    model = " ".join(parts[1:]) if len(parts) > 1 else ""
+    if not parts:
+        return year, "", ""
+    if len(parts) >= 3 and f"{parts[0]} {parts[1]}".lower() in _TWO_WORD_MAKES:
+        make = title_case(f"{parts[0]} {parts[1]}")
+        model = " ".join(parts[2:])
+    else:
+        make = title_case(parts[0])
+        model = " ".join(parts[1:])
     return year, make, model
 
 
 def parse_state(city_state_zip: str) -> str:
-    """Pull the 2-letter state out of a "CITY ST ZIP" / "City, ST 07102" line."""
+    """Pull the 2-letter state out of a "CITY ST ZIP" / "City, ST" / "City, New
+    Jersey 07102" line (handles spelled-out names and a missing ZIP)."""
     s = str(city_state_zip or "").strip()
-    m = re.search(r"\b([A-Za-z]{2})\b(?=[ ,]*\d{5}(?:-\d{4})?\s*$)", s)
-    if m:
+    if not s:
+        return ""
+    # A 2-letter abbreviation before a trailing ZIP is the most reliable signal
+    # ("WASHINGTON DC 20001" → DC, not WA-the-state-name).
+    m = re.search(r"\b([A-Za-z]{2})\b\s*,?\s*\d{5}(?:-\d{4})?\s*$", s)
+    if m and m.group(1).upper() in _STATE_ABBRS:
         return m.group(1).upper()
-    m = re.search(r",\s*([A-Za-z]{2})\b", s)
-    return m.group(1).upper() if m else ""
+    # ", ST" or a bare trailing 2-letter abbreviation.
+    m = re.search(r"[,\s]([A-Za-z]{2})\s*$", s)
+    if m and m.group(1).upper() in _STATE_ABBRS:
+        return m.group(1).upper()
+    # Spelled-out state name — the RIGHTMOST match wins (the state trails the
+    # city, so "Washington, New Jersey" → NJ, not WA).
+    low = s.lower()
+    best_pos, best_code = -1, ""
+    for name, code in _US_STATES.items():
+        for mm in re.finditer(rf"\b{re.escape(name)}\b", low):
+            if mm.start() > best_pos:
+                best_pos, best_code = mm.start(), code
+    return best_code
 
 
 # ── Drawing ───────────────────────────────────────────────────────────────
 
-def _draw_centered(tw: fitz.TextWriter, text: str, area: dict, font: fitz.Font) -> None:
+def _draw_centered(tw: fitz.TextWriter, text: str, area: dict, font: fitz.Font,
+                   max_width: float | None = None) -> None:
     if not text:
         return
     size = area["size"]
     text_w = font.text_length(text, size)
+    # Shrink to fit so an over-long plate/banner can't run off the page.
+    if max_width and text_w > max_width:
+        size = size * max_width / text_w
+        text_w = font.text_length(text, size)
     x = area["left"] + (area["width"] - text_w) / 2
     y_pdflib = area["bottom"] + area["height"] / 2 - size * 0.32
     tw.append((x, PAGE_H - y_pdflib), text, font=font, fontsize=size)
@@ -283,9 +351,16 @@ def _draw_left(tw: fitz.TextWriter, text: str, area: dict, font: fitz.Font) -> N
 
 def _draw_field(tw: fitz.TextWriter, rect: fitz.Rect, text: str, size: float, font: fitz.Font) -> None:
     """Left-aligned value inside a form widget rect (fitz top-origin), baseline
-    vertically centered like the flattened AcroForm appearance."""
+    vertically centered like the flattened AcroForm appearance. The font size
+    auto-shrinks so long values (full carrier names, long owner names) stay
+    inside their box instead of spilling across the form."""
     if not text:
         return
+    avail = rect.width - 2.4
+    if avail > 4:
+        text_w = font.text_length(text, size)
+        if text_w > avail:
+            size = max(4.0, size * avail / text_w)
     baseline_y = (rect.y0 + rect.y1) / 2 + size * 0.34
     tw.append((rect.x0 + 1.2, baseline_y), text, font=font, fontsize=size)
 
@@ -305,8 +380,11 @@ def build_tag_pdf(fields: Dict[str, Any]) -> bytes:
     plate = _up(fields.get("plate"))
     control = str(fields.get("control_number") or "").strip()
     issued = fields.get("issued")
+    if issued is None:  # a tag must always carry dates
+        from datetime import date as _date
+        issued = _date.today()
     expires = fields.get("expires")
-    if expires is None and issued is not None:
+    if expires is None:
         expires = issued + timedelta(days=29)
 
     color3 = color_code(fields.get("color"))
@@ -372,9 +450,9 @@ def build_tag_pdf(fields: Dict[str, Any]) -> bytes:
     tw = fitz.TextWriter(page.rect)
     for rect, val, size in small:
         _draw_field(tw, rect, val, size, regular)
-    _draw_centered(tw, plate, _LAYOUT["plate"], bold)
-    _draw_centered(tw, exp_banner, _LAYOUT["exp"], bold)
-    _draw_centered(tw, control, _LAYOUT["car"], bold)
+    _draw_centered(tw, plate, _LAYOUT["plate"], bold, max_width=PAGE_W - 56)
+    _draw_centered(tw, exp_banner, _LAYOUT["exp"], bold, max_width=PAGE_W - 40)
+    _draw_centered(tw, control, _LAYOUT["car"], bold, max_width=_LAYOUT["car"]["width"])
     _draw_left(tw, plate, _LAYOUT["plate_left"], regular)
     tw.write_text(page)
 

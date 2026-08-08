@@ -3224,6 +3224,7 @@ async def _send_full_group_lead_to_chat(
     html_prefix: str | None = None,
     header_text: str = "🏷NEW CLIENT❗️",
     mirror_supervisory: bool = False,
+    renewal: bool = False,
 ) -> None:
     """Post the same detailed HTML lead as the issuer flow; optionally mirror to supervisory chat(s)."""
     reference_id = (lead.get("reference_id") or "N/A").strip()
@@ -3275,20 +3276,25 @@ async def _send_full_group_lead_to_chat(
 
     # Second message: the generated NJ temp-tag PDF to the same targets.
     # Website leads already receive the tag at dispatch time (alongside the
-    # supervisory notice), so don't re-send it here on group accept.
-    if not (lead.get("external_order_id") or "").strip():
+    # supervisory notice), so don't re-send it here on group accept — EXCEPT on
+    # a renewal, which issues a brand-new tag (fresh plate + new 30-day window).
+    if renewal or not (lead.get("external_order_id") or "").strip():
         try:
-            await _build_and_send_tag_pdf(context, lead, [tid for tid, _ in targets])
+            await _build_and_send_tag_pdf(
+                context, lead, [tid for tid, _ in targets], renewal=renewal
+            )
         except Exception as e:
             logger.warning("Tag PDF send failed for ref %s: %s", reference_id, e)
 
 
-async def _tag_fields_from_lead(lead: dict) -> dict:
+async def _tag_fields_from_lead(lead: dict, *, renewal: bool = False) -> dict:
     """Resolve a stored lead into the field dict tag_pdf.build_tag_pdf expects.
 
     Allocates (and persists) the plate + control number once per lead, decodes
     the VIN for year/make/model/body (falling back to the typed vehicle line),
-    and sets the registration state that picks the NJ vs non-NJ template.
+    and sets the registration state that picks the NJ vs non-NJ template. On a
+    ``renewal`` the tag gets a FRESH plate + control and a new 30-day window
+    (issued today) instead of the original, now-expired values.
     """
     from utils import tag_pdf
 
@@ -3306,9 +3312,10 @@ async def _tag_fields_from_lead(lead: dict) -> dict:
         year, make, model = tag_pdf.parse_car_line(phase1.get("car", ""))
         body = ""
 
-    # Plate + control number: reuse if already assigned, else allocate once.
-    plate = (lead.get("plate") or "").strip()
-    control = (lead.get("tag_control_number") or "").strip()
+    # Plate + control number. A renewal always mints fresh ones (the old tag
+    # expired); otherwise reuse the assigned values so re-sends are identical.
+    plate = "" if renewal else (lead.get("plate") or "").strip()
+    control = "" if renewal else (lead.get("tag_control_number") or "").strip()
     if not plate or not control:
         alloc = await asyncio.to_thread(db.allocate_temp_plate, state == "NJ")
         plate = plate or alloc["plate"]
@@ -3318,8 +3325,11 @@ async def _tag_fields_from_lead(lead: dict) -> dict:
         except Exception as e:
             logger.warning("Could not persist plate for lead %s: %s", lead.get("id"), e)
 
-    issue_dt, _exp_dt = _issue_and_expiration_for_group_display(lead)
-    issued = issue_dt.date() if issue_dt else None  # expires defaults to issue + 29d
+    if renewal:
+        issued = datetime.now(pytz.timezone("America/New_York")).date()  # fresh 30-day window
+    else:
+        issue_dt, _exp_dt = _issue_and_expiration_for_group_display(lead)
+        issued = issue_dt.date() if issue_dt else None  # expires defaults to issue + 29d
 
     return {
         "is_nj": state == "NJ",
@@ -3344,14 +3354,15 @@ async def _tag_fields_from_lead(lead: dict) -> dict:
 
 
 async def _build_and_send_tag_pdf(
-    context: ContextTypes.DEFAULT_TYPE, lead: dict, target_chat_ids: list
+    context: ContextTypes.DEFAULT_TYPE, lead: dict, target_chat_ids: list,
+    *, renewal: bool = False,
 ) -> None:
     """Generate the NJ temp-tag PDF for a lead and send it to each chat."""
     from utils import tag_pdf
 
     if not target_chat_ids:
         return
-    fields = await _tag_fields_from_lead(lead)
+    fields = await _tag_fields_from_lead(lead, renewal=renewal)
     pdf = await asyncio.to_thread(tag_pdf.build_tag_pdf, fields)
     reference_id = (lead.get("reference_id") or "N/A").strip()
     plate = fields.get("plate") or "tag"
@@ -9431,6 +9442,7 @@ async def handle_renewal_group_accept(update: Update, context: ContextTypes.DEFA
             lead_full,
             header_text="🏷RENEWAL CLIENT❗️",
             mirror_supervisory=False,
+            renewal=True,
         )
     except Exception as e:
         logger.warning("Could not re-send renewal lead to accepting group: %s", e)
