@@ -42,7 +42,14 @@ def start_in_background_thread(db_instance=None) -> None:
     port = _port()
     app = create_app()
 
-    config = uvicorn.Config(app, host="0.0.0.0", port=port, log_level="info", access_log=False)
+    # loop="asyncio" (not uvloop): uvloop.install() sets a global event-loop policy
+    # and creating a uvloop loop inside this non-main daemon thread is fragile on
+    # Linux — the stdlib selector loop binds reliably here and keeps PTB's own
+    # main-thread loop untouched.
+    config = uvicorn.Config(
+        app, host="0.0.0.0", port=port, log_level="info",
+        access_log=False, loop="asyncio",
+    )
     server = uvicorn.Server(config)
 
     def _run() -> None:

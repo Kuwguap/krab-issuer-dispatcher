@@ -113,6 +113,16 @@ ots = OneTimeSecret()
 monday = MondayClient() if Config.is_monday_configured() else None
 
 
+def _ots_enabled() -> bool:
+    """OneTimeSecret is optional. When its credentials are absent we bypass the
+    encrypt/redact machinery entirely and dispatch raw phone numbers — no broken
+    one-time links, no finalize crash. When configured, behavior is unchanged."""
+    return bool(
+        (Config.ONETIMESECRET_USERNAME or "").strip()
+        and (Config.ONETIMESECRET_API_KEY or "").strip()
+    )
+
+
 def _resolve_receipt_detection_mode() -> str:
     """``strict`` = visible ``$`` only; ``lax`` = match amount to lead.
 
@@ -2795,9 +2805,15 @@ def _normalize_ai_phase1_text(text: str) -> str:
 
 
 def _sanitize_phones_for_send(text: str) -> str:
-    """Replace any phone numbers in user content with OneTimeSecret links (no raw numbers)."""
+    """Replace any phone numbers in user content with OneTimeSecret links (no raw numbers).
+
+    When OneTimeSecret isn't configured, leave the text untouched — otherwise every
+    phone would be swapped for a dead ``[phone – use link above]`` placeholder with
+    no link above it (the raw number would be lost)."""
     if not text or not str(text).strip():
         return text or ""
+    if not _ots_enabled():
+        return str(text).strip()
     return phone_redact.replace_phones_with_ots_links(str(text).strip(), ots)
 
 
@@ -2879,7 +2895,7 @@ def _resolve_selected_group(lead_data: dict, lead: Optional[dict] = None) -> Opt
     return None
 
 
-def _group_lead_copy_pre_html(phase1_data: dict, encrypted_link: str) -> str:
+def _group_lead_copy_pre_html(phase1_data: dict, encrypted_link: str, raw_phone: str = "") -> str:
     """HTML <pre> block for the copy-paste section (shared with group notification + fallbacks)."""
     client_name = (_sanitize_phones_for_send(phase1_data.get("name") or "") or "").strip() or "—"
     d_street = (phase1_data.get("delivery_address") or "").strip()
@@ -2890,12 +2906,18 @@ def _group_lead_copy_pre_html(phase1_data: dict, encrypted_link: str) -> str:
     delivery_combined = (delivery_combined or "").strip() or "—"
     extra_time = (_sanitize_phones_for_send(phase1_data.get("extra_info") or "") or "").strip() or "—"
     link = (encrypted_link or "").strip()
+    # With OneTimeSecret retired (no link), show the raw phone directly so the
+    # group still gets the client's number instead of an empty link line.
+    if link:
+        phone_line = f"📞 Phone 🔗 Encrypted Link: {link}"
+    else:
+        phone_line = f"📞 Phone: {(raw_phone or '').strip() or '—'}"
     copy_plain = "\n".join([
         "- - - - - - copy & paste - - - - - -",
         f"Client Name: {client_name}",
         f"⏰ {extra_time}",
         f"📍Delivery address: {delivery_combined}",
-        f"📞 Phone 🔗 Encrypted Link: {link}",
+        phone_line,
         "- - - - - - copy & paste - - - - - -",
     ])
     return f"<pre>{html.escape(copy_plain)}</pre>"
@@ -2910,6 +2932,7 @@ def _format_group_lead_message_html(
     special_request_issuers: str,
     *,
     header_text: str = "🏷NEW CLIENT❗️",
+    raw_phone: str = "",
 ) -> str:
     """Telegram HTML for the detailed group lead: copy section in <pre> for tap-to-copy."""
     def _safe_raw(s: str) -> str:
@@ -2943,7 +2966,7 @@ def _format_group_lead_message_html(
     issue_s = issue_dt.strftime("%Y-%m-%d %H:%M:%S %Z") if issue_dt else "N/A"
     expiry_s = expiry_dt.strftime("%Y-%m-%d %H:%M:%S %Z") if expiry_dt else "N/A"
 
-    pre_wrapped = _group_lead_copy_pre_html(phase1_data, encrypted_link)
+    pre_wrapped = _group_lead_copy_pre_html(phase1_data, encrypted_link, raw_phone)
     return (
         f"{_h(header_text)}\n\n"
         f"📋 Reference ID: <code>{_h(reference_id)}</code>\n"
@@ -3097,7 +3120,7 @@ def _validate_lead_data_ready_for_send(lead_data: dict) -> tuple[bool, str]:
     if not lead_data.get("phone_number"):
         return False, "Missing phone number."
     enc = lead_data.get("encrypted_data") or {}
-    if not enc.get("link"):
+    if _ots_enabled() and not enc.get("link"):
         return False, "Missing encrypted link."
     if not lead_data.get("reference_id"):
         return False, "Missing reference ID."
@@ -3181,7 +3204,7 @@ def _validate_lead_row_for_resend(lead: dict | None, *, issuer_user_id: int | No
         return False, "Missing reference ID."
     if not (lead.get("phone_number") or "").strip():
         return False, "Missing phone number."
-    if not (lead.get("encrypted_link") or "").strip():
+    if _ots_enabled() and not (lead.get("encrypted_link") or "").strip():
         return False, "Missing encrypted link."
     if not lead.get("group_id"):
         return False, "Missing group assignment."
@@ -3234,6 +3257,7 @@ async def _send_full_group_lead_to_chat(
     issue_dt, exp_dt = _issue_and_expiration_for_group_display(lead)
     body = _format_group_lead_message_html(
         reference_id, phase1, link, issue_dt, exp_dt, issuer_note, header_text=header_text,
+        raw_phone=(lead.get("phone_number") or ""),
     )
     full_html = f"{html_prefix}{body}" if html_prefix else body
     chat_id = _parse_chat_id(group.get("group_telegram_id"))
@@ -3418,7 +3442,8 @@ def _build_driver_lead_accepted_message_html(lead: dict) -> str:
 
     client_name = esc(_client_display_name_from_lead(lead))
     link_raw = _driver_phone_display(lead)
-    if link_raw.startswith("http://") or link_raw.startswith("https://"):
+    is_link = link_raw.startswith("http://") or link_raw.startswith("https://")
+    if is_link:
         link_line = f"📞Phone open link ({esc(link_raw)})"
     else:
         link_line = f"📞Phone {esc(link_raw)}"
@@ -3437,7 +3462,7 @@ def _build_driver_lead_accepted_message_html(lead: dict) -> str:
         f"📝Extra info: {extra}",
         "📞 Call Client Now Confirm: 💰 Price • ⏱️ Time • 📍 Location • 🏷 Tag",
         link_line,
-        "📞 Click link 🔗 enter password “ callclient “ to view",
+        *(["📞 Click link 🔗 enter password “ callclient “ to view"] if is_link else []),
         f"💰 Price: {price}",
         f"🆔 Reference ID: <code>{ref}</code>",
     ]
@@ -5023,29 +5048,32 @@ async def _finalize_lead_after_notes(
     issuers_note = (state_data.get("special_request_issuers") or "").strip()
     drivers_note = (state_data.get("special_request_drivers") or "").strip()
 
-    encrypted_data = await asyncio.to_thread(ots.encrypt_phone, phone_number)
-    if not encrypted_data:
-        state_data["pending_phone_number"] = phone_number
-        state_data["pending_price"] = price
-        db.set_user_state(user_id, "special_request_drivers", state_data)
-        reason = (getattr(ots, "last_error", "") or "").strip()
-        if reason:
-            await message.reply_text(
-                "❌ Error encrypting phone number.\n\n"
-                f"Reason: {reason}\n\n"
-                "If this keeps happening, the `clientsphonenumber` service is usually missing env vars "
-                "(SUPABASE_URL/SUPABASE_KEY and ONETIMESECRET_USERNAME/ONETIMESECRET_API_KEY) on Vercel "
-                "or the bot has wrong credentials.\n\n"
-                "Send your reply again when ready (or **-** for none).",
-                parse_mode="Markdown",
-            )
-        else:
-            await message.reply_text(
-                "❌ Error encrypting phone number. Please try again.\n\n"
-                "Send your reply again (or **-** for none).",
-                parse_mode="Markdown",
-            )
-        return STATE_SPECIAL_REQUEST_DRIVERS
+    # OneTimeSecret is optional. When it's configured we still one-time-link the
+    # phone; when it isn't (retired), skip it and dispatch the raw number.
+    encrypted_data = None
+    if _ots_enabled():
+        encrypted_data = await asyncio.to_thread(ots.encrypt_phone, phone_number)
+        if not encrypted_data:
+            state_data["pending_phone_number"] = phone_number
+            state_data["pending_price"] = price
+            db.set_user_state(user_id, "special_request_drivers", state_data)
+            reason = (getattr(ots, "last_error", "") or "").strip()
+            # Plain text (no parse_mode): the reason/env-var names contain '_' and
+            # '*' that break Telegram's Markdown entity parser.
+            if reason:
+                await message.reply_text(
+                    "❌ Error encrypting phone number.\n\n"
+                    f"Reason: {reason}\n\n"
+                    "If this keeps happening, the clientsphonenumber service is usually "
+                    "missing env vars on Vercel or the bot has wrong credentials.\n\n"
+                    "Send your reply again when ready (or - for none)."
+                )
+            else:
+                await message.reply_text(
+                    "❌ Error encrypting phone number. Please try again.\n\n"
+                    "Send your reply again (or - for none)."
+                )
+            return STATE_SPECIAL_REQUEST_DRIVERS
 
     reference_id = generate_reference_id()
     state_data["special_request_issuers"] = issuers_note
@@ -5250,11 +5278,13 @@ async def _submit_lead_from_review(message, context, user_id, data):
         await message.reply_text("❌ No group selected. Please select a group in the review screen.")
         return STATE_AI_REVIEW
 
-    # Encrypt
-    enc = await asyncio.to_thread(ots.encrypt_phone, phone)
-    if not enc:
-        await message.reply_text("❌ Encryption failed.")
-        return ConversationHandler.END
+    # Encrypt (only when OneTimeSecret is configured; otherwise dispatch raw phone)
+    enc = None
+    if _ots_enabled():
+        enc = await asyncio.to_thread(ots.encrypt_phone, phone)
+        if not enc:
+            await message.reply_text("❌ Encryption failed.")
+            return ConversationHandler.END
 
     ref_id = generate_reference_id()
     username = data.get("username", "Unknown")
@@ -5280,9 +5310,9 @@ async def _submit_lead_from_review(message, context, user_id, data):
         "vehicle_details": vd,
         "delivery_details": data.get("delivery_details", ""),
         "phone_number": phone, "price": price,
-        "encrypted_link": enc.get("link"),
-        "onetimesecret_token": enc.get("secret_key"),
-        "onetimesecret_secret_key": enc.get("metadata_key"),
+        "encrypted_link": (enc or {}).get("link"),
+        "onetimesecret_token": (enc or {}).get("secret_key"),
+        "onetimesecret_secret_key": (enc or {}).get("metadata_key"),
         "reference_id": ref_id, "group_id": group_id,
         "extra_info": data.get("extra_info", ""),
         "special_request_issuers": data.get("special_request_issuers", ""),
@@ -5792,7 +5822,7 @@ async def handle_driver_selection(update: Update, context: ContextTypes.DEFAULT_
     ])
     phone_number = lead_data.get('phone_number')
     price = lead_data.get('price')
-    encrypted_data = lead_data.get('encrypted_data', {})
+    encrypted_data = lead_data.get('encrypted_data') or {}
     reference_id = lead_data.get('reference_id')
     group_id = lead_data.get('group_id')
     username = query.from_user.username or "Unknown"
@@ -6032,7 +6062,11 @@ async def _background_dispatch_lead_after_driver_pick(
                 f"📋 Reference ID: {reference_id}\n"
                 f"{vehicle_safe}\n\n"
                 "Please use Krab Dispatch (@KrabIssuerBot) 📧🚘 — Enter: Tag, Phone, Delivery time, Delivery address.\n"
-                f"🔗 Encrypted Link: {encrypted_data.get('link')}"
+                + (
+                    f"🔗 Encrypted Link: {(encrypted_data or {}).get('link')}"
+                    if (encrypted_data or {}).get("link")
+                    else f"📞 Phone: {phone_number or ''}"
+                )
                 + (f"\n\n📝 Driver-only note:\n{driver_note_disp}" if driver_note_disp else "")
             ),
             "supervisor_name": selected_group.get("group_name", ""),
@@ -6086,10 +6120,11 @@ async def _background_dispatch_lead_after_driver_pick(
     group_message = _format_group_lead_message_html(
         reference_id,
         phase1_data,
-        encrypted_data.get("link") or "",
+        (encrypted_data or {}).get("link") or "",
         monday_result["issue_date"] if monday_result else None,
         monday_result["expiration_date"] if monday_result else None,
         issuer_note_disp,
+        raw_phone=(phone_number or ""),
     )
 
     d_csz_esc = _telegram_md1_escape(phase1_data.get("delivery_city_state_zip", "") or "")
@@ -6235,7 +6270,7 @@ async def _background_dispatch_lead_after_driver_pick(
                         "• Delivery address 📍\n"
                         "⸻\n"
                         "📋 Copy & paste below into the bot 🤖\n"
-                        f"{_group_lead_copy_pre_html(phase1_data, encrypted_data.get('link') or '')}\n\n"
+                        f"{_group_lead_copy_pre_html(phase1_data, (encrypted_data or {}).get('link') or '', phone_number or '')}\n\n"
                         f"📅 Issue Date: {html.escape(issue_s, quote=False)}\n"
                         f"⏰ Expires: {html.escape(exp_s, quote=False)}"
                     )
@@ -9178,7 +9213,8 @@ def _build_renewal_driver_message(renewal: dict) -> str:
     ref = lead.get("reference_id") or "N/A"
     delivery = _delivery_block_plain(lead)
     extra = _sanitize_phones_for_send(lead.get("extra_info") or "") or "—"
-    link = (lead.get("encrypted_link") or "").strip() or "N/A"
+    link = (lead.get("encrypted_link") or "").strip() or (lead.get("phone_number") or "").strip() or "N/A"
+    link_is_url = link.startswith("http://") or link.startswith("https://")
     price = (lead.get("price") or "").strip() or "N/A"
     spec_d = _lead_driver_note(lead)
     client_name = _client_display_name_from_lead(lead) or "N/A"
@@ -9200,7 +9236,7 @@ def _build_renewal_driver_message(renewal: dict) -> str:
         delivery,
         f"📝 Extra info: {extra}",
         f"📞Phone {link}",
-        "📞 Click link 🔗 enter password “ callclient “ to view",
+        *(["📞 Click link 🔗 enter password “ callclient “ to view"] if link_is_url else []),
         f"💰 Price: {price}",
         f"🆔 Reference ID: {ref}",
     ]
