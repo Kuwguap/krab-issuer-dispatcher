@@ -454,3 +454,50 @@ services:
           property: host
       - key: PORT
         value: "8080"
+
+  # --------------------------------------------------------------------------
+  # 10) Krab Tag bot — Telegram staff bot + HTTP NJ temp-tag generator.
+  #     Canonical generator = krableadsV2/utils/tag_pdf.py + assets/, copied in
+  #     at build time so there is exactly ONE source of the PDF output. Serves
+  #     tristatetags.com/tag (via its Vercel proxy) and a staff Telegram flow.
+  #     If Render ever isolates the rootDir checkout so the sibling copy fails,
+  #     switch to runtime: docker with dockerContext: . and COPY krableadsV2/...
+  # --------------------------------------------------------------------------
+  - type: web
+    name: krab-tag-bot
+    runtime: python
+    rootDir: krab-tag-bot
+    plan: starter
+    numInstances: 1
+    maxShutdownDelaySeconds: 60
+    healthCheckPath: /api/health
+    buildCommand: >-
+      pip install --upgrade pip &&
+      pip install -r requirements.txt &&
+      mkdir -p taggen assets &&
+      cp ../krableadsV2/utils/tag_pdf.py taggen/tag_pdf.py &&
+      cp -r ../krableadsV2/assets/. assets/
+    startCommand: python bot.py
+    envVars:
+      # A NEW @BotFather bot token — never reuse another bot's token (two
+      # pollers on one token conflict).
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false
+      # Shared secret for POST /api/tag/generate; the tristatetags Vercel proxy
+      # holds the matching value.
+      - key: TAG_API_KEY
+        generateValue: true
+      - key: SUPABASE_URL
+        fromService:
+          name: krab-issuer-bot
+          type: worker
+          envVarKey: SUPABASE_URL
+      - key: SUPABASE_KEY
+        fromService:
+          name: krab-issuer-bot
+          type: worker
+          envVarKey: SUPABASE_KEY
+      - key: KRAB_API_CORS_ALLOWED_ORIGINS
+        value: https://tristatetags.com,https://www.tristatetags.com
+      - key: PORT
+        value: "8080"
