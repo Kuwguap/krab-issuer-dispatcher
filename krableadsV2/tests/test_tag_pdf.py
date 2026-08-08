@@ -111,6 +111,12 @@ def test_body_style_door_suffix():
     assert fb("extended cab 2dr") == "Extended Cab 2DR"
     assert fb("crew-cab 2dr") == "Crew-Cab 2DR"
     assert fb("SUV") == "SUV" and fb("Chassis") == "Chassis"  # plain unchanged
+    # A bare body word is UPGRADED to include the door count.
+    nb = tag_pdf.normalize_body_heuristic
+    assert nb("SUV") == "SUV 4DR" and nb("suv") == "SUV 4DR"
+    assert nb("Sedan") == "Sedan 4DR" and nb("Coupe") == "Coupe 2DR"
+    assert nb("SUV 4DR") == "SUV 4DR"  # already-suffixed passes through
+    assert nb("") == ""
 
 
 def test_output_is_flattened_not_editable():

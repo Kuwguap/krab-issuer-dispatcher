@@ -110,9 +110,9 @@ def build_fields(payload: Dict[str, Any], db) -> Dict[str, Any]:
                 body = body or dec.get("body") or ""
         except Exception:
             pass
-    # Normalize an explicitly-typed body to the printed format ("sedan 4dr" →
-    # "Sedan 4DR"); a VIN-decoded body already carries the door suffix.
-    body = tag_pdf.format_body_for_pdf(body)
+    # Guarantee the door-suffix format — a bare "SUV"/"Sedan" is upgraded to
+    # "SUV 4DR"/"Sedan 4DR"; a VIN-decoded body already carries the suffix.
+    body = tag_pdf.normalize_body_heuristic(body)
 
     plate = (p.get("plate") or "").strip()
     control = (str(p.get("control_number") or "")).strip()

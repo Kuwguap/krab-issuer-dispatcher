@@ -287,6 +287,25 @@ def suggest_body_from_nhtsa(body_class: str, doors: str = "", cab: str = "") -> 
     return ""
 
 
+def normalize_body_heuristic(raw: str, body_class: str = "", doors: str = "", cab: str = "") -> str:
+    """Guarantee the printed door-suffix format. A bare body word is UPGRADED
+    to include a door count: "SUV" → "SUV 4DR", "Sedan" → "Sedan 4DR",
+    "Coupe" → "Coupe 2DR". Already-suffixed values pass through unchanged; an
+    empty body stays empty. Mirrors njtemporarytag normalizeBodyHeuristic."""
+    formatted = format_body_for_pdf(raw)
+    if formatted and re.search(r"\dDR$", formatted, re.IGNORECASE):
+        return formatted
+    from_nhtsa = suggest_body_from_nhtsa(body_class, doors, cab)
+    if from_nhtsa:
+        return format_body_for_pdf(from_nhtsa)
+    s = str(raw or "").strip()
+    if not s:
+        return ""
+    dr = _guess_doors_from_text(s)
+    first = _title_token(s.split()[0])
+    return format_body_for_pdf(f"{first} {dr}")
+
+
 def title_case(raw: str) -> str:
     return " ".join(w[:1].upper() + w[1:].lower() for w in str(raw or "").split() if w)
 

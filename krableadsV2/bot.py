@@ -3316,7 +3316,7 @@ async def _tag_fields_from_lead(lead: dict, *, renewal: bool = False) -> dict:
     else:
         year, make, model = tag_pdf.parse_car_line(phase1.get("car", ""))
         body = ""
-    body = tag_pdf.format_body_for_pdf(body)
+    body = tag_pdf.normalize_body_heuristic(body)
 
     # Plate + control number. A renewal always mints fresh ones (the old tag
     # expired); otherwise reuse the assigned values so re-sends are identical.
