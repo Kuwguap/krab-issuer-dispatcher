@@ -174,14 +174,15 @@ class Config:
         """Validate that all required environment variables are set."""
         required_vars = [
             "TELEGRAM_BOT_TOKEN",
-            "ONETIMESECRET_USERNAME",
-            "ONETIMESECRET_API_KEY",
             "SUPABASE_URL",
             "SUPABASE_KEY",
         ]
-        
-        # Monday.com is optional - warn if not set but don't fail
+
+        # OneTimeSecret + Monday.com are optional - warn if not set but don't fail.
+        # (OneTimeSecret is no longer used; phone sharing degrades gracefully.)
         optional_vars = [
+            "ONETIMESECRET_USERNAME",
+            "ONETIMESECRET_API_KEY",
             "MONDAY_API_KEY",
             "MONDAY_BOARD_ID",
         ]
@@ -205,7 +206,7 @@ class Config:
         
         if missing_optional:
             import warnings
-            warnings.warn(f"Optional Monday.com variables not set: {', '.join(missing_optional)}. Monday.com integration will be disabled.")
+            warnings.warn(f"Optional variables not set: {', '.join(missing_optional)}. Related integrations (OneTimeSecret / Monday.com) will be disabled.")
         
         return True
     
