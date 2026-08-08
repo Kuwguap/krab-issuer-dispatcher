@@ -476,14 +476,11 @@ services:
       pip install -r requirements.txt &&
       mkdir -p taggen assets &&
       cp ../krableadsV2/utils/tag_pdf.py taggen/tag_pdf.py &&
-      cp ../krableadsV2/utils/ai_vision.py taggen/ai_vision.py &&
       cp -r ../krableadsV2/assets/. assets/
     startCommand: python bot.py
     envVars:
-      # A NEW @BotFather bot token — never reuse another bot's token (two
-      # pollers on one token conflict).
-      - key: TELEGRAM_BOT_TOKEN
-        sync: false
+      # Web-only service: no Telegram bot. The Telegram tag flow + /settings live
+      # in krab-issuer-bot (krableadsV2). This service backs tristatetags.com/tag.
       # Shared secret for POST /api/tag/generate; the tristatetags Vercel proxy
       # holds the matching value.
       - key: TAG_API_KEY
@@ -500,17 +497,6 @@ services:
           envVarKey: SUPABASE_KEY
       - key: KRAB_API_CORS_ALLOWED_ORIGINS
         value: https://tristatetags.com,https://www.tristatetags.com
-      # Telegram user IDs allowed to open /settings (comma-separated).
-      - key: ADMIN_TELEGRAM_IDS
-        sync: false
-      # Same AI parsing engine as krableadsV2 (photos + text).
-      - key: OPENAI_API_KEY
-        fromService:
-          name: krab-issuer-bot
-          type: worker
-          envVarKey: OPENAI_API_KEY
-      - key: OPENAI_VISION_MODEL
-        value: gpt-4o
       # Log each generated tag to tristatetags.com/backend (reference + issuer),
       # same ledger krableadsV2 uses.
       - key: KRAB_DISPATCH_API_URL
