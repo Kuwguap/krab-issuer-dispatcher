@@ -1,8 +1,8 @@
-# Canonical generator + assets are build-copied from ../krableadsV2 (see
-# render.yaml). Never commit the copies — krableadsV2 is the single source.
-taggen/tag_pdf.py
-taggen/ai_vision.py
-assets/
 __pycache__/
 *.pyc
 .env
+venv/
+.tmp/
+.pytest_cache/
+taggen/tag_pdf.py
+taggen/ai_vision.py

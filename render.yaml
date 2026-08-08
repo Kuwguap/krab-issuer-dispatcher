@@ -465,26 +465,43 @@ services:
   # --------------------------------------------------------------------------
   - type: web
     name: krab-tag-bot
-    runtime: python
+    runtime: docker
     rootDir: krab-tag-bot
+    dockerfilePath: ./Dockerfile
+    dockerContext: .
+    dockerCommand: python bot.py
     plan: starter
     numInstances: 1
     maxShutdownDelaySeconds: 60
     healthCheckPath: /api/health
-    buildCommand: >-
-      pip install --upgrade pip &&
-      pip install -r requirements.txt &&
-      mkdir -p taggen assets &&
-      cp ../krableadsV2/utils/tag_pdf.py taggen/tag_pdf.py &&
-      cp -r ../krableadsV2/assets/. assets/
-    startCommand: python bot.py
     envVars:
-      # Web-only service: no Telegram bot. The Telegram tag flow + /settings live
-      # in krab-issuer-bot (krableadsV2). This service backs tristatetags.com/tag.
-      # Shared secret for POST /api/tag/generate; the tristatetags Vercel proxy
-      # holds the matching value.
+      # A FULL krableadsV2 DUPLICATE (welcome -> AI parse -> review -> groups/
+      # drivers -> tag PDF at the end), under its OWN Telegram token, PLUS the
+      # FastAPI /api/tag/generate endpoint for tristatetags.com/tag. It SHARES
+      # krab-issuer-bot's Supabase, so most env is linked from it; only the token
+      # differs. WARNING: this instance runs ALL background jobs on the shared DB
+      # (web-order ingest, renewals, driver-timeout, receipts) so they DOUBLE
+      # with krab-issuer-bot. Point it at a separate Supabase, or disable the
+      # ingest/renewal jobs, if you don't want double-dispatch.
+      - key: TELEGRAM_BOT_TOKEN    # NEW @BotFather token, different from krab-issuer-bot
+        sync: false
       - key: TAG_API_KEY
         generateValue: true
+      - key: ADMIN_TELEGRAM_IDS
+        sync: false
+      - key: KRAB_API_CORS_ALLOWED_ORIGINS
+        value: https://tristatetags.com,https://www.tristatetags.com
+      - key: PORT
+        value: "8080"
+      - key: OPENAI_VISION_MODEL
+        value: gpt-4o
+      - key: KRAB_DISPATCH_API_URL
+        value: https://krab-dispatch-api.onrender.com
+      - key: TRISTATECOVERAGE_API_BASE
+        value: https://tristatecoverage.com
+      - key: API_LEAD_USER_ID
+        value: tristatetag
+      # --- shared with krab-issuer-bot (same Supabase + integrations) ---
       - key: SUPABASE_URL
         fromService:
           name: krab-issuer-bot
@@ -495,16 +512,36 @@ services:
           name: krab-issuer-bot
           type: worker
           envVarKey: SUPABASE_KEY
-      - key: KRAB_API_CORS_ALLOWED_ORIGINS
-        value: https://tristatetags.com,https://www.tristatetags.com
-      # Log each generated tag to tristatetags.com/backend (reference + issuer),
-      # same ledger krableadsV2 uses.
-      - key: KRAB_DISPATCH_API_URL
-        value: https://krab-dispatch-api.onrender.com
+      - key: OPENAI_API_KEY
+        fromService:
+          name: krab-issuer-bot
+          type: worker
+          envVarKey: OPENAI_API_KEY
+      - key: SUPERVISORY_TELEGRAM_ID
+        fromService:
+          name: krab-issuer-bot
+          type: worker
+          envVarKey: SUPERVISORY_TELEGRAM_ID
       - key: KRAB_DISPATCH_ADMIN_PASSWORD
         fromService:
           name: krab-dispatch-api
           type: web
           envVarKey: ADMIN_PASSWORD
-      - key: PORT
-        value: "8080"
+      - key: LEAD_INGEST_API_KEY
+        fromService:
+          name: krab-issuer-bot
+          type: worker
+          envVarKey: LEAD_INGEST_API_KEY
+      - key: RESEND_API_KEY
+        fromService:
+          name: krab-issuer-bot
+          type: worker
+          envVarKey: RESEND_API_KEY
+      - key: RESEND_FROM
+        fromService:
+          name: krab-issuer-bot
+          type: worker
+          envVarKey: RESEND_FROM
+      # Mirror any remaining krab-issuer-bot env for full parity: ONETIMESECRET_*,
+      # TRACKING_*, RENEWAL_*, SENDGRID_*, FOLLOWUP_*, TWILIO_*, MONDAY_*,
+      # INTEGRATIONS_API_KEY, RECEIPT_DETECTION_MODE, VIN_PROVIDER, etc.

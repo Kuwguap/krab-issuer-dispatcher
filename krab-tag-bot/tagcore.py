@@ -20,6 +20,14 @@ NY_TZ = ZoneInfo("America/New_York")
 
 
 def _load_tag_pdf():
+    # This bot IS a krableadsV2 duplicate, so the canonical generator lives in
+    # the local utils/ package. Prefer it; fall back to the old build-copy /
+    # sibling paths only if utils/ is absent.
+    try:
+        from utils import tag_pdf  # type: ignore
+        return tag_pdf
+    except Exception:
+        pass
     local = os.path.join(_HERE, "taggen", "tag_pdf.py")
     if os.path.exists(local):
         import sys
