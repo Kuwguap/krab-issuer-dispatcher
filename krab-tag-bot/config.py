@@ -19,10 +19,12 @@ class Config:
 
     KRAB_API_CORS_ALLOWED_ORIGINS = (os.getenv("KRAB_API_CORS_ALLOWED_ORIGINS") or "*").strip()
 
-    # Telegram user IDs allowed to open /settings (comma-separated).
-    ADMIN_TELEGRAM_IDS = {
-        s.strip() for s in (os.getenv("ADMIN_TELEGRAM_IDS") or "").split(",") if s.strip()
-    }
+    # Telegram user IDs allowed to open /settings (comma-separated). Read at
+    # call time (not import) and tolerant of surrounding quotes/whitespace.
+    @classmethod
+    def admin_ids(cls) -> set:
+        raw = os.getenv("ADMIN_TELEGRAM_IDS") or ""
+        return {s.strip().strip('"').strip("'") for s in raw.split(",") if s.strip()}
 
     # Ledger logging: post each generated tag to tristatetags.com/backend so it
     # shows which staff user made which tag (same reference system as krableadsV2).
@@ -31,7 +33,7 @@ class Config:
 
     @classmethod
     def is_admin(cls, telegram_id) -> bool:
-        return str(telegram_id) in cls.ADMIN_TELEGRAM_IDS
+        return str(telegram_id).strip() in cls.admin_ids()
 
     @classmethod
     def ledger_configured(cls) -> bool:

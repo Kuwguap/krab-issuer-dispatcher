@@ -194,9 +194,29 @@ def _is_admin_update(update: Update) -> bool:
     return bool(u and Config.is_admin(u.id))
 
 
+async def cmd_myid(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    u = update.effective_user
+    await update.message.reply_text(
+        f"Your Telegram ID: `{u.id}`\n"
+        + ("✅ You are an admin." if Config.is_admin(u.id)
+           else "Add this exact number to ADMIN_TELEGRAM_IDS (comma-separated) and redeploy to get access."),
+        parse_mode="Markdown",
+    )
+
+
 async def cmd_settings(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not _is_admin_update(update):
-        await update.message.reply_text("⛔ Settings are restricted to admins.")
+        u = update.effective_user
+        configured = len(Config.admin_ids())
+        hint = (
+            "No admins are configured yet — set ADMIN_TELEGRAM_IDS on the bot and redeploy."
+            if configured == 0
+            else "Ask an admin to add your ID to ADMIN_TELEGRAM_IDS (then redeploy)."
+        )
+        await update.message.reply_text(
+            f"⛔ Settings are restricted to admins.\n\nYour Telegram ID: `{u.id}`\n{hint}",
+            parse_mode="Markdown",
+        )
         return
     context.user_data.pop("settings_await", None)
     await update.message.reply_text("⚙️ *Settings*", parse_mode="Markdown", reply_markup=_settings_main_kb())
@@ -337,6 +357,7 @@ def main() -> None:
     # when a staffer taps "Send to <group>"), so it can't spam the usage text.
     private = filters.ChatType.PRIVATE
     app.add_handler(CommandHandler(["start", "help", "newtag"], cmd_start, filters=private))
+    app.add_handler(CommandHandler("myid", cmd_myid, filters=private))
     app.add_handler(CommandHandler("settings", cmd_settings, filters=private))
     app.add_handler(CallbackQueryHandler(handle_settings_callback, pattern=r"^set_"))
     app.add_handler(CallbackQueryHandler(handle_send_to_group, pattern=r"^send_"))
