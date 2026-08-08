@@ -95,6 +95,24 @@ def test_samples_render_valid_pdfs():
         assert s["body"] in text and s["policy"] in text, s["name"]
 
 
+def test_body_style_door_suffix():
+    # Ported from njtemporarytag suggestBodyFromNhtsa / formatBodyForPdf.
+    f = tag_pdf.suggest_body_from_nhtsa
+    assert f("Sport Utility Vehicle (SUV)/Multipurpose Vehicle (MPV)", "4") == "SUV 4DR"
+    assert f("Sedan/Saloon", "2") == "Sedan 4DR"   # sedan forces 4DR
+    assert f("Coupe", "4") == "Coupe 2DR"           # coupe forces 2DR
+    assert f("Pickup", "", "Crew") == "Crew-Cab 2DR"
+    assert f("Pickup", "", "Extended") == "Extended Cab 2DR"
+    assert f("Pickup", "", "Regular") == "Regular Cab 2DR"
+    assert f("Cargo Van") == "Cargo 3DR"
+    assert f("Hatchback", "4") == "Sedan 4DR"
+    fb = tag_pdf.format_body_for_pdf
+    assert fb("sedan 4dr") == "Sedan 4DR"
+    assert fb("extended cab 2dr") == "Extended Cab 2DR"
+    assert fb("crew-cab 2dr") == "Crew-Cab 2DR"
+    assert fb("SUV") == "SUV" and fb("Chassis") == "Chassis"  # plain unchanged
+
+
 def test_output_is_flattened_not_editable():
     # The rendered tag must have NO interactive form fields — nothing clickable
     # or editable in a PDF viewer.
@@ -136,6 +154,7 @@ if __name__ == "__main__":
     test_exp_banner_and_mdy()
     test_default_expiry_is_issue_plus_29()
     test_samples_render_valid_pdfs()
+    test_body_style_door_suffix()
     test_output_is_flattened_not_editable()
     test_labeled_city_state_zip()
     test_normalize_city_state_zip()

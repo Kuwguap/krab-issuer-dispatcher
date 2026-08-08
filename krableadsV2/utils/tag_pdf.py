@@ -207,6 +207,86 @@ def body_label(raw_body_class: str) -> str:
     return first[:1].upper() + first[1:] if first else ""
 
 
+# ── Body style with door suffix ("Sedan 4DR", "Extended Cab 2DR", "SUV 4DR") ──
+# Ported 1:1 from the njtemporarytag generator (normalize-pdf-fields.js:
+# formatBodyForPdf / suggestBodyFromNhtsa / guessDoorsFromText). Only the DR
+# suffix is upper-case; acronyms below stay upper-case; other words title-case.
+_BODY_ACRONYMS = {"SUV", "ATV", "RV"}
+
+
+def _title_token(w: str) -> str:
+    w = str(w or "")
+    return (w[:1].upper() + w[1:].lower()) if w else ""
+
+
+def _fmt_body_words(style: str) -> str:
+    out = []
+    for w in str(style or "").split():
+        if w.upper() in _BODY_ACRONYMS:
+            out.append(w.upper())
+        else:
+            out.append("-".join(_title_token(t) for t in w.split("-")))
+    return " ".join(out)
+
+
+def format_body_for_pdf(raw: str) -> str:
+    """"sedan 4dr" → "Sedan 4DR", "extended cab 2dr" → "Extended Cab 2DR",
+    "SUV" → "SUV", "Chassis" → "Chassis". Only the DR suffix is all-caps."""
+    s = str(raw or "").strip()
+    if not s:
+        return ""
+    m = re.match(r"^(.+?)\s+(\d)\s*DR$", s, re.IGNORECASE)
+    if not m:
+        return _fmt_body_words(s)
+    return f"{_fmt_body_words(m.group(1))} {m.group(2)}DR"
+
+
+def _guess_doors_from_text(*parts: str) -> str:
+    text = " ".join(p for p in parts if p)
+    m = re.search(r"(\d)\s*[- ]?\s*dr\b", text, re.IGNORECASE)
+    if m:
+        return f"{m.group(1)}DR"
+    if re.search(r"coupe|pickup|truck|roadster|convertible|2[- ]door", text, re.IGNORECASE):
+        return "2DR"
+    if re.search(r"cargo|3[- ]door|3dr", text, re.IGNORECASE):
+        return "3DR"
+    return "4DR"
+
+
+def suggest_body_from_nhtsa(body_class: str, doors: str = "", cab: str = "") -> str:
+    """NHTSA BodyClass (+ door count + cab type) → "SUV 4DR", "Sedan 4DR",
+    "Extended Cab 2DR", "Crew-Cab 2DR", "Cargo 3DR", etc."""
+    bc = str(body_class or "").strip()
+    cab = str(cab or "").strip()
+    digits = re.sub(r"\D", "", str(doors or ""))
+    door_num = int(digits) if digits else 0
+    dr = f"{door_num}DR" if door_num > 0 else _guess_doors_from_text(bc, cab)
+    low = f"{bc} {cab}".lower()
+    if re.search(r"suv|sport utility|crossover|mpv", low):
+        return f"SUV {'4DR' if dr == '2DR' else dr}"
+    if re.search(r"sedan|saloon|hatchback", low):
+        return f"Sedan {'4DR' if dr == '2DR' else dr}"
+    if re.search(r"coupe|convertible|roadster", low):
+        return f"Coupe {'2DR' if dr == '4DR' else dr}"
+    if re.search(r"cargo|van|minivan", low):
+        return "Cargo 3DR"
+    if re.search(r"pickup|truck", low):
+        if re.search(r"crew", low):
+            return "Crew-Cab 2DR"
+        if re.search(r"extended|double|super", low):
+            return "Extended Cab 2DR"
+        if re.search(r"regular|standard|single", low):
+            return "Regular Cab 2DR"
+        return "Extended Cab 2DR"
+    if re.search(r"semi|tractor|trailer", low):
+        return "Semi-Trailer Truck 2DR"
+    if re.search(r"wagon", low):
+        return f"Sedan {'4DR' if dr == '2DR' else dr}"
+    if bc:
+        return f"{_title_token(re.split(r'[\s/]+', bc)[0])} {dr}"
+    return ""
+
+
 def title_case(raw: str) -> str:
     return " ".join(w[:1].upper() + w[1:].lower() for w in str(raw or "").split() if w)
 
@@ -241,8 +321,10 @@ def decode_vin_for_tag(vin: str) -> Optional[Dict[str, str]]:
     """One NHTSA vPIC call → ``{year, make, model, body}`` for the tag.
 
     ``make`` is title-cased and ``model`` kept verbatim (matches the samples:
-    "Infiniti"/"JX35", "Subaru"/"Impreza"). ``body`` is the short label. Blocking
-    HTTP — call via ``asyncio.to_thread``. Returns None if undecodable.
+    "Infiniti"/"JX35", "Subaru"/"Impreza"). ``body`` carries the door-count
+    suffix the njtemporarytag generator prints ("SUV 4DR", "Sedan 4DR",
+    "Extended Cab 2DR"). Blocking HTTP — call via ``asyncio.to_thread``.
+    Returns None if undecodable.
     """
     v = re.sub(r"[^A-Za-z0-9]", "", str(vin or "")).upper()
     if len(v) != 17:
@@ -261,7 +343,9 @@ def decode_vin_for_tag(vin: str) -> Optional[Dict[str, str]]:
         "year": str(res.get("ModelYear") or "").strip(),
         "make": title_case(res.get("Make") or ""),
         "model": str(res.get("Model") or "").strip(),
-        "body": body_label(res.get("BodyClass") or ""),
+        "body": suggest_body_from_nhtsa(
+            res.get("BodyClass") or "", res.get("Doors") or "", res.get("BodyCabType") or ""
+        ),
     }
 
 
