@@ -3274,15 +3274,11 @@ async def _send_full_group_lead_to_chat(
         return_exceptions=True,
     )
 
-    # Second message: the generated NJ temp-tag PDF to the same targets.
-    # Website leads already receive the tag at dispatch time, and MANUAL leads
-    # now receive it at creation (tag_sent_at_creation), so don't re-send it on
-    # group accept — EXCEPT on a renewal, which issues a brand-new tag (fresh
-    # plate + new 30-day window).
-    if renewal or (
-        not (lead.get("external_order_id") or "").strip()
-        and not lead.get("tag_sent_at_creation")
-    ):
+    # Second message: the generated NJ temp-tag PDF to the same targets — sent
+    # at the LATER part of the flow, when a group ACCEPTS the lead. Website leads
+    # already receive the tag at dispatch time (they carry external_order_id), so
+    # they're skipped here; renewals always mint a brand-new tag.
+    if renewal or not (lead.get("external_order_id") or "").strip():
         try:
             await _build_and_send_tag_pdf(
                 context, lead, [tid for tid, _ in targets], renewal=renewal
@@ -3394,35 +3390,6 @@ async def _build_and_send_tag_pdf(
         except Exception as e:
             logger.warning("Could not send tag PDF to %s: %s", cid, e)
     return sent
-
-
-async def _send_creation_tag_to_groups(
-    context: ContextTypes.DEFAULT_TYPE, lead: dict, groups: list
-) -> None:
-    """Manual-lead creation: send the informational supervisory notice + the
-    NJ temp-tag PDF to the selected group(s), then flag the lead so the
-    group-accept path does not send the tag a second time. Best-effort — a
-    failure here never blocks the claim offers already posted."""
-    targets = [g for g in (groups or []) if g]
-    if not targets:
-        return
-    try:
-        await _send_web_order_supervisory_notice(context, lead, targets)
-        chat_ids = [_parse_chat_id(g.get("group_telegram_id")) for g in targets]
-        sent = await _build_and_send_tag_pdf(context, lead, [c for c in chat_ids if c])
-        # Only mark the tag delivered when at least one group actually got it —
-        # otherwise leave the flag false so the group-accept path re-sends
-        # (fail-safe: a transient send outage never strands the tag).
-        if sent > 0:
-            ok = db.update_lead(str(lead["id"]), {"tag_sent_at_creation": True})
-            if not ok:
-                logger.warning(
-                    "tag_sent_at_creation NOT persisted for %s (run migration_tag_sent_flag.sql?) "
-                    "— the group-accept path may re-send the tag.",
-                    lead.get("id"),
-                )
-    except Exception as e:
-        logger.warning("Creation-time tag send failed for %s: %s", lead.get("id"), e)
 
 
 def _lead_issuer_note(lead: dict) -> str:
@@ -5217,10 +5184,8 @@ async def _finalize_lead_after_notes(
     else:
         await _post_single_group_approval(context, lead, selected_group)
 
-    # Manual lead: supervisory notice + tag PDF to the selected group(s) now.
-    await _send_creation_tag_to_groups(
-        context, lead, active_groups if is_all_groups else [selected_group]
-    )
+    # The temp-tag PDF is sent later, when a group ACCEPTS the lead
+    # (see _send_full_group_lead_to_chat), not at creation.
 
     _store_issuer_await_group_accept(
         user_id,
@@ -5402,10 +5367,8 @@ async def _submit_lead_from_review(message, context, user_id, data):
     else:
         await _post_single_group_approval(context, lead, group)
 
-    # Manual lead: supervisory notice + tag PDF to the selected group(s) now.
-    await _send_creation_tag_to_groups(
-        context, lead, active_groups if is_all_groups else [group]
-    )
+    # The temp-tag PDF is sent later, when a group ACCEPTS the lead
+    # (see _send_full_group_lead_to_chat), not at creation.
 
     # Safety net: only run AFTER the group approval has been posted, so any
     # failure here can never block the group from receiving the lead.
