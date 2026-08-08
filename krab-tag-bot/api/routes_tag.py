@@ -48,6 +48,7 @@ class TagRequest(BaseModel):
     policyNumber: Optional[str] = None
     issued: Optional[str] = None
     expires: Optional[str] = None
+    issuer: Optional[str] = None
 
 
 @router.post("/api/tag/generate", dependencies=[Depends(require_tag_api_key)])
@@ -62,19 +63,30 @@ async def generate_tag(body: TagRequest, store: int = Query(default=0)):
         parsed = parse_details(str(message))
         for k, v in parsed.items():
             payload.setdefault(k, v)
+    issuer = str(payload.pop("issuer", "") or "").strip() or "tristatetags-web"
     try:
-        pdf, plate, control = await asyncio.to_thread(tagcore.generate, payload, db)
+        pdf, fields = await asyncio.to_thread(tagcore.generate_full, payload, db)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
         logger.exception("Tag generation failed")
         raise HTTPException(status_code=500, detail=f"Tag generation failed: {e}")
+    plate, control = fields["plate"], fields["control_number"]
+
+    # Reference # + log to tristatetags.com/backend (same as the bot).
+    import ledger
+    reference = ledger.generate_reference_id()
+    client_name = f"{fields.get('first', '')} {fields.get('last', '')}".strip()
+    await asyncio.to_thread(
+        ledger.log_tag, reference_id=reference, client_name=client_name,
+        issuer_name=issuer, issuer_handle=issuer,
+    )
 
     if store:
         url = await asyncio.to_thread(db.upload_tag_to_storage, plate, pdf)
         if not url:
             raise HTTPException(status_code=502, detail="Could not store tag PDF")
-        return JSONResponse({"url": url, "plate": plate, "control_number": control})
+        return JSONResponse({"url": url, "plate": plate, "control_number": control, "reference": reference})
 
     filename = "tag_" + "".join(c for c in plate if c.isalnum()) + ".pdf"
     return Response(
@@ -84,5 +96,6 @@ async def generate_tag(body: TagRequest, store: int = Query(default=0)):
             "Content-Disposition": f'inline; filename="{filename}"',
             "X-Tag-Plate": plate,
             "X-Tag-Control": control,
+            "X-Tag-Reference": reference,
         },
     )

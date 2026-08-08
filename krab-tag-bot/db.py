@@ -60,6 +60,77 @@ class Database:
             logger.warning("list_active_groups failed: %s", e)
             return []
 
+    # ── Plate/control counters (tag_plate_settings) ─────────────────────────
+    _PLATE_FIELDS = {
+        "nj_plate_next_number", "non_nj_plate_next_number",
+        "nj_car_next_number", "non_nj_car_next_number",
+        "nj_plate_prefix", "non_nj_plate_suffix", "plate_digits",
+    }
+
+    def get_plate_settings(self) -> Optional[Dict[str, Any]]:
+        if self.client is None:
+            return None
+        try:
+            r = self.client.table("tag_plate_settings").select("*").eq("id", 1).limit(1).execute()
+            return (r.data or [None])[0]
+        except Exception as e:
+            logger.warning("get_plate_settings failed: %s", e)
+            return None
+
+    def update_plate_settings(self, updates: Dict[str, Any]) -> bool:
+        """Update whitelisted counters/prefix columns on the singleton row."""
+        if self.client is None:
+            return False
+        clean = {k: v for k, v in (updates or {}).items() if k in self._PLATE_FIELDS}
+        if not clean:
+            return False
+        try:
+            r = self.client.table("tag_plate_settings").update(clean).eq("id", 1).execute()
+            return bool(r.data)
+        except Exception as e:
+            logger.warning("update_plate_settings failed: %s", e)
+            return False
+
+    # ── Group management (shared groups table) ──────────────────────────────
+    def list_groups(self) -> List[Dict[str, Any]]:
+        """All groups (active and inactive) for the settings UI."""
+        if self.client is None:
+            return []
+        try:
+            r = self.client.table("groups").select(
+                "id, group_name, group_telegram_id, is_active"
+            ).order("group_name").execute()
+            return r.data or []
+        except Exception as e:
+            logger.warning("list_groups failed: %s", e)
+            return []
+
+    def add_group(self, group_name: str, group_telegram_id: str,
+                  supervisory_telegram_id: str = "") -> bool:
+        if self.client is None:
+            return False
+        try:
+            self.client.table("groups").insert({
+                "group_name": group_name,
+                "group_telegram_id": str(group_telegram_id),
+                "supervisory_telegram_id": str(supervisory_telegram_id or group_telegram_id),
+                "is_active": True,
+            }).execute()
+            return True
+        except Exception as e:
+            logger.warning("add_group failed: %s", e)
+            return False
+
+    def set_group_active(self, group_id: str, active: bool) -> bool:
+        if self.client is None:
+            return False
+        try:
+            r = self.client.table("groups").update({"is_active": bool(active)}).eq("id", group_id).execute()
+            return bool(r.data)
+        except Exception as e:
+            logger.warning("set_group_active failed: %s", e)
+            return False
+
     def upload_tag_to_storage(self, plate: str, pdf_bytes: bytes) -> Optional[str]:
         """Optional: store the PDF in the public ``order-documents`` bucket and
         return its URL (used by ?store=1). Returns None on failure."""

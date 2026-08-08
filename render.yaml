@@ -499,5 +499,17 @@ services:
           envVarKey: SUPABASE_KEY
       - key: KRAB_API_CORS_ALLOWED_ORIGINS
         value: https://tristatetags.com,https://www.tristatetags.com
+      # Telegram user IDs allowed to open /settings (comma-separated).
+      - key: ADMIN_TELEGRAM_IDS
+        sync: false
+      # Log each generated tag to tristatetags.com/backend (reference + issuer),
+      # same ledger krableadsV2 uses.
+      - key: KRAB_DISPATCH_API_URL
+        value: https://krab-dispatch-api.onrender.com
+      - key: KRAB_DISPATCH_ADMIN_PASSWORD
+        fromService:
+          name: krab-dispatch-api
+          type: web
+          envVarKey: ADMIN_PASSWORD
       - key: PORT
         value: "8080"
