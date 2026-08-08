@@ -22,6 +22,9 @@ router = APIRouter()
 
 
 class TagRequest(BaseModel):
+    # Optional free-text labeled block (same syntax the Telegram bot accepts).
+    # Parsed with the shared parser; explicit fields below override it.
+    message: Optional[str] = None
     is_nj: Optional[bool] = None
     plate: Optional[str] = None
     control_number: Optional[str] = None
@@ -50,7 +53,15 @@ class TagRequest(BaseModel):
 @router.post("/api/tag/generate", dependencies=[Depends(require_tag_api_key)])
 async def generate_tag(body: TagRequest, store: int = Query(default=0)):
     db = get_db()
-    payload: Dict[str, Any] = {k: v for k, v in body.model_dump().items() if v is not None}
+    dumped = body.model_dump()
+    message = dumped.pop("message", None)
+    payload: Dict[str, Any] = {k: v for k, v in dumped.items() if v is not None}
+    # Free-text paste (same parser as the bot); explicit fields win over parsed.
+    if message and str(message).strip():
+        from parsing import parse_labeled
+        parsed = parse_labeled(str(message))
+        for k, v in parsed.items():
+            payload.setdefault(k, v)
     try:
         pdf, plate, control = await asyncio.to_thread(tagcore.generate, payload, db)
     except ValueError as e:
