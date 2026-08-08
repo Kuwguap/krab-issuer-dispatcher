@@ -283,7 +283,8 @@ def suggest_body_from_nhtsa(body_class: str, doors: str = "", cab: str = "") -> 
     if re.search(r"wagon", low):
         return f"Sedan {'4DR' if dr == '2DR' else dr}"
     if bc:
-        return f"{_title_token(re.split(r'[\s/]+', bc)[0])} {dr}"
+        first_word = re.split(r"[\s/]+", bc)[0]
+        return f"{_title_token(first_word)} {dr}"
     return ""
 
 
