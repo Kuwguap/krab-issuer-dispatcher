@@ -398,15 +398,17 @@ def parse_city_zip(city_state_zip: str, state: str = "") -> tuple[str, str]:
         body = re.sub(rf"\b{re.escape(zipc)}(?:-\d{{4}})?\b", " ", body)
     body = _LABEL_WORD_RE.sub(" ", body)
 
-    # Strip a trailing state — passed value, 2-letter abbreviation, or spelled name.
+    # Strip a trailing state — passed value, 2-letter abbreviation, or spelled
+    # name. The trailing ``[\s,]*`` tolerates a "City, ST,ZIP" comma that's left
+    # behind once the ZIP is removed (e.g. "Bronx, NY," → "Bronx").
     if state:
-        body = re.sub(rf"[, ]+{re.escape(state)}\s*$", "", body, flags=re.IGNORECASE)
+        body = re.sub(rf"[, ]+{re.escape(state)}\b[\s,]*$", "", body, flags=re.IGNORECASE)
     for name in sorted(_US_STATES, key=len, reverse=True):
-        body2 = re.sub(rf"[, ]+{re.escape(name)}\s*$", "", body, flags=re.IGNORECASE)
+        body2 = re.sub(rf"[, ]+{re.escape(name)}\b[\s,]*$", "", body, flags=re.IGNORECASE)
         if body2 != body:
             body = body2
             break
-    body = re.sub(r"[, ]+[A-Za-z]{2}\s*$", lambda m: "" if m.group(0).strip(", ").upper() in _STATE_ABBRS else m.group(0), body)
+    body = re.sub(r"[, ]+[A-Za-z]{2}[\s,]*$", lambda m: "" if m.group(0).strip(", ").upper() in _STATE_ABBRS else m.group(0), body)
     city = re.sub(r"\s{2,}", " ", body).strip().rstrip(",").strip()
     return city, zipc
 

@@ -28,7 +28,7 @@ from telegram.ext import (
 import tagcore
 from config import Config
 from db import Database
-from parsing import parse_labeled
+from parsing import parse_details
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO
@@ -87,7 +87,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 async def handle_details(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     msg = update.message
     text = (msg.text or msg.caption or "").strip()
-    payload = parse_labeled(text)
+    payload = parse_details(text)
     if not payload.get("name") and not payload.get("vin"):
         await msg.reply_text(USAGE, parse_mode="Markdown")
         return

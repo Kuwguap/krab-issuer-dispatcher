@@ -58,8 +58,8 @@ async def generate_tag(body: TagRequest, store: int = Query(default=0)):
     payload: Dict[str, Any] = {k: v for k, v in dumped.items() if v is not None}
     # Free-text paste (same parser as the bot); explicit fields win over parsed.
     if message and str(message).strip():
-        from parsing import parse_labeled
-        parsed = parse_labeled(str(message))
+        from parsing import parse_details
+        parsed = parse_details(str(message))
         for k, v in parsed.items():
             payload.setdefault(k, v)
     try:

@@ -143,6 +143,9 @@ def test_labeled_city_state_zip():
     city, zc = tag_pdf.parse_city_zip("BRONX STATE: NY ZIP: 10465", st)
     assert city == "BRONX" and zc == "10465", (city, zc)
     assert tag_pdf.parse_state("LITTLE EGG HARBOR STATE: NJ ZIP: 08087") == "NJ"
+    # "City, ST,ZIP" with the comma glued to the ZIP must still strip the state.
+    st2 = tag_pdf.parse_state("Bronx, NY,10465")
+    assert tag_pdf.parse_city_zip("Bronx, NY,10465", st2) == ("Bronx", "10465")
 
 
 def test_normalize_city_state_zip():
