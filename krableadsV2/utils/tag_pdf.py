@@ -37,11 +37,23 @@ PAGE_H = 612.0
 
 # Hero elements — coordinates in pdf-lib bottom-left origin, exactly as the JS
 # generator's LAYOUT. Converted to PyMuPDF's top-left origin at draw time.
+# ``baseline_top`` is the exact text baseline in PyMuPDF top-left points,
+# calibrated to the reference tags (constant across every tag — the plate is
+# always 7 chars, the banner a fixed width, the control 10 digits). PyMuPDF's
+# TextWriter places a baseline where pdf-lib's drawText does NOT for the same
+# nominal box, so we anchor the baseline directly instead of the size*0.32
+# approximation, which sat the plate ~11pt low and the control ~12pt high.
+# ``x_left`` anchors the hero text's left edge at the exact reference position
+# (constant across all tags — plate is always 7 chars, banner a fixed 16-char
+# format, control 10 digits — so the reference draws them at fixed x, not
+# re-centered per string). Anchoring x removes the ±3pt jitter that per-string
+# Arial width measurement would otherwise introduce. The centering box (left/
+# width) is retained only for the shrink-to-fit safety guard.
 _LAYOUT = {
-    "plate": {"left": 38.6, "bottom": 341.9, "width": 707.5, "height": 156.3, "size": 180},
-    "exp": {"left": 120.8, "bottom": 292.1, "width": 512.4, "height": 54.9, "size": 60},
-    "car": {"left": 37.1, "bottom": 234.1, "width": 712.98, "height": 40, "size": 20},
-    "plate_left": {"left": 33.7, "bottom": 138.0, "width": 72, "height": 8, "size": 7.5},
+    "plate": {"left": 38.6, "bottom": 341.9, "width": 707.5, "height": 156.3, "size": 180, "baseline_top": 238.0, "x_left": 30.0},
+    "exp": {"left": 120.8, "bottom": 292.1, "width": 512.4, "height": 54.9, "size": 60, "baseline_top": 309.0, "x_left": 117.0},
+    "car": {"left": 37.1, "bottom": 234.1, "width": 712.98, "height": 40, "size": 20, "baseline_top": 376.0, "x_left": 338.0},
+    "plate_left": {"left": 35.8, "bottom": 138.0, "width": 72, "height": 8, "size": 7.5, "baseline_top": 472.6},
 }
 
 # Filled AcroForm fields are drawn manually at their widget rects; these three
@@ -336,17 +348,23 @@ def _draw_centered(tw: fitz.TextWriter, text: str, area: dict, font: fitz.Font,
     if max_width and text_w > max_width:
         size = size * max_width / text_w
         text_w = font.text_length(text, size)
-    x = area["left"] + (area["width"] - text_w) / 2
-    y_pdflib = area["bottom"] + area["height"] / 2 - size * 0.32
-    tw.append((x, PAGE_H - y_pdflib), text, font=font, fontsize=size)
+    x = area["x_left"] if "x_left" in area else area["left"] + (area["width"] - text_w) / 2
+    if "baseline_top" in area:
+        y_top = area["baseline_top"]
+    else:
+        y_top = PAGE_H - (area["bottom"] + area["height"] / 2 - size * 0.32)
+    tw.append((x, y_top), text, font=font, fontsize=size)
 
 
 def _draw_left(tw: fitz.TextWriter, text: str, area: dict, font: fitz.Font) -> None:
     if not text:
         return
     size = area["size"]
-    y_pdflib = area["bottom"] + area["height"] / 2 - size * 0.35
-    tw.append((area["left"], PAGE_H - y_pdflib), text, font=font, fontsize=size)
+    if "baseline_top" in area:
+        y_top = area["baseline_top"]
+    else:
+        y_top = PAGE_H - (area["bottom"] + area["height"] / 2 - size * 0.35)
+    tw.append((area["left"], y_top), text, font=font, fontsize=size)
 
 
 def _draw_field(tw: fitz.TextWriter, rect: fitz.Rect, text: str, size: float, font: fitz.Font) -> None:
