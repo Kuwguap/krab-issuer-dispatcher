@@ -1100,6 +1100,22 @@ async def process_pending_api_lead_dispatches(context: ContextTypes.DEFAULT_TYPE
             # offers flip to "taken"), then drivers are dispatched automatically
             # (see the website-lead branch in handle_accept_group_offer).
             await _post_lead_to_all_groups_for_approval(context, lead, active_groups)
+            # Unified web-order flow — two messages to every active group,
+            # alongside the claimable offer above: (1) the informational
+            # SUPERVISORY "New Lead" copy, then (2) the generated NJ temp-tag PDF.
+            group_chat_ids = [
+                _parse_chat_id(g.get("group_telegram_id")) for g in active_groups
+            ]
+            group_chat_ids = [c for c in group_chat_ids if c]
+            try:
+                await _send_web_order_supervisory_notice(context, lead, active_groups)
+            except Exception as e:
+                logger.warning("Web-order supervisory notice failed for %s: %s", lead_id, e)
+            try:
+                fresh_lead = db.get_lead_by_id(lead_id) or lead
+                await _build_and_send_tag_pdf(context, fresh_lead, group_chat_ids)
+            except Exception as e:
+                logger.warning("Web-order tag PDF failed for %s: %s", lead_id, e)
             offers = db.get_group_lead_offers(lead_id) or []
             logger.info(
                 "API ingest: lead %s ref %s offered to %d/%d group(s) for first-accept",
@@ -1112,6 +1128,76 @@ async def process_pending_api_lead_dispatches(context: ContextTypes.DEFAULT_TYPE
                 )
         except Exception as e:
             logger.error("process_pending_api_lead_dispatches failed for %s: %s", lead_id, e)
+
+
+def _extra_info_value(extra_info: str, key: str) -> str:
+    """Pull "Key: value" out of the pipe-joined extra_info line."""
+    for part in str(extra_info or "").split("|"):
+        part = part.strip()
+        if part.lower().startswith(key.lower() + ":"):
+            return part.split(":", 1)[1].strip()
+    return ""
+
+
+def _fmt_price_usd(price) -> str:
+    s = str(price or "").strip()
+    if not s:
+        return ""
+    return s if s.startswith("$") else f"${s}"
+
+
+def _build_web_order_supervisory_text(lead: dict) -> str:
+    """The informational SUPERVISORY 'New Lead' copy for a website order —
+    matches the tristatetags format (no claim buttons)."""
+    phase1 = _phase1_from_stored_lead(lead)
+    order_id = (lead.get("external_order_id") or lead.get("reference_id") or "").strip()
+    name = " ".join(w[:1].upper() + w[1:].lower() for w in (phase1.get("name") or "").split())
+    reg = ", ".join(x for x in (phase1.get("address"), phase1.get("city_state_zip")) if x)
+    delv = ", ".join(x for x in (phase1.get("delivery_address"), phase1.get("delivery_city_state_zip")) if x) or reg
+    color = phase1.get("color") or ""
+    vehicle = (phase1.get("car") or "").strip()
+    if vehicle and color:
+        vehicle = f"{vehicle}, {color[:1].upper() + color[1:].lower()}"
+    extra = phase1.get("extra_info") or ""
+    delivery_method = _extra_info_value(extra, "Delivery method") or "Email Delivery"
+    service = _extra_info_value(extra, "Service") or "30-Day NJ Temp Tag"
+    lines = [
+        "🛡️ SUPERVISORY MESSAGE",
+        "🆕 New Lead",
+        f"Order #{order_id}" if order_id else None,
+        f"Customer: {name}" if name else None,
+        f"Phone: {lead.get('phone_number')}" if lead.get("phone_number") else None,
+        f"Delivery email: {lead.get('email')}" if lead.get("email") else None,
+        f"Delivery method: {delivery_method}",
+        f"Registration address: {reg}" if reg else None,
+        f"Delivery address: {delv}" if delv else None,
+        f"VIN: {phase1.get('vin')}" if phase1.get("vin") else None,
+        f"Vehicle: {vehicle}" if vehicle else None,
+        f"Insurance: {phase1.get('insurance_company')}" if phase1.get("insurance_company") else None,
+        f"Policy #: {phase1.get('insurance_policy_number')}" if phase1.get("insurance_policy_number") else None,
+        f"Service: {service}",
+        f"Price: {_fmt_price_usd(lead.get('price'))}" if lead.get("price") else None,
+        "Informational copy — not claimable from this message.",
+        "Move Fast & Serve Client !",
+    ]
+    return "\n".join(l for l in lines if l)
+
+
+async def _send_web_order_supervisory_notice(
+    context: ContextTypes.DEFAULT_TYPE, lead: dict, groups: list
+) -> None:
+    """Send the informational supervisory 'New Lead' text to each group chat."""
+    text = _build_web_order_supervisory_text(lead)
+    seen: set = set()
+    for g in groups:
+        cid = _parse_chat_id(g.get("group_telegram_id"))
+        if not cid or cid in seen:
+            continue
+        seen.add(cid)
+        try:
+            await context.bot.send_message(chat_id=cid, text=text)
+        except Exception as e:
+            logger.warning("Could not send supervisory notice to group %s: %s", cid, e)
 
 
 def _parse_chat_id(raw: str | int | None) -> int | str | None:
@@ -3186,6 +3272,104 @@ async def _send_full_group_lead_to_chat(
         *(_post_one(tid, label) for tid, label in targets),
         return_exceptions=True,
     )
+
+    # Second message: the generated NJ temp-tag PDF to the same targets.
+    # Website leads already receive the tag at dispatch time (alongside the
+    # supervisory notice), so don't re-send it here on group accept.
+    if not (lead.get("external_order_id") or "").strip():
+        try:
+            await _build_and_send_tag_pdf(context, lead, [tid for tid, _ in targets])
+        except Exception as e:
+            logger.warning("Tag PDF send failed for ref %s: %s", reference_id, e)
+
+
+async def _tag_fields_from_lead(lead: dict) -> dict:
+    """Resolve a stored lead into the field dict tag_pdf.build_tag_pdf expects.
+
+    Allocates (and persists) the plate + control number once per lead, decodes
+    the VIN for year/make/model/body (falling back to the typed vehicle line),
+    and sets the registration state that picks the NJ vs non-NJ template.
+    """
+    from utils import tag_pdf
+
+    phase1 = _phase1_from_stored_lead(lead)
+    first, last = tag_pdf.split_name(phase1.get("name", ""))
+    csz = phase1.get("city_state_zip", "")
+    state = tag_pdf.parse_state(csz)
+    city, zipc = tag_pdf.parse_city_zip(csz, state)
+    vin = phase1.get("vin", "")
+
+    decoded = await asyncio.to_thread(tag_pdf.decode_vin_for_tag, vin) if vin else None
+    if decoded and decoded.get("make"):
+        year, make, model, body = decoded["year"], decoded["make"], decoded["model"], decoded["body"]
+    else:
+        year, make, model = tag_pdf.parse_car_line(phase1.get("car", ""))
+        body = ""
+
+    # Plate + control number: reuse if already assigned, else allocate once.
+    plate = (lead.get("plate") or "").strip()
+    control = (lead.get("tag_control_number") or "").strip()
+    if not plate or not control:
+        alloc = await asyncio.to_thread(db.allocate_temp_plate, state == "NJ")
+        plate = plate or alloc["plate"]
+        control = control or alloc["control_number"]
+        try:
+            db.update_lead(str(lead.get("id")), {"plate": plate, "tag_control_number": control})
+        except Exception as e:
+            logger.warning("Could not persist plate for lead %s: %s", lead.get("id"), e)
+
+    issue_dt, _exp_dt = _issue_and_expiration_for_group_display(lead)
+    issued = issue_dt.date() if issue_dt else None  # expires defaults to issue + 29d
+
+    return {
+        "is_nj": state == "NJ",
+        "plate": plate,
+        "control_number": control,
+        "vin": vin,
+        "year": year,
+        "make": make,
+        "model": model,
+        "color": phase1.get("color", ""),
+        "body": body,
+        "first": first,
+        "last": last,
+        "address": phase1.get("address", ""),
+        "city": city,
+        "state": state,
+        "zip": zipc,
+        "insurance_company": phase1.get("insurance_company", ""),
+        "policy": phase1.get("insurance_policy_number", ""),
+        "issued": issued,
+    }
+
+
+async def _build_and_send_tag_pdf(
+    context: ContextTypes.DEFAULT_TYPE, lead: dict, target_chat_ids: list
+) -> None:
+    """Generate the NJ temp-tag PDF for a lead and send it to each chat."""
+    from utils import tag_pdf
+
+    if not target_chat_ids:
+        return
+    fields = await _tag_fields_from_lead(lead)
+    pdf = await asyncio.to_thread(tag_pdf.build_tag_pdf, fields)
+    reference_id = (lead.get("reference_id") or "N/A").strip()
+    plate = fields.get("plate") or "tag"
+    caption = f"🧾 NJ 30-Day Temp Tag — {plate}\nReference: {reference_id}"
+    filename = f"tag_{re.sub(r'[^A-Za-z0-9]+', '', plate) or 'tag'}.pdf"
+    seen: set = set()
+    for cid in target_chat_ids:
+        if cid is None or cid in seen:
+            continue
+        seen.add(cid)
+        try:
+            await context.bot.send_document(
+                chat_id=cid,
+                document=InputFile(io.BytesIO(pdf), filename=filename),
+                caption=caption,
+            )
+        except Exception as e:
+            logger.warning("Could not send tag PDF to %s: %s", cid, e)
 
 
 def _lead_issuer_note(lead: dict) -> str:

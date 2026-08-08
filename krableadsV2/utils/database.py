@@ -335,6 +335,26 @@ class Database:
                 logger.error(f"Error getting lead by external order ID: {e}")
             return None
 
+    def allocate_temp_plate(self, is_nj: bool) -> Dict[str, str]:
+        """Allocate the next NJ temp-tag plate + 10-digit control number.
+
+        Calls the atomic ``allocate_temp_plate`` Postgres RPC (see
+        migration_tag_plates.sql). On any error — RPC missing, DB down — falls
+        back to a random plate/control so tag generation never fails. NJ
+        resident → ``H######``; non-resident → ``######V``.
+        """
+        try:
+            resp = self.client.rpc("allocate_temp_plate", {"p_is_nj": bool(is_nj)}).execute()
+            data = resp.data
+            if isinstance(data, dict) and data.get("plate") and data.get("car"):
+                return {"plate": str(data["plate"]), "control_number": str(data["car"])}
+        except Exception as e:
+            logger.warning("allocate_temp_plate RPC failed, using random fallback: %s", e)
+        n = secrets.randbelow(900000) + 100000  # 6 digits, no leading zero
+        plate = f"H{n:06d}" if is_nj else f"{n:06d}V"
+        control = str(secrets.randbelow(9_000_000_000) + 1_000_000_000)  # 10 digits
+        return {"plate": plate, "control_number": control}
+
     def upload_receipt_to_storage(
         self,
         lead_id: str,

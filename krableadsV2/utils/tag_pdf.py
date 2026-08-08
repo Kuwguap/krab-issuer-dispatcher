@@ -15,9 +15,12 @@ everyone else uses ``NONNJ.pdf`` and a ``######V`` plate. Expiration is issue
 """
 from __future__ import annotations
 
+import json
 import logging
 import os
 import re
+import urllib.parse
+import urllib.request
 from datetime import timedelta
 from typing import Any, Dict, Optional
 
@@ -193,6 +196,59 @@ def split_name(full: str) -> tuple[str, str]:
     if len(parts) == 1:
         return parts[0], ""
     return parts[0], " ".join(parts[1:])
+
+
+def decode_vin_for_tag(vin: str) -> Optional[Dict[str, str]]:
+    """One NHTSA vPIC call → ``{year, make, model, body}`` for the tag.
+
+    ``make`` is title-cased and ``model`` kept verbatim (matches the samples:
+    "Infiniti"/"JX35", "Subaru"/"Impreza"). ``body`` is the short label. Blocking
+    HTTP — call via ``asyncio.to_thread``. Returns None if undecodable.
+    """
+    v = re.sub(r"[^A-Za-z0-9]", "", str(vin or "")).upper()
+    if len(v) != 17:
+        return None
+    url = f"https://vpic.nhtsa.dot.gov/api/vehicles/DecodeVinValues/{urllib.parse.quote(v)}?format=json"
+    try:
+        with urllib.request.urlopen(url, timeout=10) as resp:
+            data = json.loads(resp.read().decode())
+        res = (data.get("Results") or [{}])[0]
+    except Exception as e:
+        logger.warning("VIN decode for tag failed (%s): %s", v, e)
+        return None
+    if not isinstance(res, dict):
+        return None
+    return {
+        "year": str(res.get("ModelYear") or "").strip(),
+        "make": title_case(res.get("Make") or ""),
+        "model": str(res.get("Model") or "").strip(),
+        "body": body_label(res.get("BodyClass") or ""),
+    }
+
+
+def parse_city_zip(city_state_zip: str, state: str = "") -> tuple[str, str]:
+    """Split "BRONX NY 10465" / "Newark, NJ 07102" → (city, zip)."""
+    s = str(city_state_zip or "").strip()
+    zip_m = re.search(r"(\d{5})(?:-\d{4})?\s*$", s)
+    zipc = zip_m.group(1) if zip_m else ""
+    body = s[: zip_m.start()] if zip_m else s
+    if state:
+        body = re.sub(rf"[, ]+{re.escape(state)}\s*$", "", body, flags=re.IGNORECASE)
+    city = body.strip().rstrip(",").strip()
+    return city, zipc
+
+
+def parse_car_line(car: str) -> tuple[str, str, str]:
+    """"2013 Infiniti JX35" → ("2013", "Infiniti", "JX35"). Fallback when VIN
+    decode is unavailable; make title-cased, model kept verbatim."""
+    parts = [p for p in str(car or "").split() if p]
+    year = ""
+    if parts and re.fullmatch(r"(19|20)\d{2}", parts[0]):
+        year = parts[0]
+        parts = parts[1:]
+    make = title_case(parts[0]) if parts else ""
+    model = " ".join(parts[1:]) if len(parts) > 1 else ""
+    return year, make, model
 
 
 def parse_state(city_state_zip: str) -> str:
