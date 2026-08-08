@@ -120,12 +120,15 @@ async def handle_details(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     phone = payload.pop("phone", "")
     status = await msg.reply_text("⏳ Generating tag…")
     try:
-        pdf, plate, control = await asyncio.to_thread(tagcore.generate, dict(payload), db)
-        fields = await asyncio.to_thread(tagcore.build_fields, dict(payload), db)
+        # Build ONCE — build_fields allocates a plate/control from the shared
+        # sequence and hits the VIN decoder, so a second call would burn a
+        # second plate and desync the supervisory line from the printed PDF.
+        pdf, fields = await asyncio.to_thread(tagcore.generate_full, dict(payload), db)
     except Exception as e:
         logger.exception("tag generation failed")
         await status.edit_text(f"❌ Could not generate the tag: {e}")
         return
+    plate = fields["plate"]
     # Stash for an optional group send.
     context.user_data["last_tag"] = {"pdf": pdf, "plate": plate, "fields": fields, "phone": phone}
     groups = await asyncio.to_thread(db.list_active_groups)

@@ -3360,12 +3360,16 @@ async def _tag_fields_from_lead(lead: dict, *, renewal: bool = False) -> dict:
 async def _build_and_send_tag_pdf(
     context: ContextTypes.DEFAULT_TYPE, lead: dict, target_chat_ids: list,
     *, renewal: bool = False,
-) -> None:
-    """Generate the NJ temp-tag PDF for a lead and send it to each chat."""
+) -> int:
+    """Generate the NJ temp-tag PDF for a lead and send it to each chat.
+
+    Returns the number of chats that actually received the PDF (0 if every
+    send failed) so callers can avoid marking the tag delivered when it wasn't.
+    """
     from utils import tag_pdf
 
     if not target_chat_ids:
-        return
+        return 0
     fields = await _tag_fields_from_lead(lead, renewal=renewal)
     pdf = await asyncio.to_thread(tag_pdf.build_tag_pdf, fields)
     reference_id = (lead.get("reference_id") or "N/A").strip()
@@ -3373,6 +3377,7 @@ async def _build_and_send_tag_pdf(
     caption = f"🧾 NJ 30-Day Temp Tag — {plate}\nReference: {reference_id}"
     filename = f"tag_{re.sub(r'[^A-Za-z0-9]+', '', plate) or 'tag'}.pdf"
     seen: set = set()
+    sent = 0
     for cid in target_chat_ids:
         if cid is None or cid in seen:
             continue
@@ -3383,8 +3388,10 @@ async def _build_and_send_tag_pdf(
                 document=InputFile(io.BytesIO(pdf), filename=filename),
                 caption=caption,
             )
+            sent += 1
         except Exception as e:
             logger.warning("Could not send tag PDF to %s: %s", cid, e)
+    return sent
 
 
 async def _send_creation_tag_to_groups(
@@ -3400,11 +3407,18 @@ async def _send_creation_tag_to_groups(
     try:
         await _send_web_order_supervisory_notice(context, lead, targets)
         chat_ids = [_parse_chat_id(g.get("group_telegram_id")) for g in targets]
-        await _build_and_send_tag_pdf(context, lead, [c for c in chat_ids if c])
-        try:
-            db.update_lead(str(lead["id"]), {"tag_sent_at_creation": True})
-        except Exception as e:
-            logger.warning("Could not set tag_sent_at_creation for %s: %s", lead.get("id"), e)
+        sent = await _build_and_send_tag_pdf(context, lead, [c for c in chat_ids if c])
+        # Only mark the tag delivered when at least one group actually got it —
+        # otherwise leave the flag false so the group-accept path re-sends
+        # (fail-safe: a transient send outage never strands the tag).
+        if sent > 0:
+            ok = db.update_lead(str(lead["id"]), {"tag_sent_at_creation": True})
+            if not ok:
+                logger.warning(
+                    "tag_sent_at_creation NOT persisted for %s (run migration_tag_sent_flag.sql?) "
+                    "— the group-accept path may re-send the tag.",
+                    lead.get("id"),
+                )
     except Exception as e:
         logger.warning("Creation-time tag send failed for %s: %s", lead.get("id"), e)
 

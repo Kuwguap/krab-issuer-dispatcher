@@ -135,8 +135,18 @@ def build_fields(payload: Dict[str, Any], db) -> Dict[str, Any]:
     }
 
 
+def generate_full(payload: Dict[str, Any], db) -> Tuple[bytes, Dict[str, Any]]:
+    """Normalize once and render. Returns (pdf_bytes, resolved_fields).
+
+    Use this when the caller also needs the resolved fields (e.g. to build a
+    supervisory message) — calling build_fields twice would allocate a SECOND
+    plate/control from the shared sequence and re-hit the VIN decoder.
+    """
+    fields = build_fields(payload, db)
+    return tag_pdf.build_tag_pdf(fields), fields
+
+
 def generate(payload: Dict[str, Any], db) -> Tuple[bytes, str, str]:
     """Return (pdf_bytes, plate, control_number)."""
-    fields = build_fields(payload, db)
-    pdf = tag_pdf.build_tag_pdf(fields)
+    pdf, fields = generate_full(payload, db)
     return pdf, fields["plate"], fields["control_number"]

@@ -24,6 +24,7 @@ _OPTIONAL_LEADS_WRITE_KEYS = frozenset({
     "portal_password",
     "ingest_dispatch_pending",
     "external_order_id",
+    "tag_sent_at_creation",
 })
 
 

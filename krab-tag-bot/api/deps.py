@@ -1,6 +1,7 @@
 """FastAPI dependencies: shared DB handle + Bearer API-key auth."""
 from __future__ import annotations
 
+import secrets
 from typing import Optional
 
 from fastapi import Header, HTTPException
@@ -29,5 +30,5 @@ async def require_tag_api_key(authorization: Optional[str] = Header(default=None
     auth = (authorization or "").strip()
     if not auth.lower().startswith("bearer "):
         raise HTTPException(status_code=401, detail="Missing Authorization: Bearer token")
-    if auth[7:].strip() != expected:
+    if not secrets.compare_digest(auth[7:].strip(), expected):
         raise HTTPException(status_code=401, detail="Invalid API key")
