@@ -476,6 +476,7 @@ services:
       pip install -r requirements.txt &&
       mkdir -p taggen assets &&
       cp ../krableadsV2/utils/tag_pdf.py taggen/tag_pdf.py &&
+      cp ../krableadsV2/utils/ai_vision.py taggen/ai_vision.py &&
       cp -r ../krableadsV2/assets/. assets/
     startCommand: python bot.py
     envVars:
@@ -502,6 +503,14 @@ services:
       # Telegram user IDs allowed to open /settings (comma-separated).
       - key: ADMIN_TELEGRAM_IDS
         sync: false
+      # Same AI parsing engine as krableadsV2 (photos + text).
+      - key: OPENAI_API_KEY
+        fromService:
+          name: krab-issuer-bot
+          type: worker
+          envVarKey: OPENAI_API_KEY
+      - key: OPENAI_VISION_MODEL
+        value: gpt-4o
       # Log each generated tag to tristatetags.com/backend (reference + issuer),
       # same ledger krableadsV2 uses.
       - key: KRAB_DISPATCH_API_URL

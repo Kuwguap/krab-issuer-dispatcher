@@ -105,6 +105,19 @@ class Database:
             logger.warning("list_groups failed: %s", e)
             return []
 
+    def list_drivers(self) -> List[Dict[str, Any]]:
+        """Active drivers (id, driver_name, driver_telegram_id) for selection."""
+        if self.client is None:
+            return []
+        try:
+            r = self.client.table("drivers").select(
+                "id, driver_name, driver_telegram_id, is_active"
+            ).order("driver_name").execute()
+            return [d for d in (r.data or []) if d.get("is_active", True) and d.get("driver_telegram_id")]
+        except Exception as e:
+            logger.warning("list_drivers failed: %s", e)
+            return []
+
     def add_group(self, group_name: str, group_telegram_id: str,
                   supervisory_telegram_id: str = "") -> bool:
         if self.client is None:

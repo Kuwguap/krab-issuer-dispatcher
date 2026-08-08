@@ -17,6 +17,14 @@ class Config:
     SUPABASE_URL = (os.getenv("SUPABASE_URL") or "").strip()
     SUPABASE_KEY = (os.getenv("SUPABASE_KEY") or os.getenv("SUPABASE_SERVICE_ROLE_KEY") or "").strip()
 
+    # AI parsing (same engine as krableadsV2 — build-copied ai_vision.py).
+    OPENAI_API_KEY = (os.getenv("OPENAI_API_KEY") or "").strip() or None
+    OPENAI_VISION_MODEL = (os.getenv("OPENAI_VISION_MODEL") or "gpt-4o").strip() or "gpt-4o"
+
+    @classmethod
+    def is_ai_vision_configured(cls) -> bool:
+        return bool(cls.OPENAI_API_KEY)
+
     KRAB_API_CORS_ALLOWED_ORIGINS = (os.getenv("KRAB_API_CORS_ALLOWED_ORIGINS") or "*").strip()
 
     # Telegram user IDs allowed to open /settings (comma-separated). Read at
