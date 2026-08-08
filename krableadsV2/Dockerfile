@@ -20,6 +20,9 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 #                      but kept explicit so wheel installs never fall back
 #                      to building from source).
 # - tini               clean shutdown so SIGTERM from Render reaches the bot
+# - fonts-liberation   Liberation Sans is metric-identical to Arial; the NJ
+#                      temp-tag generator (utils/tag_pdf.py) uses it so tags
+#                      render the same on Linux as with real Arial on Windows.
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \
         tesseract-ocr \
@@ -29,6 +32,7 @@ RUN apt-get update \
         zlib1g \
         tini \
         ca-certificates \
+        fonts-liberation \
  && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
