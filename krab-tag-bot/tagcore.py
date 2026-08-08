@@ -66,32 +66,41 @@ def build_fields(payload: Dict[str, Any], db) -> Dict[str, Any]:
     year/make/model blank, default issued=today ET and expires=issued+29."""
     p = dict(payload or {})
 
-    state = (p.get("state") or "").strip()
-    if not state and p.get("city_state_zip"):
-        state = tag_pdf.parse_state(p.get("city_state_zip"))
-    is_nj = p.get("is_nj")
-    if is_nj is None:
-        is_nj = (state or "").upper() == "NJ"
-    is_nj = bool(is_nj)
-
     # Split a combined name if first/last not given.
     first, last = (p.get("first") or "").strip(), (p.get("last") or "").strip()
     if not first and not last and p.get("name"):
         first, last = tag_pdf.split_name(p.get("name"))
 
+    # City/state/zip. Seed from a combined city_state_zip if the separate
+    # fields are blank, then normalize — this also re-splits a `city` field that
+    # actually carries the whole "CITY STATE: XX ZIP: NNNNN" blob so the labels
+    # and zip never leak into the printed City box.
     city = (p.get("city") or "").strip()
     zip_ = (p.get("zip") or "").strip()
-    if (not city or not zip_) and p.get("city_state_zip"):
-        pc = tag_pdf.parse_city_zip(p.get("city_state_zip"))
-        city = city or pc[0]
-        zip_ = zip_ or pc[1]
+    state = (p.get("state") or "").strip()
+    csz = p.get("city_state_zip")
+    if csz and (not city or not state or not zip_):
+        st0 = tag_pdf.parse_state(csz)
+        c0, z0 = tag_pdf.parse_city_zip(csz, st0)
+        city = city or c0
+        state = state or st0
+        zip_ = zip_ or z0
+    city, state, zip_ = tag_pdf.normalize_city_state_zip(city, state, zip_)
+
+    is_nj = p.get("is_nj")
+    if is_nj is None:
+        is_nj = (state or "").upper() == "NJ"
+    is_nj = bool(is_nj)
 
     year = (str(p.get("year") or "")).strip()
     make = (p.get("make") or "").strip()
     model = (p.get("model") or "").strip()
     body = (p.get("body") or "").strip()
     vin = (p.get("vin") or "").strip()
-    if vin and not (year and make and model):
+    # Decode the VIN whenever ANY of year/make/model/body is missing — a common
+    # case is make/model supplied but body left blank, which would otherwise
+    # print an empty Body Style.
+    if vin and not (year and make and model and body):
         try:
             dec = tag_pdf.decode_vin_for_tag(vin)
             if dec:

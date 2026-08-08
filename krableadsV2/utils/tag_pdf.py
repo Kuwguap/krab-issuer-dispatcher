@@ -265,13 +265,37 @@ def decode_vin_for_tag(vin: str) -> Optional[Dict[str, str]]:
     }
 
 
+# Labeled address fragments some upstreams emit, e.g.
+# "BRONX STATE: NY ZIP: 10465" — the labels must be stripped, not printed.
+_LABELED_STATE_RE = re.compile(r"\bSTATE\b\s*[:#]?\s*([A-Za-z]{2})\b", re.IGNORECASE)
+_LABELED_ZIP_RE = re.compile(r"\bZIP\b\s*[:#]?\s*(\d{5})(?:-\d{4})?\b", re.IGNORECASE)
+_LABEL_WORD_RE = re.compile(r"\b(STATE|ZIP)\b\s*[:#]?", re.IGNORECASE)
+
+
 def parse_city_zip(city_state_zip: str, state: str = "") -> tuple[str, str]:
-    """Split "BRONX NY 10465" / "Newark, NJ 07102" → (city, zip)."""
+    """Split "BRONX NY 10465" / "Newark, NJ 07102" / "BRONX STATE: NY ZIP: 10465"
+    → (city, zip). Labeled ``STATE:``/``ZIP:`` fragments are stripped so they
+    never leak into the printed City field."""
     s = str(city_state_zip or "").strip()
-    zip_m = re.search(r"(\d{5})(?:-\d{4})?\s*$", s)
-    zipc = zip_m.group(1) if zip_m else ""
-    body = s[: zip_m.start()] if zip_m else s
-    # Strip a trailing state — 2-letter abbreviation or spelled-out name.
+
+    # Labeled ZIP wins; else a trailing 5-digit run.
+    mz = _LABELED_ZIP_RE.search(s)
+    if mz:
+        zipc = mz.group(1)
+    else:
+        m = re.search(r"(\d{5})(?:-\d{4})?\s*$", s)
+        zipc = m.group(1) if m else ""
+
+    body = s
+    # Drop "STATE: NY" and "ZIP: 10465" label groups, then the zip digits, then
+    # any stray label words.
+    body = _LABELED_STATE_RE.sub(" ", body)
+    body = _LABELED_ZIP_RE.sub(" ", body)
+    if zipc:
+        body = re.sub(rf"\b{re.escape(zipc)}(?:-\d{{4}})?\b", " ", body)
+    body = _LABEL_WORD_RE.sub(" ", body)
+
+    # Strip a trailing state — passed value, 2-letter abbreviation, or spelled name.
     if state:
         body = re.sub(rf"[, ]+{re.escape(state)}\s*$", "", body, flags=re.IGNORECASE)
     for name in sorted(_US_STATES, key=len, reverse=True):
@@ -280,8 +304,41 @@ def parse_city_zip(city_state_zip: str, state: str = "") -> tuple[str, str]:
             body = body2
             break
     body = re.sub(r"[, ]+[A-Za-z]{2}\s*$", lambda m: "" if m.group(0).strip(", ").upper() in _STATE_ABBRS else m.group(0), body)
-    city = body.strip().rstrip(",").strip()
+    city = re.sub(r"\s{2,}", " ", body).strip().rstrip(",").strip()
     return city, zipc
+
+
+def normalize_city_state_zip(city: str, state: str, zip_: str) -> tuple[str, str, str]:
+    """Return clean (city, state, zip) even when ``city`` actually contains the
+    whole "CITY STATE: XX ZIP: NNNNN" blob (or a trailing state/zip) and the
+    separate state/zip came in blank. Mirrors the clean separated fields the
+    njtemporarytag generator receives from a structured order."""
+    city = str(city or "").strip()
+    state = str(state or "").strip()
+    zip_ = str(zip_ or "").strip()
+
+    combined = bool(
+        re.search(r"\d{5}", city)
+        or _LABEL_WORD_RE.search(city)
+        or (not state and re.search(r"[, ]+[A-Za-z]{2}\s*$", city))
+        or (not state and any(re.search(rf"\b{re.escape(n)}\b", city, re.IGNORECASE) for n in _US_STATES))
+    )
+    if combined or not state or not zip_:
+        st = parse_state(city)
+        c2, z2 = parse_city_zip(city, st)
+        if c2:
+            city = c2
+        if not state and st:
+            state = st
+        if not zip_ and z2:
+            zip_ = z2
+
+    # Normalize a spelled-out or lowercase state to its 2-letter code.
+    if state and state.upper() not in _STATE_ABBRS:
+        state = _US_STATES.get(state.strip().lower(), state)
+    if state.upper() in _STATE_ABBRS:
+        state = state.upper()
+    return city, state, zip_
 
 
 _TWO_WORD_MAKES = {
@@ -316,6 +373,10 @@ def parse_state(city_state_zip: str) -> str:
     s = str(city_state_zip or "").strip()
     if not s:
         return ""
+    # Labeled "STATE: NY" (some upstreams emit "BRONX STATE: NY ZIP: 10465").
+    m = _LABELED_STATE_RE.search(s)
+    if m and m.group(1).upper() in _STATE_ABBRS:
+        return m.group(1).upper()
     # A 2-letter abbreviation before a trailing ZIP is the most reliable signal
     # ("WASHINGTON DC 20001" → DC, not WA-the-state-name).
     m = re.search(r"\b([A-Za-z]{2})\b\s*,?\s*\d{5}(?:-\d{4})?\s*$", s)

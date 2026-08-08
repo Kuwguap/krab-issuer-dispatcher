@@ -95,6 +95,24 @@ def test_samples_render_valid_pdfs():
         assert s["body"] in text and s["policy"] in text, s["name"]
 
 
+def test_labeled_city_state_zip():
+    # Some upstreams emit "CITY STATE: XX ZIP: NNNNN" — labels must be stripped
+    # and city/state/zip split cleanly, never printed into the City box.
+    st = tag_pdf.parse_state("BRONX STATE: NY ZIP: 10465")
+    assert st == "NY", st
+    city, zc = tag_pdf.parse_city_zip("BRONX STATE: NY ZIP: 10465", st)
+    assert city == "BRONX" and zc == "10465", (city, zc)
+    assert tag_pdf.parse_state("LITTLE EGG HARBOR STATE: NJ ZIP: 08087") == "NJ"
+
+
+def test_normalize_city_state_zip():
+    # A city field carrying the whole blob is re-split; clean fields untouched.
+    assert tag_pdf.normalize_city_state_zip("BRONX STATE: NY ZIP: 10465", "", "") == ("BRONX", "NY", "10465")
+    assert tag_pdf.normalize_city_state_zip("BRONX, NY 10465", "", "") == ("BRONX", "NY", "10465")
+    assert tag_pdf.normalize_city_state_zip("Bronx", "NY", "10465") == ("Bronx", "NY", "10465")
+    assert tag_pdf.normalize_city_state_zip("Newark", "New Jersey", "07102") == ("Newark", "NJ", "07102")
+
+
 if __name__ == "__main__":
     test_color_code()
     test_body_label()
@@ -102,4 +120,6 @@ if __name__ == "__main__":
     test_exp_banner_and_mdy()
     test_default_expiry_is_issue_plus_29()
     test_samples_render_valid_pdfs()
+    test_labeled_city_state_zip()
+    test_normalize_city_state_zip()
     print("ALL TAG PDF TESTS PASSED")

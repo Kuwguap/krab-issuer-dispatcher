@@ -3307,6 +3307,7 @@ async def _tag_fields_from_lead(lead: dict, *, renewal: bool = False) -> dict:
     csz = phase1.get("city_state_zip", "")
     state = tag_pdf.parse_state(csz)
     city, zipc = tag_pdf.parse_city_zip(csz, state)
+    city, state, zipc = tag_pdf.normalize_city_state_zip(city, state, zipc)
     vin = phase1.get("vin", "")
 
     decoded = await asyncio.to_thread(tag_pdf.decode_vin_for_tag, vin) if vin else None
