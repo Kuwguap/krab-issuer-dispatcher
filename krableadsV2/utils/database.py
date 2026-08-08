@@ -356,6 +356,33 @@ class Database:
         control = str(secrets.randbelow(9_000_000_000) + 1_000_000_000)  # 10 digits
         return {"plate": plate, "control_number": control}
 
+    _PLATE_SETTINGS_FIELDS = {
+        "nj_plate_next_number", "non_nj_plate_next_number",
+        "nj_car_next_number", "non_nj_car_next_number",
+        "nj_plate_prefix", "non_nj_plate_suffix", "plate_digits",
+    }
+
+    def get_plate_settings(self) -> Optional[Dict[str, Any]]:
+        """Read the singleton tag_plate_settings row (counters/prefixes)."""
+        try:
+            r = self.client.table("tag_plate_settings").select("*").eq("id", 1).limit(1).execute()
+            return (r.data or [None])[0]
+        except Exception as e:
+            logger.warning("get_plate_settings failed: %s", e)
+            return None
+
+    def update_plate_settings(self, updates: Dict[str, Any]) -> bool:
+        """Update whitelisted plate-counter columns on the singleton row."""
+        clean = {k: v for k, v in (updates or {}).items() if k in self._PLATE_SETTINGS_FIELDS}
+        if not clean:
+            return False
+        try:
+            r = self.client.table("tag_plate_settings").update(clean).eq("id", 1).execute()
+            return bool(r.data)
+        except Exception as e:
+            logger.warning("update_plate_settings failed: %s", e)
+            return False
+
     def upload_receipt_to_storage(
         self,
         lead_id: str,

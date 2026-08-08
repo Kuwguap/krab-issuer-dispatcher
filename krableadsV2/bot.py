@@ -10606,6 +10606,145 @@ async def cmd_all_followups(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         await update.message.reply_text("\n".join(lines), reply_markup=kb, parse_mode="Markdown")
 
 
+# ── /settings (supervisors only): plate counters + group management ─────────
+SET_MENU, SET_INPUT = range(2)
+
+_PLATE_SET_LABELS = {
+    "nj_plate_next_number": "Resident plate number",
+    "non_nj_plate_next_number": "Non-Resident plate number",
+    "nj_car_next_number": "Resident control number",
+    "non_nj_car_next_number": "Non-Resident control number",
+}
+
+
+def _settings_main_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🔢 Plate Numbers", callback_data="tset_plates")],
+        [InlineKeyboardButton("👥 Groups", callback_data="tset_groups")],
+        [InlineKeyboardButton("✖️ Close", callback_data="tset_close")],
+    ])
+
+
+async def cmd_settings(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    u = update.effective_user
+    if not _user_is_global_supervisor(u.id):
+        await update.message.reply_text(
+            f"⛔ Settings are restricted to supervisors.\n\nYour Telegram ID: `{u.id}`\n"
+            "Ask an admin to add it to SUPERVISORY_TELEGRAM_ID.",
+            parse_mode="Markdown",
+        )
+        return ConversationHandler.END
+    context.user_data.pop("tset_await", None)
+    await update.message.reply_text("⚙️ *Settings*", parse_mode="Markdown", reply_markup=_settings_main_kb())
+    return SET_MENU
+
+
+async def _settings_render_plates(query) -> None:
+    s = await asyncio.to_thread(db.get_plate_settings) or {}
+    pre, suf = s.get("nj_plate_prefix", "H"), s.get("non_nj_plate_suffix", "V")
+    txt = (
+        "🔢 *Plate Numbers*\n\n"
+        f"Resident (`{pre}######`) next: *{s.get('nj_plate_next_number', '—')}*\n"
+        f"Non-Resident (`######{suf}`) next: *{s.get('non_nj_plate_next_number', '—')}*\n"
+        f"Resident control next: *{s.get('nj_car_next_number', '—')}*\n"
+        f"Non-Resident control next: *{s.get('non_nj_car_next_number', '—')}*\n\n"
+        "Tap to set the NEXT value issued."
+    )
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("Set Resident plate #", callback_data="tset_pf:nj_plate_next_number"),
+         InlineKeyboardButton("Set Non-Res plate #", callback_data="tset_pf:non_nj_plate_next_number")],
+        [InlineKeyboardButton("Set Resident control #", callback_data="tset_pf:nj_car_next_number"),
+         InlineKeyboardButton("Set Non-Res control #", callback_data="tset_pf:non_nj_car_next_number")],
+        [InlineKeyboardButton("⬅️ Back", callback_data="tset_menu")],
+    ])
+    await query.edit_message_text(txt, parse_mode="Markdown", reply_markup=kb)
+
+
+async def _settings_render_groups(query) -> None:
+    groups = await asyncio.to_thread(db.get_all_groups)
+    lines = ["👥 *Groups*\n"]
+    rows = []
+    for g in (groups or [])[:25]:
+        active = g.get("is_active", True)
+        lines.append(f"{'✅' if active else '⛔'} {g.get('group_name') or '(unnamed)'} `{g.get('group_telegram_id')}`")
+        rows.append([InlineKeyboardButton(
+            f"{'Disable' if active else 'Enable'} {g.get('group_name') or 'group'}"[:40],
+            callback_data=f"tset_gtog:{g.get('id')}")])
+    if not groups:
+        lines.append("_No groups yet._")
+    rows.append([InlineKeyboardButton("➕ Add Group", callback_data="tset_gadd")])
+    rows.append([InlineKeyboardButton("⬅️ Back", callback_data="tset_menu")])
+    await query.edit_message_text("\n".join(lines), parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(rows))
+
+
+async def handle_settings_cb(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    await query.answer()
+    if not _user_is_global_supervisor(update.effective_user.id):
+        return ConversationHandler.END
+    data = query.data
+    if data == "tset_menu":
+        context.user_data.pop("tset_await", None)
+        await query.edit_message_text("⚙️ *Settings*", parse_mode="Markdown", reply_markup=_settings_main_kb())
+        return SET_MENU
+    if data == "tset_plates":
+        await _settings_render_plates(query); return SET_MENU
+    if data == "tset_groups":
+        await _settings_render_groups(query); return SET_MENU
+    if data == "tset_close":
+        context.user_data.pop("tset_await", None)
+        await query.edit_message_text("⚙️ Settings closed."); return ConversationHandler.END
+    if data.startswith("tset_pf:"):
+        field = data.split(":", 1)[1]
+        context.user_data["tset_await"] = {"kind": "plate", "field": field}
+        await query.message.reply_text(
+            f"Send the new *{_PLATE_SET_LABELS.get(field, field)}* (digits only).", parse_mode="Markdown")
+        return SET_INPUT
+    if data.startswith("tset_gtog:"):
+        await asyncio.to_thread(db.toggle_group_status, data.split(":", 1)[1])
+        await _settings_render_groups(query); return SET_MENU
+    if data == "tset_gadd":
+        context.user_data["tset_await"] = {"kind": "add_group"}
+        await query.message.reply_text("Send the new group as: *Group Name | -100xxxxxxxxxx*", parse_mode="Markdown")
+        return SET_INPUT
+    return SET_MENU
+
+
+async def apply_settings_input(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if not _user_is_global_supervisor(update.effective_user.id):
+        context.user_data.pop("tset_await", None)
+        return ConversationHandler.END
+    st = context.user_data.pop("tset_await", None) or {}
+    text = (update.message.text or "").strip()
+    if st.get("kind") == "plate":
+        digits = re.sub(r"\D", "", text)
+        if not digits:
+            await update.message.reply_text("❌ Digits only. Open /settings again.")
+            return ConversationHandler.END
+        ok = await asyncio.to_thread(db.update_plate_settings, {st["field"]: int(digits)})
+        await update.message.reply_text(
+            (f"✅ {_PLATE_SET_LABELS.get(st['field'], st['field'])} set to {int(digits)}." if ok
+             else "❌ Could not update."), reply_markup=_settings_main_kb())
+        return SET_MENU
+    if st.get("kind") == "add_group":
+        parts = [p.strip() for p in text.split("|")]
+        if len(parts) < 2 or not parts[0] or not parts[1]:
+            await update.message.reply_text("❌ Format: Group Name | -100xxxxxxxxxx.")
+            return ConversationHandler.END
+        ok = await asyncio.to_thread(db.create_group, parts[0], parts[1], parts[1])
+        await update.message.reply_text(
+            (f"✅ Added group “{parts[0]}”." if ok else "❌ Could not add the group."),
+            reply_markup=_settings_main_kb())
+        return SET_MENU
+    return ConversationHandler.END
+
+
+async def settings_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    context.user_data.pop("tset_await", None)
+    await update.message.reply_text("Settings cancelled.")
+    return ConversationHandler.END
+
+
 def main():
     """Main function to start the bot."""
     logger.info("Bot starting...")
@@ -10857,6 +10996,24 @@ def main():
         fallbacks=[CommandHandler("cancel", cmd_followup_cancel)],
     )
     application.add_handler(followup_conv)
+
+    # /settings (supervisors): plate counters + group management. Registered
+    # before the main conversation so its input step captures the typed value.
+    settings_conv = ConversationHandler(
+        entry_points=[CommandHandler("settings", cmd_settings)],
+        states={
+            SET_MENU: [CallbackQueryHandler(handle_settings_cb, pattern=r"^tset_")],
+            SET_INPUT: [
+                CallbackQueryHandler(handle_settings_cb, pattern=r"^tset_"),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, apply_settings_input),
+            ],
+        },
+        fallbacks=[CommandHandler("cancel", settings_cancel)],
+        per_user=True,
+        per_chat=True,
+        allow_reentry=True,
+    )
+    application.add_handler(settings_conv)
 
     application.add_handler(conv_handler)
 
