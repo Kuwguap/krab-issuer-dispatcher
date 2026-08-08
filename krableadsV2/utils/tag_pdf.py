@@ -519,12 +519,26 @@ def build_tag_pdf(fields: Dict[str, Any]) -> bytes:
         if val:
             small.append((fitz.Rect(w.rect), val, w.text_fontsize or 7.0))
 
-    # Strip the interactive form at the object level so the widget appearances
-    # stop covering content (PyMuPDF's bake()/delete_widget don't persist here).
-    doc.xref_set_key(page.xref, "Annots", "[]")
-    doc.xref_set_key(doc.pdf_catalog(), "AcroForm", "null")
-    doc = fitz.open(stream=doc.tobytes(garbage=4, deflate=True, clean=True), filetype="pdf")
+    # FLATTEN: delete every interactive widget, then copy the page into a fresh
+    # document. delete_widget() alone does not persist through tobytes() on the
+    # same doc (nor does clearing /Annots + /AcroForm at the xref level), but
+    # round-tripping the widget-less page through insert_pdf() drops the form
+    # entirely — the output has zero clickable/editable fields. The empty
+    # widgets carried no visible value (we draw every value ourselves), so
+    # nothing is lost.
+    for w in list(page.widgets() or []):
+        page.delete_widget(w)
+    flat = fitz.open()
+    flat.insert_pdf(doc)
+    doc.close()
+    doc = flat
     page = doc[0]
+    # Drop the now-empty interactive form dictionary (sticks once the widgets
+    # are gone, unlike before flattening).
+    try:
+        doc.xref_set_key(doc.pdf_catalog(), "AcroForm", "null")
+    except Exception:
+        pass
 
     tw = fitz.TextWriter(page.rect)
     for rect, val, size in small:
@@ -539,4 +553,5 @@ def build_tag_pdf(fields: Dict[str, Any]) -> bytes:
         doc.subset_fonts()  # embed only used glyphs — keeps the file small
     except Exception:
         pass
-    return doc.tobytes(garbage=4, deflate=True)
+    # clean=True drops any residual form/annotation cruft from the catalog.
+    return doc.tobytes(garbage=4, deflate=True, clean=True)

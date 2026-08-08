@@ -95,6 +95,22 @@ def test_samples_render_valid_pdfs():
         assert s["body"] in text and s["policy"] in text, s["name"]
 
 
+def test_output_is_flattened_not_editable():
+    # The rendered tag must have NO interactive form fields — nothing clickable
+    # or editable in a PDF viewer.
+    pdf = tag_pdf.build_tag_pdf({
+        "is_nj": False, "plate": "549005V", "control_number": "9896095819",
+        "vin": "5N1AL0MM8DC337962", "make": "Infiniti", "model": "JX35",
+        "year": "2013", "color": "White", "body": "SUV", "first": "Josue",
+        "last": "Pavon", "city": "Bronx", "state": "NY", "zip": "10465",
+        "insurance_company": "Progressive", "policy": "984277252",
+        "issued": date(2026, 8, 6),
+    })
+    d = fitz.open(stream=pdf, filetype="pdf")
+    assert len(list(d[0].widgets() or [])) == 0
+    assert not d.is_form_pdf
+
+
 def test_labeled_city_state_zip():
     # Some upstreams emit "CITY STATE: XX ZIP: NNNNN" — labels must be stripped
     # and city/state/zip split cleanly, never printed into the City box.
@@ -120,6 +136,7 @@ if __name__ == "__main__":
     test_exp_banner_and_mdy()
     test_default_expiry_is_issue_plus_29()
     test_samples_render_valid_pdfs()
+    test_output_is_flattened_not_editable()
     test_labeled_city_state_zip()
     test_normalize_city_state_zip()
     print("ALL TAG PDF TESTS PASSED")
