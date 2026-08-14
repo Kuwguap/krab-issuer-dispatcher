@@ -2109,6 +2109,8 @@ def _format_phase1_ai_review_text(state_data: dict) -> str:
     return (
         "📝 Review & ✍️Edit Before Dispatching ✅\n\n"
         + _format_phase1_field_lines(state_data)
+        + "\n\n💬 Just type a change — e.g. price $50 or phone 555-123-4567"
+        + "\n   (or send a photo/PDF) and it's applied. No Edit button needed."
         + "\n\nTap ✅Dispatch when finished"
         + "\nTap ✏️Edit to make changes"
         + "\nTap 🔍Vin to lookup car info"
@@ -2633,6 +2635,158 @@ async def handle_phase1_adjust_input(update: Update, context: ContextTypes.DEFAU
         await message.reply_text("ℹ️ Nothing new found — the review is unchanged.")
     await _update_review_message_text(context, state_data)
     return STATE_AI_REVIEW
+
+
+# ── Inline review edits: type a change (no Edit button) ──────────────────────
+# Human labels/aliases → the edit_key understood by _apply_single_phase1_edit.
+# Longest aliases are tried first so "last name"/"policy number" beat "name"/"policy".
+# Bare single words that commonly START an ordinary sentence (first, last, note,
+# date, time, driver, issuer, city, street, client, number, cell, license …) are
+# intentionally NOT aliases, so casual chat like "driver is en route" or "email me
+# later" isn't misread as an edit — use the fuller label ("driver note", "first name").
+_INLINE_EDIT_ALIASES = {
+    "first name": "fn", "firstname": "fn",
+    "last name": "ln", "lastname": "ln",
+    "name": "name", "full name": "name", "client name": "name",
+    "reg address": "addr", "registration address": "addr", "address": "addr", "addr": "addr",
+    "reg city": "csz", "city/st/zip": "csz", "city state zip": "csz", "csz": "csz",
+    "delivery address": "daddr", "deliv address": "daddr", "delivery addr": "daddr", "daddr": "daddr", "drop off": "daddr", "dropoff": "daddr",
+    "delivery city": "dcsz", "deliv city": "dcsz", "delivery city/st/zip": "dcsz", "dcsz": "dcsz",
+    "vin": "vin",
+    "car": "car", "make/model": "car",
+    "color": "col", "colour": "col",
+    "insurance": "ins", "insurance company": "ins", "carrier": "ins",
+    "policy number": "pol", "policy #": "pol", "policy": "pol", "binder": "pol", "binder #": "pol",
+    "date/time": "xtra", "delivery time": "xtra", "extra info": "xtra",
+    "phone number": "phone", "phone": "phone",
+    "price": "price", "cost": "price", "amount": "price", "quote": "price",
+    "issuer note": "issuer",
+    "driver note": "driver",
+    "email": "email", "e-mail": "email",
+    "driver license": "dl", "drivers license": "dl", "driver's license": "dl", "dln": "dl",
+}
+_INLINE_EDIT_KEY_LABEL = {
+    "fn": "first name", "ln": "last name", "name": "name", "addr": "reg address", "csz": "reg city/ST/ZIP",
+    "daddr": "delivery address", "dcsz": "delivery city/ST/ZIP", "vin": "VIN", "car": "car", "col": "color",
+    "ins": "insurance", "pol": "policy #", "xtra": "date/time", "phone": "phone", "price": "price",
+    "issuer": "issuer note", "driver": "driver note", "email": "email", "dl": "driver license",
+}
+# edit_key → the state_data field it writes, so we can report only what actually
+# changed (the phone/price sanitizer may reject an invalid value after we apply it).
+_INLINE_EK_STATE_KEY = {
+    "fn": "name", "ln": "name", "name": "name",
+    "addr": "address", "csz": "city_state_zip", "daddr": "delivery_address", "dcsz": "delivery_city_state_zip",
+    "vin": "vin", "car": "car", "col": "color", "ins": "insurance_company", "pol": "insurance_policy_number", "xtra": "extra_info",
+    "phone": "pending_phone_number", "price": "pending_price", "email": "email", "dl": "driver_license_id",
+    "issuer": "special_request_issuers", "driver": "special_request_drivers",
+}
+# Label, then a separator (":", "=", or whitespace), then the value.
+_INLINE_LABEL_RE = re.compile(
+    r"^\s*(" + "|".join(re.escape(k) for k in sorted(_INLINE_EDIT_ALIASES, key=len, reverse=True))
+    + r")\s*(?:[:=]|\s)\s*(.+)$",
+    re.IGNORECASE,
+)
+
+
+def _clean_inline_value(edit_key: str, value: str) -> str:
+    """Validate/normalize a typed value for its field. Returns "" if the value
+    doesn't fit the field — so e.g. 'phone is dead' or 'email me later' are NOT
+    treated as edits, and 'price 50' becomes '$50' (the sanitizer needs the $)."""
+    # Drop a leading filler word for every field ("color is white" -> "white",
+    # "phone is 555-123-4567" -> "555-123-4567").
+    value = re.sub(r"^(?:is|are|=)\s+", "", value.strip(), flags=re.IGNORECASE).strip()
+    if not value:
+        return ""
+    if edit_key == "price":
+        m = re.search(r"\d[\d,]*(?:\.\d+)?", value)
+        return ("$" + m.group(0).replace(",", "")) if m else ""
+    if edit_key == "phone":
+        return value if len(re.sub(r"\D", "", value)) >= 10 else ""
+    if edit_key == "email":
+        return value if "@" in value else ""
+    if edit_key == "vin":
+        v = value.replace(" ", "")
+        return v if (len(v) >= 11 and v.isalnum()) else ""
+    if edit_key == "dl":
+        return value if len(value.split()) <= 4 else ""
+    return value
+
+
+def _apply_inline_review_text(state_data: dict, text: str) -> list[str]:
+    """Apply typed labeled edits ('price $50', 'phone 232-232-2322', 'color white')
+    directly to the review — one edit per line. EVERY non-empty line must be a valid
+    labeled edit; if any line isn't, returns [] so the caller falls back to the AI
+    parser (so a mixed paste isn't half-applied). Returns the labels that actually
+    changed after the phone/price sanitizer runs (so a rejected value never lies)."""
+    lines = [l.strip() for l in re.split(r"[\n;]+", text) if l.strip()]
+    if not lines:
+        return []
+    pending: list[tuple[str, str]] = []
+    for line in lines:
+        m = _INLINE_LABEL_RE.match(line)
+        if not m:
+            return []  # a non-labeled line → hand the whole message to the AI parser
+        ek = _INLINE_EDIT_ALIASES.get(m.group(1).lower().strip())
+        value = _clean_inline_value(ek, m.group(2)) if ek else ""
+        if not ek or not value:
+            return []  # unknown label or value invalid for the field → AI parser
+        pending.append((ek, value))
+
+    tracked = {_INLINE_EK_STATE_KEY[ek] for ek, _ in pending}
+    before = {k: str(state_data.get(k) or "").strip() for k in tracked}
+    for ek, value in pending:
+        if ek == "name":
+            parts = value.split()
+            _set_full_name(state_data, parts[0], " ".join(parts[1:]))
+        else:
+            _apply_single_phase1_edit(state_data, ek, value)
+    _apply_single_address_as_both(state_data)
+    _clean_vin_and_car(state_data)
+    _sanitize_phase1_pending_phone_price(state_data)
+
+    updated: list[str] = []
+    for ek, _ in pending:
+        k = _INLINE_EK_STATE_KEY[ek]
+        now = str(state_data.get(k) or "").strip()
+        if now and now != "-" and now != before.get(k):
+            lbl = _INLINE_EDIT_KEY_LABEL.get(ek, ek)
+            if lbl not in updated:
+                updated.append(lbl)
+    return updated
+
+
+async def handle_phase1_review_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """STATE_AI_REVIEW: accept typed text / photo / PDF inline — no Edit button.
+
+    Short labeled edits ('price $50', 'phone 232-232-2322') apply instantly;
+    photos, PDFs, and anything not recognized as a labeled edit go through the same
+    AI parser as the '🖼 Adjust from image/text' button."""
+    message = update.message
+    if message and (message.photo or message.document):
+        result = await handle_phase1_adjust_input(update, context)
+        return STATE_AI_REVIEW if result == STATE_ADJUST_INPUT else result
+
+    text = ((message.text if message else "") or "").strip()
+    if not text:
+        return STATE_AI_REVIEW
+
+    user_id = update.effective_user.id
+    state = db.get_user_state(user_id)
+    if not state or not state.get("data"):
+        await message.reply_text("❌ Data lost. Please start over with /start")
+        return ConversationHandler.END
+    state_data = state["data"]
+
+    updated = _apply_inline_review_text(state_data, text)
+    if updated:
+        db.set_user_state(user_id, "phase1", state_data)
+        await message.reply_text("✅ Updated: " + ", ".join(dict.fromkeys(updated)))
+        await _update_review_message_text(context, state_data)
+        return STATE_AI_REVIEW
+
+    # Not a labeled edit → let the AI parse the whole message (text block, etc.).
+    result = await handle_phase1_adjust_input(update, context)
+    return STATE_AI_REVIEW if result == STATE_ADJUST_INPUT else result
 
 
 async def _begin_lead_flow(
@@ -10861,6 +11015,11 @@ def main():
                     handle_phase1_ai_review_callback,
                     pattern=r"^(ph1_accept|ph1_edit|ph1_vin_check|ph1_adjust|adjust_cancel|ph1_back|ph1_pick_group|ph1_pick_driver|ph1_pick_source|selgrp_|seldrv_|selsrc_|ph1_sel_back|driver_suspended_|edit_cancel|ph1edit_)"
                 ),
+                # Inline edits with no Edit button: type 'price $50' / 'phone 555-1234'
+                # or send a photo/PDF, and it's parsed straight into the review.
+                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_phase1_review_message),
+                MessageHandler(filters.PHOTO, handle_phase1_review_message),
+                MessageHandler(filters.Document.ALL, handle_phase1_review_message),
             ],
             STATE_ADJUST_INPUT: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, handle_phase1_adjust_input),
