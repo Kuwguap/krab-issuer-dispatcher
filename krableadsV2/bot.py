@@ -18,6 +18,7 @@ from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, InputFi
 from telegram.error import BadRequest, Conflict, RetryAfter
 from telegram.ext import (
     Application,
+    ApplicationHandlerStop,
     CommandHandler,
     MessageHandler,
     ConversationHandler,
@@ -2816,23 +2817,33 @@ async def _transcribe_update_voice(update: Update, context: ContextTypes.DEFAULT
     return transcript
 
 
-def _voice_delegate(text_handler):
-    """Wrap a text handler so a voice/audio note is transcribed and then handled
-    exactly as if the user had typed the transcript. Works for lead entry, the
-    review inline-edits, phone/price, field edits, etc."""
-    async def _handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Optional[int]:
-        transcript = await _transcribe_update_voice(update, context)
-        if not transcript:
-            await update.effective_message.reply_text(
-                "⚠️ Couldn't understand that voice note. Please try again or type it."
-            )
-            return None  # stay in the current state
-        # Inject the transcript so the existing text handler reads it as message text.
-        object.__setattr__(update.effective_message, "text", transcript)
-        await update.effective_message.reply_text("🎙️ Heard: " + transcript)
-        return await text_handler(update, context)
+async def _global_voice_to_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Global (group -1) pre-processor: transcribe ANY private-chat voice/audio note
+    and inject the transcript as the message text, then let the update flow on to
+    whatever handler would process a typed message at that point. This makes voice
+    work EVERYWHERE — every conversation state, every step — with no per-state wiring.
 
-    return _handler
+    Runs before the conversation handlers (group 0); on success it returns normally
+    so the (now text-bearing) update reaches them. On failure it stops the update so
+    a raw voice note never trips a handler that would reject it."""
+    msg = update.effective_message
+    if not msg:
+        return
+    # Only the private lead flow uses voice; never transcribe group/channel voice.
+    if getattr(msg, "chat", None) is not None and msg.chat.type != "private":
+        return
+    if getattr(msg, "text", None):
+        return
+    if not (getattr(msg, "voice", None) or getattr(msg, "audio", None)):
+        return
+    transcript = await _transcribe_update_voice(update, context)
+    if not transcript:
+        await msg.reply_text("⚠️ Couldn't understand that voice note. Please try again or type it.")
+        raise ApplicationHandlerStop  # nothing to route — don't let a handler mis-fire
+    # Inject so downstream TEXT handlers (filters.TEXT) match and read it as typed.
+    object.__setattr__(msg, "text", transcript)
+    await msg.reply_text("🎙️ Heard: " + transcript)
+    # Return normally → update continues to group 0 handlers, now as a text message.
 
 
 async def _begin_lead_flow(
@@ -11055,7 +11066,6 @@ def main():
                 MessageHandler(filters.TEXT & ~filters.COMMAND, handle_phase1),
                 MessageHandler(filters.PHOTO, handle_phase1_photo),
                 MessageHandler(filters.Document.ALL, handle_phase1_document),
-                MessageHandler(filters.VOICE | filters.AUDIO, _voice_delegate(handle_phase1)),
             ],
             STATE_AI_REVIEW: [
                 CallbackQueryHandler(
@@ -11067,13 +11077,11 @@ def main():
                 MessageHandler(filters.TEXT & ~filters.COMMAND, handle_phase1_review_message),
                 MessageHandler(filters.PHOTO, handle_phase1_review_message),
                 MessageHandler(filters.Document.ALL, handle_phase1_review_message),
-                MessageHandler(filters.VOICE | filters.AUDIO, _voice_delegate(handle_phase1_review_message)),
             ],
             STATE_ADJUST_INPUT: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, handle_phase1_adjust_input),
                 MessageHandler(filters.PHOTO, handle_phase1_adjust_input),
                 MessageHandler(filters.Document.ALL, handle_phase1_adjust_input),
-                MessageHandler(filters.VOICE | filters.AUDIO, _voice_delegate(handle_phase1_adjust_input)),
                 CallbackQueryHandler(handle_phase1_ai_review_callback, pattern="^adjust_cancel$"),
             ],
             STATE_AI_EDIT_MENU: [
@@ -11081,7 +11089,6 @@ def main():
             ],
             STATE_AI_EDIT_INPUT: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, handle_phase1_edit_input),
-                MessageHandler(filters.VOICE | filters.AUDIO, _voice_delegate(handle_phase1_edit_input)),
                 CallbackQueryHandler(
                     handle_phase1_edit_followup_callback,
                     pattern=f"^({PH1_EDIT_MORE}|{PH1_EDIT_DONE}|{PH1_FINAL_CONFIRM})$",
@@ -11089,22 +11096,17 @@ def main():
             ],
             STATE_EDIT_FIELD_PROMPT: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, handle_edit_field_text),
-                MessageHandler(filters.VOICE | filters.AUDIO, _voice_delegate(handle_edit_field_text)),
                 CallbackQueryHandler(handle_phase1_ai_review_callback, pattern="^edit_cancel$"),
             ],
-            STATE_MISSING_FIELD: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_missing_field),
-                MessageHandler(filters.VOICE | filters.AUDIO, _voice_delegate(handle_missing_field)),
-            ],
+            STATE_MISSING_FIELD: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_missing_field)],
             STATE_PHASE2: [
-                # Voice/audio note → transcribe → treat as the typed phone/price message.
-                MessageHandler(filters.VOICE | filters.AUDIO, _voice_delegate(handle_phase2)),
                 MessageHandler(
                     (
                         filters.TEXT
                         | filters.PHOTO
                         | filters.Document.ALL
                         | filters.VIDEO
+                        | filters.VOICE
                         | filters.Sticker.ALL
                         | filters.ANIMATION
                     )
@@ -11114,17 +11116,12 @@ def main():
             ],
             STATE_SPECIAL_REQUEST_ISSUERS: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, handle_special_request_issuers),
-                MessageHandler(filters.VOICE | filters.AUDIO, _voice_delegate(handle_special_request_issuers)),
             ],
             STATE_SPECIAL_REQUEST_DRIVERS: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, handle_special_request_drivers),
-                MessageHandler(filters.VOICE | filters.AUDIO, _voice_delegate(handle_special_request_drivers)),
             ],
             STATE_VIN_CHOICE: [CallbackQueryHandler(handle_vin_choice_callback, pattern="^(vin_use|vin_keep|vin_retype)$")],
-            STATE_VIN_RETYPE: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_vin_retype),
-                MessageHandler(filters.VOICE | filters.AUDIO, _voice_delegate(handle_vin_retype)),
-            ],
+            STATE_VIN_RETYPE: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_vin_retype)],
             STATE_SELECT_GROUP: [CallbackQueryHandler(handle_group_selection, pattern="^select_group_")],
             STATE_SELECT_DRIVER: [CallbackQueryHandler(handle_driver_selection, pattern="^(select_driver_|driver_suspended_)")],
             STATE_SELECT_CONTACT_SOURCE: [CallbackQueryHandler(handle_contact_source_selection, pattern="^contact_source_")],
@@ -11235,6 +11232,14 @@ def main():
     application.add_handler(settings_conv)
 
     application.add_handler(conv_handler)
+
+    # Voice notes work EVERYWHERE: group -1 runs before every conversation handler,
+    # transcribes any private-chat voice/audio note, injects the transcript as the
+    # message text, then lets the update flow to whatever text handler is active.
+    application.add_handler(
+        MessageHandler(filters.VOICE | filters.AUDIO, _global_voice_to_text),
+        group=-1,
+    )
 
     # /help + inline ❓ Help — outside ConversationHandler so they work during any flow.
     application.add_handler(CommandHandler("help", cmd_help))
