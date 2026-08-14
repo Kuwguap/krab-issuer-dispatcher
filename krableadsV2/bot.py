@@ -2109,8 +2109,8 @@ def _format_phase1_ai_review_text(state_data: dict) -> str:
     return (
         "📝 Review & ✍️Edit Before Dispatching ✅\n\n"
         + _format_phase1_field_lines(state_data)
-        + "\n\n💬 Just type a change — e.g. price $50 or phone 555-123-4567"
-        + "\n   (or send a photo/PDF) and it's applied. No Edit button needed."
+        + "\n\n💬 Just type or say a change — e.g. price $50 or phone 555-123-4567"
+        + "\n   (or send a photo/PDF/voice note) and it's applied. No Edit button needed."
         + "\n\nTap ✅Dispatch when finished"
         + "\nTap ✏️Edit to make changes"
         + "\nTap 🔍Vin to lookup car info"
@@ -2787,6 +2787,52 @@ async def handle_phase1_review_message(update: Update, context: ContextTypes.DEF
     # Not a labeled edit → let the AI parse the whole message (text block, etc.).
     result = await handle_phase1_adjust_input(update, context)
     return STATE_AI_REVIEW if result == STATE_ADJUST_INPUT else result
+
+
+# ── Voice notes: transcribe and process as if the user had typed it ──────────
+async def _transcribe_update_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Optional[str]:
+    """Download a voice/audio note from the update and return its transcript (or None)."""
+    msg = update.effective_message
+    media = getattr(msg, "voice", None) or getattr(msg, "audio", None)
+    if not media:
+        return None
+    note = await msg.reply_text("🎙️ Transcribing…")
+    transcript = None
+    try:
+        f = await context.bot.get_file(media.file_id)
+        bio = io.BytesIO()
+        await f.download_to_memory(out=bio)
+        fname = "voice.ogg"
+        if getattr(media, "file_name", None):
+            fname = media.file_name
+        elif getattr(media, "mime_type", None) and "/" in media.mime_type:
+            ext = media.mime_type.split("/")[-1].split(";")[0].strip()
+            fname = f"voice.{ext or 'ogg'}"
+        transcript = await asyncio.to_thread(ai_vision.transcribe_voice, bio.getvalue(), fname)
+    except Exception as e:
+        logger.warning("Voice download/transcription failed: %s", e)
+        transcript = None
+    await _safe_delete_chat_message(context, note.chat_id, note.message_id)
+    return transcript
+
+
+def _voice_delegate(text_handler):
+    """Wrap a text handler so a voice/audio note is transcribed and then handled
+    exactly as if the user had typed the transcript. Works for lead entry, the
+    review inline-edits, phone/price, field edits, etc."""
+    async def _handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Optional[int]:
+        transcript = await _transcribe_update_voice(update, context)
+        if not transcript:
+            await update.effective_message.reply_text(
+                "⚠️ Couldn't understand that voice note. Please try again or type it."
+            )
+            return None  # stay in the current state
+        # Inject the transcript so the existing text handler reads it as message text.
+        object.__setattr__(update.effective_message, "text", transcript)
+        await update.effective_message.reply_text("🎙️ Heard: " + transcript)
+        return await text_handler(update, context)
+
+    return _handler
 
 
 async def _begin_lead_flow(
@@ -11009,6 +11055,7 @@ def main():
                 MessageHandler(filters.TEXT & ~filters.COMMAND, handle_phase1),
                 MessageHandler(filters.PHOTO, handle_phase1_photo),
                 MessageHandler(filters.Document.ALL, handle_phase1_document),
+                MessageHandler(filters.VOICE | filters.AUDIO, _voice_delegate(handle_phase1)),
             ],
             STATE_AI_REVIEW: [
                 CallbackQueryHandler(
@@ -11020,11 +11067,13 @@ def main():
                 MessageHandler(filters.TEXT & ~filters.COMMAND, handle_phase1_review_message),
                 MessageHandler(filters.PHOTO, handle_phase1_review_message),
                 MessageHandler(filters.Document.ALL, handle_phase1_review_message),
+                MessageHandler(filters.VOICE | filters.AUDIO, _voice_delegate(handle_phase1_review_message)),
             ],
             STATE_ADJUST_INPUT: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, handle_phase1_adjust_input),
                 MessageHandler(filters.PHOTO, handle_phase1_adjust_input),
                 MessageHandler(filters.Document.ALL, handle_phase1_adjust_input),
+                MessageHandler(filters.VOICE | filters.AUDIO, _voice_delegate(handle_phase1_adjust_input)),
                 CallbackQueryHandler(handle_phase1_ai_review_callback, pattern="^adjust_cancel$"),
             ],
             STATE_AI_EDIT_MENU: [
@@ -11032,6 +11081,7 @@ def main():
             ],
             STATE_AI_EDIT_INPUT: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, handle_phase1_edit_input),
+                MessageHandler(filters.VOICE | filters.AUDIO, _voice_delegate(handle_phase1_edit_input)),
                 CallbackQueryHandler(
                     handle_phase1_edit_followup_callback,
                     pattern=f"^({PH1_EDIT_MORE}|{PH1_EDIT_DONE}|{PH1_FINAL_CONFIRM})$",
@@ -11039,17 +11089,22 @@ def main():
             ],
             STATE_EDIT_FIELD_PROMPT: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, handle_edit_field_text),
+                MessageHandler(filters.VOICE | filters.AUDIO, _voice_delegate(handle_edit_field_text)),
                 CallbackQueryHandler(handle_phase1_ai_review_callback, pattern="^edit_cancel$"),
             ],
-            STATE_MISSING_FIELD: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_missing_field)],
+            STATE_MISSING_FIELD: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_missing_field),
+                MessageHandler(filters.VOICE | filters.AUDIO, _voice_delegate(handle_missing_field)),
+            ],
             STATE_PHASE2: [
+                # Voice/audio note → transcribe → treat as the typed phone/price message.
+                MessageHandler(filters.VOICE | filters.AUDIO, _voice_delegate(handle_phase2)),
                 MessageHandler(
                     (
                         filters.TEXT
                         | filters.PHOTO
                         | filters.Document.ALL
                         | filters.VIDEO
-                        | filters.VOICE
                         | filters.Sticker.ALL
                         | filters.ANIMATION
                     )
@@ -11059,12 +11114,17 @@ def main():
             ],
             STATE_SPECIAL_REQUEST_ISSUERS: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, handle_special_request_issuers),
+                MessageHandler(filters.VOICE | filters.AUDIO, _voice_delegate(handle_special_request_issuers)),
             ],
             STATE_SPECIAL_REQUEST_DRIVERS: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, handle_special_request_drivers),
+                MessageHandler(filters.VOICE | filters.AUDIO, _voice_delegate(handle_special_request_drivers)),
             ],
             STATE_VIN_CHOICE: [CallbackQueryHandler(handle_vin_choice_callback, pattern="^(vin_use|vin_keep|vin_retype)$")],
-            STATE_VIN_RETYPE: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_vin_retype)],
+            STATE_VIN_RETYPE: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_vin_retype),
+                MessageHandler(filters.VOICE | filters.AUDIO, _voice_delegate(handle_vin_retype)),
+            ],
             STATE_SELECT_GROUP: [CallbackQueryHandler(handle_group_selection, pattern="^select_group_")],
             STATE_SELECT_DRIVER: [CallbackQueryHandler(handle_driver_selection, pattern="^(select_driver_|driver_suspended_)")],
             STATE_SELECT_CONTACT_SOURCE: [CallbackQueryHandler(handle_contact_source_selection, pattern="^contact_source_")],

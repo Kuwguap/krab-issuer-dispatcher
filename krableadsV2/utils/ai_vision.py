@@ -14,6 +14,35 @@ from typing import Any, Optional
 logger = logging.getLogger(__name__)
 
 
+def transcribe_voice(audio_bytes: bytes, filename: str = "voice.ogg") -> Optional[str]:
+    """Transcribe a voice/audio note to text via OpenAI (Whisper by default).
+
+    Telegram voice notes are OGG/Opus, which Whisper accepts directly. Returns None
+    on any error (missing key, quota, network) so callers can fall back to text.
+    """
+    from config import Config
+    import io as _io
+
+    if not audio_bytes:
+        return None
+    api_key = (getattr(Config, "OPENAI_API_KEY", "") or "").strip()
+    if not api_key:
+        return None
+    try:
+        from openai import OpenAI
+
+        client = OpenAI(api_key=api_key, max_retries=1)
+        model = (getattr(Config, "OPENAI_TRANSCRIBE_MODEL", "") or "whisper-1").strip() or "whisper-1"
+        buf = _io.BytesIO(audio_bytes)
+        buf.name = filename  # the SDK infers the audio format from the filename
+        resp = client.audio.transcriptions.create(model=model, file=buf)
+        text = (getattr(resp, "text", "") or "").strip()
+        return text or None
+    except Exception as e:
+        logger.warning("Voice transcription failed: %s", e)
+        return None
+
+
 @dataclass
 class ReceiptValidationResult:
     """Result of AI check on a driver-uploaded receipt image."""
