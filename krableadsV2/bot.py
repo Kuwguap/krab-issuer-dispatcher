@@ -2156,10 +2156,14 @@ def _format_phase1_ai_review_text(state_data: dict) -> str:
         "📝 Review & ✍️Edit Before Dispatching ✅\n\n"
         + _format_phase1_field_lines(state_data)
         + ins_line
-        + "\n\n💬 Just type or say a change — e.g. price $50 or phone 555-123-4567"
-        + "\n   (or send a photo/PDF/voice note) and it's applied. No Edit button needed."
+        + "\n\n💬 To change a field, type its label then the value, e.g.:"
+        + "\n   name John Doe"
+        + "\n   address 123 Main St, Newark NJ 07024"
+        + "\n   car 2020 Toyota Camry"
+        + "\n   color white     phone 555-123-4567     price 50"
+        + "\n   Change several at once: price 200 color white. Or tap ✏️Edit."
         + "\n\nTap ✅Dispatch when finished"
-        + "\nTap ✏️Edit to make changes · 🛡Insurance to add a card"
+        + "\nTap ✏️Edit to make changes, 🛡Insurance to add a card"
         + "\nTap 🔍Vin to lookup car info"
     )
 
