@@ -3432,10 +3432,6 @@ async def _begin_lead_flow_with_review(context, user_id, username, msg) -> int:
     issuer sees the field checklist and fills it by typing/voice — friendlier than the
     plain text prompt. Used when someone just says 'new client' / 'start' / taps /lead."""
     await _begin_lead_flow(context, user_id, username, msg, send_welcome=False)
-    await msg.reply_text(
-        "🆕 New client — here's your review. Type or say the details "
-        "(name, phone, address, VIN, car, color, price…) and I'll fill it in."
-    )
     await _send_phase1_ai_review(msg, {}, context, user_id)
     return STATE_AI_REVIEW
 
