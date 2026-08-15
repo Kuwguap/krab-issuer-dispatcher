@@ -2803,8 +2803,8 @@ def _clean_inline_value(edit_key: str, value: str) -> str:
     doesn't fit the field — so e.g. 'phone is dead' or 'email me later' are NOT
     treated as edits, and 'price 50' becomes '$50' (the sanitizer needs the $)."""
     # Drop a leading filler word for every field ("color is white" -> "white",
-    # "phone is 555-123-4567" -> "555-123-4567").
-    value = re.sub(r"^(?:is|are|=)\s+", "", value.strip(), flags=re.IGNORECASE).strip()
+    # "change name to john doe" -> "john doe", "phone: 555-123-4567" -> "555-123-4567").
+    value = re.sub(r"^(?:is|are|to|=|:)\s+", "", value.strip(), flags=re.IGNORECASE).strip()
     if not value:
         return ""
     if edit_key == "price":
@@ -2922,6 +2922,31 @@ def _apply_inline_review_text(state_data: dict, text: str) -> list[str]:
             if lbl not in updated:
                 updated.append(lbl)
     return updated
+
+
+def _looks_like_multifield_block(text: str) -> bool:
+    """True only for a clearly-structured paste worth AI re-parsing: a MULTI-LINE block
+    (one field per line) or text containing a VIN (a vehicle block). Any single-line
+    typed value is ambiguous — the AI would have to GUESS which field it is and can
+    mis-file it (a bare name landing in the address) — so it gets a labeled-edit hint
+    instead of silently overwriting the wrong field. Deliberate single-line pastes can
+    still use the '🖼 Adjust from image/text' button, which always AI-parses."""
+    t = (text or "").strip()
+    return ("\n" in t) or bool(_extract_vin_17(t))
+
+
+_REVIEW_EDIT_HINT = (
+    "✍️ To change a field, tap ✏️ Edit — or just type it with a label:\n"
+    "• name John Doe\n"
+    "• address 123 Main St, Newark NJ 07102\n"
+    "• car 2020 Toyota Camry\n"
+    "• color white\n"
+    "• phone 555-123-4567\n"
+    "• price 200\n"
+    "• email a@b.com\n"
+    "• dl 12345678\n"
+    "Change several at once: price 200 color white"
+)
 
 
 # ── Natural-language commands during review (voice or typed) ─────────────────
@@ -3261,9 +3286,16 @@ async def handle_phase1_review_message(update: Update, context: ContextTypes.DEF
     if handled is not None:
         return handled
 
-    # 3. Otherwise let the AI parse the whole message (a full text block, etc.).
-    result = await handle_phase1_adjust_input(update, context)
-    return STATE_AI_REVIEW if result == STATE_ADJUST_INPUT else result
+    # 3. A real multi-field block (paste of a full lead) → AI re-parse. A short bare
+    #    value is ambiguous: the AI would have to guess which field it is and could
+    #    mis-file it (e.g. a bare name landing in the address). Guide the user to label
+    #    it instead of silently corrupting a field.
+    if _looks_like_multifield_block(text):
+        result = await handle_phase1_adjust_input(update, context)
+        return STATE_AI_REVIEW if result == STATE_ADJUST_INPUT else result
+    chat_id = update.effective_chat.id if update.effective_chat else message.chat_id
+    await context.bot.send_message(chat_id=chat_id, text=_REVIEW_EDIT_HINT)
+    return STATE_AI_REVIEW
 
 
 # ── Voice notes: transcribe and process as if the user had typed it ──────────
