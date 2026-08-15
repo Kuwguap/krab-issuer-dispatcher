@@ -2360,9 +2360,32 @@ def _phase1_edit_fields_keyboard(state_data: dict) -> InlineKeyboardMarkup:
             InlineKeyboardButton(f"📧 Email: {_truncate_btn_val(state_data.get('email') or '-', 22)}", callback_data="ph1edit_email"),
             InlineKeyboardButton(f"🪪 DL: {_truncate_btn_val(state_data.get('driver_license_id') or '-', 18)}", callback_data="ph1edit_dl"),
         ],
-        [InlineKeyboardButton("⬅️ Back to review", callback_data=PH1_EDIT_BACK)],
+        [
+            InlineKeyboardButton("✅ Submit", callback_data=PH1_REVIEW_ACCEPT),
+            InlineKeyboardButton("⬅️ Back to review", callback_data=PH1_EDIT_BACK),
+        ],
     ]
     return InlineKeyboardMarkup(rows)
+
+
+async def _show_edit_picker(context, state_data) -> None:
+    """Render the review message as the field-by-field edit picker (with current
+    values on every button), so the issuer can edit one field after another and
+    then tap ✅ Submit — without re-opening Edit each time."""
+    chat_id = context.user_data.get("review_chat_id")
+    mid = context.user_data.get("review_message_id")
+    if not chat_id or not mid:
+        return
+    try:
+        await context.bot.edit_message_text(
+            chat_id=chat_id,
+            message_id=mid,
+            text="✏️ Tap a field to change it, edit as many as you like, then tap ✅ Submit.\n\n"
+            + _format_phase1_field_lines(state_data),
+            reply_markup=_phase1_edit_fields_keyboard(state_data),
+        )
+    except Exception as e:
+        logger.warning("Could not show edit picker: %s", e)
 
 
 def _phase1_after_edit_keyboard() -> InlineKeyboardMarkup:
@@ -5672,8 +5695,9 @@ async def handle_edit_field_text(update, context):
         except:
             pass
 
-    # Update the review message
-    await _update_review_message_text(context, state_data)
+    # Stay in the field-edit picker (values now updated) so they can edit another
+    # field or tap ✅ Submit — no need to re-open Edit for each field.
+    await _show_edit_picker(context, state_data)
     return STATE_AI_REVIEW
 
 _PHONE_PRICE_PLACEHOLDERS = frozenset(
@@ -6042,12 +6066,7 @@ async def handle_phase1_ai_review_callback(update, context):
 
     elif data == PH1_REVIEW_EDIT:
         context.user_data["phase1_recent_edits"] = []
-        await _edit_message_keyboard(
-            context,
-            context.user_data["review_chat_id"],
-            context.user_data["review_message_id"],
-            _phase1_edit_fields_keyboard(state_data)
-        )
+        await _show_edit_picker(context, state_data)
         return STATE_AI_REVIEW
 
     elif data == "ph1_adjust":
@@ -6219,6 +6238,13 @@ async def handle_phase1_edit_menu_callback(update: Update, context: ContextTypes
     query = update.callback_query
     await _safe_answer_callback_query(query)
     user_id = query.from_user.id
+    if query.data == PH1_REVIEW_ACCEPT:
+        state = db.get_user_state(user_id)
+        if not state or not state.get("data"):
+            await query.message.reply_text("❌ Lead data not found. Please start over with /start")
+            return ConversationHandler.END
+        context.user_data.pop("phase1_recent_edits", None)
+        return await _continue_phase1_after_ai_review(query.message, context, user_id)
     if query.data == PH1_EDIT_BACK:
         state = db.get_user_state(user_id)
         if not state or not state.get("data"):
@@ -12647,7 +12673,7 @@ def main():
                 CallbackQueryHandler(handle_phase1_ai_review_callback, pattern="^adjust_cancel$"),
             ],
             STATE_AI_EDIT_MENU: [
-                CallbackQueryHandler(handle_phase1_edit_menu_callback, pattern=r"^(ph1_back|ph1edit_[a-z]+)$"),
+                CallbackQueryHandler(handle_phase1_edit_menu_callback, pattern=r"^(ph1_back|ph1_accept|ph1edit_[a-z]+)$"),
             ],
             STATE_AI_EDIT_INPUT: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, handle_phase1_edit_input),
