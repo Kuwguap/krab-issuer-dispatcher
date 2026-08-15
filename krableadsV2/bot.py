@@ -2108,13 +2108,23 @@ def _format_phase1_field_lines(state_data: dict) -> str:
 
 def _format_phase1_ai_review_text(state_data: dict) -> str:
     """Human-readable summary of how the bot understood Phase 1 (AI path). Plain text (safe for special chars)."""
+    ins_line = ""
+    if state_data.get("wants_insurance"):
+        hard, soft = _insurance_readiness(state_data)
+        if hard:
+            ins_line = "\n\n🛡 Insurance: ON — still needs " + ", ".join(hard)
+        elif soft:
+            ins_line = "\n\n🛡 Insurance: ON — ready (add " + ", ".join(soft) + " for a full card)"
+        else:
+            ins_line = "\n\n🛡 Insurance: ON — ready ✅"
     return (
         "📝 Review & ✍️Edit Before Dispatching ✅\n\n"
         + _format_phase1_field_lines(state_data)
+        + ins_line
         + "\n\n💬 Just type or say a change — e.g. price $50 or phone 555-123-4567"
         + "\n   (or send a photo/PDF/voice note) and it's applied. No Edit button needed."
         + "\n\nTap ✅Dispatch when finished"
-        + "\nTap ✏️Edit to make changes"
+        + "\nTap ✏️Edit to make changes · 🛡Insurance to add a card"
         + "\nTap 🔍Vin to lookup car info"
     )
 
@@ -2152,6 +2162,61 @@ def _truncate_btn_val(val: str, max_len: int = 22) -> str:
     return (v[: max_len - 1] + "…") if len(v) > max_len else v
 
 
+def _insurance_readiness(state_data: dict) -> tuple[list, list]:
+    """(hard_missing, soft_missing) for issuing an insurance card from this review.
+    Hard blocks generation (client email + a valid 17-char VIN); soft is recommended
+    but the card still issues without it (driver license # → AAMVA DAQ)."""
+    hard, soft = [], []
+    if not (state_data.get("email") or "").strip():
+        hard.append("client email")
+    vin = re.sub(r"[^A-Za-z0-9]", "", (state_data.get("vin") or ""))
+    if len(vin) != 17:
+        hard.append("a valid 17-char VIN")
+    if not (state_data.get("driver_license_id") or "").strip():
+        soft.append("driver license #")
+    return hard, soft
+
+
+_INS_OFF_RE = re.compile(
+    r"\b(?:no|not?|remove|disable|turn\s*off|switch\s*off|skip|without|drop)\s+"
+    r"(?:the\s+)?insurance\b|^\s*insurance\s*(?:off|no)\s*[.!]*$",
+    re.I,
+)
+_INS_ON_RE = re.compile(
+    r"\b(?:add|enable|turn\s*on|switch\s*on|include|want|with|need|do|get|issue)\s+"
+    r"(?:the\s+|an?\s+)?insurance\b|^\s*insurance\s*(?:on|yes|please)?\s*[.!]*$",
+    re.I,
+)
+
+
+def _insurance_intent(text: str):
+    """True = turn insurance on, False = off, None = not an insurance command.
+    Whole-ish phrase match so a value like 'insurance GEICO' stays a field edit."""
+    t = (text or "").strip()
+    if not t:
+        return None
+    if _INS_OFF_RE.search(t):
+        return False
+    if _INS_ON_RE.search(t):
+        return True
+    return None
+
+
+def _insurance_toggle_message(state_data: dict) -> str:
+    """Human confirmation shown when insurance is turned on/off during review."""
+    if not state_data.get("wants_insurance"):
+        return "🛡 Insurance off for this tag."
+    hard, soft = _insurance_readiness(state_data)
+    msg = "🛡 Insurance ON — a card will be issued together with the tag."
+    if hard:
+        msg += "\n\n⚠️ Still needed: " + ", ".join(hard) + "."
+    if soft:
+        msg += ("\n" if hard else "\n\n") + "➕ Recommended: " + ", ".join(soft) + "."
+    if hard or soft:
+        msg += "\n\nAdd them the easy way — type or say e.g. “email john@example.com”, “dl 123456789”."
+    return msg
+
+
 def _build_review_keyboard_with_selections(state_data):
     group_label = state_data.get("selected_group_name", "auto")
     driver_label = state_data.get("selected_driver_names", "auto")
@@ -2167,6 +2232,10 @@ def _build_review_keyboard_with_selections(state_data):
             InlineKeyboardButton("🔍 VIN", callback_data=PH1_REVIEW_VIN_CHECK),
             InlineKeyboardButton("✅ Submit", callback_data=PH1_REVIEW_ACCEPT),
         ],
+        [InlineKeyboardButton(
+            "🛡 Insurance: ON" if state_data.get("wants_insurance") else "🛡 Add insurance",
+            callback_data="ph1_ins_toggle",
+        )],
         [InlineKeyboardButton("🖼 Adjust from image/text", callback_data="ph1_adjust")],
     ])
 
@@ -3108,6 +3177,30 @@ async def handle_phase1_review_message(update: Update, context: ContextTypes.DEF
         await message.reply_text("❌ Data lost. Please start over with /start")
         return ConversationHandler.END
     state_data = state["data"]
+
+    # 0. Insurance on/off by voice/text ("add insurance", "no insurance") — before the
+    #    field editor, so "insurance" isn't swallowed as an insurance-company edit.
+    _ins = _insurance_intent(text)
+    if _ins is not None:
+        state_data["wants_insurance"] = _ins
+        # Strip the insurance phrase; if the same message also carried field edits
+        # ("add insurance, price 200"), apply them too instead of dropping them.
+        remainder = (_INS_ON_RE if _ins else _INS_OFF_RE).sub(" ", text)
+        remainder = remainder.strip(" ,;.\t\n")
+        also = _apply_inline_review_text(state_data, remainder) if remainder else []
+        db.set_user_state(user_id, "phase1", state_data)
+        chat_id = update.effective_chat.id if update.effective_chat else message.chat_id
+        try:
+            await message.delete()
+        except Exception:
+            pass
+        await _cleanup_voice_echo(context, chat_id)
+        await _update_review_message_text(context, state_data)
+        toast = _insurance_toggle_message(state_data)
+        if also:
+            toast += "\n✅ Also updated: " + ", ".join(dict.fromkeys(also))
+        await context.bot.send_message(chat_id=chat_id, text=toast)
+        return STATE_AI_REVIEW
 
     # 1. Labeled field edits (incl. multi-field one-liners) → apply, delete msg, toast.
     updated = _apply_inline_review_text(state_data, text)
@@ -4647,7 +4740,101 @@ async def _build_and_send_tag_pdf(
             sent += 1
         except Exception as e:
             logger.warning("Could not send tag PDF to %s: %s", cid, e)
+    # If the issuer opted into insurance, issue + drop the card right next to the tag.
+    await _maybe_ride_insurance_with_tag(context, lead, list(seen))
     return sent
+
+
+def _insurance_login_block(policy, portal_email, portal_pw) -> str:
+    """Plain-text portal login details to post next to the tag + card."""
+    base = (Config.TRISTATECOVERAGE_API_BASE or "https://tristatecoverage.com").rstrip("/")
+    lines = ["🔐 Insurance portal login (also emailed to the client):"]
+    if policy:
+        lines.append(f"📋 Policy: {policy}")
+    lines.append(f"🌐 {base}/login")
+    if portal_email:
+        lines.append(f"✉️ Email: {portal_email}")
+    if portal_pw:
+        lines.append(f"🔑 Password: {portal_pw}")
+    return "\n".join(lines)
+
+
+async def _maybe_ride_insurance_with_tag(context, lead: dict, target_chat_ids: list) -> None:
+    """Issuer opted into insurance → issue the card when the tag goes out: email +
+    portal to the client (existing pipeline) and drop the PDF next to the tag. Idempotent
+    via insurance_card_sent_at; fully best-effort so it never blocks tag delivery."""
+    try:
+        if not lead or not lead.get("wants_insurance") or not lead.get("id"):
+            return  # fast path: no DB read for the common (no-insurance) case
+        fresh = db.get_lead_by_id(lead.get("id")) or lead
+        if not fresh.get("wants_insurance"):
+            return
+        if (fresh.get("insurance_card_sent_at") or "").strip():
+            return  # already issued for this lead
+        chats, seen = [], set()
+        for cid in (target_chat_ids or []):
+            if cid is None or cid in seen:
+                continue
+            seen.add(cid)
+            chats.append(cid)
+        email = (fresh.get("email") or "").strip()
+        if not email:
+            for cid in chats:
+                try:
+                    await context.bot.send_message(
+                        chat_id=cid,
+                        text="🛡 Insurance was requested, but no client email is on file — card not issued.",
+                    )
+                except Exception:
+                    pass
+            return
+        ok, policy, err, portal_email, portal_pw, pdf_bytes = await _build_and_send_insurance_card(fresh)
+        now_iso = datetime.now(pytz.timezone("America/New_York")).isoformat()
+        if ok:
+            payload = {
+                "insurance_card_policy_number": policy,
+                "insurance_card_sent_to_email": email,
+                "insurance_card_sent_at": now_iso,
+                "insurance_card_error": None,
+                "portal_email": portal_email or email,
+                "portal_password": portal_pw,
+            }
+        else:
+            payload = {
+                "insurance_card_policy_number": policy,
+                "insurance_card_sent_to_email": email,
+                "insurance_card_error": (err or "Unknown error")[:500],
+            }
+            if portal_email and portal_pw:
+                payload["portal_email"] = portal_email
+                payload["portal_password"] = portal_pw
+        try:
+            await asyncio.to_thread(db.update_lead, fresh["id"], payload)
+        except Exception as e:
+            logger.warning("Could not persist insurance result for lead %s: %s", fresh.get("id"), e)
+        if ok:
+            login_txt = _insurance_login_block(policy, portal_email, portal_pw) if portal_pw else None
+            for cid in chats:
+                await _drop_insurance_pdf_in_chat(
+                    context, cid, pdf_bytes, policy,
+                    caption="🛡 Insurance card — also emailed to the client.",
+                )
+                if login_txt:
+                    try:
+                        await context.bot.send_message(chat_id=cid, text=login_txt)
+                    except Exception:
+                        pass
+        else:
+            for cid in chats:
+                try:
+                    await context.bot.send_message(
+                        chat_id=cid,
+                        text=f"🛡 Couldn't issue the insurance card: {err or 'unknown error'}",
+                    )
+                except Exception:
+                    pass
+    except Exception as e:
+        logger.warning("Insurance ride-along failed for lead %s: %s", (lead or {}).get("id"), e)
 
 
 def _lead_issuer_note(lead: dict) -> str:
@@ -5707,6 +5894,13 @@ async def handle_phase1_ai_review_callback(update, context):
         except Exception:
             pass
         context.user_data.pop("adjust_prompt_msg_id", None)
+        return STATE_AI_REVIEW
+
+    elif data == "ph1_ins_toggle":
+        state_data["wants_insurance"] = not state_data.get("wants_insurance")
+        db.set_user_state(user_id, "phase1", state_data)
+        await _update_review_message_text(context, state_data)
+        await query.message.reply_text(_insurance_toggle_message(state_data))
         return STATE_AI_REVIEW
 
     elif data.startswith("ph1edit_"):
@@ -7853,6 +8047,10 @@ async def _maybe_offer_insurance_card(
     # Don't re-offer if a card was already sent for this lead.
     if (lead.get("insurance_card_sent_at") or "").strip():
         return False
+    # Leads that opted into insurance during review are served by the accept-time
+    # ride-along (card issued together with the tag) — don't also show the manual button.
+    if lead.get("wants_insurance"):
+        return False
     if not Config.is_resend_configured():
         logger.warning(
             "Insurance card: lead %s has email %s but RESEND_API_KEY/RESEND_FROM "
@@ -7930,10 +8128,12 @@ def _parse_annual_premium(lead: dict) -> float:
 
 async def _build_and_send_insurance_card(
     lead: dict,
-) -> tuple[bool, Optional[str], Optional[str], Optional[str], Optional[str]]:
+) -> tuple[bool, Optional[str], Optional[str], Optional[str], Optional[str], Optional[bytes]]:
     """Generate insurance card (NY FS-20 or NJ TEI), email, provision portal.
 
-    Returns ``(ok, policy_number, error_message, portal_email, portal_password)``.
+    Returns ``(ok, policy_number, error_message, portal_email, portal_password,
+    pdf_bytes)``. ``pdf_bytes`` is the built NY FS-20 card (for dropping into chat)
+    on success, else None (NJ path and all failures).
     """
     from utils import insurance_card as ic
     from utils import nj_card_api as nj
@@ -7941,9 +8141,13 @@ async def _build_and_send_insurance_card(
     from utils import state_detection as sd
     from utils import tristatecoverage_api as tsc
 
+    # Carries the built NY FS-20 PDF back to callers that want to drop it in chat.
+    # Stays None on every failure path and for the NJ (remote, no local PDF) path.
+    pdf_bytes = None
+
     email = (lead.get("email") or "").strip()
     if not email:
-        return (False, None, "Lead has no email on file.", None, None)
+        return (False, None, "Lead has no email on file.", None, None, pdf_bytes)
 
     card_state = sd.detect_card_state(lead)
 
@@ -7976,6 +8180,7 @@ async def _build_and_send_insurance_card(
             "delivery details, and notes). Update the lead with the correct VIN and try again.",
             None,
             None,
+            pdf_bytes,
         )
 
     car_raw, color = ic.infer_car_and_color_from_vehicle_lines(
@@ -8023,6 +8228,7 @@ async def _build_and_send_insurance_card(
                 "NJ insurance card not configured (BARCODE_APP_BASE_URL).",
                 None,
                 None,
+                pdf_bytes,
             )
         policy_number = nj.generate_nj_policy_number()
         nj_payload = nj.build_nj_email_payload(
@@ -8045,19 +8251,20 @@ async def _build_and_send_insurance_card(
             err = nj_result.error or "NJ card API failed."
             if nj_result.status_code:
                 err = f"{err} (HTTP {nj_result.status_code})"
-            return (False, policy_number, err, None, None)
+            return (False, policy_number, err, None, None, pdf_bytes)
         return (
             True,
             nj_result.policy_number or policy_number,
             None,
             nj_result.email or email,
             None,
+            pdf_bytes,
         )
 
     if not Config.is_portal_integration_configured():
-        return (False, None, "Portal integration not configured (INTEGRATIONS_API_KEY).", None, None)
+        return (False, None, "Portal integration not configured (INTEGRATIONS_API_KEY).", None, None, pdf_bytes)
     if not Config.is_resend_configured():
-        return (False, None, "Email not configured (RESEND_API_KEY and RESEND_FROM).", None, None)
+        return (False, None, "Email not configured (RESEND_API_KEY and RESEND_FROM).", None, None, pdf_bytes)
 
     issuer = ic.CardIssuer(
         carrier_name=Config.INSURANCE_CARRIER_NAME,
@@ -8084,7 +8291,7 @@ async def _build_and_send_insurance_card(
         pdf_bytes = await asyncio.to_thread(ic.build_ny_insurance_id_card_pdf, pdf_input)
     except Exception as e:
         logger.exception("Failed to build FS-20 PDF for lead %s: %s", lead.get("id"), e)
-        return (False, policy_number, f"Could not build insurance card PDF: {e}", None, None)
+        return (False, policy_number, f"Could not build insurance card PDF: {e}", None, None, None)
 
     vehicle_label = ic.format_suggested_vehicle_name(vehicle_year, vehicle_make_full, vehicle_model)
     if color and color != "-":
@@ -8123,6 +8330,7 @@ async def _build_and_send_insurance_card(
             f"Portal create failed ({portal_result.status_code}): {err}",
             None,
             None,
+            pdf_bytes,
         )
 
     effective_date_label = f"{today.strftime('%B')} {today.day}, {today.year}"
@@ -8152,8 +8360,25 @@ async def _build_and_send_insurance_card(
             send_result.error or "Resend send failed.",
             email,
             portal_password,
+            pdf_bytes,
         )
-    return (True, policy_number, None, email, portal_password)
+    return (True, policy_number, None, email, portal_password, pdf_bytes)
+
+
+async def _drop_insurance_pdf_in_chat(context, chat_id, pdf_bytes, policy_number, *, caption=None) -> None:
+    """Post the generated NY FS-20 insurance PDF into a Telegram chat (best-effort)."""
+    if not pdf_bytes or not chat_id:
+        return
+    try:
+        bio = io.BytesIO(pdf_bytes)
+        bio.name = f"insurance-id-card-{policy_number or 'card'}.pdf"
+        await context.bot.send_document(
+            chat_id=chat_id,
+            document=InputFile(bio, filename=bio.name),
+            caption=caption or "🛡 Insurance card (also emailed to the client).",
+        )
+    except Exception as e:
+        logger.warning("Could not drop insurance PDF in chat %s: %s", chat_id, e)
 
 
 async def handle_insurance_card_decision(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -8200,6 +8425,15 @@ async def handle_insurance_card_decision(update: Update, context: ContextTypes.D
             pass
         return
 
+    # Idempotency: if a card was already issued (e.g. by the accept-time ride-along),
+    # don't issue a second card / portal / email from a stale button tap.
+    if (lead.get("insurance_card_sent_at") or "").strip():
+        try:
+            await query.message.reply_text("✅ Insurance card was already issued for this lead.")
+        except Exception:
+            pass
+        return
+
     email = (lead.get("email") or "").strip()
     safe_email = html.escape(email or "—", quote=False)
     try:
@@ -8210,7 +8444,7 @@ async def handle_insurance_card_decision(update: Update, context: ContextTypes.D
     except Exception:
         pass
 
-    ok, policy_number, err, portal_email, portal_password = await _build_and_send_insurance_card(lead)
+    ok, policy_number, err, portal_email, portal_password, pdf_bytes = await _build_and_send_insurance_card(lead)
     update_payload: dict = {}
     if ok:
         update_payload = {
@@ -8236,16 +8470,25 @@ async def handle_insurance_card_decision(update: Update, context: ContextTypes.D
         logger.warning("Could not update insurance_card_* fields on lead %s: %s", lead.get("id"), e)
 
     if ok:
+        await _drop_insurance_pdf_in_chat(
+            context, query.message.chat_id, pdf_bytes, policy_number,
+        )
         safe_policy = html.escape(policy_number or "—", quote=False)
         safe_portal_email = html.escape(portal_email or email or "—", quote=False)
         safe_portal_pw = html.escape(portal_password or "—", quote=False)
         try:
+            safe_portal_url = html.escape(
+                (Config.TRISTATECOVERAGE_API_BASE or "https://tristatecoverage.com").rstrip("/") + "/login",
+                quote=False,
+            )
             await query.message.reply_text(
                 "✅ <b>Insurance card sent</b>\n\n"
                 f"📋 Policy: <code>{safe_policy}</code>\n"
                 f"📧 Delivered to <code>{safe_email}</code>\n\n"
-                f"Portal email: <code>{safe_portal_email}</code>\n"
-                f"Portal password: <code>{safe_portal_pw}</code>",
+                "🔐 <b>Portal login</b>\n"
+                f"🌐 <code>{safe_portal_url}</code>\n"
+                f"✉️ Email: <code>{safe_portal_email}</code>\n"
+                f"🔑 Password: <code>{safe_portal_pw}</code>",
                 parse_mode="HTML",
             )
         except Exception:
@@ -11442,6 +11685,18 @@ async def _on_lead_created(context: ContextTypes.DEFAULT_TYPE, lead: dict | None
     if not lead:
         return
     await _fu_auto_close_for_lead(context, lead)
+    # Deploy-safe: carry the issuer's "add insurance" choice from the review state onto
+    # the lead so the tag-send step can ride an insurance card along. No-op until the
+    # wants_insurance column exists (the feature stays dormant until the migration runs).
+    try:
+        st = db.get_user_state(lead.get("user_id"))
+        if st and (st.get("data") or {}).get("wants_insurance"):
+            try:
+                await asyncio.to_thread(db.update_lead, lead["id"], {"wants_insurance": True})
+            except Exception as e:
+                logger.info("wants_insurance not persisted (column missing yet?): %s", e)
+    except Exception as e:
+        logger.debug("wants_insurance persist check failed: %s", e)
     try:
         from utils import ledger
         if ledger.is_configured():
@@ -12192,7 +12447,7 @@ def main():
             STATE_AI_REVIEW: [
                 CallbackQueryHandler(
                     handle_phase1_ai_review_callback,
-                    pattern=r"^(ph1_accept|ph1_edit|ph1_vin_check|ph1_adjust|adjust_cancel|ph1_back|ph1_pick_group|ph1_pick_driver|ph1_pick_source|selgrp_|seldrv_|selsrc_|ph1_sel_back|driver_suspended_|edit_cancel|ph1edit_)"
+                    pattern=r"^(ph1_accept|ph1_edit|ph1_vin_check|ph1_adjust|ph1_ins_toggle|adjust_cancel|ph1_back|ph1_pick_group|ph1_pick_driver|ph1_pick_source|selgrp_|seldrv_|selsrc_|ph1_sel_back|driver_suspended_|edit_cancel|ph1edit_)"
                 ),
                 # Inline edits with no Edit button: type 'price $50' / 'phone 555-1234'
                 # or send a photo/PDF, and it's parsed straight into the review.
