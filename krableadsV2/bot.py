@@ -3228,6 +3228,19 @@ async def _begin_lead_flow(
         await reply_message.reply_text(f"Welcome, @{username}! 👋\n\n{phase1_instruction}")
 
 
+async def _begin_lead_flow_with_review(context, user_id, username, msg) -> int:
+    """Start an empty lead but show the interactive review card right away, so the
+    issuer sees the field checklist and fills it by typing/voice — friendlier than the
+    plain text prompt. Used when someone just says 'new client' / 'start' / taps /lead."""
+    await _begin_lead_flow(context, user_id, username, msg, send_welcome=False)
+    await msg.reply_text(
+        "🆕 New client — here's your review. Type or say the details "
+        "(name, phone, address, VIN, car, color, price…) and I'll fill it in."
+    )
+    await _send_phase1_ai_review(msg, {}, context, user_id)
+    return STATE_AI_REVIEW
+
+
 async def begin_lead_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """Start the issuer lead flow (Phase 1). Used by /lead /client /newclient /newsale
     /enterlead /enterclient /newtag /tag. Args are pre-filled: '/lead William Smith'
@@ -3238,11 +3251,11 @@ async def begin_lead_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
     user_id = update.effective_user.id
     username = update.effective_user.username or "Unknown"
     prefill = " ".join(context.args).strip() if getattr(context, "args", None) else ""
-    await _begin_lead_flow(context, user_id, username, msg, send_welcome=not prefill)
     if prefill:
+        await _begin_lead_flow(context, user_id, username, msg, send_welcome=False)
         object.__setattr__(msg, "text", prefill)
         return await handle_phase1(update, context)
-    return STATE_PHASE1
+    return await _begin_lead_flow_with_review(context, user_id, username, msg)
 
 
 # Words a bare idle message can be without starting a lead (greetings/acks).
@@ -3289,10 +3302,10 @@ async def handle_idle_lead_start(update: Update, context: ContextTypes.DEFAULT_T
             handled = False
         if handled:
             raise ApplicationHandlerStop
-    # Bare trigger word ("start", "lead", "new client", "new entry", "tag") → empty lead.
+    # Bare trigger word ("start", "lead", "new client", "new entry", "tag") → empty
+    # lead shown as the review card, so they immediately see what's needed.
     if _PURE_TRIGGER_RE.match(text):
-        await _begin_lead_flow(context, user_id, username, msg, send_welcome=True)
-        return STATE_PHASE1
+        return await _begin_lead_flow_with_review(context, user_id, username, msg)
     # Trigger + info ("new lead William Smith") or just info ("William Smith") → parse it.
     body = _LEAD_TRIGGER_RE.sub("", text).strip()
     await _begin_lead_flow(context, user_id, username, msg, send_welcome=not body)
@@ -3315,9 +3328,17 @@ _ROUTER_HINT_RE = re.compile(
     r"|\b(?:disable|enable|deactivate|activate|reactivate|suspend|unsuspend|"
     r"turn\s+(?:on|off)|switch\s+(?:on|off)|broadcast|announce|announcement|pause|"
     r"resume|block|unblock|redact(?:ion)?|driver\s*block|driverblock|pending|owes?|"
-    r"owed|suspended|status|look\s*up|reference|refs?)\b",
+    r"owed|suspended|status|look\s*up|reference|refs?|plate|tag\s*number|"
+    r"control\s*number|temp\s*tag|resident)\b",
     re.I,
 )
+# Which plate/control counter a spoken "which" maps to (column on tag_plate_settings).
+_ROUTER_PLATE_COL = {
+    "resident_plate": "nj_plate_next_number",
+    "nonresident_plate": "non_nj_plate_next_number",
+    "resident_control": "nj_car_next_number",
+    "nonresident_control": "non_nj_car_next_number",
+}
 # A staged clarification ("what should the announcement say?") is only honored if
 # answered promptly — otherwise a forgotten prompt could later swallow an unrelated
 # lead dictation. Real answers arrive in seconds; abandoned ones auto-discard.
@@ -3326,7 +3347,8 @@ _ROUTER_FOLLOWUP_TTL_SEC = 180
 # the AI router is unavailable (no OpenAI key / quota).
 _ROUTER_STRONG_RE = re.compile(
     r"\b(?:disable|enable|deactivate|activate|reactivate|suspend|unsuspend|"
-    r"turn\s+(?:on|off)|broadcast|announce|driver\s*block|driverblock)\b",
+    r"turn\s+(?:on|off)|broadcast|announce|driver\s*block|driverblock|"
+    r"tag\s*number|plate\s*number|control\s*number|temp\s*tag)\b",
     re.I,
 )
 
@@ -3441,6 +3463,7 @@ _ROUTER_HELP = (
     "• “turn driver phone redaction on/off”\n"
     "• “disable group HighKage” / “activate driver Arman” (I'll confirm first)\n"
     "• “broadcast: trucks roll out at 9” (I'll confirm first)\n"
+    "• “update resident tag number 553300” / “set non-resident control to 12345”\n"
     "Or just start dictating a client and I'll build the tag."
 )
 
@@ -3600,6 +3623,24 @@ async def _route_supervisor_message(update, context, user_id, text: str) -> bool
                     "kind": "broadcast", "payload": payload,
                     "prompt": f"Broadcast to every group, driver, and lead sender?\n\n“{preview}”",
                 })
+        elif intent == "set_plate":
+            col = _ROUTER_PLATE_COL.get(str(args.get("which") or "").strip().lower())
+            digits = re.sub(r"\D", "", str(args.get("number") or ""))
+            if not col or not digits:
+                await msg.reply_text(
+                    "🔢 Tell me which counter and the number — e.g. "
+                    "“update resident tag number 553300”."
+                )
+            else:
+                cur = await asyncio.to_thread(db.get_plate_settings) or {}
+                label = _PLATE_SET_LABELS.get(col, col)
+                await _router_stage_confirm(msg, context, {
+                    "kind": "set_plate", "col": col, "value": int(digits),
+                    "prompt": (
+                        f"Set {label} to {int(digits)} "
+                        f"(currently {cur.get(col, '—')})?\nThe H/V letter is kept automatically."
+                    ),
+                })
         else:  # "none" — matched a command hint but isn't actionable; don't start a lead
             await msg.reply_text(_ROUTER_HELP)
     except Exception as e:
@@ -3650,6 +3691,15 @@ async def handle_router_confirm_callback(update: Update, context: ContextTypes.D
                 f"📢 Announcement delivered to {sent_n} chat(s)"
                 + (f" — {failed_n} failed." if failed_n else ".")
             )
+        elif kind == "set_plate":
+            col = pending.get("col")
+            val = int(pending.get("value"))
+            ok = await asyncio.to_thread(db.update_plate_settings, {col: val})
+            label = _PLATE_SET_LABELS.get(col, col)
+            await query.edit_message_text(
+                f"🔢 {label} set to {val}. The H/V letter is applied automatically."
+                if ok else "⚠️ Couldn't update the plate number."
+            )
         else:
             await query.edit_message_text("⚠️ Unknown action.")
     except Exception as e:
@@ -3671,8 +3721,7 @@ async def handle_driver_add_lead_callback(update: Update, context: ContextTypes.
         return ConversationHandler.END
     user_id = query.from_user.id
     username = query.from_user.username or "Unknown"
-    await _begin_lead_flow(context, user_id, username, msg)
-    return STATE_PHASE1
+    return await _begin_lead_flow_with_review(context, user_id, username, msg)
 
 
 async def handle_another_tag_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -12076,7 +12125,7 @@ def main():
     # /settings (supervisors): plate counters + group management. Registered
     # before the main conversation so its input step captures the typed value.
     settings_conv = ConversationHandler(
-        entry_points=[CommandHandler("settings", cmd_settings)],
+        entry_points=[CommandHandler(["settings", "setting"], cmd_settings)],
         states={
             SET_MENU: [CallbackQueryHandler(handle_settings_cb, pattern=r"^tset_")],
             SET_INPUT: [

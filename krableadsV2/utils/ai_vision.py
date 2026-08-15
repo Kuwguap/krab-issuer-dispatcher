@@ -329,6 +329,13 @@ SUPERVISOR_ROUTER_PROMPT = (
     "- \"driver_status\": activate or deactivate a driver by name. args: "
     "{\"name\": \"<driver name>\", \"active\": true|false}.\n"
     "- \"broadcast\": send an announcement to everyone. args: {\"message\": \"<text>\"}.\n"
+    "- \"set_plate\": change a temp-tag / plate counter to a number. args: "
+    "{\"which\": \"resident_plate\"|\"nonresident_plate\"|\"resident_control\"|"
+    "\"nonresident_control\", \"number\": \"<digits only>\"}. Mapping: \"resident\" / "
+    "\"NJ\" / \"in-state\" / \"H\" tags are resident; \"non-resident\" / \"out of state\" / "
+    "\"V\" tags are nonresident. \"tag number\" or \"plate number\" -> *_plate; \"control "
+    "number\" -> *_control. Strip any leading H or trailing V letter — put ONLY the digits "
+    "in number (e.g. \"H553300\" -> \"553300\").\n"
     "- \"help\": asking what the bot can do.\n"
     "- \"none\": small talk or unclear.\n\n"
     "Rules: return exactly one intent. Put only the requested keys in args, as an "
@@ -359,7 +366,7 @@ def classify_supervisor_command(user_message: str) -> Optional[dict]:
     known = {
         "lead", "list_groups", "list_drivers", "list_suspended", "pending_receipts",
         "usage", "lead_lookup", "driverblock", "group_status", "driver_status",
-        "broadcast", "help", "none",
+        "broadcast", "set_plate", "help", "none",
     }
     if intent not in known:
         intent = "none"
