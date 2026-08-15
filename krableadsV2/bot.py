@@ -3464,6 +3464,7 @@ _ROUTER_HELP = (
     "• “disable group HighKage” / “activate driver Arman” (I'll confirm first)\n"
     "• “broadcast: trucks roll out at 9” (I'll confirm first)\n"
     "• “update resident tag number 553300” / “set non-resident control to 12345”\n"
+    "• …or just send / forward a tag photo or PDF and I'll read the number\n"
     "Or just start dictating a client and I'll build the tag."
 )
 
@@ -3745,29 +3746,47 @@ _PLATE_IMAGE_KIND_COL = {
 }
 
 
+def _user_in_active_conversation(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    """True when this user/chat is inside any registered ConversationHandler's active
+    state, using PTB's in-memory conversation map (the authoritative truth — cleared on
+    END, so never stale unlike the DB ``states`` shadow). Lets the idle plate-image
+    reader stand down so it never grabs a photo that belongs to an in-progress flow
+    (a text-only sub-state like 'send me the missing field' would otherwise fall
+    through to it). Degrades to False if PTB internals change, so behavior is safe."""
+    try:
+        groups = context.application.handlers
+    except Exception:
+        return False
+    for group in groups.values():
+        for h in group:
+            if isinstance(h, ConversationHandler):
+                try:
+                    if h._conversations.get(h._get_key(update)) is not None:
+                        return True
+                except Exception:
+                    continue
+    return False
+
+
 async def handle_supervisor_plate_image(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Idle supervisor photo/PDF → read the temp-tag number and stage a plate-counter
-    update. Only fires when the supervisor armed 'read from a picture' (or captioned the
-    image with that intent); otherwise the image is left untouched. Registered AFTER the
-    lead/receipt conversations, so it only ever sees images sent while idle."""
+    update. Any image or PDF a supervisor sends (or forwards) while idle is treated as a
+    tag to read — no need to say 'read from a picture' first — and nothing is written
+    until they tap Confirm. Registered AFTER the lead/receipt conversations, so images
+    sent mid-lead go to the lead and are never seen here; only truly-idle supervisor
+    images reach this handler."""
     msg = update.effective_message
     if not msg or not update.effective_user:
         return
     user_id = update.effective_user.id
     if not _user_is_global_supervisor(user_id):
         return
-    fu = context.user_data.get("router_image_followup")
-    armed = bool(fu) and (time.time() - float((fu or {}).get("ts") or 0)) <= _ROUTER_FOLLOWUP_TTL_SEC
-    caption = (msg.caption or "").strip()
-    caption_intent = False
-    if not armed and caption and _ROUTER_HINT_RE.search(caption):
-        try:
-            c = ai_vision.classify_supervisor_command(caption)
-        except Exception:
-            c = None
-        caption_intent = bool(c and c.get("intent") in ("set_plate", "set_plate_from_image"))
-    if not (armed or caption_intent):
-        return  # not a plate-read request — leave the image alone
+    # Only read images sent while genuinely idle. If they're inside any flow (lead,
+    # receipt, appeal…), even a text-only sub-state that would ignore this photo, leave
+    # it alone so we never hijack an in-progress conversation.
+    if _user_in_active_conversation(update, context):
+        return
+    # Clear any prior "send me the photo" arming — we read every idle image now anyway.
     context.user_data.pop("router_image_followup", None)
 
     img_bytes, mime = await _download_update_image_bytes(update, context)
@@ -12261,7 +12280,10 @@ def main():
         | filters.Document.MimeType("image/webp")
     )
     application.add_handler(
-        MessageHandler(_plate_img_filter & ~filters.COMMAND, handle_supervisor_plate_image)
+        MessageHandler(
+            _plate_img_filter & filters.ChatType.PRIVATE & ~filters.COMMAND,
+            handle_supervisor_plate_image,
+        )
     )
 
     # Voice notes work EVERYWHERE: group -1 runs before every conversation handler,
