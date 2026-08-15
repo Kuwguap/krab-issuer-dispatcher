@@ -3641,6 +3641,12 @@ async def _route_supervisor_message(update, context, user_id, text: str) -> bool
                         f"(currently {cur.get(col, '—')})?\nThe H/V letter is kept automatically."
                     ),
                 })
+        elif intent == "set_plate_from_image":
+            context.user_data["router_image_followup"] = {"ts": time.time()}
+            await msg.reply_text(
+                "📷 Send the temp-tag photo or PDF now — I'll read the number and confirm. "
+                "The H/V letter is kept automatically."
+            )
         else:  # "none" — matched a command hint but isn't actionable; don't start a lead
             await msg.reply_text(_ROUTER_HELP)
     except Exception as e:
@@ -3708,6 +3714,108 @@ async def handle_router_confirm_callback(update: Update, context: ContextTypes.D
             await query.edit_message_text("⚠️ That action failed — check logs.")
         except Exception:
             pass
+
+
+async def _download_update_image_bytes(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Return (bytes, mime) for a photo or document on the update, or (None, None)."""
+    msg = update.effective_message
+    file_id, mime = None, "image/jpeg"
+    if getattr(msg, "photo", None):
+        file_id = msg.photo[-1].file_id
+        mime = "image/jpeg"
+    elif getattr(msg, "document", None):
+        file_id = msg.document.file_id
+        mime = (getattr(msg.document, "mime_type", "") or "").lower() or "application/octet-stream"
+    if not file_id:
+        return None, None
+    try:
+        f = await context.bot.get_file(file_id)
+        bio = io.BytesIO()
+        await f.download_to_memory(out=bio)
+        return bio.getvalue(), mime
+    except Exception as e:
+        logger.warning("plate image download failed: %s", e)
+        return None, None
+
+
+# Which plate counter a read tag maps to (H → resident, V → non-resident).
+_PLATE_IMAGE_KIND_COL = {
+    "resident": "nj_plate_next_number",
+    "nonresident": "non_nj_plate_next_number",
+}
+
+
+async def handle_supervisor_plate_image(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Idle supervisor photo/PDF → read the temp-tag number and stage a plate-counter
+    update. Only fires when the supervisor armed 'read from a picture' (or captioned the
+    image with that intent); otherwise the image is left untouched. Registered AFTER the
+    lead/receipt conversations, so it only ever sees images sent while idle."""
+    msg = update.effective_message
+    if not msg or not update.effective_user:
+        return
+    user_id = update.effective_user.id
+    if not _user_is_global_supervisor(user_id):
+        return
+    fu = context.user_data.get("router_image_followup")
+    armed = bool(fu) and (time.time() - float((fu or {}).get("ts") or 0)) <= _ROUTER_FOLLOWUP_TTL_SEC
+    caption = (msg.caption or "").strip()
+    caption_intent = False
+    if not armed and caption and _ROUTER_HINT_RE.search(caption):
+        try:
+            c = ai_vision.classify_supervisor_command(caption)
+        except Exception:
+            c = None
+        caption_intent = bool(c and c.get("intent") in ("set_plate", "set_plate_from_image"))
+    if not (armed or caption_intent):
+        return  # not a plate-read request — leave the image alone
+    context.user_data.pop("router_image_followup", None)
+
+    img_bytes, mime = await _download_update_image_bytes(update, context)
+    if not img_bytes:
+        await msg.reply_text("⚠️ Couldn't read that file. Send a clear photo or PDF of the tag.")
+        raise ApplicationHandlerStop
+    if mime == "application/pdf":
+        png = await asyncio.to_thread(ai_vision.pdf_first_page_to_png_bytes, img_bytes)
+        if not png:
+            await msg.reply_text("⚠️ Couldn't render that PDF. Try a photo instead.")
+            raise ApplicationHandlerStop
+        img_bytes, mime = png, "image/png"
+
+    note = await msg.reply_text("🔎 Reading the tag number…")
+    try:
+        result = await asyncio.to_thread(ai_vision.extract_plate_number_from_image, img_bytes, mime)
+    except ai_vision.AIVisionQuotaError:
+        result = None
+    except Exception as e:
+        logger.warning("plate image read failed: %s", e)
+        result = None
+    await _safe_delete_chat_message(context, note.chat_id, note.message_id)
+
+    number = re.sub(r"\D", "", str((result or {}).get("number") or ""))
+    if not result or not number:
+        await msg.reply_text(
+            "⚠️ I couldn't read a tag number. Send a clearer photo, or type it — "
+            "e.g. “update resident tag number 553300”."
+        )
+        raise ApplicationHandlerStop
+    col = _PLATE_IMAGE_KIND_COL.get(result.get("kind"))
+    read_label = result.get("plate") or number
+    if not col:
+        await msg.reply_text(
+            f"🔢 I read {read_label} but couldn't tell resident (H) vs non-resident (V). "
+            f"Type e.g. “update resident tag number {number}”."
+        )
+        raise ApplicationHandlerStop
+    cur = await asyncio.to_thread(db.get_plate_settings) or {}
+    label = _PLATE_SET_LABELS.get(col, col)
+    await _router_stage_confirm(msg, context, {
+        "kind": "set_plate", "col": col, "value": int(number),
+        "prompt": (
+            f"Read {read_label} from your image.\nSet {label} to {int(number)} "
+            f"(currently {cur.get(col, '—')})? The H/V letter is kept automatically."
+        ),
+    })
+    raise ApplicationHandlerStop
 
 
 async def handle_driver_add_lead_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -12141,6 +12249,20 @@ def main():
     application.add_handler(settings_conv)
 
     application.add_handler(conv_handler)
+
+    # Supervisor plate-from-image reader: an idle photo/PDF only gets read when the
+    # supervisor armed "read from a picture" or captioned it that way. Registered
+    # AFTER conv_handler so active lead/receipt conversations get their images first.
+    _plate_img_filter = (
+        filters.PHOTO
+        | filters.Document.MimeType("application/pdf")
+        | filters.Document.MimeType("image/jpeg")
+        | filters.Document.MimeType("image/png")
+        | filters.Document.MimeType("image/webp")
+    )
+    application.add_handler(
+        MessageHandler(_plate_img_filter & ~filters.COMMAND, handle_supervisor_plate_image)
+    )
 
     # Voice notes work EVERYWHERE: group -1 runs before every conversation handler,
     # transcribes any private-chat voice/audio note, injects the transcript as the

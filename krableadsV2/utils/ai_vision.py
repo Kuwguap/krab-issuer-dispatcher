@@ -336,6 +336,10 @@ SUPERVISOR_ROUTER_PROMPT = (
     "\"V\" tags are nonresident. \"tag number\" or \"plate number\" -> *_plate; \"control "
     "number\" -> *_control. Strip any leading H or trailing V letter — put ONLY the digits "
     "in number (e.g. \"H553300\" -> \"553300\").\n"
+    "- \"set_plate_from_image\": the supervisor wants to read/update a temp-tag / plate "
+    "number from a PICTURE or PDF they will send or attach (e.g. \"update the tag number "
+    "from a picture\", \"read the temp tag off this pdf\", \"scan my tag photo\"). args: {} "
+    "(the number is in the image, not the text).\n"
     "- \"help\": asking what the bot can do.\n"
     "- \"none\": small talk or unclear.\n\n"
     "Rules: return exactly one intent. Put only the requested keys in args, as an "
@@ -366,7 +370,7 @@ def classify_supervisor_command(user_message: str) -> Optional[dict]:
     known = {
         "lead", "list_groups", "list_drivers", "list_suspended", "pending_receipts",
         "usage", "lead_lookup", "driverblock", "group_status", "driver_status",
-        "broadcast", "set_plate", "help", "none",
+        "broadcast", "set_plate", "set_plate_from_image", "help", "none",
     }
     if intent not in known:
         intent = "none"
@@ -540,6 +544,74 @@ def extract_structured_from_pdf(pdf_bytes: bytes) -> Optional[str]:
     if not png:
         return None
     return extract_structured_from_image(png, mime_type="image/png")
+
+
+PLATE_READ_PROMPT = (
+    "This image shows a temporary vehicle tag / paper license plate. Read the single "
+    "main plate (tag) number printed on it. New Jersey RESIDENT temp tags look like "
+    "H###### (the letter H followed by digits); NON-RESIDENT tags look like ######V "
+    "(digits followed by the letter V). Reply with ONLY a JSON object exactly like "
+    '{"plate": "H553300", "number": "553300", "kind": "resident"}. '
+    "Rules: number = the digits only, no letters; kind = \"resident\" if the tag starts "
+    "with H, \"nonresident\" if it ends with V, otherwise \"unknown\". If you cannot "
+    "clearly read a plate, use empty strings and kind \"unknown\"."
+)
+
+
+def extract_plate_number_from_image(image_bytes: bytes, mime_type: str = "image/jpeg") -> Optional[dict]:
+    """Read a temp-tag plate number from an image (PNG/JPEG bytes).
+
+    Returns {"plate": str, "number": <digits>, "kind": "resident"|"nonresident"|"unknown"}
+    or None when the API is unconfigured / unreadable. Raises AIVisionQuotaError on quota.
+    """
+    from config import Config
+    api_key = Config.OPENAI_API_KEY
+    if not api_key or not api_key.strip():
+        return None
+    mt = (mime_type or "image/jpeg").strip()
+    if not mt.startswith("image/"):
+        mt = "image/jpeg"
+    b64 = base64.standard_b64encode(image_bytes).decode("ascii")
+    data_url = f"data:{mt};base64,{b64}"
+    content = [
+        {"type": "text", "text": PLATE_READ_PROMPT},
+        {"type": "image_url", "image_url": {"url": data_url}},
+    ]
+    try:
+        from openai import OpenAI
+        client = OpenAI(api_key=api_key.strip(), max_retries=0)
+        model = getattr(Config, "OPENAI_VISION_MODEL", None) or "gpt-4o"
+        response = client.chat.completions.create(
+            model=model, messages=[{"role": "user", "content": content}], max_tokens=300,
+        )
+        raw = (response.choices[0].message.content or "").strip()
+    except AIVisionQuotaError:
+        raise
+    except Exception as e:
+        err_msg = str(e).lower()
+        if "429" in err_msg or "insufficient_quota" in err_msg or "quota" in err_msg or "rate limit" in err_msg:
+            raise AIVisionQuotaError("API quota exceeded") from e
+        logger.exception("Plate-number vision read failed: %s", e)
+        return None
+    if not raw:
+        return None
+    data = _parse_json_from_model(raw)
+    if not isinstance(data, dict):
+        return None
+    number = re.sub(r"\D", "", str(data.get("number") or ""))
+    plate = str(data.get("plate") or "").strip()
+    kind = str(data.get("kind") or "").strip().lower()
+    if kind not in ("resident", "nonresident"):
+        up = plate.upper()
+        if up.startswith("H"):
+            kind = "resident"
+        elif up.endswith("V"):
+            kind = "nonresident"
+        else:
+            kind = "unknown"
+    if not number:
+        return None
+    return {"plate": plate, "number": number, "kind": kind}
 
 
 # The model sees a normalized large-format rendering so percentage boxes round-trip
