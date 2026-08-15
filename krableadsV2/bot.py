@@ -2566,6 +2566,9 @@ def _merge_phase1_adjust(state_data: dict, structured_text: str) -> list[str]:
 
 async def handle_phase1_adjust_input(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """Review 'Adjust from image/text': read media/text, merge only found fields."""
+    _cr = _cancel_restart_kind_from_update(update)
+    if _cr:
+        return await _do_cancel_or_restart(update, context, _cr)
     user_id = update.effective_user.id
     state = db.get_user_state(user_id)
     if not state or not state.get("data"):
@@ -3095,6 +3098,10 @@ async def handle_phase1_review_message(update: Update, context: ContextTypes.DEF
     if not text:
         return STATE_AI_REVIEW
 
+    _cr = _cancel_restart_kind(text)
+    if _cr:
+        return await _do_cancel_or_restart(update, context, _cr)
+
     user_id = update.effective_user.id
     state = db.get_user_state(user_id)
     if not state or not state.get("data"):
@@ -3241,6 +3248,62 @@ async def _begin_lead_flow_with_review(context, user_id, username, msg) -> int:
     return STATE_AI_REVIEW
 
 
+# Bare-word "cancel" / "restart" (typed or spoken) work at any point in the lead flow.
+# Whole-message match only, so a field value is never mistaken for a command.
+_CANCEL_RE = re.compile(
+    r"^\s*(?:cancel|stop|never\s*mind|nvm|scrap(?:\s+it|\s+this)?|forget\s+it|"
+    r"abort|quit|exit|discard)\s*[.!]*\s*$",
+    re.I,
+)
+_RESTART_RE = re.compile(
+    r"^\s*(?:re-?start|start\s*over|start\s*again|start\s*fresh|begin\s*again|"
+    r"redo|reset|do\s*over|over\s*again|scratch\s*that|start\s*from\s*scratch)\s*[.!]*\s*$",
+    re.I,
+)
+
+
+def _cancel_restart_kind(text: str):
+    """'restart' | 'cancel' | None for a whole-message cancel/restart phrase."""
+    t = (text or "").strip()
+    if not t:
+        return None
+    if _RESTART_RE.match(t):
+        return "restart"
+    if _CANCEL_RE.match(t):
+        return "cancel"
+    return None
+
+
+def _cancel_restart_kind_from_update(update: Update):
+    msg = update.effective_message
+    return _cancel_restart_kind((msg.text if msg else "") or "")
+
+
+async def _do_cancel_or_restart(update: Update, context: ContextTypes.DEFAULT_TYPE, kind: str) -> int:
+    """Wipe the current lead flow. 'restart' opens a fresh empty review to enter a new
+    tag right away; 'cancel' drops to idle. Shared by the bare-word guard and /restart."""
+    msg = update.effective_message
+    user_id = update.effective_user.id
+    username = update.effective_user.username or "Unknown"
+    try:
+        await _clear_phase1_vision_upload_state(context, msg.chat_id)
+    except Exception:
+        pass
+    _clear_lead_conversation_user_data(context)
+    db.clear_user_state(user_id)
+    if kind == "restart":
+        return await _begin_lead_flow_with_review(context, user_id, username, msg)
+    await msg.reply_text(
+        "❌ Cancelled. Say “restart” or “new client” (or just send the info) to start a new tag."
+    )
+    return ConversationHandler.END
+
+
+async def restart_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """/restart — abort whatever's in progress and open a fresh tag review."""
+    return await _do_cancel_or_restart(update, context, "restart")
+
+
 async def begin_lead_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """Start the issuer lead flow (Phase 1). Used by /lead /client /newclient /newsale
     /enterlead /enterclient /newtag /tag. Args are pre-filled: '/lead William Smith'
@@ -3302,6 +3365,13 @@ async def handle_idle_lead_start(update: Update, context: ContextTypes.DEFAULT_T
             handled = False
         if handled:
             raise ApplicationHandlerStop
+    # "restart" → open a fresh tag review; "cancel" → nothing to cancel when idle.
+    _cr = _cancel_restart_kind(text)
+    if _cr == "restart":
+        return await _begin_lead_flow_with_review(context, user_id, username, msg)
+    if _cr == "cancel":
+        await msg.reply_text("Nothing to cancel — say “new client” or send the info to start a tag.")
+        return ConversationHandler.END
     # Bare trigger word ("start", "lead", "new client", "new entry", "tag") → empty
     # lead shown as the review card, so they immediately see what's needed.
     if _PURE_TRIGGER_RE.match(text):
@@ -5075,6 +5145,10 @@ async def handle_phase1(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
         )
         return STATE_PHASE1
 
+    _cr = _cancel_restart_kind(message_text)
+    if _cr:
+        return await _do_cancel_or_restart(update, context, _cr)
+
     await _clear_phase1_vision_upload_state(
         context, update.effective_chat.id if update.effective_chat else None
     )
@@ -5207,6 +5281,9 @@ async def handle_phase1(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
 
 async def handle_edit_field_text(update, context):
     user_id = update.effective_user.id
+    _cr = _cancel_restart_kind_from_update(update)
+    if _cr:
+        return await _do_cancel_or_restart(update, context, _cr)
     ek = context.user_data.get("phase1_pending_edit_key")
     if not ek:
         return STATE_AI_REVIEW
@@ -5886,6 +5963,9 @@ async def handle_missing_field(update: Update, context: ContextTypes.DEFAULT_TYP
         sent = await update.message.reply_text("Please send the missing value.")
         _track_missing_prompt(context, sent)
         return STATE_MISSING_FIELD
+    _cr = _cancel_restart_kind(text)
+    if _cr:
+        return await _do_cancel_or_restart(update, context, _cr)
     missing_fields = context.user_data.get("missing_fields") or []
     state_data = context.user_data.get("missing_field_state_data") or {}
     field = missing_fields[0] if missing_fields else "color"
@@ -5995,6 +6075,9 @@ async def handle_vin_choice_text(update: Update, context: ContextTypes.DEFAULT_T
     """STATE_VIN_CHOICE: answer the VIN conflict by voice/text ('use the new',
     'keep the same', 'retype vin') instead of tapping a button."""
     text = ((update.message.text if update.message else "") or "").strip()
+    _cr = _cancel_restart_kind(text)
+    if _cr:
+        return await _do_cancel_or_restart(update, context, _cr)
     kind, _ = _classify_review_command(text)
     mapping = {"VIN_USE": "use", "VIN_KEEP": "keep", "VIN_RETYPE": "retype"}
     if kind in mapping:
@@ -6112,6 +6195,9 @@ async def handle_phase2(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
                 "❌ Please send your phone number and price as text.\n\n" + PHASE2_INTRO_MESSAGE
             )
         return STATE_PHASE2
+    _cr = _cancel_restart_kind(message_text)
+    if _cr:
+        return await _do_cancel_or_restart(update, context, _cr)
 
     # Get phase 1 data
     state = db.get_user_state(user_id)
@@ -6169,6 +6255,9 @@ async def handle_special_request_issuers(update: Update, context: ContextTypes.D
         return STATE_PHASE2
 
     raw = (update.message.text or "").strip()
+    _cr = _cancel_restart_kind(raw)
+    if _cr:
+        return await _do_cancel_or_restart(update, context, _cr)
     skip_tokens = frozenset(("-", "—", "–", "none", "n/a", "na"))
     issuers_note = "" if not raw or raw.lower() in skip_tokens else raw
     state_data["special_request_issuers"] = issuers_note
@@ -6200,6 +6289,9 @@ async def handle_special_request_drivers(update: Update, context: ContextTypes.D
         return STATE_PHASE2
 
     raw_d = (update.message.text or "").strip()
+    _cr = _cancel_restart_kind(raw_d)
+    if _cr:
+        return await _do_cancel_or_restart(update, context, _cr)
     skip_tokens = frozenset(("-", "—", "–", "none", "n/a", "na"))
     drivers_note = "" if not raw_d or raw_d.lower() in skip_tokens else raw_d
     state_data["special_request_drivers"] = drivers_note
@@ -12073,6 +12165,7 @@ def main():
                 ["lead", "client", "newclient", "newsale", "enterlead", "enterclient", "newtag", "tag"],
                 begin_lead_command,
             ),
+            CommandHandler("restart", restart_command),
             CallbackQueryHandler(handle_driver_add_lead_callback, pattern="^driver_add_lead$"),
             CallbackQueryHandler(handle_another_tag_callback, pattern="^another_tag_"),
             CallbackQueryHandler(handle_driver_add_receipt_callback, pattern="^driver_add_receipt$"),
@@ -12160,6 +12253,7 @@ def main():
         },
         fallbacks=[
             CommandHandler("cancel", cancel_from_lead_conversation),
+            CommandHandler("restart", restart_command),
             CommandHandler("start", start),
             CommandHandler(
                 ["lead", "client", "newclient", "newsale", "enterlead", "enterclient", "newtag", "tag"],
