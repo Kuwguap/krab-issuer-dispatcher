@@ -1010,11 +1010,14 @@ async def _api_lead_auto_dispatch_after_group_accept(
     context: ContextTypes.DEFAULT_TYPE,
     lead: dict,
     winner_group: dict,
+    *,
+    accepted_by: str | None = None,
 ) -> None:
     """Website (API-ingested) lead: a team accepted — dispatch drivers now.
 
     There is no human issuer to hand-pick drivers, so the winning group gets
-    the full tag and every eligible driver gets Accept/Decline immediately.
+    the full tag (now sent here, after accept — not at dispatch) and every
+    eligible driver gets Accept/Decline immediately.
     """
     reference_id = lead.get("reference_id", "N/A")
     try:
@@ -1024,6 +1027,7 @@ async def _api_lead_auto_dispatch_after_group_accept(
             lead,
             html_prefix="<b>✅ Your group claimed this website client</b>\n\n",
             mirror_supervisory=False,
+            accepted_by=accepted_by,
         )
     except Exception as e:
         logger.warning("API lead: could not post full lead to winner group: %s", e)
@@ -1102,22 +1106,15 @@ async def process_pending_api_lead_dispatches(context: ContextTypes.DEFAULT_TYPE
             # offers flip to "taken"), then drivers are dispatched automatically
             # (see the website-lead branch in handle_accept_group_offer).
             await _post_lead_to_all_groups_for_approval(context, lead, active_groups)
-            # Unified web-order flow — two messages to every active group,
-            # alongside the claimable offer above: (1) the informational
-            # SUPERVISORY "New Lead" copy, then (2) the generated NJ temp-tag PDF.
-            group_chat_ids = [
-                _parse_chat_id(g.get("group_telegram_id")) for g in active_groups
-            ]
-            group_chat_ids = [c for c in group_chat_ids if c]
+            # Post the informational SUPERVISORY "New Lead" copy alongside the
+            # claimable offer above. The temp-tag PDF (and insurance, if opted in)
+            # is NOT sent here — it goes out only after a team ACCEPTS the lead,
+            # via the website-lead branch in handle_accept_group_offer →
+            # _api_lead_auto_dispatch_after_group_accept → _send_full_group_lead_to_chat.
             try:
                 await _send_web_order_supervisory_notice(context, lead, active_groups)
             except Exception as e:
                 logger.warning("Web-order supervisory notice failed for %s: %s", lead_id, e)
-            try:
-                fresh_lead = db.get_lead_by_id(lead_id) or lead
-                await _build_and_send_tag_pdf(context, fresh_lead, group_chat_ids)
-            except Exception as e:
-                logger.warning("Web-order tag PDF failed for %s: %s", lead_id, e)
             offers = db.get_group_lead_offers(lead_id) or []
             logger.info(
                 "API ingest: lead %s ref %s offered to %d/%d group(s) for first-accept",
@@ -3441,6 +3438,9 @@ async def handle_idle_lead_start(update: Update, context: ContextTypes.DEFAULT_T
     msg = update.effective_message
     if not msg or not update.effective_user:
         return None
+    # Lead entry is a DM activity — never react to (untagged) group/channel text.
+    if update.effective_chat is not None and update.effective_chat.type != "private":
+        return None
     text = (msg.text or "").strip()
     low = text.lower().strip(" .!?,")
     if not text or len(text) < 3 or low in _IDLE_CHATTER:
@@ -4576,6 +4576,7 @@ async def _send_full_group_lead_to_chat(
     header_text: str = "🏷NEW CLIENT❗️",
     mirror_supervisory: bool = False,
     renewal: bool = False,
+    accepted_by: str | None = None,
 ) -> None:
     """Post the same detailed HTML lead as the issuer flow; optionally mirror to supervisory chat(s)."""
     reference_id = (lead.get("reference_id") or "N/A").strip()
@@ -4586,7 +4587,11 @@ async def _send_full_group_lead_to_chat(
     body = _format_group_lead_message_html(
         reference_id, phase1, link, issue_dt, exp_dt, issuer_note, header_text=header_text,
     )
-    full_html = f"{html_prefix}{body}" if html_prefix else body
+    accept_line = (
+        f"✅ <b>Accepted by {html.escape(accepted_by, quote=False)}</b>\n\n"
+        if accepted_by else ""
+    )
+    full_html = f"{html_prefix or ''}{accept_line}{body}"
     chat_id = _parse_chat_id(group.get("group_telegram_id"))
     group_name = group.get("group_name", "")
     sup_ids = (
@@ -4625,17 +4630,15 @@ async def _send_full_group_lead_to_chat(
         return_exceptions=True,
     )
 
-    # Second message: the generated NJ temp-tag PDF to the same targets — sent
-    # at the LATER part of the flow, when a group ACCEPTS the lead. Website leads
-    # already receive the tag at dispatch time (they carry external_order_id), so
-    # they're skipped here; renewals always mint a brand-new tag.
-    if renewal or not (lead.get("external_order_id") or "").strip():
-        try:
-            await _build_and_send_tag_pdf(
-                context, lead, [tid for tid, _ in targets], renewal=renewal
-            )
-        except Exception as e:
-            logger.warning("Tag PDF send failed for ref %s: %s", reference_id, e)
+    # Second message: the generated NJ temp-tag PDF (+ insurance ride-along) to the
+    # same targets. This runs only from accept handlers, so the tag now goes out for
+    # EVERY lead type — including website leads — only after a team ACCEPTS.
+    try:
+        await _build_and_send_tag_pdf(
+            context, lead, [tid for tid, _ in targets], renewal=renewal, accepted_by=accepted_by,
+        )
+    except Exception as e:
+        logger.warning("Tag PDF send failed for ref %s: %s", reference_id, e)
 
 
 async def _tag_fields_from_lead(lead: dict, *, renewal: bool = False) -> dict:
@@ -4708,7 +4711,7 @@ async def _tag_fields_from_lead(lead: dict, *, renewal: bool = False) -> dict:
 
 async def _build_and_send_tag_pdf(
     context: ContextTypes.DEFAULT_TYPE, lead: dict, target_chat_ids: list,
-    *, renewal: bool = False,
+    *, renewal: bool = False, accepted_by: str | None = None,
 ) -> int:
     """Generate the NJ temp-tag PDF for a lead and send it to each chat.
 
@@ -4724,6 +4727,8 @@ async def _build_and_send_tag_pdf(
     reference_id = (lead.get("reference_id") or "N/A").strip()
     plate = fields.get("plate") or "tag"
     caption = f"🧾 NJ 30-Day Temp Tag — {plate}\nReference: {reference_id}"
+    if accepted_by:
+        caption += f"\n✅ Accepted by {accepted_by}"
     filename = f"tag_{re.sub(r'[^A-Za-z0-9]+', '', plate) or 'tag'}.pdf"
     seen: set = set()
     sent = 0
@@ -9439,6 +9444,7 @@ async def handle_accept_group_offer(update: Update, context: ContextTypes.DEFAUL
         query.from_user.full_name or "Unknown"
     )
     acceptor_esc = _telegram_md1_escape(acceptor_handle)
+    accepted_by_label = f"{winner_name} (@{acceptor_handle})"
 
     # Update all group offer messages to reflect taken/accepted
     offers = db.get_group_lead_offers(lead_id)
@@ -9501,6 +9507,7 @@ async def handle_accept_group_offer(update: Update, context: ContextTypes.DEFAUL
                         "<i>Sender already notified driver(s).</i>\n\n"
                     ),
                     mirror_supervisory=False,
+                    accepted_by=accepted_by_label,
                 )
             else:
                 _claimed_txt = (
@@ -9522,7 +9529,7 @@ async def handle_accept_group_offer(update: Update, context: ContextTypes.DEFAUL
             if lead_fresh.get("external_order_id"):
                 # Website lead — no human issuer: auto-dispatch drivers now.
                 await _api_lead_auto_dispatch_after_group_accept(
-                    context, lead_fresh, winner_group
+                    context, lead_fresh, winner_group, accepted_by=accepted_by_label
                 )
                 return
             try:
@@ -9538,6 +9545,7 @@ async def handle_accept_group_offer(update: Update, context: ContextTypes.DEFAUL
                     lead_fresh,
                     html_prefix="<b>✅ Your group claimed this client</b>\n\n",
                     mirror_supervisory=False,
+                    accepted_by=accepted_by_label,
                 )
             except Exception as e:
                 logger.warning("Could not post full lead to group after broadcast accept: %s", e)
@@ -11007,6 +11015,7 @@ async def handle_renewal_group_accept(update: Update, context: ContextTypes.DEFA
     # Re-send the lead to the accepting group with a RENEWAL header (not NEW CLIENT).
     try:
         lead_full = db.get_lead_by_id(refreshed.get("lead_id")) or (refreshed.get("lead") or {})
+        _renew_acceptor = (query.from_user.username or "").strip() or (query.from_user.full_name or "Unknown")
         await _send_full_group_lead_to_chat(
             context,
             group,
@@ -11014,6 +11023,7 @@ async def handle_renewal_group_accept(update: Update, context: ContextTypes.DEFA
             header_text="🏷RENEWAL CLIENT❗️",
             mirror_supervisory=False,
             renewal=True,
+            accepted_by=f"{gname} (@{_renew_acceptor})",
         )
     except Exception as e:
         logger.warning("Could not re-send renewal lead to accepting group: %s", e)
@@ -12432,7 +12442,7 @@ def main():
             CallbackQueryHandler(handle_driver_selection, pattern="^(select_driver_|driver_suspended_)"),
             # Idle natural-language / voice start: any substantive text starts a lead
             # and auto-fills what's given. MUST be last (only plain text reaches it).
-            MessageHandler(filters.TEXT & ~filters.COMMAND, handle_idle_lead_start),
+            MessageHandler(filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE, handle_idle_lead_start),
         ],
         states={
             STATE_PHASE1: [
