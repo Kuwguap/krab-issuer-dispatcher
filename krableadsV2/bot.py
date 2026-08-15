@@ -3278,6 +3278,17 @@ async def handle_idle_lead_start(update: Update, context: ContextTypes.DEFAULT_T
         return None  # ignore — don't start a lead from greetings/acks
     user_id = update.effective_user.id
     username = update.effective_user.username or "Unknown"
+    # A global supervisor can talk to the bot (ask about data, toggle settings,
+    # enable/disable a group or driver, broadcast) instead of starting a lead.
+    if _user_is_global_supervisor(user_id):
+        handled = False
+        try:
+            handled = await _route_supervisor_message(update, context, user_id, text)
+        except Exception as e:
+            logger.warning("supervisor router failed: %s", e)
+            handled = False
+        if handled:
+            raise ApplicationHandlerStop
     # Bare trigger word ("start", "lead", "new client", "new entry", "tag") → empty lead.
     if _PURE_TRIGGER_RE.match(text):
         await _begin_lead_flow(context, user_id, username, msg, send_welcome=True)
@@ -3289,6 +3300,364 @@ async def handle_idle_lead_start(update: Update, context: ContextTypes.DEFAULT_T
         object.__setattr__(msg, "text", body)
         return await handle_phase1(update, context)
     return STATE_PHASE1
+
+
+# ── Supervisor voice/text router ─────────────────────────────────────────────
+# A global supervisor can just talk to the bot — ask about drivers / groups /
+# receipts, toggle settings, enable/disable a group or driver, or broadcast — by
+# voice or plain typing. We only spend an AI classification call when the text
+# smells like a command or a question (so dictating a lead stays on the fast
+# path). Destructive actions (disable a group/driver, broadcast) are staged behind
+# an inline Confirm button; reads and enables apply immediately.
+_ROUTER_HINT_RE = re.compile(
+    r"\?\s*$"
+    r"|^\s*(?:who|what|which|when|where|how\s+many|how\s+much|is|are|do|does|can|show|list|tell)\b"
+    r"|\b(?:disable|enable|deactivate|activate|reactivate|suspend|unsuspend|"
+    r"turn\s+(?:on|off)|switch\s+(?:on|off)|broadcast|announce|announcement|pause|"
+    r"resume|block|unblock|redact(?:ion)?|driver\s*block|driverblock|pending|owes?|"
+    r"owed|suspended|status|look\s*up|reference|refs?)\b",
+    re.I,
+)
+# A staged clarification ("what should the announcement say?") is only honored if
+# answered promptly — otherwise a forgotten prompt could later swallow an unrelated
+# lead dictation. Real answers arrive in seconds; abandoned ones auto-discard.
+_ROUTER_FOLLOWUP_TTL_SEC = 180
+# Clearly a command, never lead info — used to avoid starting a spurious lead when
+# the AI router is unavailable (no OpenAI key / quota).
+_ROUTER_STRONG_RE = re.compile(
+    r"\b(?:disable|enable|deactivate|activate|reactivate|suspend|unsuspend|"
+    r"turn\s+(?:on|off)|broadcast|announce|driver\s*block|driverblock)\b",
+    re.I,
+)
+
+
+def _fmt_router_groups() -> str:
+    groups = db.get_all_groups() or []
+    if not groups:
+        return "🏢 No groups configured."
+    active = [g for g in groups if record_is_active(g)]
+    lines = [f"🏢 Groups — {len(active)} active / {len(groups)} total:"]
+    for g in groups:
+        flag = "" if record_is_active(g) else " (disabled)"
+        lines.append(f"• {g.get('group_name') or '—'}{flag}")
+    return "\n".join(lines)
+
+
+def _fmt_router_drivers() -> str:
+    drivers = _get_all_drivers_cached() or []
+    if not drivers:
+        return "🚗 No drivers configured."
+    suspended = _get_suspended_driver_ids()
+    active = [d for d in drivers if record_is_active(d)]
+    lines = [f"🚗 Drivers — {len(active)} active / {len(drivers)} total:"]
+    for d in drivers:
+        if not record_is_active(d):
+            flag = " (inactive)"
+        elif str(d.get("id")) in suspended:
+            flag = " ⛔ suspended"
+        else:
+            flag = ""
+        lines.append(f"• {d.get('driver_name') or '—'}{flag}")
+    return "\n".join(lines)
+
+
+def _fmt_router_suspended() -> str:
+    suspended = _get_suspended_driver_ids()
+    if not suspended:
+        return "✅ No drivers are suspended (nobody is at the receipt-debt threshold)."
+    drivers = {str(d.get("id")): d for d in (_get_all_drivers_cached() or [])}
+    lines = [f"⛔ Suspended drivers ({len(suspended)}):"]
+    for did in suspended:
+        d = drivers.get(str(did))
+        lines.append(f"• {(d.get('driver_name') if d else None) or did}")
+    return "\n".join(lines)
+
+
+def _fmt_router_pending_receipts() -> str:
+    try:
+        owed = db.get_drivers_owed_receipts_over_24h() or []
+    except Exception as e:
+        logger.warning("router pending_receipts lookup failed: %s", e)
+        owed = []
+    if not owed:
+        return "✅ No drivers owe receipts past 24h."
+    lines = [f"🧾 Drivers owing receipts ({len(owed)}):"]
+    for row in owed:
+        refs = row.get("refs") or []
+        lines.append(f"• {row.get('driver_name') or row.get('driver_id') or '—'} — {len(refs)} owed")
+    return "\n".join(lines)
+
+
+def _fmt_router_usage() -> str:
+    try:
+        stats = db.get_lead_sender_stats() or []
+    except Exception as e:
+        logger.warning("router usage lookup failed: %s", e)
+        stats = []
+    if not stats:
+        return "📊 No lead activity recorded yet."
+    total_7d = sum(int(s.get("leads_count_7d") or 0) for s in stats)
+    return (
+        f"📊 Lead activity: {len(stats)} sender(s) on record, "
+        f"{total_7d} lead(s) in the last 7 days."
+    )
+
+
+def _fmt_router_lead_lookup(reference: str) -> str:
+    ref = (reference or "").strip()
+    if not ref:
+        return "Tell me the reference id to look up (e.g. “look up ABC12345”)."
+    try:
+        lead = db.get_lead_by_reference_id(ref)
+    except Exception as e:
+        logger.warning("router lead_lookup failed: %s", e)
+        lead = None
+    if not lead:
+        return f"🔎 No lead found for reference {ref}."
+    name = _client_display_name_from_lead(lead)
+    created = (lead.get("created_at") or "")[:16].replace("T", " ")
+    status = ""
+    try:
+        st = db.get_lead_assignment_status(str(lead.get("id")))
+        if isinstance(st, dict):
+            status = str(st.get("status") or "").strip()
+        elif st:
+            status = str(st).strip()
+    except Exception:
+        status = ""
+    out = [f"🔎 Reference {ref}", f"👤 {name}"]
+    if created:
+        out.append(f"🕒 {created}")
+    if status:
+        out.append(f"📌 Status: {status}")
+    return "\n".join(out)
+
+
+_ROUTER_HELP = (
+    "🤖 You can just tell me things like:\n"
+    "• “which groups are active?” / “list drivers” / “who's suspended?”\n"
+    "• “who owes receipts?” / “how many leads this week?”\n"
+    "• “look up ABC12345”\n"
+    "• “turn driver phone redaction on/off”\n"
+    "• “disable group HighKage” / “activate driver Arman” (I'll confirm first)\n"
+    "• “broadcast: trucks roll out at 9” (I'll confirm first)\n"
+    "Or just start dictating a client and I'll build the tag."
+)
+
+
+def _set_group_active(group_id, want_active: bool) -> bool:
+    """Toggle a group to the desired active state (no-op if already there)."""
+    g = db.get_group_by_id(group_id)
+    if not g:
+        return False
+    if bool(record_is_active(g)) == bool(want_active):
+        return True
+    return bool(db.toggle_group_status(group_id))
+
+
+def _set_driver_active(driver_id, want_active: bool) -> bool:
+    """Toggle a driver to the desired active state (no-op if already there)."""
+    cur = next((d for d in (db.get_all_drivers() or []) if str(d.get("id")) == str(driver_id)), None)
+    if not cur:
+        return False
+    if bool(record_is_active(cur)) == bool(want_active):
+        return True
+    return bool(db.toggle_driver_status(driver_id))
+
+
+async def _router_stage_confirm(msg, context, action: dict) -> None:
+    """Stash a destructive action and ask for an inline Confirm/Cancel. A per-stage
+    token rides in the callback data, so if a second action is staged before the
+    first is resolved, the older card's buttons no longer match and can't fire the
+    newer action (they report 'expired' instead)."""
+    token = generate_reference_id()
+    action["token"] = token
+    context.user_data["router_pending"] = action
+    kb = InlineKeyboardMarkup([[
+        InlineKeyboardButton("✅ Confirm", callback_data=f"route_do:{token}"),
+        InlineKeyboardButton("❌ Cancel", callback_data=f"route_no:{token}"),
+    ]])
+    await msg.reply_text(action.get("prompt") or "Confirm this action?", reply_markup=kb)
+
+
+async def _route_supervisor_message(update, context, user_id, text: str) -> bool:
+    """Interpret a supervisor's freeform message. Returns True if handled (caller
+    then stops the update so no lead is started); False = not a router command."""
+    msg = update.effective_message
+    # A pending clarification (broadcast text / lookup reference) consumes the very
+    # next idle message — even if it doesn't look like a command — so the answer is
+    # never mistaken for a new lead. It's always cleared here (single-use); a stale
+    # one (abandoned via a command/photo/chatter, then answered much later) is
+    # discarded so it can't swallow an unrelated lead dictation.
+    followup = context.user_data.pop("router_followup", None)
+    if followup and (time.time() - float(followup.get("ts") or 0)) <= _ROUTER_FOLLOWUP_TTL_SEC:
+        answer = (text or "").strip()
+        fkind = followup.get("kind")
+        if fkind == "broadcast" and answer:
+            preview = answer if len(answer) <= 200 else answer[:200] + "…"
+            await _router_stage_confirm(msg, context, {
+                "kind": "broadcast", "payload": answer,
+                "prompt": f"Broadcast to every group, driver, and lead sender?\n\n“{preview}”",
+            })
+            return True
+        if fkind == "lead_lookup" and answer:
+            await msg.reply_text(_fmt_router_lead_lookup(answer))
+            return True
+        # Unusable answer — fall through to normal routing below.
+    if not _ROUTER_HINT_RE.search(text):
+        return False
+    try:
+        cls = ai_vision.classify_supervisor_command(text)
+    except ai_vision.AIVisionQuotaError:
+        cls = None
+    except Exception as e:
+        logger.warning("router classify failed: %s", e)
+        cls = None
+    if not cls:
+        # AI unavailable — only intercept if it's unmistakably a command, so we
+        # never turn a real lead into a no-op. Otherwise let the lead flow have it.
+        if _ROUTER_STRONG_RE.search(text):
+            await msg.reply_text(
+                "🤖 I couldn't reach the AI router right now. Use /settings, "
+                "/announce, or /driverblock directly."
+            )
+            return True
+        return False
+
+    intent = cls.get("intent") or "none"
+    args = cls.get("args") or {}
+
+    if intent == "lead":
+        return False  # real client info — hand it to the lead flow
+
+    # From here the message is a recognized command/question — handle it and never
+    # fall through to the lead flow, even if a reply or DB call fails.
+    try:
+        if intent == "list_groups":
+            await msg.reply_text(_fmt_router_groups())
+        elif intent == "list_drivers":
+            await msg.reply_text(_fmt_router_drivers())
+        elif intent == "list_suspended":
+            await msg.reply_text(_fmt_router_suspended())
+        elif intent == "pending_receipts":
+            await msg.reply_text(_fmt_router_pending_receipts())
+        elif intent == "usage":
+            await msg.reply_text(_fmt_router_usage())
+        elif intent == "lead_lookup":
+            ref = str(args.get("reference") or "").strip()
+            if not ref:
+                context.user_data["router_followup"] = {"kind": "lead_lookup", "ts": time.time()}
+                await msg.reply_text("🔎 What's the reference id? Send it in your next message.")
+            else:
+                await msg.reply_text(_fmt_router_lead_lookup(ref))
+        elif intent == "help":
+            await msg.reply_text(_ROUTER_HELP)
+        elif intent == "driverblock":
+            want = bool(args.get("enable"))
+            await asyncio.to_thread(_set_driverblock_enabled, want)
+            state = "ON — driver messages hide the client phone" if want else "OFF — drivers can see the client phone"
+            await msg.reply_text(f"🔐 Phone redaction is now {state}.")
+        elif intent == "group_status":
+            groups = db.get_all_groups() or []
+            g = _match_name(str(args.get("name") or ""), groups, "group_name")
+            if not g:
+                await msg.reply_text(f"🏢 I couldn't find a group matching “{args.get('name') or ''}”.")
+            else:
+                want = bool(args.get("enable"))
+                gname = g.get("group_name") or "group"
+                if want:  # enabling is non-destructive → do it now
+                    ok = await asyncio.to_thread(_set_group_active, g.get("id"), True)
+                    await msg.reply_text(f"🏢 Group “{gname}” is now enabled." if ok else f"⚠️ Couldn't enable “{gname}”.")
+                else:  # disabling stops dispatch → confirm
+                    await _router_stage_confirm(msg, context, {
+                        "kind": "group_status", "id": g.get("id"), "want_active": False,
+                        "prompt": f"Disable group “{gname}”? It will stop receiving leads.",
+                    })
+        elif intent == "driver_status":
+            drivers = _get_all_drivers_cached() or []
+            d = _match_name(str(args.get("name") or ""), drivers, "driver_name")
+            if not d:
+                await msg.reply_text(f"🚗 I couldn't find a driver matching “{args.get('name') or ''}”.")
+            else:
+                want = bool(args.get("active"))
+                dname = d.get("driver_name") or "driver"
+                if want:  # activating is non-destructive → do it now
+                    ok = await asyncio.to_thread(_set_driver_active, d.get("id"), True)
+                    await msg.reply_text(f"🚗 Driver “{dname}” is now active." if ok else f"⚠️ Couldn't activate “{dname}”.")
+                else:  # deactivating pulls them from dispatch → confirm
+                    await _router_stage_confirm(msg, context, {
+                        "kind": "driver_status", "id": d.get("id"), "want_active": False,
+                        "prompt": f"Deactivate driver “{dname}”? They'll stop receiving leads.",
+                    })
+        elif intent == "broadcast":
+            payload = str(args.get("message") or "").strip()
+            if not payload:
+                context.user_data["router_followup"] = {"kind": "broadcast", "ts": time.time()}
+                await msg.reply_text("📢 What should the announcement say? Send it in your next message.")
+            else:
+                preview = payload if len(payload) <= 200 else payload[:200] + "…"
+                await _router_stage_confirm(msg, context, {
+                    "kind": "broadcast", "payload": payload,
+                    "prompt": f"Broadcast to every group, driver, and lead sender?\n\n“{preview}”",
+                })
+        else:  # "none" — matched a command hint but isn't actionable; don't start a lead
+            await msg.reply_text(_ROUTER_HELP)
+    except Exception as e:
+        logger.warning("router dispatch failed (%s): %s", intent, e)
+        try:
+            await msg.reply_text("⚠️ That didn't go through — try again, or use the matching /command.")
+        except Exception:
+            pass
+    return True
+
+
+async def handle_router_confirm_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Execute (or cancel) a staged destructive router action."""
+    query = update.callback_query
+    if not query:
+        return
+    await _safe_answer_callback_query(query)
+    if not _user_is_global_supervisor(query.from_user.id):
+        return
+    verb, _, token = (query.data or "").partition(":")
+    pending = context.user_data.get("router_pending")
+    # Only the card whose token matches the currently-staged action may act; an
+    # older (superseded) card reports expired without touching what's pending.
+    if not pending or pending.get("token") != token:
+        try:
+            await query.edit_message_text("⌛ This confirmation expired — please repeat the request.")
+        except Exception:
+            pass
+        return
+    context.user_data.pop("router_pending", None)
+    if verb == "route_no":
+        try:
+            await query.edit_message_text("❌ Cancelled.")
+        except Exception:
+            pass
+        return
+    kind = pending.get("kind")
+    try:
+        if kind == "group_status":
+            ok = await asyncio.to_thread(_set_group_active, pending.get("id"), bool(pending.get("want_active")))
+            await query.edit_message_text("🏢 Group disabled." if ok else "⚠️ Couldn't update the group.")
+        elif kind == "driver_status":
+            ok = await asyncio.to_thread(_set_driver_active, pending.get("id"), bool(pending.get("want_active")))
+            await query.edit_message_text("🚗 Driver deactivated." if ok else "⚠️ Couldn't update the driver.")
+        elif kind == "broadcast":
+            sent_n, failed_n = await _broadcast_announcement(context, query.from_user.id, pending.get("payload") or "")
+            await query.edit_message_text(
+                f"📢 Announcement delivered to {sent_n} chat(s)"
+                + (f" — {failed_n} failed." if failed_n else ".")
+            )
+        else:
+            await query.edit_message_text("⚠️ Unknown action.")
+    except Exception as e:
+        logger.warning("router confirm execute failed: %s", e)
+        try:
+            await query.edit_message_text("⚠️ That action failed — check logs.")
+        except Exception:
+            pass
 
 
 async def handle_driver_add_lead_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -11190,22 +11559,10 @@ async def handle_cf_info(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     await query.message.reply_text("\n".join(lines))
 
 
-async def cmd_announce(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Supervisor broadcast: /announce <message> → every group chat + every
-    driver DM + every lead-sender DM (deduped)."""
-    if not _user_is_global_supervisor(update.effective_user.id):
-        await update.message.reply_text("⛔ Supervisors only.")
-        return
-    raw = update.message.text or ""
-    payload = raw.split(" ", 1)[1].strip() if " " in raw else ""
-    if not payload:
-        await update.message.reply_text(
-            "Usage: /announce <message>\n\n"
-            "Sends your message to every group chat, driver, and lead sender."
-        )
-        return
+async def _broadcast_announcement(context: ContextTypes.DEFAULT_TYPE, announcer_id, payload: str) -> tuple[int, int]:
+    """Send ``payload`` to every active group chat + driver DM + lead-sender DM (deduped),
+    skipping the announcer. Returns (sent, failed). Shared by /announce and the voice router."""
     msg = f"📢 ANNOUNCEMENT\n\n{payload}\n\n🏁Automated🏎Automotive"
-
     targets: dict = {}
     try:
         for g in db.get_all_groups() or []:
@@ -11233,7 +11590,8 @@ async def cmd_announce(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     except Exception as e:
         logger.warning("Announce: lead senders lookup failed: %s", e)
     # Don't echo back to the announcer.
-    targets.pop(_norm_chat_id(update.effective_user.id), None)
+    if announcer_id is not None:
+        targets.pop(_norm_chat_id(announcer_id), None)
 
     sent_n, failed_n = 0, 0
     for cid in targets.values():
@@ -11243,6 +11601,24 @@ async def cmd_announce(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         except Exception as e:
             failed_n += 1
             logger.warning("Announce to %s failed: %s", cid, e)
+    return sent_n, failed_n
+
+
+async def cmd_announce(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Supervisor broadcast: /announce <message> → every group chat + every
+    driver DM + every lead-sender DM (deduped)."""
+    if not _user_is_global_supervisor(update.effective_user.id):
+        await update.message.reply_text("⛔ Supervisors only.")
+        return
+    raw = update.message.text or ""
+    payload = raw.split(" ", 1)[1].strip() if " " in raw else ""
+    if not payload:
+        await update.message.reply_text(
+            "Usage: /announce <message>\n\n"
+            "Sends your message to every group chat, driver, and lead sender."
+        )
+        return
+    sent_n, failed_n = await _broadcast_announcement(context, update.effective_user.id, payload)
     await update.message.reply_text(
         f"📢 Announcement delivered to {sent_n} chat(s)"
         + (f" — {failed_n} failed (blocked bot / bad id)." if failed_n else ".")
@@ -11734,6 +12110,8 @@ def main():
     application.add_handler(CommandHandler("driverblock", cmd_driverblock))
     # Supervisor broadcast to all groups + drivers + lead senders.
     application.add_handler(CommandHandler("announce", cmd_announce))
+    # Confirm/cancel for the supervisor voice/text router's destructive actions.
+    application.add_handler(CallbackQueryHandler(handle_router_confirm_callback, pattern=r"^route_(do|no):"))
 
     # Add accept/decline handlers for driver assignments
     application.add_handler(CallbackQueryHandler(handle_accept_lead, pattern="^accept_lead_"))

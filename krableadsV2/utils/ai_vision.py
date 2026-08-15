@@ -307,6 +307,68 @@ def extract_followup_fields(user_message: str) -> Optional[dict]:
     return out
 
 
+SUPERVISOR_ROUTER_PROMPT = (
+    "You are the intent router for a car-tag dispatch Telegram bot. A SUPERVISOR "
+    "typed or dictated the message below. Classify what they want and reply with "
+    "ONLY a JSON object like {\"intent\": \"\", \"args\": {}}.\n\n"
+    "Valid intents:\n"
+    "- \"lead\": the message is CLIENT/VEHICLE INFO or a request to add/create/start "
+    "a lead/tag/client/sale (e.g. a name, address, VIN, or \"add a lead for ...\"). "
+    "When unsure, choose this.\n"
+    "- \"list_groups\": asking which groups/teams exist or are active.\n"
+    "- \"list_drivers\": asking which drivers exist or are active.\n"
+    "- \"list_suspended\": asking who is suspended / owes receipts and is blocked.\n"
+    "- \"pending_receipts\": asking who owes receipts / outstanding receipt debt.\n"
+    "- \"usage\": asking who has been sending leads / lead activity / recent stats.\n"
+    "- \"lead_lookup\": asking about ONE lead by its reference id. args: "
+    "{\"reference\": \"<the id>\"}.\n"
+    "- \"driverblock\": turn driver phone-number redaction on or off. args: "
+    "{\"enable\": true|false}.\n"
+    "- \"group_status\": enable or disable a group/team by name. args: "
+    "{\"name\": \"<group name>\", \"enable\": true|false}.\n"
+    "- \"driver_status\": activate or deactivate a driver by name. args: "
+    "{\"name\": \"<driver name>\", \"active\": true|false}.\n"
+    "- \"broadcast\": send an announcement to everyone. args: {\"message\": \"<text>\"}.\n"
+    "- \"help\": asking what the bot can do.\n"
+    "- \"none\": small talk or unclear.\n\n"
+    "Rules: return exactly one intent. Put only the requested keys in args, as an "
+    "empty object {} when none apply. Do NOT invent names or ids not present in the "
+    "message. Booleans must be real JSON true/false.\n\nMESSAGE:\n"
+)
+
+
+def classify_supervisor_command(user_message: str) -> Optional[dict]:
+    """AI-classify a supervisor's freeform message into a router intent + args.
+
+    Returns {"intent": str, "args": dict} or None when the API is unconfigured/fails
+    (caller then falls back to normal handling). ``intent`` is always a non-empty
+    string from the known set; unknown labels collapse to "none".
+    """
+    txt = (user_message or "").strip()
+    if not txt:
+        return None
+    raw = _call_openai_text([
+        {"role": "user", "content": SUPERVISOR_ROUTER_PROMPT + txt[:2000]}
+    ])
+    if not raw:
+        return None
+    data = _parse_json_from_model(raw)
+    if not isinstance(data, dict):
+        return None
+    intent = str(data.get("intent") or "").strip().lower()
+    known = {
+        "lead", "list_groups", "list_drivers", "list_suspended", "pending_receipts",
+        "usage", "lead_lookup", "driverblock", "group_status", "driver_status",
+        "broadcast", "help", "none",
+    }
+    if intent not in known:
+        intent = "none"
+    args = data.get("args")
+    if not isinstance(args, dict):
+        args = {}
+    return {"intent": intent, "args": args}
+
+
 # Appended to the vision request when the sender typed a message alongside the
 # file(s) (photo caption). Typed text is authoritative for phone/price; images
 # stay authoritative for the VIN (people mistype VINs far more than cameras).
