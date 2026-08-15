@@ -2735,6 +2735,7 @@ async def handle_phase1_adjust_input(update: Update, context: ContextTypes.DEFAU
 
     updated = _merge_phase1_adjust(state_data, structured)
     db.set_user_state(user_id, "phase1", state_data)
+    await _autoclean_user_msg(update, context)  # merge OK — safe to clear the typed input
     prompt_id = context.user_data.pop("adjust_prompt_msg_id", None)
     if prompt_id:
         await _safe_delete_chat_message(context, message.chat_id, prompt_id)
@@ -3237,6 +3238,10 @@ async def handle_phase1_review_message(update: Update, context: ContextTypes.DEF
         await context.bot.send_message(chat_id=chat_id, text=toast)
         return STATE_AI_REVIEW
 
+    # Typed text in review → clean it up (edits/commands below also delete; this also
+    # covers the AI-reparse fallback so nothing the issuer types lingers).
+    await _autoclean_user_msg(update, context)
+
     # 1. Labeled field edits (incl. multi-field one-liners) → apply, delete msg, toast.
     updated = _apply_inline_review_text(state_data, text)
     if updated:
@@ -3430,6 +3435,28 @@ async def _do_cancel_or_restart(update: Update, context: ContextTypes.DEFAULT_TY
 async def restart_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """/restart — abort whatever's in progress and open a fresh tag review."""
     return await _do_cancel_or_restart(update, context, "restart")
+
+
+async def _autoclean_user_msg(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Delete the issuer's typed text during the lead flow so the chat stays clean —
+    the review card + prompts are the single source of truth. Private chats only, TYPED
+    text only (photos/PDFs/voice keep their own handling); best-effort. Safe to call
+    before the handler's replies: in a DM, reply_text does not quote the message."""
+    msg = update.effective_message
+    chat = update.effective_chat
+    if not msg or not chat or getattr(chat, "type", None) != "private":
+        return
+    if (
+        getattr(msg, "voice", None) or getattr(msg, "audio", None)
+        or getattr(msg, "photo", None) or getattr(msg, "document", None)
+    ):
+        return  # keep media + let the voice pipeline manage its own echo cleanup
+    if not (msg.text or "").strip():
+        return
+    try:
+        await msg.delete()
+    except Exception:
+        pass
 
 
 async def begin_lead_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -3705,6 +3732,30 @@ async def _router_stage_confirm(msg, context, action: dict) -> None:
     await msg.reply_text(action.get("prompt") or "Confirm this action?", reply_markup=kb)
 
 
+def _looks_like_plate_answer(text: str) -> bool:
+    """True only if the message is just a plate/control number (optionally H-prefixed
+    or V-suffixed, spaces/dashes ok) — NOT prose, a lead dictation, or another command.
+    Lets a pending 'what's the new number?' consume '553300' / 'H553300' but never
+    swallow 'William Smith apt 5', 'cancel', or 'look up ABC12345'."""
+    t = (text or "").strip()
+    if not re.fullmatch(r"[Hh]?\d[\d\s\-]*[Vv]?", t):
+        return False
+    return len(re.sub(r"\D", "", t)) >= 3
+
+
+async def _stage_plate_confirm(msg, context, col: str, digits: str) -> None:
+    """Stage a one-tap Confirm to set a plate/control counter to ``digits``."""
+    cur = await asyncio.to_thread(db.get_plate_settings) or {}
+    label = _PLATE_SET_LABELS.get(col, col)
+    await _router_stage_confirm(msg, context, {
+        "kind": "set_plate", "col": col, "value": int(digits),
+        "prompt": (
+            f"Set {label} to {int(digits)} "
+            f"(currently {cur.get(col, '—')})?\nThe H/V letter is kept automatically."
+        ),
+    })
+
+
 async def _route_supervisor_message(update, context, user_id, text: str) -> bool:
     """Interpret a supervisor's freeform message. Returns True if handled (caller
     then stops the update so no lead is started); False = not a router command."""
@@ -3729,6 +3780,24 @@ async def _route_supervisor_message(update, context, user_id, text: str) -> bool
             await msg.reply_text(_fmt_router_lead_lookup(answer))
             return True
         # Unusable answer — fall through to normal routing below.
+
+    # A pending plate clarification ("change resident plate number" → "what's the
+    # update?") consumes the next TEXT/VOICE number for that specific counter — but
+    # ONLY when the reply is actually a number. Anything else (prose, a lead, cancel/
+    # restart, another command) drops the pending ask and routes normally, so the
+    # supervisor is never trapped. (An image/PDF answer is handled by
+    # handle_supervisor_plate_image instead.)
+    pfu = context.user_data.pop("router_plate_followup", None)
+    if (
+        pfu
+        and (time.time() - float(pfu.get("ts") or 0)) <= _ROUTER_FOLLOWUP_TTL_SEC
+        and _looks_like_plate_answer(text)
+    ):
+        digits = re.sub(r"\D", "", text or "")
+        if digits:
+            await _stage_plate_confirm(msg, context, pfu["col"], digits)
+            return True
+
     if not _ROUTER_HINT_RE.search(text):
         return False
     try:
@@ -3828,21 +3897,21 @@ async def _route_supervisor_message(update, context, user_id, text: str) -> bool
         elif intent == "set_plate":
             col = _ROUTER_PLATE_COL.get(str(args.get("which") or "").strip().lower())
             digits = re.sub(r"\D", "", str(args.get("number") or ""))
-            if not col or not digits:
+            if col and digits:
+                await _stage_plate_confirm(msg, context, col, digits)
+            elif col:
+                # Counter named but no number ("change resident plate number") → ask,
+                # and accept the answer as text, a tag photo/PDF, or a voice note.
+                context.user_data["router_plate_followup"] = {"col": col, "ts": time.time()}
                 await msg.reply_text(
-                    "🔢 Tell me which counter and the number — e.g. "
-                    "“update resident tag number 553300”."
+                    f"🔢 What's the new {_PLATE_SET_LABELS.get(col, col)}? "
+                    "Send it as text, a tag photo/PDF, or a voice note."
                 )
             else:
-                cur = await asyncio.to_thread(db.get_plate_settings) or {}
-                label = _PLATE_SET_LABELS.get(col, col)
-                await _router_stage_confirm(msg, context, {
-                    "kind": "set_plate", "col": col, "value": int(digits),
-                    "prompt": (
-                        f"Set {label} to {int(digits)} "
-                        f"(currently {cur.get(col, '—')})?\nThe H/V letter is kept automatically."
-                    ),
-                })
+                await msg.reply_text(
+                    "🔢 Which counter? e.g. “change resident plate number” (then send the "
+                    "number), or in one go “update resident tag number 553300”."
+                )
         elif intent == "set_plate_from_image":
             context.user_data["router_image_followup"] = {"ts": time.time()}
             await msg.reply_text(
@@ -3987,7 +4056,13 @@ async def handle_supervisor_plate_image(update: Update, context: ContextTypes.DE
     # it alone so we never hijack an in-progress conversation.
     if _user_in_active_conversation(update, context):
         return
-    # Clear any prior "send me the photo" arming — we read every idle image now anyway.
+    # If a "change <counter> → what's the update?" ask is pending, an image answer
+    # sets THAT specific counter; otherwise we auto-detect resident/non-resident from
+    # the tag's H/V. Clear the old "send me the photo" arming either way.
+    forced_col = None
+    _pfu = context.user_data.pop("router_plate_followup", None)
+    if _pfu and (time.time() - float(_pfu.get("ts") or 0)) <= _ROUTER_FOLLOWUP_TTL_SEC:
+        forced_col = _pfu.get("col")
     context.user_data.pop("router_image_followup", None)
 
     img_bytes, mime = await _download_update_image_bytes(update, context)
@@ -4013,13 +4088,30 @@ async def handle_supervisor_plate_image(update: Update, context: ContextTypes.DE
 
     number = re.sub(r"\D", "", str((result or {}).get("number") or ""))
     if not result or not number:
+        extra = ""
+        if forced_col:
+            # Keep the pinned counter armed so the next photo/text still targets it.
+            context.user_data["router_plate_followup"] = {"col": forced_col, "ts": time.time()}
+            extra = f" (still updating {_PLATE_SET_LABELS.get(forced_col, 'that counter')})"
         await msg.reply_text(
             "⚠️ I couldn't read a tag number. Send a clearer photo, or type it — "
-            "e.g. “update resident tag number 553300”."
+            f"e.g. “update resident tag number 553300”.{extra}"
         )
         raise ApplicationHandlerStop
-    col = _PLATE_IMAGE_KIND_COL.get(result.get("kind"))
     read_label = result.get("plate") or number
+    # A pending clarification pinned the exact counter — use it, skip H/V auto-detect.
+    if forced_col:
+        cur = await asyncio.to_thread(db.get_plate_settings) or {}
+        label = _PLATE_SET_LABELS.get(forced_col, forced_col)
+        await _router_stage_confirm(msg, context, {
+            "kind": "set_plate", "col": forced_col, "value": int(number),
+            "prompt": (
+                f"Read {read_label} from your image.\nSet {label} to {int(number)} "
+                f"(currently {cur.get(forced_col, '—')})? The H/V letter is kept automatically."
+            ),
+        })
+        raise ApplicationHandlerStop
+    col = _PLATE_IMAGE_KIND_COL.get(result.get("kind"))
     if not col:
         await msg.reply_text(
             f"🔢 I read {read_label} but couldn't tell resident (H) vs non-resident (V). "
@@ -5471,6 +5563,7 @@ async def handle_phase1(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
 
         _sanitize_phase1_pending_phone_price(state_data)
         db.set_user_state(user_id, "phase1", state_data)
+        await _autoclean_user_msg(update, context)  # parse OK — safe to clear the input now
         await _send_phase1_ai_review(update.message, state_data, context, user_id)
         return STATE_AI_REVIEW
     else:
@@ -5495,6 +5588,7 @@ async def handle_phase1(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
             state_data["driver_license_id"] = raw_dl
         _sanitize_phase1_pending_phone_price(state_data)
         db.set_user_state(user_id, "phase1", state_data)
+        await _autoclean_user_msg(update, context)  # structured parse OK — clear the input now
         await _send_phase1_ai_review(update.message, state_data, context, user_id)
         # VIN decode is opt-in via the review screen's "🔍 VIN" button.
         missing = ai_vision.detect_missing_fields(state_data, message_text)
@@ -5514,6 +5608,7 @@ async def handle_edit_field_text(update, context):
     _cr = _cancel_restart_kind_from_update(update)
     if _cr:
         return await _do_cancel_or_restart(update, context, _cr)
+    await _autoclean_user_msg(update, context)
     ek = context.user_data.get("phase1_pending_edit_key")
     if not ek:
         return STATE_AI_REVIEW
@@ -6203,6 +6298,7 @@ async def handle_missing_field(update: Update, context: ContextTypes.DEFAULT_TYP
     _cr = _cancel_restart_kind(text)
     if _cr:
         return await _do_cancel_or_restart(update, context, _cr)
+    await _autoclean_user_msg(update, context)
     missing_fields = context.user_data.get("missing_fields") or []
     state_data = context.user_data.get("missing_field_state_data") or {}
     field = missing_fields[0] if missing_fields else "color"
@@ -6315,6 +6411,7 @@ async def handle_vin_choice_text(update: Update, context: ContextTypes.DEFAULT_T
     _cr = _cancel_restart_kind(text)
     if _cr:
         return await _do_cancel_or_restart(update, context, _cr)
+    await _autoclean_user_msg(update, context)
     kind, _ = _classify_review_command(text)
     mapping = {"VIN_USE": "use", "VIN_KEEP": "keep", "VIN_RETYPE": "retype"}
     if kind in mapping:
@@ -6342,6 +6439,7 @@ async def handle_vin_retype(update: Update, context: ContextTypes.DEFAULT_TYPE) 
             "Please send a valid 17-character VIN (letters and numbers only)."
         )
         return STATE_VIN_RETYPE
+    await _autoclean_user_msg(update, context)  # valid VIN captured — clear the input
     state = db.get_user_state(user_id)
     if not state or not state.get("data"):
         await update.message.reply_text("❌ Error: Phase 1 data not found. Please start over with /start")
@@ -6435,6 +6533,7 @@ async def handle_phase2(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
     _cr = _cancel_restart_kind(message_text)
     if _cr:
         return await _do_cancel_or_restart(update, context, _cr)
+    await _autoclean_user_msg(update, context)
 
     # Get phase 1 data
     state = db.get_user_state(user_id)
@@ -6495,6 +6594,7 @@ async def handle_special_request_issuers(update: Update, context: ContextTypes.D
     _cr = _cancel_restart_kind(raw)
     if _cr:
         return await _do_cancel_or_restart(update, context, _cr)
+    await _autoclean_user_msg(update, context)
     skip_tokens = frozenset(("-", "—", "–", "none", "n/a", "na"))
     issuers_note = "" if not raw or raw.lower() in skip_tokens else raw
     state_data["special_request_issuers"] = issuers_note
@@ -6529,6 +6629,7 @@ async def handle_special_request_drivers(update: Update, context: ContextTypes.D
     _cr = _cancel_restart_kind(raw_d)
     if _cr:
         return await _do_cancel_or_restart(update, context, _cr)
+    await _autoclean_user_msg(update, context)
     skip_tokens = frozenset(("-", "—", "–", "none", "n/a", "na"))
     drivers_note = "" if not raw_d or raw_d.lower() in skip_tokens else raw_d
     state_data["special_request_drivers"] = drivers_note
