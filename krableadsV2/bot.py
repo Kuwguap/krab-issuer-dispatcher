@@ -312,6 +312,44 @@ async def cmd_driverblock(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     await msg.reply_text(header + _driverblock_status_text(new_val), parse_mode="Markdown")
 
 
+async def cmd_whoami(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Self-check (anyone): your Telegram ID + whether the bot treats you as a
+    supervisor — the gate for ALL AI features (talk-to-the-bot, update tag numbers
+    by photo/PDF, /settings, /announce). Also shows if AI image reading is configured."""
+    msg = update.effective_message
+    user = update.effective_user
+    if not msg or not user:
+        return
+    is_sup = _user_is_global_supervisor(user.id)
+    chat_type = update.effective_chat.type if update.effective_chat else "?"
+    ai_on = Config.is_ai_vision_configured()
+    uname = f"@{user.username}" if user.username else (user.full_name or "—")
+    lines = [
+        "🪪 <b>Your details</b>",
+        f"• ID: <code>{user.id}</code>",
+        f"• Username: {html.escape(uname, quote=False)}",
+        f"• Chat: {chat_type}",
+        f"• Supervisor / AI mode: {'✅ enabled' if is_sup else '❌ not a supervisor'}",
+        f"• AI image reading: {'✅ on' if ai_on else '❌ OPENAI_API_KEY not set'}",
+    ]
+    if not is_sup:
+        lines += [
+            "",
+            "To turn on the supervisor AI features (talk-to-the-bot, update tag numbers "
+            "by photo/PDF, /settings, /announce), add the ID above to "
+            "<code>SUPERVISORY_TELEGRAM_ID</code> in the bot's environment, then redeploy.",
+        ]
+    else:
+        lines += [
+            "",
+            "✅ You're set — there's no “mode” to turn on. Just DM me here and talk: "
+            "“which drivers are active?”, “disable group HighKage”, “update resident tag "
+            "number 553300”, or send/forward a photo or PDF of a tag to update the counter. "
+            "(For photo→tag, make sure you're not mid-lead — send /cancel first.)",
+        ]
+    await msg.reply_text("\n".join(lines), parse_mode="HTML")
+
+
 async def handle_help_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Inline ❓ Help — same text as /help."""
     query = update.callback_query
@@ -12659,6 +12697,8 @@ def main():
 
     # Secret supervisory-only commands: status (/test) + toggle (/driverblock).
     application.add_handler(CommandHandler("test", cmd_test))
+    # Self-check (anyone): shows your Telegram ID + supervisor/AI status.
+    application.add_handler(CommandHandler(["whoami", "id", "me"], cmd_whoami))
     application.add_handler(CommandHandler("driverblock", cmd_driverblock))
     # Supervisor broadcast to all groups + drivers + lead senders.
     application.add_handler(CommandHandler("announce", cmd_announce))
