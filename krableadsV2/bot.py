@@ -3306,6 +3306,45 @@ async def handle_driver_add_lead_callback(update: Update, context: ContextTypes.
     return STATE_PHASE1
 
 
+async def handle_another_tag_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Inline '➕ Another tag (same client)': re-seat the just-saved client's contact +
+       delivery into a fresh Phase 1, blank the vehicle, and reopen review. Same client,
+       new vehicle → a fresh reference + plate get minted at Submit."""
+    query = update.callback_query
+    if not query:
+        return ConversationHandler.END
+    await _safe_answer_callback_query(query)
+    msg = update.effective_message
+    if not msg:
+        return ConversationHandler.END
+    user_id = query.from_user.id
+    lead_id = (query.data or "").replace("another_tag_", "").strip()
+    lead = db.get_lead_by_id(lead_id) if lead_id else None
+    if not lead:
+        await msg.reply_text("⚠️ Couldn't find that client. Use /lead to start a new one.")
+        return ConversationHandler.END
+
+    # Same client & delivery; fresh vehicle.
+    p1 = _phase1_from_stored_lead(lead)
+    p1["vin"] = ""
+    p1["car"] = ""
+    p1["color"] = ""
+    # These contact fields live on the lead row, not in the details blob — carry them.
+    p1["pending_phone_number"] = lead.get("phone_number") or ""
+    p1["pending_price"] = lead.get("price") or ""
+    p1["email"] = lead.get("email") or ""
+    p1["driver_license_id"] = lead.get("driver_license_id") or ""
+
+    _clear_lead_conversation_user_data(context)
+    db.clear_user_state(user_id)
+    await msg.reply_text(
+        "➕ *Same client* — just add the new vehicle (VIN / car / color), then Submit.",
+        parse_mode="Markdown",
+    )
+    await _send_phase1_ai_review(msg, p1, context, user_id)
+    return STATE_AI_REVIEW
+
+
 def _clear_lead_conversation_user_data(context: ContextTypes.DEFAULT_TYPE) -> None:
     """Drop ConversationHandler scratch keys so /cancel leaves no stale UI/state."""
     if not context.user_data:
@@ -5827,6 +5866,9 @@ async def _finalize_lead_after_notes(
     ref_h = html.escape(str(reference_id), quote=False)
     drivers_count = len([d for d in drivers_list if d and d.get("id")])
     source_label = html.escape((state_data.get("selected_source_label") or "—"), quote=False)
+    _another = InlineKeyboardMarkup(
+        [[InlineKeyboardButton("➕ Another tag (same client)", callback_data=f"another_tag_{lead['id']}")]]
+    )
     if is_all_groups:
         await message.reply_text(
             "✅ Lead saved.\n\n"
@@ -5835,6 +5877,7 @@ async def _finalize_lead_after_notes(
             f"🚗 Approval sent to <b>{drivers_count}</b> driver(s)\n"
             f"📊 Lead source: <b>{source_label}</b>",
             parse_mode="HTML",
+            reply_markup=_another,
         )
     else:
         await message.reply_text(
@@ -5844,6 +5887,7 @@ async def _finalize_lead_after_notes(
             f"🚗 Approval sent to <b>{drivers_count}</b> driver(s)\n"
             f"📊 Lead source: <b>{source_label}</b>",
             parse_mode="HTML",
+            reply_markup=_another,
         )
     await _maybe_offer_insurance_card(
         context, message, lead_id=str(lead["id"]), reference_id=str(reference_id),
@@ -6048,6 +6092,9 @@ async def _submit_lead_from_review(message, context, user_id, data):
         f"In **Krab Dispatch**, name the tag PDF **similar to this client’s name** (first line of details) so it auto‑links to reference `{ref_id}`.\n\n"
         f"Use /lead to add another.",
         parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup(
+            [[InlineKeyboardButton("➕ Another tag (same client)", callback_data=f"another_tag_{lead['id']}")]]
+        ),
     )
     await _maybe_offer_insurance_card(
         context, message, lead_id=str(lead["id"]), reference_id=str(ref_id),
@@ -11475,6 +11522,7 @@ def main():
                 begin_lead_command,
             ),
             CallbackQueryHandler(handle_driver_add_lead_callback, pattern="^driver_add_lead$"),
+            CallbackQueryHandler(handle_another_tag_callback, pattern="^another_tag_"),
             CallbackQueryHandler(handle_driver_add_receipt_callback, pattern="^driver_add_receipt$"),
             CallbackQueryHandler(handle_resend_driver, pattern="^resend_driver_"),
             CallbackQueryHandler(handle_reassign_group_pick, pattern="^reassign_group_"),
@@ -11566,6 +11614,7 @@ def main():
                 begin_lead_command,
             ),
             CallbackQueryHandler(handle_driver_add_lead_callback, pattern="^driver_add_lead$"),
+            CallbackQueryHandler(handle_another_tag_callback, pattern="^another_tag_"),
             CallbackQueryHandler(handle_driver_add_receipt_callback, pattern="^driver_add_receipt$"),
             CallbackQueryHandler(handle_reassign_group_pick, pattern="^reassign_group_"),
         ],
