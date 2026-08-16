@@ -728,7 +728,7 @@ def _build_driver_keyboard(drivers: list, exclude_suspended: bool = True, includ
     if include_all:
         elig = [d for d in drivers if str(d.get("id")) not in suspended]
         if elig:
-            buttons.append([InlineKeyboardButton("📢 Send to All Drivers", callback_data="select_driver_all")])
+            buttons.append([InlineKeyboardButton("📢 Send to All Dispatchers", callback_data="select_driver_all")])
     return InlineKeyboardMarkup(buttons)
 
 
@@ -2506,7 +2506,7 @@ async def _send_phase1_ai_review(target_message, state_data: dict, context, user
     eligible = [d for d in active_drivers if str(d.get("id")) not in suspended]
     if eligible:
         state_data["selected_driver_ids"] = [d["id"] for d in eligible]
-        state_data["selected_driver_names"] = "All Drivers"
+        state_data["selected_driver_names"] = "All Dispatchers"
     else:
         state_data["selected_driver_ids"] = []
         state_data["selected_driver_names"] = "None"
@@ -3090,11 +3090,28 @@ async def _smart_place_single_value(state_data: dict, value: str) -> list:
     return _apply_inline_review_text(state_data, f"{alias} {value}")
 
 
+# A phrase that looks like a (mis-typed / mis-heard) COMMAND — never smart-place it as
+# a field value. So a select/submit/VIN command that didn't classify shows the hint
+# instead of turning 'choose the driver kita' or 'submit' into a name.
+_COMMAND_LIKE_RE = re.compile(
+    r"^\s*(?:choose|select|pick|assign|use|go\s+with|send|submit|dispatch|deploy|ship|"
+    r"finish|run|check|look\s*up|lookup|decode|verify)\b"
+    # a bare select-noun at the START ('driver', 'the dispatcher', 'group …') — anchored
+    # so a real surname/company containing the word (e.g. 'Ryan Driver', 'Acme Group')
+    # is still placed as a value.
+    r"|^\s*(?:the\s+|a\s+|my\s+)?(?:drivers?|drv|dispatchers?|group|team|crew)\b",
+    re.I,
+)
+
+
 # ── Natural-language commands during review (voice or typed) ─────────────────
 _CMD_VERB = r"(?:choose|select|pick|set|use|assign|go\s+with|send\s+to|dispatch\s+to)?"
-_SELECT_SOURCE_RE = re.compile(rf"^\s*{_CMD_VERB}\s*(?:contact\s+source|lead\s+source|contact\s+info|source|origin)\s+(.+)$", re.I)
-_SELECT_GROUP_RE = re.compile(rf"^\s*{_CMD_VERB}\s*(?:group|team|dispatcher|dispatch|disp|crew)\s+(.+)$", re.I)
-_SELECT_DRIVER_RE = re.compile(rf"^\s*{_CMD_VERB}\s*(?:driver|drv)\s+(.+)$", re.I)
+_ART = r"(?:the\s+|a\s+|an\s+|my\s+|this\s+)?"  # optional article between verb and noun
+_SELECT_SOURCE_RE = re.compile(rf"^\s*{_CMD_VERB}\s*{_ART}(?:contact\s+source|lead\s+source|contact\s+info|source|origin)\s+(.+)$", re.I)
+# Teams/groups are "group|team|crew". The DELIVERY people are "driver|dispatcher" —
+# the user calls them dispatchers, so 'choose dispatcher X' selects a driver.
+_SELECT_GROUP_RE = re.compile(rf"^\s*{_CMD_VERB}\s*{_ART}(?:group|team|crew)\s+(.+)$", re.I)
+_SELECT_DRIVER_RE = re.compile(rf"^\s*{_CMD_VERB}\s*{_ART}(?:drivers?|drv|dispatchers?|dispatch|disp)\s+(.+)$", re.I)
 _VIN_KEEP_RE = re.compile(r"\b(keep|same|leave\s+it|leave\s+alone|as\s+is|as-is|don'?t\s+change|current|mine|stated|original)\b", re.I)
 _VIN_RETYPE_RE = re.compile(r"\b(retype|re-?enter|redo|fix|correct)\b.*\bvin\b|\btype\b.*\bvin\b.*\bagain\b", re.I)
 _VIN_USE_RE = re.compile(r"\buse\b.*\b(vin|dmv|new|decoded|lookup|api|theirs?|that)\b", re.I)
@@ -3221,7 +3238,7 @@ def _select_driver(state_data: dict, user_id: int, driver) -> None:
         suspended = _get_suspended_driver_ids()
         selected = [d for d in active if str(d["id"]) not in suspended]
         state_data["selected_driver_ids"] = [d["id"] for d in selected]
-        state_data["selected_driver_names"] = "All Drivers"
+        state_data["selected_driver_names"] = "All Dispatchers"
     else:
         state_data["selected_driver_ids"] = [driver["id"]]
         state_data["selected_driver_names"] = driver.get("driver_name", "?")
@@ -3261,7 +3278,7 @@ async def _open_driver_picker(context: ContextTypes.DEFAULT_TYPE) -> None:
         else:
             buttons.append([InlineKeyboardButton(f"🚗 {name}", callback_data=f"seldrv_{did}")])
     if [d for d in active if str(d.get("id")) not in suspended]:
-        buttons.append([InlineKeyboardButton("📢 Send to All Drivers", callback_data="seldrv_all")])
+        buttons.append([InlineKeyboardButton("📢 Send to All Dispatchers", callback_data="seldrv_all")])
     buttons.append([InlineKeyboardButton("⬅️ Back", callback_data="ph1_sel_back")])
     await _edit_message_keyboard(context, chat_id, mid, InlineKeyboardMarkup(buttons))
 
@@ -3324,7 +3341,7 @@ async def _interpret_review_command(update, context, user_id, state_data, text):
         if _ALL_SELECT_RE.match(payload or ""):
             _select_driver(state_data, user_id, "all")
             await _update_review_message_text(context, state_data)
-            await _finish("✅ Driver → All Drivers")
+            await _finish("✅ Dispatcher → All Dispatchers")
             return STATE_AI_REVIEW
         active = [d for d in _get_all_drivers_cached() if record_is_active(d)]
         suspended = _get_suspended_driver_ids()
@@ -3336,11 +3353,11 @@ async def _interpret_review_command(update, context, user_id, state_data, text):
                 await update.message.reply_text(f"🚫 {susp.get('driver_name', 'Driver')} is suspended (PENALTY).")
                 return STATE_AI_REVIEW
             await _open_driver_picker(context)
-            await update.message.reply_text(f"🤔 No driver matched “{payload}”. Pick one above.")
+            await update.message.reply_text(f"🤔 No dispatcher matched “{payload}”. Pick one above.")
             return STATE_AI_REVIEW
         _select_driver(state_data, user_id, d)
         await _update_review_message_text(context, state_data)
-        await _finish(f"✅ Driver → {d.get('driver_name', '?')}")
+        await _finish(f"✅ Dispatcher → {d.get('driver_name', '?')}")
         return STATE_AI_REVIEW
 
     if kind == "SELECT_SOURCE":
@@ -3456,9 +3473,11 @@ async def handle_phase1_review_message(update: Update, context: ContextTypes.DEF
 
     # 3b. A single bare value typed one-at-a-time ('John Doe', 'white', '$200',
     #     '555-…') → place it in the RIGHT field (strong signals, then the AI
-    #     classifier, then name/color/car heuristics).
+    #     classifier, then name/color/car heuristics). A command-looking phrase that
+    #     didn't classify (e.g. 'choose the driver kita', 'submit') is NOT placed as a
+    #     value — it gets the hint instead.
     chat_id = update.effective_chat.id if update.effective_chat else message.chat_id
-    updated = await _smart_place_single_value(state_data, text)
+    updated = [] if _COMMAND_LIKE_RE.search(text) else await _smart_place_single_value(state_data, text)
     if updated:
         db.set_user_state(user_id, "phase1", state_data)
         await context.bot.send_message(chat_id=chat_id, text="✅ Updated: " + ", ".join(dict.fromkeys(updated)))
@@ -6291,7 +6310,7 @@ async def handle_phase1_ai_review_callback(update, context):
                 buttons.append([InlineKeyboardButton(f"🚗 {name}", callback_data=f"seldrv_{did}")])
         elig = [d for d in active if str(d.get("id")) not in suspended]
         if elig:
-            buttons.append([InlineKeyboardButton("📢 Send to All Drivers", callback_data="seldrv_all")])
+            buttons.append([InlineKeyboardButton("📢 Send to All Dispatchers", callback_data="seldrv_all")])
         buttons.append([InlineKeyboardButton("⬅️ Back", callback_data="ph1_sel_back")])
         await _edit_message_keyboard(context, chat_id, mid, InlineKeyboardMarkup(buttons))
         return STATE_AI_REVIEW
@@ -6346,7 +6365,7 @@ async def handle_phase1_ai_review_callback(update, context):
         suspended = _get_suspended_driver_ids()
         if data == "seldrv_all":
             selected = [d for d in active if str(d["id"]) not in suspended]
-            names = "All Drivers"
+            names = "All Dispatchers"
             ids = [d["id"] for d in selected]
         else:
             driver_id = data.replace("seldrv_", "")
