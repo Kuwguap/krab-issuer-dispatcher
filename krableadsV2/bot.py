@@ -2173,14 +2173,11 @@ def _format_phase1_ai_review_text(state_data: dict) -> str:
         "📝 Review & ✍️Edit Before Dispatching ✅\n\n"
         + _format_phase1_field_lines(state_data)
         + ins_line
-        + "\n\n💬 To change a field, type its label then the value, e.g.:"
-        + "\n   name John Doe"
-        + "\n   address 123 Main St, Newark NJ 07024"
-        + "\n   car 2020 Toyota Camry"
-        + "\n   color white     phone 555-123-4567     price 50"
-        + "\n   Change several at once: price 200 color white. Or tap ✏️Edit."
-        + "\n\nTap ✅Dispatch when finished"
-        + "\nTap ✏️Edit to make changes, 🛡Insurance to add a card"
+        + "\n\nTap 🏢Dispatch to choose dispatcher"
+        + "\nTap 🚗Drivers to choose a driver"
+        + "\nTap ✅Dispatch when finished"
+        + "\nTap ✏️Edit to make changes"
+        + "\nTap 🛡Insurance to add insurance"
         + "\nTap 🔍Vin to lookup car info"
     )
 
