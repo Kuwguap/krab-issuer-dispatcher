@@ -728,7 +728,7 @@ def _build_driver_keyboard(drivers: list, exclude_suspended: bool = True, includ
     if include_all:
         elig = [d for d in drivers if str(d.get("id")) not in suspended]
         if elig:
-            buttons.append([InlineKeyboardButton("📢 Send to All Dispatchers", callback_data="select_driver_all")])
+            buttons.append([InlineKeyboardButton("📢 Send to All Drivers", callback_data="select_driver_all")])
     return InlineKeyboardMarkup(buttons)
 
 
@@ -736,7 +736,7 @@ def _build_group_keyboard(groups: list, include_all: bool = True) -> InlineKeybo
     """Build group selection keyboard; optionally include broadcast-to-all."""
     buttons = [[InlineKeyboardButton(g.get("group_name", str(g["id"])), callback_data=f"select_group_{g['id']}")] for g in groups]
     if include_all and groups:
-        buttons.append([InlineKeyboardButton("📢 Send to All Groups", callback_data="select_group_all")])
+        buttons.append([InlineKeyboardButton("📢 Send to All Dispatchers", callback_data="select_group_all")])
     return InlineKeyboardMarkup(buttons)
 
 
@@ -2495,7 +2495,7 @@ async def _send_phase1_ai_review(target_message, state_data: dict, context, user
     active_groups = [g for g in groups if record_is_active(g)]
     if active_groups:
         state_data["selected_group_id"] = "all"
-        state_data["selected_group_name"] = "All Groups"
+        state_data["selected_group_name"] = "All Dispatchers"
     else:
         state_data["selected_group_id"] = None
         state_data["selected_group_name"] = "None"
@@ -2506,7 +2506,7 @@ async def _send_phase1_ai_review(target_message, state_data: dict, context, user
     eligible = [d for d in active_drivers if str(d.get("id")) not in suspended]
     if eligible:
         state_data["selected_driver_ids"] = [d["id"] for d in eligible]
-        state_data["selected_driver_names"] = "All Dispatchers"
+        state_data["selected_driver_names"] = "All Drivers"
     else:
         state_data["selected_driver_ids"] = []
         state_data["selected_driver_names"] = "None"
@@ -3095,7 +3095,7 @@ async def _smart_place_single_value(state_data: dict, value: str) -> list:
 # instead of turning 'choose the driver kita' or 'submit' into a name.
 _COMMAND_LIKE_RE = re.compile(
     r"^\s*(?:choose|select|pick|assign|use|go\s+with|send|submit|dispatch|deploy|ship|"
-    r"finish|run|check|look\s*up|lookup|decode|verify)\b"
+    r"done|finish|run|check|look\s*up|lookup|decode|verify)\b"
     # a bare select-noun at the START ('driver', 'the dispatcher', 'group …') — anchored
     # so a real surname/company containing the word (e.g. 'Ryan Driver', 'Acme Group')
     # is still placed as a value.
@@ -3108,10 +3108,10 @@ _COMMAND_LIKE_RE = re.compile(
 _CMD_VERB = r"(?:choose|select|pick|set|use|assign|go\s+with|send\s+to|dispatch\s+to)?"
 _ART = r"(?:the\s+|a\s+|an\s+|my\s+|this\s+)?"  # optional article between verb and noun
 _SELECT_SOURCE_RE = re.compile(rf"^\s*{_CMD_VERB}\s*{_ART}(?:contact\s+source|lead\s+source|contact\s+info|source|origin)\s+(.+)$", re.I)
-# Teams/groups are "group|team|crew". The DELIVERY people are "driver|dispatcher" —
-# the user calls them dispatchers, so 'choose dispatcher X' selects a driver.
-_SELECT_GROUP_RE = re.compile(rf"^\s*{_CMD_VERB}\s*{_ART}(?:group|team|crew)\s+(.+)$", re.I)
-_SELECT_DRIVER_RE = re.compile(rf"^\s*{_CMD_VERB}\s*{_ART}(?:drivers?|drv|dispatchers?|dispatch|disp)\s+(.+)$", re.I)
+# The GROUPS/teams are the "dispatchers" in the UI, so 'choose dispatcher X' selects a
+# group. The DELIVERY people stay "drivers": 'choose driver X' selects a driver.
+_SELECT_GROUP_RE = re.compile(rf"^\s*{_CMD_VERB}\s*{_ART}(?:group|team|crew|dispatchers?|dispatch|disp)\s+(.+)$", re.I)
+_SELECT_DRIVER_RE = re.compile(rf"^\s*{_CMD_VERB}\s*{_ART}(?:drivers?|drv)\s+(.+)$", re.I)
 _VIN_KEEP_RE = re.compile(r"\b(keep|same|leave\s+it|leave\s+alone|as\s+is|as-is|don'?t\s+change|current|mine|stated|original)\b", re.I)
 _VIN_RETYPE_RE = re.compile(r"\b(retype|re-?enter|redo|fix|correct)\b.*\bvin\b|\btype\b.*\bvin\b.*\bagain\b", re.I)
 _VIN_USE_RE = re.compile(r"\buse\b.*\b(vin|dmv|new|decoded|lookup|api|theirs?|that)\b", re.I)
@@ -3123,7 +3123,7 @@ _ALL_SELECT_RE = re.compile(r"^\s*(?:all|every\s*one|everybody|everything)\b", r
 # message match so "send to HighKage" (a group pick) and "send driver note …" are
 # NOT caught here.
 _SUBMIT_RE = re.compile(
-    r"^\s*(?:submit|send|dispatch|deploy|ship|go\s*ahead|finish(?:\s*up)?|"
+    r"^\s*(?:submit|send|dispatch|deploy|ship|done|go\s*ahead|finish(?:\s*up)?|"
     r"send\s*out|push(?:\s*it)?)"
     r"(?:\s+(?:the|this|that|my|it|out|now|please|lead|leads|tag|client|sale))*\s*[.!]*$",
     re.I,
@@ -3225,7 +3225,7 @@ async def _cleanup_voice_echo(context: ContextTypes.DEFAULT_TYPE, chat_id) -> No
 def _select_group(state_data: dict, user_id: int, group) -> None:
     if group == "all":
         state_data["selected_group_id"] = "all"
-        state_data["selected_group_name"] = "All Groups"
+        state_data["selected_group_name"] = "All Dispatchers"
     else:
         state_data["selected_group_id"] = group.get("id")
         state_data["selected_group_name"] = group.get("group_name", "?")
@@ -3238,7 +3238,7 @@ def _select_driver(state_data: dict, user_id: int, driver) -> None:
         suspended = _get_suspended_driver_ids()
         selected = [d for d in active if str(d["id"]) not in suspended]
         state_data["selected_driver_ids"] = [d["id"] for d in selected]
-        state_data["selected_driver_names"] = "All Dispatchers"
+        state_data["selected_driver_names"] = "All Drivers"
     else:
         state_data["selected_driver_ids"] = [driver["id"]]
         state_data["selected_driver_names"] = driver.get("driver_name", "?")
@@ -3259,7 +3259,7 @@ async def _open_group_picker(context: ContextTypes.DEFAULT_TYPE) -> None:
     if not active:
         return
     buttons = [[InlineKeyboardButton(g.get("group_name", str(g["id"])), callback_data=f"selgrp_{g['id']}")] for g in active]
-    buttons.append([InlineKeyboardButton("📢 Send to All Groups", callback_data="selgrp_all")])
+    buttons.append([InlineKeyboardButton("📢 Send to All Dispatchers", callback_data="selgrp_all")])
     buttons.append([InlineKeyboardButton("⬅️ Back", callback_data="ph1_sel_back")])
     await _edit_message_keyboard(context, chat_id, mid, InlineKeyboardMarkup(buttons))
 
@@ -3278,7 +3278,7 @@ async def _open_driver_picker(context: ContextTypes.DEFAULT_TYPE) -> None:
         else:
             buttons.append([InlineKeyboardButton(f"🚗 {name}", callback_data=f"seldrv_{did}")])
     if [d for d in active if str(d.get("id")) not in suspended]:
-        buttons.append([InlineKeyboardButton("📢 Send to All Dispatchers", callback_data="seldrv_all")])
+        buttons.append([InlineKeyboardButton("📢 Send to All Drivers", callback_data="seldrv_all")])
     buttons.append([InlineKeyboardButton("⬅️ Back", callback_data="ph1_sel_back")])
     await _edit_message_keyboard(context, chat_id, mid, InlineKeyboardMarkup(buttons))
 
@@ -3325,23 +3325,23 @@ async def _interpret_review_command(update, context, user_id, state_data, text):
         if _ALL_SELECT_RE.match(payload or ""):
             _select_group(state_data, user_id, "all")
             await _update_review_message_text(context, state_data)
-            await _finish("✅ Group → All Groups")
+            await _finish("✅ Dispatcher → All Dispatchers")
             return STATE_AI_REVIEW
         g = _match_name(payload, [x for x in db.get_all_groups() if record_is_active(x)], "group_name")
         if not g:
             await _open_group_picker(context)
-            await update.message.reply_text(f"🤔 No group matched “{payload}”. Pick one above.")
+            await update.message.reply_text(f"🤔 No dispatcher matched “{payload}”. Pick one above.")
             return STATE_AI_REVIEW
         _select_group(state_data, user_id, g)
         await _update_review_message_text(context, state_data)
-        await _finish(f"✅ Group → {g.get('group_name', '?')}")
+        await _finish(f"✅ Dispatcher → {g.get('group_name', '?')}")
         return STATE_AI_REVIEW
 
     if kind == "SELECT_DRIVER":
         if _ALL_SELECT_RE.match(payload or ""):
             _select_driver(state_data, user_id, "all")
             await _update_review_message_text(context, state_data)
-            await _finish("✅ Dispatcher → All Dispatchers")
+            await _finish("✅ Driver → All Drivers")
             return STATE_AI_REVIEW
         active = [d for d in _get_all_drivers_cached() if record_is_active(d)]
         suspended = _get_suspended_driver_ids()
@@ -3353,11 +3353,11 @@ async def _interpret_review_command(update, context, user_id, state_data, text):
                 await update.message.reply_text(f"🚫 {susp.get('driver_name', 'Driver')} is suspended (PENALTY).")
                 return STATE_AI_REVIEW
             await _open_driver_picker(context)
-            await update.message.reply_text(f"🤔 No dispatcher matched “{payload}”. Pick one above.")
+            await update.message.reply_text(f"🤔 No driver matched “{payload}”. Pick one above.")
             return STATE_AI_REVIEW
         _select_driver(state_data, user_id, d)
         await _update_review_message_text(context, state_data)
-        await _finish(f"✅ Dispatcher → {d.get('driver_name', '?')}")
+        await _finish(f"✅ Driver → {d.get('driver_name', '?')}")
         return STATE_AI_REVIEW
 
     if kind == "SELECT_SOURCE":
@@ -6279,10 +6279,10 @@ async def handle_phase1_ai_review_callback(update, context):
         active = [g for g in groups if record_is_active(g)]
         if not active:
             if query.message:
-                await query.message.reply_text("⚠️ No active groups configured.")
+                await query.message.reply_text("⚠️ No active dispatchers configured.")
             return STATE_AI_REVIEW
         buttons = [[InlineKeyboardButton(g.get("group_name", str(g["id"])), callback_data=f"selgrp_{g['id']}")] for g in active]
-        buttons.append([InlineKeyboardButton("📢 Send to All Groups", callback_data="selgrp_all")])
+        buttons.append([InlineKeyboardButton("📢 Send to All Dispatchers", callback_data="selgrp_all")])
         buttons.append([InlineKeyboardButton("⬅️ Back", callback_data="ph1_sel_back")])
         await _edit_message_keyboard(
             context,
@@ -6310,7 +6310,7 @@ async def handle_phase1_ai_review_callback(update, context):
                 buttons.append([InlineKeyboardButton(f"🚗 {name}", callback_data=f"seldrv_{did}")])
         elig = [d for d in active if str(d.get("id")) not in suspended]
         if elig:
-            buttons.append([InlineKeyboardButton("📢 Send to All Dispatchers", callback_data="seldrv_all")])
+            buttons.append([InlineKeyboardButton("📢 Send to All Drivers", callback_data="seldrv_all")])
         buttons.append([InlineKeyboardButton("⬅️ Back", callback_data="ph1_sel_back")])
         await _edit_message_keyboard(context, chat_id, mid, InlineKeyboardMarkup(buttons))
         return STATE_AI_REVIEW
@@ -6346,7 +6346,7 @@ async def handle_phase1_ai_review_callback(update, context):
     elif data == "selgrp_all" or data.startswith("selgrp_"):
         if data == "selgrp_all":
             state_data["selected_group_id"] = "all"
-            state_data["selected_group_name"] = "All Groups"
+            state_data["selected_group_name"] = "All Dispatchers"
             db.set_user_state(user_id, "phase1", state_data)
             await _update_review_message_text(context, state_data)
             return STATE_AI_REVIEW
@@ -6365,7 +6365,7 @@ async def handle_phase1_ai_review_callback(update, context):
         suspended = _get_suspended_driver_ids()
         if data == "seldrv_all":
             selected = [d for d in active if str(d["id"]) not in suspended]
-            names = "All Dispatchers"
+            names = "All Drivers"
             ids = [d["id"] for d in selected]
         else:
             driver_id = data.replace("seldrv_", "")
