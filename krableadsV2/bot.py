@@ -2105,19 +2105,36 @@ def _name_parts_from_full(name: str) -> tuple:
     return (first, last)
 
 
+def _display_name_parts(state_data: dict) -> tuple:
+    """(first, last) for the review/edit UI. Uses the explicitly-edited split first/
+    last names ONLY while they still match the combined ``name`` (so setting only the
+    last name shows correctly); if anything else rewrote ``name`` afterwards (an AI
+    re-parse, a full 'name …' edit) the splits are stale and we derive from ``name``."""
+    if "first_name" in state_data or "last_name" in state_data:
+        f = (state_data.get("first_name") or "").strip()
+        l = (state_data.get("last_name") or "").strip()
+        if (f + " " + l).strip() == (state_data.get("name") or "").strip():
+            return (f or "-", l or "-")
+    return _name_parts_from_full(state_data.get("name"))
+
+
 def _set_full_name(state_data: dict, first: str, last: str) -> None:
     f, l = (first or "").strip(), (last or "").strip()
     if l in ("", "-"):
         state_data["name"] = f if f else "-"
     else:
         state_data["name"] = f"{f} {l}".strip() if f else l
+    # The combined name is now authoritative; drop any split first/last helpers so a
+    # later "edit first name" / "edit last name" re-seeds cleanly from this name.
+    state_data.pop("first_name", None)
+    state_data.pop("last_name", None)
 
 
 def _format_phase1_field_lines(state_data: dict) -> str:
     """Plain-text list of all Phase 1 fields (same labels as the edit picker).
     Always renders Issuer note / Driver note so the summary matches the edit menu.
     """
-    first, last = _name_parts_from_full(state_data.get("name"))
+    first, last = _display_name_parts(state_data)
     lines = [
         f"👤First name: {first}",
         f"👤Last name: {last}",
@@ -2171,10 +2188,10 @@ def _format_phase1_ai_review_text(state_data: dict) -> str:
 def _preview_value_after_phase1_edit(state_data: dict, edit_key: str) -> str:
     """Current display value for a field after an edit (for recent-changes list)."""
     if edit_key == "fn":
-        first, _ = _name_parts_from_full(state_data.get("name"))
+        first, _ = _display_name_parts(state_data)
         return first
     if edit_key == "ln":
-        _, last = _name_parts_from_full(state_data.get("name"))
+        _, last = _display_name_parts(state_data)
         return last
     sk = PH1_EDIT_TO_STATE_KEY.get(edit_key)
     if sk:
@@ -2322,7 +2339,7 @@ async def _update_review_text(context, state_data):
 
 
 def _phase1_edit_fields_keyboard(state_data: dict) -> InlineKeyboardMarkup:
-    first, last = _name_parts_from_full(state_data.get("name"))
+    first, last = _display_name_parts(state_data)
     rows = [
         [
             InlineKeyboardButton(f"First name: {_truncate_btn_val(first)}", callback_data="ph1edit_fn"),
@@ -2564,13 +2581,20 @@ async def _clear_missing_prompts(context: ContextTypes.DEFAULT_TYPE) -> None:
 def _apply_single_phase1_edit(state_data: dict, edit_key: str, new_text: str) -> None:
     """Apply one field edit from the AI review flow."""
     new_text = (new_text or "").strip()
-    if edit_key == "fn":
-        first, last = _name_parts_from_full(state_data.get("name"))
-        _set_full_name(state_data, new_text, last if last != "-" else "")
-        return
-    if edit_key == "ln":
-        first, last = _name_parts_from_full(state_data.get("name"))
-        _set_full_name(state_data, first if first != "-" else "", new_text)
+    if edit_key in ("fn", "ln"):
+        # Track first/last separately so editing them in EITHER order (or one without
+        # the other) never clobbers the part you already set. Seed from the validated
+        # split names (or the combined name if the splits are stale/absent).
+        pf, pl = _display_name_parts(state_data)
+        f = "" if pf == "-" else pf
+        l = "" if pl == "-" else pl
+        if edit_key == "fn":
+            f = new_text if new_text and new_text != "-" else ""
+        else:
+            l = new_text if new_text and new_text != "-" else ""
+        state_data["first_name"] = f
+        state_data["last_name"] = l
+        state_data["name"] = ((f + " " + l).strip() or "-") if (f or l) else "-"
         return
     if edit_key == "email":
         if not new_text or new_text == "-":
@@ -2975,6 +2999,96 @@ _REVIEW_EDIT_HINT = (
     "Change several at once: price 200 color white"
 )
 
+# Canonical label for each inline edit-key (to re-apply a single value as a labeled edit).
+_EK_TO_ALIAS = {
+    "name": "name", "addr": "address", "csz": "city state zip",
+    "daddr": "delivery address", "dcsz": "delivery city", "vin": "vin", "car": "car",
+    "col": "color", "ins": "insurance", "pol": "policy number", "xtra": "extra info",
+    "phone": "phone", "price": "price", "email": "email", "dl": "driver license",
+}
+_COMMON_COLORS = frozenset({
+    "white", "black", "gray", "grey", "silver", "red", "blue", "green", "yellow",
+    "orange", "brown", "gold", "beige", "tan", "maroon", "navy", "purple", "pink",
+    "charcoal", "burgundy", "bronze", "champagne", "cream", "teal", "ivory", "pearl",
+})
+_CAR_MAKE_RE = re.compile(
+    r"\b(toyota|honda|ford|chevy|chevrolet|nissan|bmw|mercedes|benz|audi|kia|hyundai|"
+    r"jeep|dodge|ram|gmc|lexus|mazda|subaru|volkswagen|vw|tesla|acura|infiniti|"
+    r"infinity|cadillac|buick|chrysler|volvo|mitsubishi|porsche|jaguar|mini|fiat|"
+    r"genesis|lincoln|scion|hummer|maserati|bentley|alfa|land\s*rover|range\s*rover)\b",
+    re.I,
+)
+_STREET_RE = re.compile(
+    r"\b(st|street|ave|avenue|rd|road|blvd|boulevard|dr|drive|lane|ln|way|ct|court|"
+    r"pl|place|apt|apartment|suite|ste|hwy|highway|pkwy|parkway|cir|circle|ter|"
+    r"terrace|unit)\b|#\d",
+    re.I,
+)
+
+
+def _structured_value_ek(v: str):
+    """Clear-cut field for a bare value from strong signals (email/vin/phone/price/
+    address). Returns an inline edit-key or None (then AI + name/color/car heuristics)."""
+    v = (v or "").strip()
+    if not v:
+        return None
+    if re.search(r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}", v):
+        return "email"
+    if _extract_vin_17(v):
+        return "vin"
+    digits = re.sub(r"\D", "", v)
+    if v.startswith("$"):
+        return "price"
+    if re.fullmatch(r"\d[\d,]*(?:\.\d{1,2})?", v):
+        return "phone" if len(digits) >= 10 else "price"
+    if 10 <= len(digits) <= 15 and re.fullmatch(r"[\d\s\-\(\)\+\.]+", v):
+        return "phone"
+    # A street line: has a digit AND (a street-type word OR a comma), OR a leading
+    # house number. A lone ZIP is NOT enough — 'Fort Lee NJ 07024' is city/state/zip,
+    # so leave that to the AI classifier.
+    if re.search(r"\d", v) and (_STREET_RE.search(v) or "," in v):
+        return "addr"
+    if re.match(r"^\s*\d+\s+[A-Za-z]", v):
+        return "addr"
+    return None
+
+
+def _alpha_value_ek_heuristic(v: str):
+    """Fallback field for a bare word/phrase when the AI is unavailable: color word →
+    color, 'City ST 07024' → city/state/zip, year/known-make → car, 1–4 plain words →
+    name."""
+    v = (v or "").strip()
+    words = v.split()
+    if words and len(words) <= 2 and all(w.strip(".").lower() in _COMMON_COLORS for w in words):
+        return "col"
+    # 'Fort Lee NJ 07024' — a ZIP with words but no street token → city/state/zip.
+    if re.search(r"\b\d{5}\b", v) and not _STREET_RE.search(v) and re.search(r"[A-Za-z]", v):
+        return "csz"
+    if re.search(r"\b(19|20)\d{2}\b", v) or _CAR_MAKE_RE.search(v):
+        return "car"
+    if 1 <= len(words) <= 4 and re.fullmatch(r"[A-Za-z][A-Za-z.'\-]*(?:\s+[A-Za-z][A-Za-z.'\-]*){0,3}", v):
+        return "name"
+    return None
+
+
+async def _smart_place_single_value(state_data: dict, value: str) -> list:
+    """Place one bare value ('John Doe', 'white', '$200', '555-…') into the best field
+    and return the changed labels (or [] if it couldn't be placed). Strong signals win
+    first; then the AI classifier (smarter); then name/color/car heuristics."""
+    ek = _structured_value_ek(value)
+    if ek is None and Config.is_ai_vision_configured():
+        try:
+            ek = await asyncio.to_thread(ai_vision.classify_single_field_value, value)
+        except Exception as e:
+            logger.warning("single-field AI classify failed: %s", e)
+            ek = None
+    if ek is None:
+        ek = _alpha_value_ek_heuristic(value)
+    alias = _EK_TO_ALIAS.get(ek) if ek else None
+    if not alias:
+        return []
+    return _apply_inline_review_text(state_data, f"{alias} {value}")
+
 
 # ── Natural-language commands during review (voice or typed) ─────────────────
 _CMD_VERB = r"(?:choose|select|pick|set|use|assign|go\s+with|send\s+to|dispatch\s+to)?"
@@ -2988,11 +3102,22 @@ _RUN_VIN_RE = re.compile(r"\b(run|check|lookup|look\s+up|decode|verify|pull|scan
 _ALL_SELECT_RE = re.compile(r"^\s*(?:all|every\s*one|everybody|everything)\b", re.I)
 
 
+# "submit" / "send lead" / "dispatch" / "send it" → dispatch the lead now. Whole-
+# message match so "send to HighKage" (a group pick) and "send driver note …" are
+# NOT caught here.
+_SUBMIT_RE = re.compile(
+    r"^\s*(?:submit|send|dispatch|deploy|ship|go\s*ahead|finish(?:\s*up)?|"
+    r"send\s*out|push(?:\s*it)?)"
+    r"(?:\s+(?:the|this|that|my|it|out|now|please|lead|leads|tag|client|sale))*\s*[.!]*$",
+    re.I,
+)
+
+
 def _classify_review_command(text: str):
     """Classify a review-screen message into an action. Returns (kind, payload) where
-    kind ∈ FIELD_EDITS | SELECT_GROUP | SELECT_DRIVER | SELECT_SOURCE | RUN_VIN |
+    kind ∈ FIELD_EDITS | SUBMIT | SELECT_GROUP | SELECT_DRIVER | SELECT_SOURCE | RUN_VIN |
     VIN_USE | VIN_KEEP | VIN_RETYPE | NONE. Field edits win first (so 'driver note …'
-    and 'phone …' stay field edits); then selections; then VIN verbs."""
+    and 'phone …' stay field edits); then submit; then selections; then VIN verbs."""
     t = (text or "").strip()
     if not t:
         return ("NONE", None)
@@ -3010,6 +3135,9 @@ def _classify_review_command(text: str):
         fe.extend(parsed)
     if clean and fe:
         return ("FIELD_EDITS", fe)
+    # A2) submit / send the lead
+    if _SUBMIT_RE.match(t):
+        return ("SUBMIT", None)
     # B) selections: source → group → driver (distinct nouns, order avoids overlap)
     m = _SELECT_SOURCE_RE.match(t)
     if m:
@@ -3168,6 +3296,14 @@ async def _interpret_review_command(update, context, user_id, state_data, text):
         if toast and chat_id:
             await context.bot.send_message(chat_id=chat_id, text=toast)
 
+    if kind == "SUBMIT":
+        try:
+            await update.message.delete()
+        except Exception:
+            pass
+        await _cleanup_voice_echo(context, chat_id)
+        return await _continue_phase1_after_ai_review(update.message, context, user_id)
+
     if kind == "SELECT_GROUP":
         if _ALL_SELECT_RE.match(payload or ""):
             _select_group(state_data, user_id, "all")
@@ -3313,14 +3449,23 @@ async def handle_phase1_review_message(update: Update, context: ContextTypes.DEF
     if handled is not None:
         return handled
 
-    # 3. A real multi-field block (paste of a full lead) → AI re-parse. A short bare
-    #    value is ambiguous: the AI would have to guess which field it is and could
-    #    mis-file it (e.g. a bare name landing in the address). Guide the user to label
-    #    it instead of silently corrupting a field.
+    # 3a. A real multi-field block (paste of a full lead) → AI re-parse.
     if _looks_like_multifield_block(text):
         result = await handle_phase1_adjust_input(update, context)
         return STATE_AI_REVIEW if result == STATE_ADJUST_INPUT else result
+
+    # 3b. A single bare value typed one-at-a-time ('John Doe', 'white', '$200',
+    #     '555-…') → place it in the RIGHT field (strong signals, then the AI
+    #     classifier, then name/color/car heuristics).
     chat_id = update.effective_chat.id if update.effective_chat else message.chat_id
+    updated = await _smart_place_single_value(state_data, text)
+    if updated:
+        db.set_user_state(user_id, "phase1", state_data)
+        await context.bot.send_message(chat_id=chat_id, text="✅ Updated: " + ", ".join(dict.fromkeys(updated)))
+        await _update_review_message_text(context, state_data)
+        return STATE_AI_REVIEW
+
+    # 3c. Truly couldn't tell → show the labeled-edit how-to (nothing mis-filed).
     await context.bot.send_message(chat_id=chat_id, text=_REVIEW_EDIT_HINT)
     return STATE_AI_REVIEW
 

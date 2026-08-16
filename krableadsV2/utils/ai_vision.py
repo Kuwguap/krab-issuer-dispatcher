@@ -350,6 +350,43 @@ SUPERVISOR_ROUTER_PROMPT = (
 )
 
 
+SINGLE_FIELD_PROMPT = (
+    "A dispatcher typed ONE piece of info while filling out a car-tag lead. Decide "
+    "which single field it is. Reply with ONLY one of these exact words:\n"
+    "name, registration_address, city_state_zip, delivery_address, delivery_city, "
+    "vin, car, color, insurance, policy, phone, price, email, driver_license, notes, "
+    "unknown\n"
+    "Guidance: a person or business name -> name; a street line (has a number) -> "
+    "registration_address; 'City ST 07024' -> city_state_zip; a paint color (even "
+    "two words like 'midnight blue') -> color; a vehicle like '2020 Toyota Camry' or "
+    "just 'Camry' or 'Accord' -> car; a 17-char code -> vin; a $ amount or bare "
+    "number under 7 digits -> price; a 10+ digit number -> phone; has an @ -> email; "
+    "a driver-license number -> driver_license; a date/time or free note -> notes. "
+    "If it is a whole sentence or you truly cannot tell, reply 'unknown'.\n\nVALUE: "
+)
+
+_SINGLE_FIELD_TO_EK = {
+    "name": "name", "registration_address": "addr", "city_state_zip": "csz",
+    "delivery_address": "daddr", "delivery_city": "dcsz", "vin": "vin", "car": "car",
+    "color": "col", "insurance": "ins", "policy": "pol", "phone": "phone",
+    "price": "price", "email": "email", "driver_license": "dl", "notes": "xtra",
+}
+
+
+def classify_single_field_value(value: str) -> Optional[str]:
+    """AI-classify a single bare value into an inline edit-key (name/addr/phone/car/…),
+    or None when unconfigured / unclear. Used so typing a lead one field at a time
+    ('John Doe', then 'white', then '$200') lands each in the right field."""
+    v = (value or "").strip()
+    if not v:
+        return None
+    raw = _call_openai_text([{"role": "user", "content": SINGLE_FIELD_PROMPT + v[:200]}])
+    if not raw:
+        return None
+    token = re.sub(r"[^a-z_]", "", (raw.strip().split() or [""])[0].lower())
+    return _SINGLE_FIELD_TO_EK.get(token)
+
+
 def classify_supervisor_command(user_message: str) -> Optional[dict]:
     """AI-classify a supervisor's freeform message into a router intent + args.
 
