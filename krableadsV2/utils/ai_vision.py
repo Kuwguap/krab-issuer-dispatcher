@@ -1602,11 +1602,12 @@ Return ONLY valid JSON (no markdown, no explanation outside JSON):
 }
 
 Rules:
-- looks_like_receipt: true only if this clearly shows a real payment document: printed or digital receipt, invoice, cashier slip, card/terminal receipt, payment confirmation screenshot, bank app payment detail with amount, etc.
-- Set looks_like_receipt to false for: random photos, memes, selfies, vehicle photos with no payment info, blank/blurry unusable images, chat screenshots with no payment line, unrelated documents.
-- has_dollar_sign: true only if the ASCII dollar symbol $ is clearly visible as a currency marker on the receipt or payment screen (not guessed). False if the image uses only "USD" text, foreign currency, or no currency symbol.
-- amounts_usd: list every total or payment amount in US dollars visible (e.g. 1200, 99.5). Use numbers only. If no amount is readable, use [].
-- confidence: how sure you are that this is a legitimate payment/receipt image (not random upload).
+- looks_like_receipt: true if the image shows ANY proof of payment with an amount. This includes a printed or digital receipt, invoice, cashier/card/terminal slip, a bank or payment-app confirmation screen, OR a peer-to-peer / mobile payment that shows an amount — Apple Pay, Apple Cash, Cash App, Venmo, Zelle, PayPal, Google Pay, Chime, Samsung Pay, etc.
+- A messaging screenshot (iMessage / SMS / WhatsApp / Messenger) DOES count when it contains a payment bubble or a sent/received amount — e.g. an Apple Cash "$163" bubble, "You sent $150", a Venmo/Zelle/Cash App confirmation line. Treat these as valid payment receipts.
+- Set looks_like_receipt to false ONLY when there is no payment amount at all: random photos, memes, selfies, vehicle photos with no payment info, blank/blurry unusable images, or a plain chat with no payment bubble/line/amount.
+- has_dollar_sign: true only if the ASCII dollar symbol $ is clearly visible as a currency marker (including inside a payment bubble). False if the image uses only "USD" text, foreign currency, or no currency symbol.
+- amounts_usd: list every payment/total amount in US dollars visible, including amounts inside payment bubbles (e.g. 150, 163, 99.5). Use numbers only. If no amount is readable, use [].
+- confidence: how sure you are that this is a legitimate payment/receipt image (not a random upload).
 """
 
 # Strict mode: do not prioritize matching dollar amounts — only receipt-like image + visible ASCII $ .
@@ -1622,8 +1623,8 @@ Return ONLY valid JSON (no markdown, no explanation outside JSON):
 }
 
 Rules:
-- looks_like_receipt: true if this clearly shows a real payment document or payment screen (receipt, invoice, terminal slip, app payment confirmation, etc.). False for unrelated images.
-- has_dollar_sign: true ONLY if the ASCII character $ appears visibly on the image as a currency marker. False if only "USD" as letters, only numbers, €, £, or no dollar sign.
+- looks_like_receipt: true if this shows a real payment document or payment screen — a receipt, invoice, terminal slip, bank/app payment confirmation, OR a peer-to-peer / mobile payment (Apple Pay, Apple Cash, Cash App, Venmo, Zelle, PayPal, Google Pay, Chime). A messaging screenshot (iMessage/SMS/WhatsApp) with a payment bubble or a sent/received amount (e.g. an Apple Cash "$163" bubble, "You sent $150") DOES count. False only for images with no payment amount at all.
+- has_dollar_sign: true ONLY if the ASCII character $ appears visibly on the image as a currency marker (including inside a payment bubble). False if only "USD" as letters, only numbers, €, £, or no dollar sign.
 - Always set amounts_usd to [] — amounts are NOT evaluated in this mode.
 - confidence: how sure you are that this is a payment/receipt image.
 """
