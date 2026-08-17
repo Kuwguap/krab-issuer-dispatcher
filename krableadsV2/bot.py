@@ -744,6 +744,10 @@ def _build_group_keyboard(groups: list, include_all: bool = True) -> InlineKeybo
 # 5 MB raw == ~6.7 MB base64; Telegram bot uploads themselves cap at 10 MB
 # for photos. Anything larger gets skipped (the lead itself still dispatches).
 _PHASE1_MEDIA_MAX_BYTES = 5 * 1024 * 1024
+# Caps for user-attached (title/license) photos so the inline-base64 attachments can't
+# bloat the create_lead insert past the DB gateway limit and fail the whole save.
+_MAX_ATTACH_COUNT = 6
+_MAX_ATTACH_TOTAL_B64 = 12 * 1024 * 1024
 
 
 async def _finalize_phase1_media_for_dispatch(
@@ -765,9 +769,13 @@ async def _finalize_phase1_media_for_dispatch(
     """
     if not context.user_data:
         return []
+    # User-attached title/license photos (already inline base64 descriptors, no phone
+    # redaction needed — they carry no issuer phone). Appended to whatever media the
+    # vision path produces so both reach the accepting team.
+    extras = [e for e in (context.user_data.get("phase1_extra_attachments") or []) if isinstance(e, dict)]
     cached = context.user_data.get("phase1_attached_files")
     if cached and isinstance(cached, list):
-        return cached
+        return list(cached) + extras
     pending: list[dict] = list(context.user_data.get("phase1_pending_media") or [])
     # Fallback: rebuild from an in-memory batch if extraction ran but pending was not stashed.
     if not pending:
@@ -788,7 +796,7 @@ async def _finalize_phase1_media_for_dispatch(
                 if png:
                     pending.append({"kind": "image", "bytes": png, "mime": "image/png"})
     if not pending:
-        return []
+        return extras
 
     attached: list[dict] = []
     skipped_unsafe = 0
@@ -863,7 +871,7 @@ async def _finalize_phase1_media_for_dispatch(
     if attached:
         context.user_data["phase1_attached_files"] = attached
     context.user_data.pop("phase1_pending_media", None)
-    return attached
+    return attached + extras
 
 
 async def _forward_phase1_attached_files_to_targets(
@@ -2289,7 +2297,10 @@ def _build_review_keyboard_with_selections(state_data):
             "🛡 Insurance: ON" if state_data.get("wants_insurance") else "🛡 Add insurance",
             callback_data="ph1_ins_toggle",
         )],
-        [InlineKeyboardButton("🖼 Adjust from image/text", callback_data="ph1_adjust")],
+        [
+            InlineKeyboardButton("📎 Attach photo", callback_data="ph1_attach"),
+            InlineKeyboardButton("🖼 Adjust from image/text", callback_data="ph1_adjust"),
+        ],
     ])
 
 async def _edit_message_keyboard(context, chat_id, message_id, keyboard):
@@ -3410,6 +3421,82 @@ async def _interpret_review_command(update, context, user_id, state_data, text):
     return None
 
 
+def _extra_attachments(context: ContextTypes.DEFAULT_TYPE) -> list:
+    """User-attached title/license photos (inline descriptors), if any."""
+    return [e for e in (context.user_data.get("phase1_extra_attachments") or []) if isinstance(e, dict)]
+
+
+def _dispatch_attach_files(context: ContextTypes.DEFAULT_TYPE, lead_data: dict) -> list:
+    """attached_files for a lead payload = STATE_ADD_FILES files + the user's attached
+    title/license photos, so they reach the accepting team on EVERY dispatch path."""
+    return list(lead_data.get("attached_files") or []) + _extra_attachments(context)
+
+
+async def _attach_photo_to_lead(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Include the sent photo/PDF with the dispatch (title, license, etc.) as an inline
+    attachment forwarded to the accepting team — NOT parsed for field data."""
+    msg = update.message
+    chat_id = update.effective_chat.id if update.effective_chat else (getattr(msg, "chat_id", None))
+    ftype, mime, filename, file_id = "photo", "image/jpeg", "attachment.jpg", None
+    if msg and msg.photo:
+        file_id = msg.photo[-1].file_id
+    elif msg and msg.document:
+        file_id = msg.document.file_id
+        dmime = (getattr(msg.document, "mime_type", "") or "").lower()
+        if "pdf" in dmime:
+            ftype, mime, filename = "document", "application/pdf", (msg.document.file_name or "attachment.pdf")
+        elif dmime.startswith("image/"):
+            ftype, mime, filename = "photo", dmime, (msg.document.file_name or "attachment.jpg")
+        else:
+            ftype, mime, filename = "document", (dmime or "application/octet-stream"), (msg.document.file_name or "attachment.bin")
+    if not file_id:
+        return STATE_AI_REVIEW
+    try:
+        f = await context.bot.get_file(file_id)
+        bio = io.BytesIO()
+        await f.download_to_memory(out=bio)
+        blob = bio.getvalue()
+    except Exception as e:
+        logger.warning("attach download failed: %s", e)
+        blob = b""
+    if not blob:
+        await _send_vanishing(context, chat_id, "⚠️ Couldn't read that file — try sending it again.")
+        return STATE_AI_REVIEW
+    if len(blob) > _PHASE1_MEDIA_MAX_BYTES:
+        await _send_vanishing(context, chat_id, "⚠️ That file is too large to attach (max 5 MB).")
+        return STATE_AI_REVIEW
+    b64 = base64.b64encode(blob).decode("ascii")
+    extras = context.user_data.get("phase1_extra_attachments") or []
+    # Bound the aggregate so the inline-base64 attachments can't bloat the create_lead
+    # insert past the DB gateway limit and fail the whole lead save.
+    if len(extras) >= _MAX_ATTACH_COUNT:
+        await _send_vanishing(context, chat_id, f"📎 Max {_MAX_ATTACH_COUNT} attachments. Dispatch this lead, then attach more to the next.")
+        return STATE_AI_REVIEW
+    # Count any already-finalized vision media too — they ride in the SAME create_lead
+    # payload, so the combined base64 is what must stay under the gateway limit.
+    vision_b64 = sum(len(f.get("data_b64") or "") for f in (context.user_data.get("phase1_attached_files") or []))
+    if vision_b64 + sum(len(e.get("data_b64") or "") for e in extras) + len(b64) > _MAX_ATTACH_TOTAL_B64:
+        await _send_vanishing(context, chat_id, "📎 Attachments are getting large — dispatch this lead first, then add more to the next one.")
+        return STATE_AI_REVIEW
+    descriptor = {
+        "type": ftype, "mime": mime, "filename": filename,
+        "data_b64": b64,
+        "caption": (msg.caption or "").strip()[:200] or "📎 Attachment",
+    }
+    extras.append(descriptor)
+    context.user_data["phase1_extra_attachments"] = extras
+    try:
+        await msg.delete()
+    except Exception:
+        pass
+    await _send_vanishing(
+        context, chat_id,
+        f"📎 Attached ({len(extras)}) — it'll be sent to the team that accepts the lead. "
+        "Send more, or type/tap to continue.",
+    )
+    return STATE_AI_REVIEW
+
+
 async def handle_phase1_review_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """STATE_AI_REVIEW: accept typed text / photo / PDF inline — no Edit button.
 
@@ -3418,12 +3505,19 @@ async def handle_phase1_review_message(update: Update, context: ContextTypes.DEF
     AI parser as the '🖼 Adjust from image/text' button."""
     message = update.message
     if message and (message.photo or message.document):
+        # In "attach" mode the photo/PDF is INCLUDED with the dispatch (title/license),
+        # not read for field data. Otherwise it's parsed like the Adjust button.
+        if context.user_data.get("phase1_attach_mode"):
+            return await _attach_photo_to_lead(update, context)
         result = await handle_phase1_adjust_input(update, context)
         return STATE_AI_REVIEW if result == STATE_ADJUST_INPUT else result
 
     text = ((message.text if message else "") or "").strip()
     if not text:
         return STATE_AI_REVIEW
+
+    # Typed text ends attach mode (they're back to editing/commanding).
+    context.user_data.pop("phase1_attach_mode", None)
 
     _cr = _cancel_restart_kind(text)
     if _cr:
@@ -3576,6 +3670,8 @@ async def _begin_lead_flow(
     db.clear_user_state(user_id)
     if context.user_data:
         context.user_data.pop("phase1_attached_files", None)
+        context.user_data.pop("phase1_extra_attachments", None)
+        context.user_data.pop("phase1_attach_mode", None)
         context.user_data.pop("phase1_vision_batch", None)
         context.user_data.pop("phase1_pending_media", None)
         context.user_data.pop("phase1_pending_edit_key", None)
@@ -4432,6 +4528,8 @@ def _clear_lead_conversation_user_data(context: ContextTypes.DEFAULT_TYPE) -> No
         "phase1_send_another_msg_id",
         "phase1_pending_media",
         "phase1_attached_files",
+        "phase1_extra_attachments",
+        "phase1_attach_mode",
         "phase1_recent_edits",
         "review_message_id",
         "review_chat_id",
@@ -6266,6 +6364,19 @@ async def handle_phase1_ai_review_callback(update, context):
         context.user_data.pop("adjust_prompt_msg_id", None)
         return STATE_AI_REVIEW
 
+    elif data == "ph1_attach":
+        # Arm "attach" mode: the next photo(s)/PDF are INCLUDED with the dispatch
+        # (title, license, etc.) instead of being read for field data.
+        context.user_data["phase1_attach_mode"] = True
+        n = len(context.user_data.get("phase1_extra_attachments") or [])
+        await query.message.reply_text(
+            "📎 Send the photo(s) or PDF to include with the dispatch — title, "
+            "license, anything. They go to the team that accepts the lead.\n\n"
+            + (f"({n} already attached.) " if n else "")
+            + "Send as many as you like, then type or tap a button to continue."
+        )
+        return STATE_AI_REVIEW
+
     elif data == "ph1_ins_toggle":
         state_data["wants_insurance"] = not state_data.get("wants_insurance")
         db.set_user_state(user_id, "phase1", state_data)
@@ -7356,7 +7467,7 @@ async def handle_group_selection(update: Update, context: ContextTypes.DEFAULT_T
             "email": (lead_data.get("email") or "") or None,
             "driver_license_id": (lead_data.get("driver_license_id") or "") or None,
             "contact_info_source": _resolve_contact_source_label(lead_data),
-            "phase1_attached_files": lead_data.get("attached_files") or [],
+            "phase1_attached_files": _dispatch_attach_files(context, lead_data),
         }
         lead = db.create_lead(final_lead_data)
         if not lead:
@@ -7490,6 +7601,11 @@ async def handle_group_selection(update: Update, context: ContextTypes.DEFAULT_T
         db.delete_group_lead_offers_for_lead(rid)
         db.update_lead(rid, {
             "group_id": group_id,
+            # Reassign re-dispatches an EXISTING lead: keep its own stored files
+            # (carried in lead_data by _issuer_state_data_from_lead). Do NOT pull the
+            # in-memory phase1_extra_attachments here — those belong to whatever lead the
+            # user is currently reviewing and would leak that client's title/license photo
+            # to this lead's newly chosen team.
             "phase1_attached_files": lead_data.get("attached_files") or [],
         })
         lead = db.get_lead_by_id(rid) or lead
@@ -7557,7 +7673,7 @@ async def handle_group_selection(update: Update, context: ContextTypes.DEFAULT_T
         "email": (lead_data.get("email") or "") or None,
         "driver_license_id": (lead_data.get("driver_license_id") or "") or None,
         "contact_info_source": _resolve_contact_source_label(lead_data),
-        "phase1_attached_files": lead_data.get("attached_files") or [],
+        "phase1_attached_files": _dispatch_attach_files(context, lead_data),
     }
     lead = db.create_lead(final_lead_data)
     if not lead:
@@ -7766,7 +7882,7 @@ async def handle_driver_selection(update: Update, context: ContextTypes.DEFAULT_
         "email": (lead_data.get("email") or "") or None,
         "driver_license_id": (lead_data.get("driver_license_id") or "") or None,
         "contact_info_source": _resolve_contact_source_label(lead_data),
-        "phase1_attached_files": lead_data.get("attached_files") or [],
+        "phase1_attached_files": _dispatch_attach_files(context, lead_data),
     }
 
     if lead_data.get("follow_after_broadcast") and lead_data.get("lead_id"):
@@ -12072,6 +12188,11 @@ async def _on_lead_created(context: ContextTypes.DEFAULT_TYPE, lead: dict | None
     (PENDING row now; the tag send fills the remaining columns later)."""
     if not lead:
         return
+    # The lead is saved (its payload already carried any attached photos) — clear the
+    # per-lead attach state so a prior client's title/license photos can NEVER leak
+    # onto the next lead.
+    context.user_data.pop("phase1_extra_attachments", None)
+    context.user_data.pop("phase1_attach_mode", None)
     await _fu_auto_close_for_lead(context, lead)
     # Deploy-safe: carry the issuer's "add insurance" choice from the review state onto
     # the lead so the tag-send step can ride an insurance card along. No-op until the
@@ -12835,7 +12956,7 @@ def main():
             STATE_AI_REVIEW: [
                 CallbackQueryHandler(
                     handle_phase1_ai_review_callback,
-                    pattern=r"^(ph1_accept|ph1_edit|ph1_vin_check|ph1_adjust|ph1_ins_toggle|adjust_cancel|ph1_back|ph1_pick_group|ph1_pick_driver|ph1_pick_source|selgrp_|seldrv_|selsrc_|ph1_sel_back|driver_suspended_|edit_cancel|ph1edit_)"
+                    pattern=r"^(ph1_accept|ph1_edit|ph1_vin_check|ph1_adjust|ph1_attach|ph1_ins_toggle|adjust_cancel|ph1_back|ph1_pick_group|ph1_pick_driver|ph1_pick_source|selgrp_|seldrv_|selsrc_|ph1_sel_back|driver_suspended_|edit_cancel|ph1edit_)"
                 ),
                 # Inline edits with no Edit button: type 'price $50' / 'phone 555-1234'
                 # or send a photo/PDF, and it's parsed straight into the review.
