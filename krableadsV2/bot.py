@@ -3218,6 +3218,26 @@ async def _cleanup_voice_echo(context: ContextTypes.DEFAULT_TYPE, chat_id) -> No
         await _safe_delete_chat_message(context, chat_id, mid)
 
 
+async def _send_vanishing(context: ContextTypes.DEFAULT_TYPE, chat_id, text: str, *, delay: float = 4.0) -> None:
+    """Send a transient confirmation that auto-deletes after ``delay`` seconds, so the
+    review card stays the last visible message. Best-effort; never blocks the flow."""
+    if not chat_id or not text:
+        return
+    try:
+        msg = await context.bot.send_message(chat_id=chat_id, text=text)
+    except Exception:
+        return
+
+    async def _vanish():
+        try:
+            await asyncio.sleep(delay)
+            await _safe_delete_chat_message(context, chat_id, msg.message_id)
+        except Exception:
+            pass
+
+    asyncio.create_task(_vanish())
+
+
 # Shared selection writers — used by both the review buttons and the NL commands.
 def _select_group(state_data: dict, user_id: int, group) -> None:
     if group == "all":
@@ -3308,7 +3328,7 @@ async def _interpret_review_command(update, context, user_id, state_data, text):
             pass
         await _cleanup_voice_echo(context, chat_id)
         if toast and chat_id:
-            await context.bot.send_message(chat_id=chat_id, text=toast)
+            await _send_vanishing(context, chat_id, toast)
 
     if kind == "SUBMIT":
         try:
@@ -3437,7 +3457,7 @@ async def handle_phase1_review_message(update: Update, context: ContextTypes.DEF
         toast = _insurance_toggle_message(state_data)
         if also:
             toast += "\n✅ Also updated: " + ", ".join(dict.fromkeys(also))
-        await context.bot.send_message(chat_id=chat_id, text=toast)
+        await _send_vanishing(context, chat_id, toast)
         return STATE_AI_REVIEW
 
     # Typed text in review → clean it up (edits/commands below also delete; this also
@@ -3454,7 +3474,7 @@ async def handle_phase1_review_message(update: Update, context: ContextTypes.DEF
         except Exception:
             pass
         await _cleanup_voice_echo(context, chat_id)
-        await context.bot.send_message(chat_id=chat_id, text="✅ Updated: " + ", ".join(dict.fromkeys(updated)))
+        await _send_vanishing(context, chat_id, "✅ Updated: " + ", ".join(dict.fromkeys(updated)))
         await _update_review_message_text(context, state_data)
         return STATE_AI_REVIEW
 
@@ -3477,12 +3497,12 @@ async def handle_phase1_review_message(update: Update, context: ContextTypes.DEF
     updated = [] if _COMMAND_LIKE_RE.search(text) else await _smart_place_single_value(state_data, text)
     if updated:
         db.set_user_state(user_id, "phase1", state_data)
-        await context.bot.send_message(chat_id=chat_id, text="✅ Updated: " + ", ".join(dict.fromkeys(updated)))
+        await _send_vanishing(context, chat_id, "✅ Updated: " + ", ".join(dict.fromkeys(updated)))
         await _update_review_message_text(context, state_data)
         return STATE_AI_REVIEW
 
     # 3c. Truly couldn't tell → show the labeled-edit how-to (nothing mis-filed).
-    await context.bot.send_message(chat_id=chat_id, text=_REVIEW_EDIT_HINT)
+    await _send_vanishing(context, chat_id, _REVIEW_EDIT_HINT, delay=12.0)
     return STATE_AI_REVIEW
 
 
