@@ -2167,26 +2167,12 @@ def _format_phase1_field_lines(state_data: dict) -> str:
 
 
 def _format_phase1_ai_review_text(state_data: dict) -> str:
-    """Human-readable summary of how the bot understood Phase 1 (AI path). Plain text (safe for special chars)."""
-    ins_line = ""
-    if state_data.get("wants_insurance"):
-        hard, soft = _insurance_readiness(state_data)
-        if hard:
-            ins_line = "\n\n🛡 Insurance: ON — still needs " + ", ".join(hard)
-        elif soft:
-            ins_line = "\n\n🛡 Insurance: ON — ready (add " + ", ".join(soft) + " for a full card)"
-        else:
-            ins_line = "\n\n🛡 Insurance: ON — ready ✅"
+    """Human-readable summary of how the bot understood Phase 1 (AI path). Plain text (safe for special chars).
+    Insurance ON/OFF and every action live on the inline buttons — the message body stays the
+    clean field list so the review card is as short as possible and always visible."""
     return (
         "📝 Review & ✍️Edit Before Dispatching ✅\n\n"
         + _format_phase1_field_lines(state_data)
-        + ins_line
-        + "\n\nTap 🏢Dispatch to choose dispatcher"
-        + "\nTap 🚗Drivers to choose a driver"
-        + "\nTap ✅Dispatch when finished"
-        + "\nTap ✏️Edit to make changes"
-        + "\nTap 🛡Insurance to add insurance"
-        + "\nTap 🔍Vin to lookup car info"
     )
 
 
@@ -2223,21 +2209,6 @@ def _truncate_btn_val(val: str, max_len: int = 22) -> str:
     return (v[: max_len - 1] + "…") if len(v) > max_len else v
 
 
-def _insurance_readiness(state_data: dict) -> tuple[list, list]:
-    """(hard_missing, soft_missing) for issuing an insurance card from this review.
-    Hard blocks generation (client email + a valid 17-char VIN); soft is recommended
-    but the card still issues without it (driver license # → AAMVA DAQ)."""
-    hard, soft = [], []
-    if not (state_data.get("email") or "").strip():
-        hard.append("client email")
-    vin = re.sub(r"[^A-Za-z0-9]", "", (state_data.get("vin") or ""))
-    if len(vin) != 17:
-        hard.append("a valid 17-char VIN")
-    if not (state_data.get("driver_license_id") or "").strip():
-        soft.append("driver license #")
-    return hard, soft
-
-
 _INS_OFF_RE = re.compile(
     r"\b(?:no|not?|remove|disable|turn\s*off|switch\s*off|skip|without|drop)\s+"
     r"(?:the\s+)?insurance\b|^\s*insurance\s*(?:off|no)\s*[.!]*$",
@@ -2261,21 +2232,6 @@ def _insurance_intent(text: str):
     if _INS_ON_RE.search(t):
         return True
     return None
-
-
-def _insurance_toggle_message(state_data: dict) -> str:
-    """Human confirmation shown when insurance is turned on/off during review."""
-    if not state_data.get("wants_insurance"):
-        return "🛡 Insurance off for this tag."
-    hard, soft = _insurance_readiness(state_data)
-    msg = "🛡 Insurance ON — a card will be issued together with the tag."
-    if hard:
-        msg += "\n\n⚠️ Still needed: " + ", ".join(hard) + "."
-    if soft:
-        msg += ("\n" if hard else "\n\n") + "➕ Recommended: " + ", ".join(soft) + "."
-    if hard or soft:
-        msg += "\n\nAdd them the easy way — type or say e.g. “email john@example.com”, “dl 123456789”."
-    return msg
 
 
 def _build_review_keyboard_with_selections(state_data):
@@ -2344,6 +2300,31 @@ async def _update_review_text(context, state_data):
         )
     except Exception as e:
         logger.warning("Could not update review text: %s", e)
+
+
+async def _reanchor_review_card(context, chat_id, state_data) -> None:
+    """Repost the review card at the BOTTOM of the chat (below any pictures the user kept
+    in view) and delete the old one, so there is only ever a single card and the parsed
+    result sits directly UNDER the photo for a spelling double-check. Selections and
+    insurance state carry over because both the text and keyboard are rebuilt from
+    state_data. Falls back to an in-place edit if the repost fails."""
+    old_mid = context.user_data.get("review_message_id")
+    old_cid = context.user_data.get("review_chat_id")
+    try:
+        msg = await context.bot.send_message(
+            chat_id=chat_id,
+            text=_format_phase1_ai_review_text(state_data),
+            reply_markup=_build_review_keyboard_with_selections(state_data),
+        )
+    except Exception as e:
+        logger.warning("Could not re-anchor review card: %s", e)
+        await _update_review_message_text(context, state_data)
+        return
+    context.user_data["review_message_id"] = msg.message_id
+    context.user_data["review_chat_id"] = msg.chat_id
+    # Remove the old card only after the new one is up (never a gap with no review).
+    if old_mid and old_cid and old_mid != msg.message_id:
+        await _safe_delete_chat_message(context, old_cid, old_mid)
 
 
 def _phase1_edit_fields_keyboard(state_data: dict) -> InlineKeyboardMarkup:
@@ -2794,15 +2775,20 @@ async def handle_phase1_adjust_input(update: Update, context: ContextTypes.DEFAU
 
     updated = _merge_phase1_adjust(state_data, structured)
     db.set_user_state(user_id, "phase1", state_data)
-    await _autoclean_user_msg(update, context)  # merge OK — safe to clear the typed input
+    await _autoclean_user_msg(update, context)  # text is cleared; media is always kept
     prompt_id = context.user_data.pop("adjust_prompt_msg_id", None)
     if prompt_id:
         await _safe_delete_chat_message(context, message.chat_id, prompt_id)
-    if updated:
-        await message.reply_text("✅ Updated: " + ", ".join(dict.fromkeys(updated)))
+    is_media = bool(message.photo or message.document)
+    if is_media:
+        # Keep the picture visible so the issuer can eyeball spelling, and move the review
+        # card DIRECTLY UNDER it — the fresh card is the confirmation, no extra text.
+        await _reanchor_review_card(context, message.chat_id, state_data)
     else:
-        await message.reply_text("ℹ️ Nothing new found — the review is unchanged.")
-    await _update_review_message_text(context, state_data)
+        # Typed text: vanishing toast + edit the card in place (nothing pushes it up).
+        toast = ("✅ Updated: " + ", ".join(dict.fromkeys(updated))) if updated else "ℹ️ Nothing new found — the review is unchanged."
+        await _send_vanishing(context, message.chat_id, toast)
+        await _update_review_message_text(context, state_data)
     return STATE_AI_REVIEW
 
 
@@ -3485,15 +3471,16 @@ async def _attach_photo_to_lead(update: Update, context: ContextTypes.DEFAULT_TY
     }
     extras.append(descriptor)
     context.user_data["phase1_extra_attachments"] = extras
-    try:
-        await msg.delete()
-    except Exception:
-        pass
+    # Keep the picture visible (pics never disappear) and re-anchor the review card under
+    # it, so the card stays at the bottom and the issuer can see what they attached.
     await _send_vanishing(
         context, chat_id,
         f"📎 Attached ({len(extras)}) — it'll be sent to the team that accepts the lead. "
         "Send more, or type/tap to continue.",
     )
+    _st = db.get_user_state(update.effective_user.id) if update.effective_user else None
+    if _st and _st.get("data"):
+        await _reanchor_review_card(context, chat_id, _st["data"])
     return STATE_AI_REVIEW
 
 
@@ -3547,11 +3534,11 @@ async def handle_phase1_review_message(update: Update, context: ContextTypes.DEF
         except Exception:
             pass
         await _cleanup_voice_echo(context, chat_id)
+        # Flip the button in place, no insurance on/off message. Only toast (vanishing)
+        # if the same message also carried real field edits, so that feedback isn't lost.
         await _update_review_message_text(context, state_data)
-        toast = _insurance_toggle_message(state_data)
         if also:
-            toast += "\n✅ Also updated: " + ", ".join(dict.fromkeys(also))
-        await _send_vanishing(context, chat_id, toast)
+            await _send_vanishing(context, chat_id, "✅ Updated: " + ", ".join(dict.fromkeys(also)))
         return STATE_AI_REVIEW
 
     # Typed text in review → clean it up (edits/commands below also delete; this also
@@ -6380,8 +6367,9 @@ async def handle_phase1_ai_review_callback(update, context):
     elif data == "ph1_ins_toggle":
         state_data["wants_insurance"] = not state_data.get("wants_insurance")
         db.set_user_state(user_id, "phase1", state_data)
+        # Just flip the button in place ("🛡 Add insurance" ⇄ "🛡 Insurance: ON").
+        # No separate on/off message — keep the review card clean and visible.
         await _update_review_message_text(context, state_data)
-        await query.message.reply_text(_insurance_toggle_message(state_data))
         return STATE_AI_REVIEW
 
     elif data.startswith("ph1edit_"):
