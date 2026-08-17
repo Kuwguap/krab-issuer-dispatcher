@@ -2253,10 +2253,7 @@ def _build_review_keyboard_with_selections(state_data):
             "🛡 Insurance: ON" if state_data.get("wants_insurance") else "🛡 Add insurance",
             callback_data="ph1_ins_toggle",
         )],
-        [
-            InlineKeyboardButton("📎 Attach photo", callback_data="ph1_attach"),
-            InlineKeyboardButton("🖼 Adjust from image/text", callback_data="ph1_adjust"),
-        ],
+        [InlineKeyboardButton("🖼 Add image (title / license)", callback_data="ph1_add_image")],
     ])
 
 async def _edit_message_keyboard(context, chat_id, message_id, keyboard):
@@ -2748,12 +2745,16 @@ async def handle_phase1_adjust_input(update: Update, context: ContextTypes.DEFAU
     note = await message.reply_text("🤖 Reading…")
     structured = None
     adjust_caption = (message.caption or "").strip() or None
+    # Keep the downloaded bytes so the SAME upload can both be read for fields AND ride
+    # along to the dispatch group (no second download, no separate button).
+    attach_blob, attach_ftype, attach_mime, attach_filename = None, "photo", "image/jpeg", "attachment.jpg"
     try:
         if message.photo:
             f = await context.bot.get_file(message.photo[-1].file_id)
             bio = io.BytesIO()
             await f.download_to_memory(out=bio)
             _img = bio.getvalue()
+            attach_blob = _img
             structured = await asyncio.to_thread(
                 lambda: ai_vision.extract_structured_from_media_parts(
                     [(_img, "image/jpeg")], typed_text=adjust_caption
@@ -2766,7 +2767,9 @@ async def handle_phase1_adjust_input(update: Update, context: ContextTypes.DEFAU
             await f.download_to_memory(out=bio)
             raw = bio.getvalue()
             mime = (doc.mime_type or "").lower()
+            attach_blob = raw
             if "pdf" in mime or (doc.file_name or "").lower().endswith(".pdf"):
+                attach_ftype, attach_mime, attach_filename = "document", "application/pdf", (doc.file_name or "attachment.pdf")
                 png = await asyncio.to_thread(ai_vision.pdf_first_page_to_png_bytes, raw)
                 if png:
                     structured = await asyncio.to_thread(
@@ -2774,7 +2777,15 @@ async def handle_phase1_adjust_input(update: Update, context: ContextTypes.DEFAU
                             [(png, "image/png")], typed_text=adjust_caption
                         )
                     )
+            elif mime.startswith("image/"):
+                attach_ftype, attach_mime, attach_filename = "photo", mime, (doc.file_name or "attachment.jpg")
+                structured = await asyncio.to_thread(
+                    lambda: ai_vision.extract_structured_from_media_parts(
+                        [(raw, mime or "image/jpeg")], typed_text=adjust_caption
+                    )
+                )
             else:
+                attach_ftype, attach_mime, attach_filename = "document", (mime or "application/octet-stream"), (doc.file_name or "attachment.bin")
                 structured = await asyncio.to_thread(
                     lambda: ai_vision.extract_structured_from_media_parts(
                         [(raw, mime or "image/jpeg")], typed_text=adjust_caption
@@ -2791,22 +2802,41 @@ async def handle_phase1_adjust_input(update: Update, context: ContextTypes.DEFAU
         structured = None
     await _safe_delete_chat_message(context, note.chat_id, note.message_id)
 
-    if not structured:
-        await message.reply_text(
-            "⚠️ Couldn't read that. Send a clearer photo/PDF or paste the text — or ❌ Cancel above."
-        )
-        return STATE_ADJUST_INPUT
+    is_media = bool(message.photo or message.document)
 
-    updated = _merge_phase1_adjust(state_data, structured)
+    # Pure text that couldn't be read → guide the user (no image to keep/attach).
+    if not structured and not is_media:
+        await message.reply_text(
+            "⚠️ Couldn't read that. Paste the text as a labeled edit (e.g. “price $500”) "
+            "or send a photo/PDF."
+        )
+        return STATE_AI_REVIEW
+
+    updated = _merge_phase1_adjust(state_data, structured) if structured else []
     db.set_user_state(user_id, "phase1", state_data)
     await _autoclean_user_msg(update, context)  # text is cleared; media is always kept
-    prompt_id = context.user_data.pop("adjust_prompt_msg_id", None)
-    if prompt_id:
-        await _safe_delete_chat_message(context, message.chat_id, prompt_id)
-    is_media = bool(message.photo or message.document)
+
     if is_media:
-        # Keep the picture visible so the issuer can eyeball spelling, and move the review
-        # card DIRECTLY UNDER it — the fresh card is the confirmation, no extra text.
+        # ONE upload does everything: fields were read above (so spelling can be
+        # double-checked), the picture stays visible, AND it rides along to the dispatch
+        # group. Keep the review card directly UNDER the picture.
+        upd_txt = ", ".join(dict.fromkeys(updated)) if updated else ""
+        if attach_blob is None:
+            # The file couldn't be fetched — nothing was read or attached. Say so plainly
+            # instead of claiming a (0) attachment.
+            note_txt = "⚠️ Couldn't read that file — please send it again."
+        else:
+            cap_note = _add_extra_attachment(context, attach_ftype, attach_mime, attach_filename, attach_blob, adjust_caption)
+            n_att = len(context.user_data.get("phase1_extra_attachments") or [])
+            if cap_note:
+                # A size/count cap blocked the attach — but any parsed fields WERE saved,
+                # so surface both, not just the cap notice.
+                note_txt = (f"✅ Read: {upd_txt}\n{cap_note}") if upd_txt else cap_note
+            elif updated:
+                note_txt = f"✅ Read & attached ({n_att}): {upd_txt}"
+            else:
+                note_txt = f"📎 Image attached ({n_att}) — it'll go to the team that accepts the lead."
+        await _send_vanishing(context, message.chat_id, note_txt)
         await _reanchor_review_card(context, message.chat_id, state_data)
     else:
         # Typed text: vanishing toast + edit the card in place (nothing pushes it up).
@@ -3442,70 +3472,31 @@ def _dispatch_attach_files(context: ContextTypes.DEFAULT_TYPE, lead_data: dict) 
     return list(lead_data.get("attached_files") or []) + _extra_attachments(context)
 
 
-async def _attach_photo_to_lead(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Include the sent photo/PDF with the dispatch (title, license, etc.) as an inline
-    attachment forwarded to the accepting team — NOT parsed for field data."""
-    msg = update.message
-    chat_id = update.effective_chat.id if update.effective_chat else (getattr(msg, "chat_id", None))
-    ftype, mime, filename, file_id = "photo", "image/jpeg", "attachment.jpg", None
-    if msg and msg.photo:
-        file_id = msg.photo[-1].file_id
-    elif msg and msg.document:
-        file_id = msg.document.file_id
-        dmime = (getattr(msg.document, "mime_type", "") or "").lower()
-        if "pdf" in dmime:
-            ftype, mime, filename = "document", "application/pdf", (msg.document.file_name or "attachment.pdf")
-        elif dmime.startswith("image/"):
-            ftype, mime, filename = "photo", dmime, (msg.document.file_name or "attachment.jpg")
-        else:
-            ftype, mime, filename = "document", (dmime or "application/octet-stream"), (msg.document.file_name or "attachment.bin")
-    if not file_id:
-        return STATE_AI_REVIEW
-    try:
-        f = await context.bot.get_file(file_id)
-        bio = io.BytesIO()
-        await f.download_to_memory(out=bio)
-        blob = bio.getvalue()
-    except Exception as e:
-        logger.warning("attach download failed: %s", e)
-        blob = b""
+def _add_extra_attachment(context: ContextTypes.DEFAULT_TYPE, ftype: str, mime: str,
+                          filename: str, blob: bytes, caption: str | None) -> str | None:
+    """Store an uploaded photo/PDF so it rides along to the dispatch group. Returns None
+    on success, or a short user-facing reason string when a size/count cap blocks it (the
+    caller shows it as a vanishing note). Caps keep the inline-base64 attachments from
+    bloating the create_lead insert past the DB gateway limit and failing the whole save."""
     if not blob:
-        await _send_vanishing(context, chat_id, "⚠️ Couldn't read that file — try sending it again.")
-        return STATE_AI_REVIEW
+        return None
     if len(blob) > _PHASE1_MEDIA_MAX_BYTES:
-        await _send_vanishing(context, chat_id, "⚠️ That file is too large to attach (max 5 MB).")
-        return STATE_AI_REVIEW
+        return "⚠️ That image is too large to include with the dispatch (max 5 MB)."
     b64 = base64.b64encode(blob).decode("ascii")
     extras = context.user_data.get("phase1_extra_attachments") or []
-    # Bound the aggregate so the inline-base64 attachments can't bloat the create_lead
-    # insert past the DB gateway limit and fail the whole lead save.
     if len(extras) >= _MAX_ATTACH_COUNT:
-        await _send_vanishing(context, chat_id, f"📎 Max {_MAX_ATTACH_COUNT} attachments. Dispatch this lead, then attach more to the next.")
-        return STATE_AI_REVIEW
-    # Count any already-finalized vision media too — they ride in the SAME create_lead
-    # payload, so the combined base64 is what must stay under the gateway limit.
+        return f"📎 Max {_MAX_ATTACH_COUNT} images — dispatch this lead, then add more to the next."
+    # Count any already-finalized vision media too — they ride in the SAME payload.
     vision_b64 = sum(len(f.get("data_b64") or "") for f in (context.user_data.get("phase1_attached_files") or []))
     if vision_b64 + sum(len(e.get("data_b64") or "") for e in extras) + len(b64) > _MAX_ATTACH_TOTAL_B64:
-        await _send_vanishing(context, chat_id, "📎 Attachments are getting large — dispatch this lead first, then add more to the next one.")
-        return STATE_AI_REVIEW
-    descriptor = {
+        return "📎 Attachments are getting large — dispatch this lead first, then add more."
+    extras.append({
         "type": ftype, "mime": mime, "filename": filename,
         "data_b64": b64,
-        "caption": (msg.caption or "").strip()[:200] or "📎 Attachment",
-    }
-    extras.append(descriptor)
+        "caption": (caption or "").strip()[:200] or "📎 Attachment",
+    })
     context.user_data["phase1_extra_attachments"] = extras
-    # Keep the picture visible (pics never disappear) and re-anchor the review card under
-    # it, so the card stays at the bottom and the issuer can see what they attached.
-    await _send_vanishing(
-        context, chat_id,
-        f"📎 Attached ({len(extras)}) — it'll be sent to the team that accepts the lead. "
-        "Send more, or type/tap to continue.",
-    )
-    _st = db.get_user_state(update.effective_user.id) if update.effective_user else None
-    if _st and _st.get("data"):
-        await _reanchor_review_card(context, chat_id, _st["data"])
-    return STATE_AI_REVIEW
+    return None
 
 
 async def handle_phase1_review_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -3516,19 +3507,14 @@ async def handle_phase1_review_message(update: Update, context: ContextTypes.DEF
     AI parser as the '🖼 Adjust from image/text' button."""
     message = update.message
     if message and (message.photo or message.document):
-        # In "attach" mode the photo/PDF is INCLUDED with the dispatch (title/license),
-        # not read for field data. Otherwise it's parsed like the Adjust button.
-        if context.user_data.get("phase1_attach_mode"):
-            return await _attach_photo_to_lead(update, context)
+        # ONE behavior for every image/PDF: read it for fields, keep it visible, and
+        # include it with the dispatch. No mode toggle, no second button.
         result = await handle_phase1_adjust_input(update, context)
         return STATE_AI_REVIEW if result == STATE_ADJUST_INPUT else result
 
     text = ((message.text if message else "") or "").strip()
     if not text:
         return STATE_AI_REVIEW
-
-    # Typed text ends attach mode (they're back to editing/commanding).
-    context.user_data.pop("phase1_attach_mode", None)
 
     _cr = _cancel_restart_kind(text)
     if _cr:
@@ -6356,17 +6342,22 @@ async def handle_phase1_ai_review_callback(update, context):
         await _show_edit_picker(context, state_data)
         return STATE_AI_REVIEW
 
-    elif data == "ph1_adjust":
-        prompt = await query.message.reply_text(
-            "🖼 Send a photo, PDF, or paste text with the corrected info.\n\n"
-            "Only the fields found in it will be updated — everything else "
-            "on the review stays as-is.",
-            reply_markup=InlineKeyboardMarkup([[
-                InlineKeyboardButton("❌ Cancel", callback_data="adjust_cancel")
-            ]]),
+    elif data in ("ph1_add_image", "ph1_adjust", "ph1_attach"):
+        # Single "Add image" action. The old Attach/Adjust callbacks alias here too so any
+        # card sent before this change still works. It's just a hint — the issuer can send
+        # a photo/PDF any time; EVERY upload is read for fields, kept visible, and included
+        # with the dispatch. Vanishing so the review card stays put.
+        n = len(context.user_data.get("phase1_extra_attachments") or [])
+        chat_id = update.effective_chat.id if update.effective_chat else query.message.chat_id
+        await _send_vanishing(
+            context, chat_id,
+            "🖼 Send a photo or PDF — title, license, anything. I'll read it, keep it, and "
+            "include it with the dispatch to the team.\n\n"
+            + (f"({n} already added.) " if n else "")
+            + "Send as many as you like.",
+            delay=10,
         )
-        context.user_data["adjust_prompt_msg_id"] = prompt.message_id
-        return STATE_ADJUST_INPUT
+        return STATE_AI_REVIEW
 
     elif data == "adjust_cancel":
         try:
@@ -6374,19 +6365,6 @@ async def handle_phase1_ai_review_callback(update, context):
         except Exception:
             pass
         context.user_data.pop("adjust_prompt_msg_id", None)
-        return STATE_AI_REVIEW
-
-    elif data == "ph1_attach":
-        # Arm "attach" mode: the next photo(s)/PDF are INCLUDED with the dispatch
-        # (title, license, etc.) instead of being read for field data.
-        context.user_data["phase1_attach_mode"] = True
-        n = len(context.user_data.get("phase1_extra_attachments") or [])
-        await query.message.reply_text(
-            "📎 Send the photo(s) or PDF to include with the dispatch — title, "
-            "license, anything. They go to the team that accepts the lead.\n\n"
-            + (f"({n} already attached.) " if n else "")
-            + "Send as many as you like, then type or tap a button to continue."
-        )
         return STATE_AI_REVIEW
 
     elif data == "ph1_ins_toggle":
@@ -12977,7 +12955,7 @@ def main():
             STATE_AI_REVIEW: [
                 CallbackQueryHandler(
                     handle_phase1_ai_review_callback,
-                    pattern=r"^(ph1_accept|ph1_edit|ph1_vin_check|ph1_adjust|ph1_attach|ph1_ins_toggle|adjust_cancel|ph1_back|ph1_pick_group|ph1_pick_driver|ph1_pick_source|selgrp_|seldrv_|selsrc_|ph1_sel_back|driver_suspended_|edit_cancel|ph1edit_)"
+                    pattern=r"^(ph1_accept|ph1_edit|ph1_vin_check|ph1_add_image|ph1_adjust|ph1_attach|ph1_ins_toggle|adjust_cancel|ph1_back|ph1_pick_group|ph1_pick_driver|ph1_pick_source|selgrp_|seldrv_|selsrc_|ph1_sel_back|driver_suspended_|edit_cancel|ph1edit_)"
                 ),
                 # Inline edits with no Edit button: type 'price $50' / 'phone 555-1234'
                 # or send a photo/PDF, and it's parsed straight into the review.
