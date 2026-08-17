@@ -2567,6 +2567,30 @@ async def _clear_missing_prompts(context: ContextTypes.DEFAULT_TYPE) -> None:
         await _safe_delete_chat_message(context, chat_id, message_id)
 
 
+def _track_vin_flow_msg(context: ContextTypes.DEFAULT_TYPE, sent_message) -> None:
+    """Remember a VIN-check/choice/retype message so the whole exchange can be wiped
+    once the VIN is resolved — the review card stays the single source of truth."""
+    try:
+        context.user_data.setdefault("vin_flow_msg_ids", []).append(
+            (sent_message.chat_id, sent_message.message_id)
+        )
+    except Exception:
+        pass
+
+
+async def _clear_vin_flow_msgs(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Delete every tracked VIN-flow message (the DMV lookup card, the 'Please type the
+    correct VIN' prompt, any repeat conflict cards) so nothing lingers after a retype."""
+    ids = context.user_data.pop("vin_flow_msg_ids", None) or []
+    for chat_id, message_id in ids:
+        await _safe_delete_chat_message(context, chat_id, message_id)
+    # Back-compat: also drop the legacy single-id pointer if it wasn't in the list.
+    legacy = context.user_data.pop("vin_conflict_msg_id", None)
+    # (chat_id is unknown for the legacy pointer; the tracked list above covers the
+    # real deletes — this pop just keeps stale state from leaking to the next lead.)
+    _ = legacy
+
+
 def _apply_single_phase1_edit(state_data: dict, edit_key: str, new_text: str) -> None:
     """Apply one field edit from the AI review flow."""
     new_text = (new_text or "").strip()
@@ -4523,6 +4547,7 @@ def _clear_lead_conversation_user_data(context: ContextTypes.DEFAULT_TYPE) -> No
         "vin_choice_api_car",
         "vin_choice_stated_car",
         "vin_conflict_msg_id",
+        "vin_flow_msg_ids",
         "missing_fields",
         "missing_field_state_data",
         "add_files_prompt_msg_id",
@@ -6701,7 +6726,11 @@ async def _apply_vin_choice(context, reply_msg, chat_id, user_id, choice: str) -
     """Apply a VIN-conflict decision. choice ∈ {use, keep, retype}. Shared by the
     inline buttons and the voice/text path. reply_msg = a Message to reply on."""
     if choice == "retype":
-        await reply_msg.reply_text("Please type the correct VIN (17 characters):")
+        # The "choose which to use" card is now stale — drop it, then show (and track)
+        # the retype prompt so it too gets wiped once the new VIN is captured.
+        await _clear_vin_flow_msgs(context)
+        prompt = await reply_msg.reply_text("Please type the correct VIN (17 characters):")
+        _track_vin_flow_msg(context, prompt)
         return STATE_VIN_RETYPE
     api_car = context.user_data.get("vin_choice_api_car")
     if choice == "use":
@@ -6721,12 +6750,8 @@ async def _apply_vin_choice(context, reply_msg, chat_id, user_id, choice: str) -
             db.set_user_state(user_id, "phase1", d)
     context.user_data.pop("vin_choice_api_car", None)
     context.user_data.pop("vin_choice_stated_car", None)
-    vin_msg_id = context.user_data.pop("vin_conflict_msg_id", None)
-    if vin_msg_id and chat_id:
-        try:
-            await context.bot.delete_message(chat_id=chat_id, message_id=vin_msg_id)
-        except Exception:
-            pass
+    # Wipe the whole VIN exchange (lookup card + any retype prompts/repeat cards).
+    await _clear_vin_flow_msgs(context)
     # Return to the AI review screen — Submit is the only path forward.
     state = db.get_user_state(user_id)
     if state and state.get("data"):
@@ -6773,9 +6798,11 @@ async def handle_vin_retype(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     text = (update.message.text or "").strip()
     vin_new = _extract_vin_17(text)
     if not vin_new or len(vin_new) != 17:
-        await update.message.reply_text(
+        await _autoclean_user_msg(update, context)  # drop the bad attempt
+        warn = await update.message.reply_text(
             "Please send a valid 17-character VIN (letters and numbers only)."
         )
+        _track_vin_flow_msg(context, warn)  # cleared once a good VIN lands
         return STATE_VIN_RETYPE
     await _autoclean_user_msg(update, context)  # valid VIN captured — clear the input
     state = db.get_user_state(user_id)
@@ -6791,15 +6818,20 @@ async def handle_vin_retype(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         api_car, stated_car = conflict
         context.user_data["vin_choice_api_car"] = api_car
         context.user_data["vin_choice_stated_car"] = stated_car
-        keyboard = _vin_choice_keyboard(api_car, stated_car)
+        # Wipe the prior prompt/card before showing the fresh conflict card.
+        await _clear_vin_flow_msgs(context)
         vin_msg = await update.message.reply_text(
             _vin_conflict_body(stated_car, api_car),
-            reply_markup=keyboard,
+            reply_markup=_vin_choice_keyboard(api_car, stated_car),
         )
         context.user_data["vin_conflict_msg_id"] = vin_msg.message_id
+        _track_vin_flow_msg(context, vin_msg)
         return STATE_VIN_CHOICE
+    # VIN resolved — wipe every VIN message so only the review card remains.
+    await _clear_vin_flow_msgs(context)
     if alert_msg:
-        await update.message.reply_text(alert_msg)
+        chat_id = update.effective_chat.id if update.effective_chat else update.message.chat_id
+        await _send_vanishing(context, chat_id, alert_msg)
     await _update_review_message_text(context, state_data)
     return STATE_AI_REVIEW
 
@@ -6845,6 +6877,7 @@ async def _handle_phase1_vin_check_button(
         reply_markup=_vin_choice_keyboard(api_car, stated),
     )
     context.user_data["vin_conflict_msg_id"] = vin_msg.message_id
+    _track_vin_flow_msg(context, vin_msg)
     return STATE_VIN_CHOICE
 
 
