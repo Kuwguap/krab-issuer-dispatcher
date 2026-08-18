@@ -179,6 +179,54 @@ class SmartPlaceRoutingTest(unittest.TestCase):
         self.assertEqual(bot._structured_value_ek("12 Elm"), "addr")            # bare number+word
         self.assertIsNone(bot._structured_value_ek("2019 Honda Accord"))        # vehicle → defer to AI
 
+    def test_multifield_dictation_routes_to_extractor(self):
+        # A whole lead spoken in one voice note (single line, no valid 17-char VIN) must be
+        # recognized as a multi-field block so it's AI-extracted, not dropped.
+        dictation = ("Name John Damien Address 123 Main Street VIN 347GH7ZFF291 Car 2020 "
+                     "100 Civic Colour Red Insurance Company Allstate Insurance Insurance "
+                     "Policy 267112 Phone 134248123 Price $150")
+        self.assertTrue(bot._looks_like_multifield_block(dictation))
+        self.assertGreaterEqual(bot._count_field_anchors(dictation), 3)
+        # single-field commands must NOT be treated as multi-field blocks
+        for single in ("first name John", "blue", "geico", "policy ABC123", "$500", "Camry"):
+            self.assertFalse(bot._looks_like_multifield_block(single), single)
+        # a clean 2-field one-liner is handled by the labeled path first, not this detector
+        self.assertFalse(bot._looks_like_multifield_block("price 200 color white"))
+        # multi-line paste and a real 17-char VIN still qualify
+        self.assertTrue(bot._looks_like_multifield_block("name John\naddress 12 Main St"))
+        self.assertTrue(bot._looks_like_multifield_block("1HGCM82633A004352"))
+
+    def test_dictation_merge_is_non_destructive_of_filled_fields(self):
+        # only_empty=True must fill blanks but NEVER overwrite an already-filled field.
+        sd = {k: "-" for k in _STATE_KEYS}
+        sd["name"] = "Existing Name"          # already set — must be preserved
+        sd["pending_phone_number"] = "+15551110000"
+        block = "\n".join([
+            "John Damien", "123 Main Street", "-", "-", "-", "-", "2020 Civic", "Red",
+            "Allstate", "267112", "-", "Phone: 9738675309", "Price: $150",
+            "Issuer note: -", "Driver note: -", "Email: -", "DriverLicenseID: -",
+        ])
+        changed = bot._merge_phase1_adjust(sd, block, only_empty=True)
+        self.assertEqual(sd["name"], "Existing Name")            # NOT overwritten
+        self.assertEqual(sd["pending_phone_number"], "+15551110000")  # NOT overwritten
+        self.assertEqual(sd["address"], "123 Main Street")       # empty → filled
+        self.assertIn(sd["color"], ("Red", "RED"))               # empty → filled
+        self.assertNotIn("name", changed)
+        self.assertNotIn("phone", changed)
+        # destructive mode (default) DOES overwrite
+        sd2 = {k: "-" for k in _STATE_KEYS}
+        sd2["name"] = "Old Name"
+        bot._merge_phase1_adjust(sd2, block, only_empty=False)
+        self.assertEqual(sd2["name"], "John Damien")
+
+    def test_anchor_set_excludes_value_words(self):
+        # A single address VALUE must not accumulate spurious anchors → stays single-field.
+        self.assertLess(bot._count_field_anchors("123 Price Street, Kansas City"), 3)
+        self.assertLess(bot._count_field_anchors("Main Street Jersey City"), 3)
+        # a genuine dictation still trips the threshold
+        self.assertGreaterEqual(bot._count_field_anchors(
+            "Name John Address 123 VIN abc Car Civic Colour Red Phone 555 Price 150"), 3)
+
     def test_apply_ek_value_edge_cases(self):
         # unknown edit-key → no-op
         self.assertEqual(bot._apply_ek_value(_fresh_state(), "bogus", "x"), [])

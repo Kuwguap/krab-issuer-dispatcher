@@ -2677,20 +2677,30 @@ _PHASE1_ADJUST_LABELS = {
 }
 
 
-def _merge_phase1_adjust(state_data: dict, structured_text: str) -> list[str]:
+def _merge_phase1_adjust(state_data: dict, structured_text: str, only_empty: bool = False) -> list[str]:
     """Merge an AI extraction into state_data — ONLY the fields actually found.
 
     Empty / "-" / placeholder values never overwrite existing data. Returns the
-    human labels of the fields that changed.
+    human labels of the fields that changed. When ``only_empty`` is set, a field that
+    already holds a real (non-placeholder) value is left untouched — used for the
+    single-line voice-dictation path so a mis-detected note can never overwrite good
+    data that's already on the card.
     """
     normalized = _normalize_ai_phase1_text(structured_text or "")
     lines = [l.strip() for l in normalized.splitlines()]
     parsed = parse_phase1_structured("\n".join(lines[: ai_vision.PHASE1_LINE_COUNT]))
     placeholders = {"", "-", "n/a", "na", "none", "unknown", "not found"}
+
+    def _blocked(sk: str) -> bool:
+        # In fill-only mode, keep an already-filled field (never overwrite).
+        return only_empty and str(state_data.get(sk) or "").strip().lower() not in placeholders
+
     updated: list[str] = []
     for key in _PHASE1_ADJUST_FIELD_ORDER:
         val = str(parsed.get(key) or "").strip()
         if val.lower() in placeholders:
+            continue
+        if _blocked(key):
             continue
         if val != str(state_data.get(key) or "").strip():
             state_data[key] = val
@@ -2705,20 +2715,21 @@ def _merge_phase1_adjust(state_data: dict, structured_text: str) -> list[str]:
         if v.lower() in placeholders:
             continue
         if low.startswith("phone"):
-            if len(re.sub(r"\D", "", v)) >= 10:
+            if not _blocked("pending_phone_number") and len(re.sub(r"\D", "", v)) >= 10:
                 state_data["pending_phone_number"] = v
                 updated.append("phone")
         elif low.startswith("price"):
-            state_data["pending_price"] = v
-            updated.append("price")
+            if not _blocked("pending_price"):
+                state_data["pending_price"] = v
+                updated.append("price")
         elif low.startswith("email"):
             em = ai_vision.normalize_email(v)
-            if em:
+            if em and not _blocked("email"):
                 state_data["email"] = em
                 updated.append("email")
         elif low.startswith("driverlicense") or low == "dl":
             dl = ai_vision.normalize_driver_license_id(v)
-            if dl:
+            if dl and not _blocked("driver_license_id"):
                 state_data["driver_license_id"] = dl
                 updated.append("driver license")
     if updated:
@@ -2729,8 +2740,11 @@ def _merge_phase1_adjust(state_data: dict, structured_text: str) -> list[str]:
     return updated
 
 
-async def handle_phase1_adjust_input(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Review 'Adjust from image/text': read media/text, merge only found fields."""
+async def handle_phase1_adjust_input(update: Update, context: ContextTypes.DEFAULT_TYPE,
+                                     fill_only_empty: bool = False) -> int:
+    """Review 'Adjust from image/text': read media/text, merge only found fields. When
+    fill_only_empty is set (single-line voice dictation), never overwrite a field that
+    already holds a real value."""
     _cr = _cancel_restart_kind_from_update(update)
     if _cr:
         return await _do_cancel_or_restart(update, context, _cr)
@@ -2812,7 +2826,7 @@ async def handle_phase1_adjust_input(update: Update, context: ContextTypes.DEFAU
         )
         return STATE_AI_REVIEW
 
-    updated = _merge_phase1_adjust(state_data, structured) if structured else []
+    updated = _merge_phase1_adjust(state_data, structured, only_empty=fill_only_empty) if structured else []
     db.set_user_state(user_id, "phase1", state_data)
     await _autoclean_user_msg(update, context)  # text is cleared; media is always kept
 
@@ -3023,15 +3037,44 @@ def _apply_inline_review_text(state_data: dict, text: str) -> list[str]:
     return updated
 
 
+# Field-label anchor words — one regex per field so synonyms count once. A message that
+# names several of these (a dictated lead: "Name John … Address 123 … VIN … Car …
+# Colour Red … Insurance … Policy … Phone … Price …") is a multi-field block worth
+# AI-extracting even on a single line, since voice notes arrive with no line breaks.
+# Only true LABEL words — deliberately NOT value words that live inside ordinary field
+# values ('street'/'city'/'state' appear in addresses like 'Kansas City' / 'Main Street',
+# so they'd inflate the anchor count on a single address value).
+_FIELD_ANCHOR_RES = [
+    re.compile(r"\bnames?\b", re.I),
+    re.compile(r"\baddress\b", re.I),
+    re.compile(r"\bdelivery\b", re.I),
+    re.compile(r"\bvin\b", re.I),
+    re.compile(r"\b(?:car|vehicle)\b", re.I),
+    re.compile(r"\bcolou?r\b", re.I),
+    re.compile(r"\binsurance\b", re.I),
+    re.compile(r"\b(?:policy|binder)\b", re.I),
+    re.compile(r"\bphone\b", re.I),
+    re.compile(r"\bprice\b", re.I),
+    re.compile(r"\be-?mail\b", re.I),
+    re.compile(r"\b(?:licen[cs]e|dln)\b", re.I),
+]
+
+
+def _count_field_anchors(text: str) -> int:
+    """How many DISTINCT field labels a message names (a dictated-lead signal)."""
+    return sum(1 for rx in _FIELD_ANCHOR_RES if rx.search(text or ""))
+
+
 def _looks_like_multifield_block(text: str) -> bool:
-    """True only for a clearly-structured paste worth AI re-parsing: a MULTI-LINE block
-    (one field per line) or text containing a VIN (a vehicle block). Any single-line
-    typed value is ambiguous — the AI would have to GUESS which field it is and can
-    mis-file it (a bare name landing in the address) — so it gets a labeled-edit hint
-    instead of silently overwriting the wrong field. Deliberate single-line pastes can
-    still use the '🖼 Adjust from image/text' button, which always AI-parses."""
+    """True for a clearly-structured message worth AI re-parsing: a MULTI-LINE block (one
+    field per line), text containing a full 17-char VIN, or a single-line dictation that
+    NAMES several fields (>=3 distinct labels — e.g. a whole lead spoken in one voice
+    note). A single ambiguous value is NOT this (it gets smart-placement / a hint instead
+    of the AI guessing which one field it is)."""
     t = (text or "").strip()
-    return ("\n" in t) or bool(_extract_vin_17(t))
+    if ("\n" in t) or bool(_extract_vin_17(t)):
+        return True
+    return _count_field_anchors(t) >= 3
 
 
 _REVIEW_EDIT_HINT = (
@@ -3624,9 +3667,15 @@ async def handle_phase1_review_message(update: Update, context: ContextTypes.DEF
     if handled is not None:
         return handled
 
-    # 3a. A real multi-field block (paste of a full lead) → AI re-parse.
+    # 3a. A real multi-field block (a paste OR a dictated lead naming several fields,
+    #     e.g. a whole lead spoken in one voice note) → AI re-parse fills every field.
     if _looks_like_multifield_block(text):
-        result = await handle_phase1_adjust_input(update, context)
+        # A deliberate multi-line paste / VIN block is a full correction (may overwrite);
+        # a single-line ">=3 labels" dictation only FILLS EMPTY fields, so a message that
+        # merely names fields can never clobber good data already on the card.
+        fill_only = ("\n" not in text) and not _extract_vin_17(text)
+        result = await handle_phase1_adjust_input(update, context, fill_only_empty=fill_only)
+        await _cleanup_voice_echo(context, update.effective_chat.id if update.effective_chat else message.chat_id)
         return STATE_AI_REVIEW if result == STATE_ADJUST_INPUT else result
 
     # 3b. A single bare value typed one-at-a-time ('John Doe', 'white', '$200',
@@ -3638,6 +3687,7 @@ async def handle_phase1_review_message(update: Update, context: ContextTypes.DEF
     updated = [] if _COMMAND_LIKE_RE.search(text) else await _smart_place_single_value(state_data, text)
     if updated:
         db.set_user_state(user_id, "phase1", state_data)
+        await _cleanup_voice_echo(context, chat_id)
         await _send_vanishing(context, chat_id, "✅ Updated: " + ", ".join(dict.fromkeys(updated)))
         await _update_review_message_text(context, state_data)
         return STATE_AI_REVIEW
