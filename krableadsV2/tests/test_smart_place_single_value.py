@@ -227,6 +227,46 @@ class SmartPlaceRoutingTest(unittest.TestCase):
         self.assertGreaterEqual(bot._count_field_anchors(
             "Name John Address 123 VIN abc Car Civic Colour Red Phone 555 Price 150"), 3)
 
+    def test_full_handler_dictation_uses_extractor_not_labeled_parser(self):
+        # A single-line voice dictation must be routed to the AI extractor (clean) BEFORE
+        # the labeled parser (which greedily mis-splits messy dictation). We stub the
+        # extractor to a clean 17-line block and assert the fields match it exactly —
+        # proving the extractor path was taken, not the mangling labeled path.
+        import types
+        clean_block = "\n".join([
+            "John Damien", "123 Main Street", "-", "-", "-", "-", "2020 Civic", "Red",
+            "Allstate", "267112", "-", "Phone: -", "Price: $150",
+            "Issuer note: -", "Driver note: -", "Email: -", "DriverLicenseID: -",
+        ])
+        store = {"data": {k: "-" for k in _STATE_KEYS}}
+        with mock.patch.object(bot.ai_vision, "extract_structured_from_text", return_value=clean_block), \
+             mock.patch.object(bot.db, "get_user_state", lambda uid: {"data": dict(store["data"])}), \
+             mock.patch.object(bot.db, "set_user_state", lambda uid, key, data: store.update(data={**data})):
+            class B:
+                async def send_message(self, chat_id, text, reply_markup=None, parse_mode=None):
+                    return types.SimpleNamespace(message_id=1, chat_id=chat_id)
+                async def edit_message_text(self, **k): pass
+                async def edit_message_reply_markup(self, **k): pass
+                async def delete_message(self, **k): pass
+            class M:
+                def __init__(self, t):
+                    self.text = t; self.caption = None; self.photo = None; self.document = None
+                    self.voice = types.SimpleNamespace(file_id="f"); self.chat_id = 42; self.message_id = 9
+                async def reply_text(self, t, **k):
+                    m = M(t); m.voice = None; return m
+                async def delete(self): pass
+            ctx = types.SimpleNamespace(bot=B(), user_data={"review_chat_id": 42, "review_message_id": 900}, args=[])
+            m = M("Name John Damien Address 123 Main Street Car 2020 Civic Colour Red "
+                  "Insurance Allstate Policy 267112 Price $150")
+            upd = types.SimpleNamespace(message=m, effective_message=m,
+                effective_user=types.SimpleNamespace(id=7, username="jb"),
+                effective_chat=types.SimpleNamespace(id=42, type="private"))
+            asyncio.run(bot.handle_phase1_review_message(upd, ctx))
+        self.assertEqual(store["data"]["name"], "John Damien")
+        self.assertEqual(store["data"]["car"], "2020 Civic")        # color NOT absorbed
+        self.assertIn(store["data"]["color"], ("Red", "RED"))        # color is its own field
+        self.assertEqual(store["data"]["insurance_policy_number"], "267112")  # phone NOT absorbed
+
     def test_apply_ek_value_edge_cases(self):
         # unknown edit-key → no-op
         self.assertEqual(bot._apply_ek_value(_fresh_state(), "bogus", "x"), [])

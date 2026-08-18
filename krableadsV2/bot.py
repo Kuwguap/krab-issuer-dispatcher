@@ -3644,6 +3644,17 @@ async def handle_phase1_review_message(update: Update, context: ContextTypes.DEF
             await _send_vanishing(context, chat_id, "✅ Updated: " + ", ".join(dict.fromkeys(also)))
         return STATE_AI_REVIEW
 
+    # 0b. A whole lead spoken/typed in ONE single-line message that names several fields
+    #     (a voice dictation: "Name John … Address 123 … VIN … Car … Colour Red …") goes
+    #     STRAIGHT to the AI extractor — the strict labeled parser below would greedily
+    #     mis-split messy dictation (absorbing 'Colour Red' into car, a phone into the
+    #     policy). Fill-only-empty so it can never clobber data already on the card.
+    #     (Multi-line pastes / VIN blocks keep their existing spot at step 3a.)
+    if ("\n" not in text) and not _extract_vin_17(text) and _count_field_anchors(text) >= 3:
+        result = await handle_phase1_adjust_input(update, context, fill_only_empty=True)
+        await _cleanup_voice_echo(context, update.effective_chat.id if update.effective_chat else message.chat_id)
+        return STATE_AI_REVIEW if result == STATE_ADJUST_INPUT else result
+
     # Typed text in review → clean it up (edits/commands below also delete; this also
     # covers the AI-reparse fallback so nothing the issuer types lingers).
     await _autoclean_user_msg(update, context)
