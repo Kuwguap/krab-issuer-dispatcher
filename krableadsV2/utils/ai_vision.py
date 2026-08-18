@@ -350,41 +350,122 @@ SUPERVISOR_ROUTER_PROMPT = (
 )
 
 
-SINGLE_FIELD_PROMPT = (
-    "A dispatcher typed ONE piece of info while filling out a car-tag lead. Decide "
-    "which single field it is. Reply with ONLY one of these exact words:\n"
-    "name, registration_address, city_state_zip, delivery_address, delivery_city, "
-    "vin, car, color, insurance, policy, phone, price, email, driver_license, notes, "
-    "unknown\n"
-    "Guidance: a person or business name -> name; a street line (has a number) -> "
-    "registration_address; 'City ST 07024' -> city_state_zip; a paint color (even "
-    "two words like 'midnight blue') -> color; a vehicle like '2020 Toyota Camry' or "
-    "just 'Camry' or 'Accord' -> car; a 17-char code -> vin; a $ amount or bare "
-    "number under 7 digits -> price; a 10+ digit number -> phone; has an @ -> email; "
-    "a driver-license number -> driver_license; a date/time or free note -> notes. "
-    "If it is a whole sentence or you truly cannot tell, reply 'unknown'.\n\nVALUE: "
-)
-
-_SINGLE_FIELD_TO_EK = {
-    "name": "name", "registration_address": "addr", "city_state_zip": "csz",
-    "delivery_address": "daddr", "delivery_city": "dcsz", "vin": "vin", "car": "car",
-    "color": "col", "insurance": "ins", "policy": "pol", "phone": "phone",
-    "price": "price", "email": "email", "driver_license": "dl", "notes": "xtra",
+# Any of these (the short edit-key OR a verbose synonym the model might emit) normalizes
+# to one of the 19 review edit-keys; anything else collapses to "unknown".
+_FIELD_VALUE_TO_EK = {
+    "fn": "fn", "first_name": "fn", "firstname": "fn",
+    "ln": "ln", "last_name": "ln", "lastname": "ln",
+    "name": "name", "full_name": "name",
+    "addr": "addr", "address": "addr", "registration_address": "addr", "reg_address": "addr",
+    "csz": "csz", "city_state_zip": "csz",
+    "daddr": "daddr", "delivery_address": "daddr",
+    "dcsz": "dcsz", "delivery_city": "dcsz", "delivery_city_state_zip": "dcsz",
+    "vin": "vin",
+    "car": "car", "vehicle": "car",
+    "col": "col", "color": "col", "colour": "col",
+    "ins": "ins", "insurance": "ins", "insurance_company": "ins",
+    "pol": "pol", "policy": "pol", "policy_number": "pol",
+    "phone": "phone",
+    "price": "price",
+    "email": "email",
+    "dl": "dl", "driver_license": "dl", "drivers_license": "dl",
+    "xtra": "xtra", "notes": "xtra", "note": "xtra", "date_time": "xtra", "extra": "xtra",
+    "issuer": "issuer", "issuer_note": "issuer",
+    "driver": "driver", "driver_note": "driver",
+    "unknown": "unknown",
 }
 
+FIELD_VALUE_PROMPT = (
+    "You route ONE short message a car-tag dispatcher typed or dictated while filling "
+    "out a lead. Decide which SINGLE field it belongs to and extract the clean value.\n"
+    "Reply with ONLY a JSON object: {\"field\": \"<key>\", \"value\": \"<value>\"}.\n\n"
+    "Valid field keys (choose exactly one):\n"
+    "  fn      - first name ONLY ('first name John')\n"
+    "  ln      - last name ONLY ('last name Smith')\n"
+    "  name    - a full personal or business name ('John Doe')\n"
+    "  addr    - registration street address (house number + street)\n"
+    "  csz     - registration city, state, ZIP ('Newark NJ 07102')\n"
+    "  daddr   - delivery / drop-off street address\n"
+    "  dcsz    - delivery city, state, ZIP\n"
+    "  vin     - a 17-character vehicle identification number\n"
+    "  car     - vehicle year / make / model ('2019 Honda Accord', 'Camry')\n"
+    "  col     - paint color, even two words ('midnight blue')\n"
+    "  ins     - insurance company / carrier ('Geico')\n"
+    "  pol     - insurance policy or binder number\n"
+    "  phone   - a phone number\n"
+    "  price   - a price / quote / amount ('$500', '500')\n"
+    "  email   - an email address\n"
+    "  dl      - a driver-license number\n"
+    "  xtra    - delivery date/time or a general note ('deliver tomorrow 5pm')\n"
+    "  issuer  - a note meant for the ISSUER ('issuer note rush')\n"
+    "  driver  - a note meant for the DRIVER ('tell the driver gate code 4455')\n"
+    "  unknown - a command or anything that fits no field (see rules)\n\n"
+    "Rules:\n"
+    "1. value = ONLY the data, with label words and surrounding punctuation removed. "
+    "'first name John' -> value 'John'; 'policy # ABC-123' -> value 'ABC-123'; "
+    "'tell the driver gate code 4455' -> value 'gate code 4455'.\n"
+    "2. Use fn or ln ONLY when the message explicitly says first/last name. A bare "
+    "two-part name like 'John Doe' is name.\n"
+    "3. Never invent data. Keep the value exactly as given aside from trimming labels/"
+    "punctuation. Do not reformat, correct, translate, or complete it.\n"
+    "4. Voice transcripts may have odd spacing or hyphens in the label "
+    "('first  name john', 'first-name john') - still classify by meaning.\n"
+    "5. Return field 'unknown' (value '') when the message is a COMMAND or control "
+    "phrase rather than field data - e.g. submit / send it / dispatch / done, choose or "
+    "select a driver or group or dispatcher, run/check/decode the VIN, add/remove "
+    "insurance, cancel, restart - or when it is gibberish.\n"
+    "6. Output raw JSON only. No markdown, no commentary.\n\n"
+    "Examples:\n"
+    "'first name John' -> {\"field\":\"fn\",\"value\":\"John\"}\n"
+    "'last name Smith' -> {\"field\":\"ln\",\"value\":\"Smith\"}\n"
+    "'first  name john' -> {\"field\":\"fn\",\"value\":\"john\"}\n"
+    "'customer first name john' -> {\"field\":\"fn\",\"value\":\"john\"}\n"
+    "'John Doe' -> {\"field\":\"name\",\"value\":\"John Doe\"}\n"
+    "'midnight blue' -> {\"field\":\"col\",\"value\":\"midnight blue\"}\n"
+    "'blue' -> {\"field\":\"col\",\"value\":\"blue\"}\n"
+    "'2019 Honda Accord' -> {\"field\":\"car\",\"value\":\"2019 Honda Accord\"}\n"
+    "'Camry' -> {\"field\":\"car\",\"value\":\"Camry\"}\n"
+    "'geico' -> {\"field\":\"ins\",\"value\":\"geico\"}\n"
+    "'policy ABC123' -> {\"field\":\"pol\",\"value\":\"ABC123\"}\n"
+    "'732 555 1212' -> {\"field\":\"phone\",\"value\":\"732 555 1212\"}\n"
+    "'$500' -> {\"field\":\"price\",\"value\":\"$500\"}\n"
+    "'john@example.com' -> {\"field\":\"email\",\"value\":\"john@example.com\"}\n"
+    "'DL D1234567' -> {\"field\":\"dl\",\"value\":\"D1234567\"}\n"
+    "'12 Main St' -> {\"field\":\"addr\",\"value\":\"12 Main St\"}\n"
+    "'Newark NJ 07102' -> {\"field\":\"csz\",\"value\":\"Newark NJ 07102\"}\n"
+    "'deliver tomorrow 5pm' -> {\"field\":\"xtra\",\"value\":\"tomorrow 5pm\"}\n"
+    "'tell the driver gate code 4455' -> {\"field\":\"driver\",\"value\":\"gate code 4455\"}\n"
+    "'issuer note rush' -> {\"field\":\"issuer\",\"value\":\"rush\"}\n"
+    "'submit' -> {\"field\":\"unknown\",\"value\":\"\"}\n"
+    "'choose driver Kita' -> {\"field\":\"unknown\",\"value\":\"\"}\n"
+    "'run vin' -> {\"field\":\"unknown\",\"value\":\"\"}\n\n"
+    "MESSAGE:\n"
+)
 
-def classify_single_field_value(value: str) -> Optional[str]:
-    """AI-classify a single bare value into an inline edit-key (name/addr/phone/car/…),
-    or None when unconfigured / unclear. Used so typing a lead one field at a time
-    ('John Doe', then 'white', then '$200') lands each in the right field."""
-    v = (value or "").strip()
-    if not v:
+
+def classify_field_value(utterance: str) -> Optional[dict]:
+    """AI-classify one free-text/voice command into a review edit-key + cleaned value.
+
+    Returns {"field": <one of the 19 edit-keys or "unknown">, "value": <str>}, or None
+    when the API is unconfigured / errors / can't be parsed (caller then falls back to
+    the deterministic heuristics). "unknown" or an empty value collapses to
+    {"field": "unknown", "value": ""} so the caller shows the hint instead of guessing.
+    """
+    txt = (utterance or "").strip()
+    if not txt:
         return None
-    raw = _call_openai_text([{"role": "user", "content": SINGLE_FIELD_PROMPT + v[:200]}])
+    raw = _call_openai_text([{"role": "user", "content": FIELD_VALUE_PROMPT + txt[:400]}])
     if not raw:
         return None
-    token = re.sub(r"[^a-z_]", "", (raw.strip().split() or [""])[0].lower())
-    return _SINGLE_FIELD_TO_EK.get(token)
+    data = _parse_json_from_model(raw)
+    if not isinstance(data, dict):
+        return None
+    field_tok = re.sub(r"[^a-z_]", "", str(data.get("field") or "").strip().lower())
+    ek = _FIELD_VALUE_TO_EK.get(field_tok, "unknown")
+    value = str(data.get("value") or "").strip()
+    if ek == "unknown" or not value:
+        return {"field": "unknown", "value": ""}
+    return {"field": ek, "value": value}
 
 
 def classify_supervisor_command(user_message: str) -> Optional[dict]:

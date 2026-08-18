@@ -3048,12 +3048,6 @@ _REVIEW_EDIT_HINT = (
 )
 
 # Canonical label for each inline edit-key (to re-apply a single value as a labeled edit).
-_EK_TO_ALIAS = {
-    "name": "name", "addr": "address", "csz": "city state zip",
-    "daddr": "delivery address", "dcsz": "delivery city", "vin": "vin", "car": "car",
-    "col": "color", "ins": "insurance", "pol": "policy number", "xtra": "extra info",
-    "phone": "phone", "price": "price", "email": "email", "dl": "driver license",
-}
 _COMMON_COLORS = frozenset({
     "white", "black", "gray", "grey", "silver", "red", "blue", "green", "yellow",
     "orange", "brown", "gold", "beige", "tan", "maroon", "navy", "purple", "pink",
@@ -3093,10 +3087,14 @@ def _structured_value_ek(v: str):
         return "phone"
     # A street line: has a digit AND (a street-type word OR a comma), OR a leading
     # house number. A lone ZIP is NOT enough — 'Fort Lee NJ 07024' is city/state/zip,
-    # so leave that to the AI classifier.
-    if re.search(r"\d", v) and (_STREET_RE.search(v) or "," in v):
+    # so leave that to the AI classifier. Guard against a year+make ('2019 Honda
+    # Accord') claiming the address slot: an explicit street token still wins, but a
+    # bare leading number / comma does NOT when the value looks like a vehicle.
+    looks_vehicle = bool(_CAR_MAKE_RE.search(v) or re.search(r"\b(19|20)\d{2}\b", v))
+    if re.search(r"\d", v) and _STREET_RE.search(v):
         return "addr"
-    if re.match(r"^\s*\d+\s+[A-Za-z]", v):
+    if not looks_vehicle and (("," in v and re.search(r"\d", v))
+                              or re.match(r"^\s*\d+\s+[A-Za-z]", v)):
         return "addr"
     return None
 
@@ -3112,30 +3110,82 @@ def _alpha_value_ek_heuristic(v: str):
     # 'Fort Lee NJ 07024' — a ZIP with words but no street token → city/state/zip.
     if re.search(r"\b\d{5}\b", v) and not _STREET_RE.search(v) and re.search(r"[A-Za-z]", v):
         return "csz"
-    if re.search(r"\b(19|20)\d{2}\b", v) or _CAR_MAKE_RE.search(v):
+    if _CAR_MAKE_RE.search(v):
+        return "car"
+    # A leading year-range number + a word is ambiguous (house number vs model year).
+    # With no car-make word to confirm a vehicle, default it to registration address in
+    # this no-AI fallback — matches the old deterministic behavior ('2015 Broadway').
+    if re.match(r"^\s*(?:19|20)\d{2}\s+[A-Za-z]", v):
+        return "addr"
+    if re.search(r"\b(19|20)\d{2}\b", v):
         return "car"
     if 1 <= len(words) <= 4 and re.fullmatch(r"[A-Za-z][A-Za-z.'\-]*(?:\s+[A-Za-z][A-Za-z.'\-]*){0,3}", v):
         return "name"
     return None
 
 
-async def _smart_place_single_value(state_data: dict, value: str) -> list:
-    """Place one bare value ('John Doe', 'white', '$200', '555-…') into the best field
-    and return the changed labels (or [] if it couldn't be placed). Strong signals win
-    first; then the AI classifier (smarter); then name/color/car heuristics."""
-    ek = _structured_value_ek(value)
-    if ek is None and Config.is_ai_vision_configured():
-        try:
-            ek = await asyncio.to_thread(ai_vision.classify_single_field_value, value)
-        except Exception as e:
-            logger.warning("single-field AI classify failed: %s", e)
-            ek = None
-    if ek is None:
-        ek = _alpha_value_ek_heuristic(value)
-    alias = _EK_TO_ALIAS.get(ek) if ek else None
-    if not alias:
+def _apply_ek_value(state_data: dict, ek: str, value: str) -> list:
+    """Apply ONE already-classified (edit_key, value) to the review and return the human
+    label(s) that actually changed ([] on no-op / rejected / unknown key). Direct writer
+    used by _smart_place_single_value instead of re-parsing 'alias value' (which could
+    mis-split a mangled label back into the wrong field)."""
+    if ek not in _INLINE_EDIT_KEY_LABEL:          # not one of the 19 review fields
         return []
-    return _apply_inline_review_text(state_data, f"{alias} {value}")
+    # Same per-field validation/normalization the labeled path uses ('500' -> '$500',
+    # phone needs >=10 digits, email needs '@', …). Returns '' when the value doesn't
+    # fit the field, so a mis-guess is dropped instead of written.
+    value = _clean_inline_value(ek, (value or "").strip())
+    if not value:
+        return []
+    sk = _INLINE_EK_STATE_KEY[ek]                 # tracked state key (fn/ln -> "name")
+    def _norm(s: str) -> str:                     # compare content, not case/spacing
+        return re.sub(r"\s+", " ", str(s or "")).strip().lower()
+    before = _norm(state_data.get(sk))
+    if ek == "name":
+        parts = value.split()
+        _set_full_name(state_data, parts[0], " ".join(parts[1:]))
+    else:
+        _apply_single_phase1_edit(state_data, ek, value)
+    # Same post-processing the labeled-edit path runs, so phone/price/vin/address are
+    # normalized and a rejected value never reports a false change.
+    _apply_single_address_as_both(state_data)
+    _clean_vin_and_car(state_data)
+    _sanitize_phase1_pending_phone_price(state_data)
+    now = str(state_data.get(sk) or "").strip()
+    # Case/whitespace-insensitive diff — the applied value is re-normalized on write
+    # (e.g. colors title-cased), so a pure re-normalization is not a real change.
+    if now and now != "-" and _norm(now) != before:
+        return [_INLINE_EDIT_KEY_LABEL.get(ek, ek)]
+    return []
+
+
+async def _smart_place_single_value(state_data: dict, value: str) -> list:
+    """Place one free-text/voice value ('first name John', 'white', '$200', '555-…') into
+    the best field and return the changed labels (or [] if it couldn't be placed).
+    Order: deterministic strong signals → AI {field,value} classifier → name/color/car
+    heuristic fallback (only when the AI is unavailable)."""
+    # (a) FAST-PATH: unambiguous structured signals apply instantly, no AI round-trip.
+    ek = _structured_value_ek(value)
+    if ek:
+        return _apply_ek_value(state_data, ek, value)
+    # (b) AI: choose among all 19 fields AND return the label-stripped value.
+    if Config.is_ai_vision_configured():
+        try:
+            res = await asyncio.to_thread(ai_vision.classify_field_value, value)
+        except Exception as e:
+            logger.warning("field-value AI classify failed: %s", e)
+            res = None
+        if isinstance(res, dict):
+            ek2 = res.get("field")
+            if ek2 and ek2 != "unknown":
+                return _apply_ek_value(state_data, ek2, str(res.get("value") or ""))
+            if ek2 == "unknown":
+                return []          # AI is confident it's a command/gibberish → hint
+    # (c) FALLBACK: AI unconfigured/errored → deterministic alpha heuristic, orig value.
+    ek3 = _alpha_value_ek_heuristic(value)
+    if ek3:
+        return _apply_ek_value(state_data, ek3, value)
+    return []
 
 
 # A phrase that looks like a (mis-typed / mis-heard) COMMAND — never smart-place it as
