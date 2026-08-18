@@ -2510,6 +2510,33 @@ async def _send_phase1_ai_review(target_message, state_data: dict, context, user
     context.user_data["review_chat_id"] = msg.chat_id
 
 
+async def _repost_review_card(target_message, state_data: dict, context, user_id) -> None:
+    """Re-post the review card from EXISTING lead data (used to RESTORE an orphaned card
+    after the bot's in-memory conversation state was lost on a restart / redeploy). Unlike
+    _send_phase1_ai_review it PRESERVES any dispatch selections already chosen — only
+    filling in defaults that are missing — and re-establishes the live review_message_id so
+    the very next inline edit updates this fresh card in place."""
+    if not state_data.get("selected_group_name"):
+        groups = [g for g in db.get_all_groups() if record_is_active(g)]
+        state_data["selected_group_id"] = "all" if groups else None
+        state_data["selected_group_name"] = "All Dispatchers" if groups else "None"
+    if not state_data.get("selected_driver_names"):
+        drivers = [d for d in _get_all_drivers_cached() if record_is_active(d)]
+        suspended = _get_suspended_driver_ids()
+        eligible = [d for d in drivers if str(d.get("id")) not in suspended]
+        state_data["selected_driver_ids"] = [d["id"] for d in eligible] if eligible else []
+        state_data["selected_driver_names"] = "All Drivers" if eligible else "None"
+    if not state_data.get("selected_source_label"):
+        state_data["selected_source_label"] = _default_phase1_review_source_label()
+    db.set_user_state(user_id, "phase1", state_data)
+    msg = await target_message.reply_text(
+        _format_phase1_ai_review_text(state_data),
+        reply_markup=_build_review_keyboard_with_selections(state_data),
+    )
+    context.user_data["review_message_id"] = msg.message_id
+    context.user_data["review_chat_id"] = msg.chat_id
+
+
 async def _continue_phase1_after_ai_review(message, context: ContextTypes.DEFAULT_TYPE, user_id: int) -> int:
     """After user accepts AI interpretation (or finishes edits): VIN check → missing fields → files."""
     state = db.get_user_state(user_id)
@@ -3954,6 +3981,18 @@ async def handle_idle_lead_start(update: Update, context: ContextTypes.DEFAULT_T
         return None  # ignore — don't start a lead from greetings/acks
     user_id = update.effective_user.id
     username = update.effective_user.username or "Unknown"
+    # RE-ENTRY (restart-safe): if the DB still holds an active "phase1" lead but PTB's
+    # in-memory conversation was lost (redeploy / process restart / multi-worker), this
+    # text/voice is an inline REVIEW EDIT on an orphaned card — NOT a new lead and NOT a
+    # supervisor command. Restore the card from the saved data and route the edit into the
+    # review handler, re-establishing STATE_AI_REVIEW. Without this, control fell through to
+    # _begin_lead_flow which wiped the card to empty (the "it does nothing / stays -" bug).
+    if not _cancel_restart_kind(text):  # let "restart"/"cancel" keep their own handling below
+        _active = db.get_user_state(user_id)
+        if _active and _active.get("state") == "phase1":
+            await _repost_review_card(msg, dict(_active.get("data") or {}), context, user_id)
+            await handle_phase1_review_message(update, context)
+            return STATE_AI_REVIEW
     # A global supervisor can talk to the bot (ask about data, toggle settings,
     # enable/disable a group or driver, broadcast) instead of starting a lead.
     if _user_is_global_supervisor(user_id):

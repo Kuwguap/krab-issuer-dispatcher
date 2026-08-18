@@ -277,6 +277,42 @@ class SmartPlaceRoutingTest(unittest.TestCase):
         self.assertIn(store["data"]["color"], ("Red", "RED"))        # color is its own field
         self.assertEqual(store["data"]["insurance_policy_number"], "267112")  # phone NOT absorbed
 
+    def test_restart_reentry_restores_orphaned_review_card(self):
+        # After a redeploy, PTB's in-memory conversation is gone but the DB still holds the
+        # "phase1" lead. A text/voice edit must RESTORE the card and apply the edit, NOT
+        # fall through and wipe it. Verify handle_idle_lead_start re-enters STATE_AI_REVIEW.
+        import types
+        db_row = {"state": "phase1", "data": {k: "-" for k in _STATE_KEYS}}
+        with mock.patch.object(bot.db, "get_user_state", lambda uid: dict(db_row)), \
+             mock.patch.object(bot.db, "set_user_state", lambda uid, s, d: db_row.update(state=s, data=dict(d))), \
+             mock.patch.object(bot.db, "get_all_groups", lambda: [{"id": "g1", "group_name": "A"}]), \
+             mock.patch.object(bot, "record_is_active", lambda x: True), \
+             mock.patch.object(bot, "_get_all_drivers_cached", lambda: [{"id": "d1", "driver_name": "K"}]), \
+             mock.patch.object(bot, "_get_suspended_driver_ids", lambda: set()), \
+             mock.patch.object(bot, "_user_is_global_supervisor", lambda uid: True):
+            class B:
+                async def send_message(self, chat_id, text, reply_markup=None, parse_mode=None):
+                    return types.SimpleNamespace(message_id=1, chat_id=chat_id)
+                async def edit_message_text(self, **k): pass
+                async def edit_message_reply_markup(self, **k): pass
+                async def delete_message(self, **k): pass
+            class M:
+                _n = 100
+                def __init__(self, t):
+                    M._n += 1; self.text = t; self.caption = None; self.photo = None
+                    self.document = None; self.voice = None; self.chat_id = 42; self.message_id = M._n
+                async def reply_text(self, t, reply_markup=None, parse_mode=None):
+                    m = M(t); return m
+                async def delete(self): pass
+            ctx = types.SimpleNamespace(bot=B(), user_data={}, args=[])
+            m = M("Name John Doe")
+            upd = types.SimpleNamespace(message=m, effective_message=m,
+                effective_user=types.SimpleNamespace(id=7, username="jb"),
+                effective_chat=types.SimpleNamespace(id=42, type="private"))
+            ret = asyncio.run(bot.handle_idle_lead_start(upd, ctx))
+        self.assertEqual(ret, bot.STATE_AI_REVIEW)            # conversation re-armed
+        self.assertEqual(db_row["data"].get("name"), "John Doe")  # edit applied, card not wiped
+
     def test_apply_ek_value_edge_cases(self):
         # unknown edit-key → no-op
         self.assertEqual(bot._apply_ek_value(_fresh_state(), "bogus", "x"), [])
