@@ -667,14 +667,21 @@ def extract_structured_from_pdf(pdf_bytes: bytes) -> Optional[str]:
 
 
 PLATE_READ_PROMPT = (
-    "This image shows a temporary vehicle tag / paper license plate. Read the single "
-    "main plate (tag) number printed on it. New Jersey RESIDENT temp tags look like "
-    "H###### (the letter H followed by digits); NON-RESIDENT tags look like ######V "
-    "(digits followed by the letter V). Reply with ONLY a JSON object exactly like "
-    '{"plate": "H553300", "number": "553300", "kind": "resident"}. '
-    "Rules: number = the digits only, no letters; kind = \"resident\" if the tag starts "
-    "with H, \"nonresident\" if it ends with V, otherwise \"unknown\". If you cannot "
-    "clearly read a plate, use empty strings and kind \"unknown\"."
+    "First decide whether this image is a TEMPORARY VEHICLE TAG / paper license plate — a "
+    "temporary registration tag showing a big plate number (New Jersey RESIDENT tags look "
+    "like H###### — the letter H then digits; NON-RESIDENT tags look like ######V — digits "
+    "then the letter V).\n"
+    "Reply with ONLY a JSON object exactly like "
+    '{"is_temp_tag": true, "plate": "H553300", "number": "553300", "kind": "resident"}.\n'
+    "Rules:\n"
+    "- If the image is NOT a temporary vehicle tag — e.g. a driver's license, a vehicle "
+    "title, an insurance/ID card, a receipt, a photo of a car, or any other document — reply "
+    'EXACTLY {"is_temp_tag": false, "plate": "", "number": "", "kind": "unknown"} and read '
+    "NOTHING. Do NOT guess a plate number from a license, title, or receipt.\n"
+    "- If it IS a temp tag: number = the main plate digits only (no letters); kind = "
+    '"resident" if it starts with H, "nonresident" if it ends with V, otherwise "unknown".\n'
+    "- If it clearly is a temp tag but you cannot read the number, use is_temp_tag true with "
+    "an empty number."
 )
 
 
@@ -717,6 +724,10 @@ def extract_plate_number_from_image(image_bytes: bytes, mime_type: str = "image/
         return None
     data = _parse_json_from_model(raw)
     if not isinstance(data, dict):
+        return None
+    # The model explicitly says this is NOT a temp tag (a license / title / receipt / other
+    # image) → read nothing, so a mid-lead title/license photo is never mistaken for a plate.
+    if data.get("is_temp_tag") is False:
         return None
     number = re.sub(r"\D", "", str(data.get("number") or ""))
     plate = str(data.get("plate") or "").strip()

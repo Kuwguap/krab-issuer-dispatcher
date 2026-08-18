@@ -4009,6 +4009,15 @@ async def handle_idle_lead_start(update: Update, context: ContextTypes.DEFAULT_T
     if _cr == "restart":
         return await _begin_lead_flow_with_review(context, user_id, username, msg)
     if _cr == "cancel":
+        # An orphaned "phase1" card (restart) can't be cancelled via the review handler
+        # because the conversation is gone — clear the saved lead here so it doesn't come
+        # back on the next message.
+        _act = db.get_user_state(user_id)
+        if _act and _act.get("state") == "phase1":
+            db.clear_user_state(user_id)
+            _clear_lead_conversation_user_data(context)
+            await msg.reply_text("✅ Cancelled — the lead was cleared. Send the info to start a new tag.")
+            return ConversationHandler.END
         await msg.reply_text("Nothing to cancel — say “new client” or send the info to start a tag.")
         return ConversationHandler.END
     # Bare trigger word ("start", "lead", "new client", "new entry", "tag") → empty
@@ -4520,30 +4529,36 @@ def _user_in_active_conversation(update: Update, context: ContextTypes.DEFAULT_T
 
 
 async def handle_supervisor_plate_image(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Idle supervisor photo/PDF → read the temp-tag number and stage a plate-counter
-    update. Any image or PDF a supervisor sends (or forwards) while idle is treated as a
-    tag to read — no need to say 'read from a picture' first — and nothing is written
-    until they tap Confirm. Registered AFTER the lead/receipt conversations, so images
-    sent mid-lead go to the lead and are never seen here; only truly-idle supervisor
-    images reach this handler."""
+    """Supervisor photo/PDF → read a temp-tag number and stage a plate-counter update —
+    works in ANY state. Registered at group -1 (before every conversation), it reads the
+    image FIRST: if the AI finds a temp-tag number it stages the update and stops; if it's
+    NOT a tag (e.g. a lead's title/license image sent mid-lead) it returns so the update
+    flows on to the active conversation's own image handler. Nothing is written until the
+    supervisor taps Confirm."""
     msg = update.effective_message
     if not msg or not update.effective_user:
+        return
+    if getattr(msg, "chat", None) is not None and msg.chat.type != "private":
+        return
+    if not (getattr(msg, "photo", None) or getattr(msg, "document", None)):
         return
     user_id = update.effective_user.id
     if not _user_is_global_supervisor(user_id):
         return
-    # Only read images sent while genuinely idle. If they're inside any flow (lead,
-    # receipt, appeal…), even a text-only sub-state that would ignore this photo, leave
-    # it alone so we never hijack an in-progress conversation.
-    if _user_in_active_conversation(update, context):
-        return
-    # If a "change <counter> → what's the update?" ask is pending, an image answer
-    # sets THAT specific counter; otherwise we auto-detect resident/non-resident from
-    # the tag's H/V. Clear the old "send me the photo" arming either way.
+    # Peek (don't consume yet) at an armed "update <counter> from image" request.
+    _pfu = context.user_data.get("router_plate_followup")
     forced_col = None
-    _pfu = context.user_data.pop("router_plate_followup", None)
     if _pfu and (time.time() - float(_pfu.get("ts") or 0)) <= _ROUTER_FOLLOWUP_TTL_SEC:
         forced_col = _pfu.get("col")
+    # DEFER a photo sent inside a LIVE lead/receipt conversation to that flow's own image
+    # handler (title/license attach, receipt) — BEFORE any download or AI call, so a legit
+    # lead image is never read as a tag or hijacked. Unless a plate update was explicitly
+    # armed (forced_col). After a restart the in-memory conversation is gone, so an
+    # orphaned-lead / idle plate photo is still read here — "no matter the state".
+    if not forced_col and _user_in_active_conversation(update, context):
+        return
+    # Reading it as a tag now → consume the arming.
+    context.user_data.pop("router_plate_followup", None)
     context.user_data.pop("router_image_followup", None)
 
     img_bytes, mime = await _download_update_image_bytes(update, context)
@@ -13283,9 +13298,10 @@ def main():
 
     application.add_handler(conv_handler)
 
-    # Supervisor plate-from-image reader: an idle photo/PDF only gets read when the
-    # supervisor armed "read from a picture" or captioned it that way. Registered
-    # AFTER conv_handler so active lead/receipt conversations get their images first.
+    # Supervisor plate-from-image reader — works in ANY state (like voice). At group -1 it
+    # inspects a supervisor's photo/PDF FIRST: if the AI reads a temp-tag number it stages a
+    # plate-counter update and stops; if it's NOT a tag (a lead's title/license image) it
+    # returns so the image flows on to the active conversation's own handler.
     _plate_img_filter = (
         filters.PHOTO
         | filters.Document.MimeType("application/pdf")
@@ -13297,7 +13313,8 @@ def main():
         MessageHandler(
             _plate_img_filter & filters.ChatType.PRIVATE & ~filters.COMMAND,
             handle_supervisor_plate_image,
-        )
+        ),
+        group=-1,
     )
 
     # Voice notes work EVERYWHERE: group -1 runs before every conversation handler,
