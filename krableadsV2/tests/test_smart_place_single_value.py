@@ -219,6 +219,16 @@ class SmartPlaceRoutingTest(unittest.TestCase):
         bot._merge_phase1_adjust(sd2, block, only_empty=False)
         self.assertEqual(sd2["name"], "John Damien")
 
+    def test_normalizer_strips_markdown_code_fence(self):
+        # Models sometimes wrap the 17-line block in ```...``` — the fence must be
+        # stripped, not leaked into the first field (name).
+        block = "```\nJohn Damien\n123 Main St\n```"
+        out = bot._normalize_ai_phase1_text(block)
+        self.assertNotIn("```", out)
+        self.assertTrue(out.splitlines()[0].startswith("John"))
+        # ```json fence variant too
+        self.assertNotIn("```", bot._normalize_ai_phase1_text("```json\nJane\n```"))
+
     def test_anchor_set_excludes_value_words(self):
         # A single address VALUE must not accumulate spurious anchors → stays single-field.
         self.assertLess(bot._count_field_anchors("123 Price Street, Kansas City"), 3)

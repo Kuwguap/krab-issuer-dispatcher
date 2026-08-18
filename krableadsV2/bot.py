@@ -3646,9 +3646,11 @@ async def handle_phase1_review_message(update: Update, context: ContextTypes.DEF
 
     # 0b. A whole lead spoken/typed in ONE single-line message that names several fields
     #     (a voice dictation: "Name John … Address 123 … VIN … Car … Colour Red …") goes
-    #     STRAIGHT to the AI extractor — the strict labeled parser below would greedily
-    #     mis-split messy dictation (absorbing 'Colour Red' into car, a phone into the
-    #     policy). Fill-only-empty so it can never clobber data already on the card.
+    #     STRAIGHT to the AI extractor. The strict labeled parser below can't handle a
+    #     multi-field message with no separators — it greedily absorbs everything into the
+    #     first field (name) or mis-splits values — so a >=3-label message is routed here
+    #     instead. Fill-only-empty so it can never clobber data already on the card; a
+    #     single-field edit ("color blue" / "first name John") stays <3 and is unaffected.
     #     (Multi-line pastes / VIN blocks keep their existing spot at step 3a.)
     if ("\n" not in text) and not _extract_vin_17(text) and _count_field_anchors(text) >= 3:
         result = await handle_phase1_adjust_input(update, context, fill_only_empty=True)
@@ -4708,10 +4710,15 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
 
 
 def _normalize_ai_phase1_text(text: str) -> str:
-    """Strip optional leading 'N) ' from each line so parse_phase1_structured gets clean lines."""
+    """Strip optional leading 'N) ' and any markdown code fences so parse_phase1_structured
+    gets clean lines (models sometimes wrap the 17-line block in ```...``` — otherwise the
+    fence leaks into the first field, e.g. name '```')."""
     lines = []
     for line in text.splitlines():
         line = line.strip()
+        # Drop a whole-line markdown fence (``` or ```json / ```text).
+        if re.fullmatch(r"`{3,}[a-zA-Z]*", line):
+            continue
         # Remove leading "1) ", "2) ", ... "11) "
         line = re.sub(r"^\d{1,2}\)\s*", "", line).strip()
         lines.append(line)
