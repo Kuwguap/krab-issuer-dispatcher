@@ -331,6 +331,7 @@ async def cmd_whoami(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         f"• Chat: {chat_type}",
         f"• Supervisor / AI mode: {'✅ enabled' if is_sup else '❌ not a supervisor'}",
         f"• AI image reading: {'✅ on' if ai_on else '❌ OPENAI_API_KEY not set'}",
+        f"• Build: <code>{(os.environ.get('RENDER_GIT_COMMIT') or 'local')[:7]}</code>",
     ]
     if not is_sup:
         lines += [
@@ -3626,6 +3627,18 @@ async def handle_phase1_review_message(update: Update, context: ContextTypes.DEF
     photos, PDFs, and anything not recognized as a labeled edit go through the same
     AI parser as the '🖼 Adjust from image/text' button."""
     message = update.message
+    # SELF-HEAL: the live card id lives in context.user_data, which is RAM-only and wiped on
+    # a process restart / redeploy. If it's gone but the DB still holds the "phase1" lead,
+    # re-post the card here so THIS edit has a live card to update in place (otherwise
+    # _update_review_message_text silently no-ops and the edit "does nothing"). This makes
+    # the handler work no matter how it was reached (normal state OR restart re-entry).
+    if message and not context.user_data.get("review_message_id") and update.effective_user:
+        try:
+            _st = db.get_user_state(update.effective_user.id)
+            if _st and _st.get("state") == "phase1":
+                await _repost_review_card(message, dict(_st.get("data") or {}), context, update.effective_user.id)
+        except Exception as e:
+            logger.warning("review card self-heal failed: %s", e)
     if message and (message.photo or message.document):
         # ONE behavior for every image/PDF: read it for fields, keep it visible, and
         # include it with the dispatch. No mode toggle, no second button.
