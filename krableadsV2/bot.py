@@ -2271,6 +2271,7 @@ async def _update_review_message_text(context, state_data):
     chat_id = context.user_data.get("review_chat_id")
     mid = context.user_data.get("review_message_id")
     if not chat_id or not mid:
+        logger.info("🔎DIAG update_review NO-OP: chat=%s mid=%s (ids missing)", chat_id, mid)
         return
     new_text = _format_phase1_ai_review_text(state_data)
     try:
@@ -2280,8 +2281,9 @@ async def _update_review_message_text(context, state_data):
             text=new_text,
             reply_markup=_build_review_keyboard_with_selections(state_data),
         )
+        logger.info("🔎DIAG update_review EDITED chat=%s mid=%s", chat_id, mid)
     except Exception as e:
-        logger.warning("Could not update review text: %s", e)
+        logger.info("🔎DIAG update_review EDIT FAILED chat=%s mid=%s: %s", chat_id, mid, e)
 
 async def _update_review_text(context, state_data):
     # Only updates the text, not the keyboard (used in some places)
@@ -3655,6 +3657,9 @@ async def handle_phase1_review_message(update: Update, context: ContextTypes.DEF
 
     user_id = update.effective_user.id
     state = db.get_user_state(user_id)
+    logger.info("🔎DIAG review_msg uid=%s text=%r has_review_id=%s db_state=%s data_empty=%s",
+                user_id, text[:60], bool(context.user_data.get("review_message_id")),
+                (state or {}).get("state"), not bool((state or {}).get("data")))
     if not state or not state.get("data"):
         await message.reply_text("❌ Data lost. Please start over with /start")
         return ConversationHandler.END
@@ -3994,6 +3999,13 @@ async def handle_idle_lead_start(update: Update, context: ContextTypes.DEFAULT_T
         return None  # ignore — don't start a lead from greetings/acks
     user_id = update.effective_user.id
     username = update.effective_user.username or "Unknown"
+    try:
+        _dbg = db.get_user_state(user_id)
+        logger.info("🔎DIAG idle_lead_start uid=%s text=%r db_state=%s data_keys=%s",
+                    user_id, text[:60], (_dbg or {}).get("state"),
+                    list((_dbg or {}).get("data") or {})[:6])
+    except Exception as _e:
+        logger.info("🔎DIAG idle_lead_start uid=%s text=%r db_state=ERR %s", user_id, text[:60], _e)
     # RE-ENTRY (restart-safe): if the DB still holds an active "phase1" lead but PTB's
     # in-memory conversation was lost (redeploy / process restart / multi-worker), this
     # text/voice is an inline REVIEW EDIT on an orphaned card — NOT a new lead and NOT a
@@ -4003,9 +4015,16 @@ async def handle_idle_lead_start(update: Update, context: ContextTypes.DEFAULT_T
     if not _cancel_restart_kind(text):  # let "restart"/"cancel" keep their own handling below
         _active = db.get_user_state(user_id)
         if _active and _active.get("state") == "phase1":
-            await _repost_review_card(msg, dict(_active.get("data") or {}), context, user_id)
-            await handle_phase1_review_message(update, context)
+            logger.info("🔎DIAG re-entry FIRED uid=%s text=%r -> restoring review card", user_id, text[:60])
+            try:
+                await _repost_review_card(msg, dict(_active.get("data") or {}), context, user_id)
+                await handle_phase1_review_message(update, context)
+            except Exception as _e:
+                logger.exception("🔎DIAG re-entry CRASHED: %s", _e)
+                await msg.reply_text(f"⚠️ (diag) re-entry error: {type(_e).__name__}: {_e}")
             return STATE_AI_REVIEW
+        logger.info("🔎DIAG re-entry SKIPPED uid=%s db_state=%s (not phase1) -> falling through",
+                    user_id, (_active or {}).get("state"))
     # A global supervisor can talk to the bot (ask about data, toggle settings,
     # enable/disable a group or driver, broadcast) instead of starting a lead.
     if _user_is_global_supervisor(user_id):
