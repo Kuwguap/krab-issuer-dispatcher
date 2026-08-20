@@ -49,12 +49,19 @@ def add_cors_headers(response):
 
 @app.route("/api/health", methods=["GET"])
 def api_health():
-    """Health check for Render / monitoring."""
+    """Health check for Render / monitoring.
+
+    Reports the deployed commit so "is my fix actually live?" is answerable without
+    sending a message: every service in render.yaml deploys from the same push, so
+    this commit is the one the bot worker is running too. Several rounds of bot fixes
+    were debugged blind because nothing exposed the running build.
+    """
     from config import Config
 
     return jsonify({
         "ok": True,
         "service": "krab-issuer-admin",
+        "commit": (os.environ.get("RENDER_GIT_COMMIT") or "local")[:7],
         "lead_ingest_configured": Config.is_lead_ingest_configured(),
     })
 
