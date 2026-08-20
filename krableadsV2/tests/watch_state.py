@@ -18,7 +18,12 @@ WATCHED = ("name", "pending_price", "color", "car", "address", "city_state_zip",
 
 
 def snapshot(client, user_id):
-    r = client.table("states").select("*").eq("user_id", user_id).execute()
+    """Read the row, tolerating a transient network blip (returns None to skip a tick)."""
+    try:
+        r = client.table("states").select("*").eq("user_id", user_id).execute()
+    except Exception as e:
+        print(f"  (transient read error, retrying: {type(e).__name__})", flush=True)
+        return None
     if not r.data:
         return ("<no row>", {})
     row = r.data[0]
@@ -28,13 +33,19 @@ def snapshot(client, user_id):
 
 def main(user_id, seconds):
     client = create_client(ENV["SUPABASE_URL"], ENV["SUPABASE_KEY"])
-    prev = snapshot(client, user_id)
+    prev = None
+    while prev is None:
+        prev = snapshot(client, user_id)
+        if prev is None:
+            time.sleep(3)
     print(f"watching user {user_id} for {seconds}s")
     print(f"  start: state={prev[0]!r} {prev[1]}", flush=True)
     deadline = time.time() + seconds
     while time.time() < deadline:
         time.sleep(6)
         cur = snapshot(client, user_id)
+        if cur is None:
+            continue                      # blip — keep watching
         if cur != prev:
             changed = {k: v for k, v in cur[1].items() if v != prev[1].get(k)}
             print(f"  CHANGE state={cur[0]!r} -> {changed}", flush=True)
