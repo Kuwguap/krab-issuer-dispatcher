@@ -2,6 +2,7 @@
 import logging
 import re
 import secrets
+import time
 from supabase import create_client, Client
 from config import Config
 from typing import Optional, Dict, Any
@@ -74,10 +75,16 @@ class Database:
         self._error_logged = False
     
     def _check_tables_exist(self) -> bool:
-        """Check if required tables exist in the database."""
+        """Check if required tables exist in the database.
+
+        Only a DEFINITIVE "table missing" answer is cached. A transient failure
+        (network blip / timeout right after a cold start) must not poison the
+        cache: it used to cache False for the process lifetime, silently killing
+        every state read/write — orphaned review cards, "Data lost", edits that
+        do nothing — until the next redeploy."""
         if self._tables_checked:
             return self._tables_exist
-        
+
         try:
             # Try a simple query to check if tables exist
             self.client.table("states").select("user_id").limit(1).execute()
@@ -86,60 +93,77 @@ class Database:
             return True
         except Exception as e:
             error_msg = str(e)
-            if ("Could not find the table" in error_msg or "PGRST205" in error_msg) and not self._error_logged:
-                logger.error(
-                    "\n" + "="*60 + "\n"
-                    "DATABASE ERROR: Tables not found!\n\n"
-                    "Please run the SQL schema from 'database/schema.sql' in your Supabase SQL Editor.\n"
-                    "Go to: https://supabase.com/dashboard -> Your Project -> SQL Editor\n"
-                    "="*60
-                )
-                self._error_logged = True
-            self._tables_checked = True
-            self._tables_exist = False
-            return False
+            if "Could not find the table" in error_msg or "PGRST205" in error_msg:
+                if not self._error_logged:
+                    logger.error(
+                        "\n" + "="*60 + "\n"
+                        "DATABASE ERROR: Tables not found!\n\n"
+                        "Please run the SQL schema from 'database/schema.sql' in your Supabase SQL Editor.\n"
+                        "Go to: https://supabase.com/dashboard -> Your Project -> SQL Editor\n"
+                        "="*60
+                    )
+                    self._error_logged = True
+                self._tables_checked = True
+                self._tables_exist = False
+                return False
+            # Transient — don't cache; let the real query run (it has its own
+            # error handling) and re-probe on the next call.
+            logger.warning(f"Table check failed transiently (will retry): {e}")
+            return True
     
     def get_user_state(self, user_id: int) -> Optional[Dict[str, Any]]:
-        """Get the current state for a user."""
+        """Get the current state for a user.
+
+        One quick retry on transient errors: a lost read here is indistinguishable
+        from "no lead" to the bot, which then wipes or restarts a live review card."""
         if not self._check_tables_exist():
             return None
-        
-        try:
-            response = self.client.table("states").select("*").eq("user_id", user_id).execute()
-            if response.data:
-                return response.data[0]
-            return None
-        except Exception as e:
-            error_msg = str(e)
-            if "Could not find the table" not in error_msg and "PGRST205" not in error_msg:
+
+        for attempt in (0, 1):
+            try:
+                response = self.client.table("states").select("*").eq("user_id", user_id).execute()
+                if response.data:
+                    return response.data[0]
+                return None
+            except Exception as e:
+                error_msg = str(e)
+                if "Could not find the table" in error_msg or "PGRST205" in error_msg:
+                    return None
+                if attempt == 0:
+                    time.sleep(0.4)
+                    continue
                 logger.error(f"Error getting user state: {e}")
-            return None
+        return None
     
     def set_user_state(self, user_id: int, state: str, data: Optional[Dict[str, Any]] = None) -> bool:
-        """Set or update the state for a user."""
+        """Set or update the state for a user.
+
+        One quick retry on transient errors — a silently dropped write here loses
+        the user's just-applied review edit."""
         if not self._check_tables_exist():
             return False
-        
-        try:
-            state_data = {
-                "user_id": user_id,
-                "state": state,
-                "data": data or {}
-            }
-            
-            # Try to update first
-            existing = self.get_user_state(user_id)
-            if existing:
-                self.client.table("states").update(state_data).eq("user_id", user_id).execute()
-            else:
-                self.client.table("states").insert(state_data).execute()
-            
-            return True
-        except Exception as e:
-            error_msg = str(e)
-            if "Could not find the table" not in error_msg and "PGRST205" not in error_msg:
+
+        state_data = {
+            "user_id": user_id,
+            "state": state,
+            "data": data or {}
+        }
+        for attempt in (0, 1):
+            try:
+                # Single atomic upsert on the user_id PK — the old read-then-write
+                # turned a transient read failure into a PK-violating INSERT that
+                # silently lost the edit (the card then "reverted" after a restart).
+                self.client.table("states").upsert(state_data, on_conflict="user_id").execute()
+                return True
+            except Exception as e:
+                error_msg = str(e)
+                if "Could not find the table" in error_msg or "PGRST205" in error_msg:
+                    return False
+                if attempt == 0:
+                    time.sleep(0.4)
+                    continue
                 logger.error(f"Error setting user state: {e}")
-            return False
+        return False
     
     def clear_user_state(self, user_id: int) -> bool:
         """Clear the state for a user."""

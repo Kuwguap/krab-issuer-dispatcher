@@ -2672,26 +2672,24 @@ def _clean_vin_and_car(state_data: dict) -> None:
     co = state_data.get("color")
     if co is not None and str(co).strip() and str(co).strip() != "-":
         state_data["color"] = ai_vision.normalize_phase1_color(str(co))
-    # Rebuild derived fields
+    # Rebuild derived fields. Every line is coerced to a string with a "-" fallback:
+    # a card that is still EMPTY (only dispatch selections saved, no field keys yet)
+    # has these keys MISSING, and joining a None crashed the whole edit — the handler
+    # died mid-apply and the typed edit silently did nothing.
     vehicle_lines = [
-        state_data.get("name"),
-        state_data.get("address"),
-        state_data.get("city_state_zip"),
-        state_data.get("delivery_address") or "-",
-        state_data.get("delivery_city_state_zip") or "-",
-        state_data.get("vin"),
-        state_data.get("car"),
-        state_data.get("color"),
-        state_data.get("insurance_company"),
-        state_data.get("insurance_policy_number"),
-        state_data.get("extra_info"),
+        str(state_data.get(k) or "-")
+        for k in (
+            "name", "address", "city_state_zip", "delivery_address",
+            "delivery_city_state_zip", "vin", "car", "color",
+            "insurance_company", "insurance_policy_number", "extra_info",
+        )
     ]
     state_data["vehicle_details"] = "\n".join(vehicle_lines)
     delivery_lines = [
         state_data.get("delivery_address"),
         state_data.get("delivery_city_state_zip"),
     ]
-    state_data["delivery_details"] = "\n".join([l for l in delivery_lines if l])
+    state_data["delivery_details"] = "\n".join([str(l) for l in delivery_lines if l])
 
 
 _PHASE1_ADJUST_FIELD_ORDER = (
@@ -3637,7 +3635,7 @@ async def handle_phase1_review_message(update: Update, context: ContextTypes.DEF
     if message and not context.user_data.get("review_message_id") and update.effective_user:
         try:
             _st = db.get_user_state(update.effective_user.id)
-            if _st and _st.get("state") == "phase1":
+            if _st and _st.get("state") in _LEAD_REVIEWABLE_DB_STATES:
                 await _repost_review_card(message, dict(_st.get("data") or {}), context, update.effective_user.id)
         except Exception as e:
             logger.warning("review card self-heal failed: %s", e)
@@ -3656,13 +3654,39 @@ async def handle_phase1_review_message(update: Update, context: ContextTypes.DEF
         return await _do_cancel_or_restart(update, context, _cr)
 
     user_id = update.effective_user.id
-    state = db.get_user_state(user_id)
+    try:
+        state = db.get_user_state(user_id)
+    except Exception as e:
+        # A storage hiccup must NOT kill the edit silently — tell the user to retry.
+        logger.warning("review_msg: get_user_state failed: %s", e)
+        await _send_vanishing(
+            context,
+            update.effective_chat.id if update.effective_chat else message.chat_id,
+            "⚠️ Storage hiccup — please send that again in a few seconds.",
+        )
+        return STATE_AI_REVIEW
     logger.info("🔎DIAG review_msg uid=%s text=%r has_review_id=%s db_state=%s data_empty=%s",
                 user_id, text[:60], bool(context.user_data.get("review_message_id")),
                 (state or {}).get("state"), not bool((state or {}).get("data")))
     if not state or not state.get("data"):
+        # A live card in RAM + an empty DB read is usually a transient storage miss,
+        # not a real wipe (a wipe clears user_data in the same process). Warn once
+        # and let the user resend; a SECOND consecutive miss means the row really
+        # is gone — drop the stale card ids so we never loop on the warning.
+        if context.user_data.get("review_message_id") and not context.user_data.get("state_miss_once"):
+            context.user_data["state_miss_once"] = True
+            await _send_vanishing(
+                context,
+                update.effective_chat.id if update.effective_chat else message.chat_id,
+                "⚠️ Storage hiccup — please send that again in a few seconds.",
+            )
+            return STATE_AI_REVIEW
+        context.user_data.pop("state_miss_once", None)
+        context.user_data.pop("review_message_id", None)
+        context.user_data.pop("review_chat_id", None)
         await message.reply_text("❌ Data lost. Please start over with /start")
         return ConversationHandler.END
+    context.user_data.pop("state_miss_once", None)
     state_data = state["data"]
 
     # 0. Insurance on/off by voice/text ("add insurance", "no insurance") — before the
@@ -3762,7 +3786,13 @@ async def _transcribe_update_voice(update: Update, context: ContextTypes.DEFAULT
     media = getattr(msg, "voice", None) or getattr(msg, "audio", None)
     if not media:
         return None
-    note = await msg.reply_text("🎙️ Transcribing…")
+    # A failed status send must not abort the pipeline — the transcript injection
+    # below is what makes the voice note act as typed text.
+    note = None
+    try:
+        note = await msg.reply_text("🎙️ Transcribing…")
+    except Exception as e:
+        logger.warning("Transcribing note send failed: %s", e)
     transcript = None
     try:
         f = await context.bot.get_file(media.file_id)
@@ -3778,7 +3808,8 @@ async def _transcribe_update_voice(update: Update, context: ContextTypes.DEFAULT
     except Exception as e:
         logger.warning("Voice download/transcription failed: %s", e)
         transcript = None
-    await _safe_delete_chat_message(context, note.chat_id, note.message_id)
+    if note:
+        await _safe_delete_chat_message(context, note.chat_id, note.message_id)
     return transcript
 
 
@@ -3810,7 +3841,125 @@ async def _global_voice_to_text(update: Update, context: ContextTypes.DEFAULT_TY
     heard = await msg.reply_text("🎙️ Heard: " + transcript)
     # Stash the echo id so a review command can delete it ("my text disappears").
     context.user_data["voice_echo_msg_id"] = heard.message_id
-    # Return normally → update continues to group 0 handlers, now as a text message.
+    # Return normally → update continues to later groups, now as a text message.
+
+
+# ── Review edits from ANY state: the state-independent safety net ────────────
+# Conversation states that HAVE a text listener, so typed/voice edits are handled
+# by the conversation itself and the group -2 safety net below must stand down.
+# Any state NOT in this set (a legacy/future button-only state) would silently
+# swallow text — those are exactly what the safety net catches.
+_REVIEW_TEXT_CAPABLE_STATES = frozenset({
+    STATE_PHASE1, STATE_PHASE2, STATE_AI_REVIEW, STATE_ADJUST_INPUT,
+    STATE_AI_EDIT_MENU, STATE_AI_EDIT_INPUT, STATE_EDIT_FIELD_PROMPT,
+    STATE_MISSING_FIELD, STATE_SPECIAL_REQUEST_ISSUERS, STATE_SPECIAL_REQUEST_DRIVERS,
+    STATE_VIN_CHOICE, STATE_VIN_RETYPE,
+    STATE_SELECT_GROUP, STATE_SELECT_DRIVER, STATE_SELECT_CONTACT_SOURCE,
+})
+
+# The main lead ConversationHandler, so the safety net can read (and repair) its
+# in-memory state. Set once in main(); stays None in unit tests.
+_MAIN_CONV_HANDLER = None
+
+
+def _main_conv_state(update: Update):
+    """The main lead conversation's ACTIVE in-memory state for this chat/user, or
+    None when idle. Reads the same PTB internals as _user_in_active_conversation;
+    degrades to None if they ever change."""
+    h = _MAIN_CONV_HANDLER
+    if h is None:
+        return None
+    try:
+        return h._conversations.get(h._get_key(update))
+    except Exception:
+        return None
+
+
+def _nonlead_conv_active(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    """True when a conversation OTHER than the main lead flow (receipt, appeal,
+    follow-up, settings) is active for this chat/user — their text inputs must win."""
+    try:
+        groups = context.application.handlers
+    except Exception:
+        return False
+    for group in groups.values():
+        for h in group:
+            if isinstance(h, ConversationHandler) and h is not _MAIN_CONV_HANDLER:
+                try:
+                    if h._conversations.get(h._get_key(update)) is not None:
+                        return True
+                except Exception:
+                    continue
+    return False
+
+
+async def handle_review_edit_anywhere(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Group -2 safety net: a typed/spoken edit for a LIVE review card is never
+    dropped, no matter which state PTB's conversation is in. Fires only when the
+    main conversation sits in a state with no text listener while the DB still
+    holds the live "phase1" lead. Everything else passes through untouched: idle
+    text keeps flowing to handle_idle_lead_start (which re-enters the review),
+    and text-capable states keep their own handlers."""
+    msg = update.effective_message
+    if not msg or not update.effective_user:
+        return
+    text = (msg.text or "").strip()
+    if not text:
+        return
+    if _cancel_restart_kind(text):
+        return  # cancel/restart keep their normal (state-aware) handling
+    conv_state = _main_conv_state(update)
+    if conv_state is None or conv_state in _REVIEW_TEXT_CAPABLE_STATES:
+        return
+    if _nonlead_conv_active(update, context):
+        return
+    user_id = update.effective_user.id
+    try:
+        db_state = db.get_user_state(user_id)
+    except Exception as e:
+        logger.warning("review-anywhere: get_user_state failed: %s", e)
+        return
+    if not db_state or db_state.get("state") not in _LEAD_REVIEWABLE_DB_STATES or not db_state.get("data"):
+        return
+    logger.info("🔎DIAG review-anywhere FIRED uid=%s conv_state=%r text=%r",
+                user_id, conv_state, text[:60])
+    result = await handle_phase1_review_message(update, context)
+    # Re-arm (or clear) the conversation to match what the review handler decided,
+    # so the card's buttons work again after a ghost-state rescue.
+    try:
+        h = _MAIN_CONV_HANDLER
+        key = h._get_key(update)
+        if result == ConversationHandler.END:
+            h._conversations.pop(key, None)
+        else:
+            h._conversations[key] = result if result is not None else STATE_AI_REVIEW
+    except Exception:
+        pass  # edits still work (this net keeps catching them); only buttons lag
+    raise ApplicationHandlerStop
+
+
+async def handle_select_state_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Optional[int]:
+    """Typed/voice text while a button picker (dispatcher/driver/source) is on
+    screen. With a live phase1 lead this is a review edit or spoken command
+    ("driver John", "price 150") — route it through the review handler. Without
+    one (e.g. a resend driver pick) nudge to the buttons instead of dropping it."""
+    msg = update.effective_message
+    text = ((msg.text if msg else "") or "").strip()
+    if not text:
+        return None
+    _cr = _cancel_restart_kind(text)
+    if _cr:
+        return await _do_cancel_or_restart(update, context, _cr)
+    st = None
+    try:
+        st = db.get_user_state(update.effective_user.id) if update.effective_user else None
+    except Exception as e:
+        logger.warning("select-state text: get_user_state failed: %s", e)
+    if st and st.get("state") == "phase1" and st.get("data"):
+        return await handle_phase1_review_message(update, context)
+    if msg:
+        await _send_vanishing(context, msg.chat_id, "☝️ Tap a button above to continue.")
+    return None
 
 
 async def _begin_lead_flow(
@@ -3963,6 +4112,21 @@ async def begin_lead_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
     return await _begin_lead_flow_with_review(context, user_id, username, msg)
 
 
+# DB lead states with a live BUTTON PICKER (dispatcher/driver pick after the lead
+# was saved). A stray text while the in-memory conversation is gone (redeploy) must
+# never fall through to a NEW lead — _begin_lead_flow would clear the saved row and
+# destroy the in-flight pick. The pickers' buttons re-enter on their own. NOT here:
+# "special_request_drivers" (no lead row yet → safely re-enters the review card) and
+# "await_group_accept" (lead fully dispatched → the issuer's next text should start
+# their next lead, as before).
+_LEAD_MID_DISPATCH_STATES = frozenset({"select_group", "select_driver"})
+
+# DB states whose data blob is still the editable phase1 card: the plain review
+# window plus the driver-notes step (set on Accept BEFORE the lead row is created —
+# also where an OTS-encryption failure strands the flow). Restoring the review card
+# from these is always safe: nothing was dispatched yet.
+_LEAD_REVIEWABLE_DB_STATES = ("phase1", "special_request_drivers")
+
 # Words a bare idle message can be without starting a lead (greetings/acks).
 _IDLE_CHATTER = frozenset({
     "hi", "hey", "hello", "yo", "sup", "ok", "okay", "k", "kk", "thanks", "thank you",
@@ -4013,8 +4177,14 @@ async def handle_idle_lead_start(update: Update, context: ContextTypes.DEFAULT_T
     # review handler, re-establishing STATE_AI_REVIEW. Without this, control fell through to
     # _begin_lead_flow which wiped the card to empty (the "it does nothing / stays -" bug).
     if not _cancel_restart_kind(text):  # let "restart"/"cancel" keep their own handling below
-        _active = db.get_user_state(user_id)
-        if _active and _active.get("state") == "phase1":
+        try:
+            _active = db.get_user_state(user_id)
+        except Exception as _e:
+            # Storage down must not crash the entry point (the message would die
+            # silently) — treat as "no active lead" and fall through.
+            logger.warning("idle re-entry: get_user_state failed: %s", _e)
+            _active = None
+        if _active and _active.get("state") in _LEAD_REVIEWABLE_DB_STATES:
             logger.info("🔎DIAG re-entry FIRED uid=%s text=%r -> restoring review card", user_id, text[:60])
             try:
                 await _repost_review_card(msg, dict(_active.get("data") or {}), context, user_id)
@@ -4023,6 +4193,20 @@ async def handle_idle_lead_start(update: Update, context: ContextTypes.DEFAULT_T
                 logger.exception("🔎DIAG re-entry CRASHED: %s", _e)
                 await msg.reply_text(f"⚠️ (diag) re-entry error: {type(_e).__name__}: {_e}")
             return STATE_AI_REVIEW
+        if _active:
+            context.user_data.pop("state_miss_once", None)
+        elif context.user_data.get("review_message_id"):
+            # RAM still shows a live review card but the DB read came back empty —
+            # more likely a storage miss than a real wipe. Never destroy the lead
+            # on a first miss: ask to retry. A SECOND consecutive miss means the
+            # row really is gone — drop the stale ids and route normally.
+            if not context.user_data.get("state_miss_once"):
+                context.user_data["state_miss_once"] = True
+                await msg.reply_text("⚠️ Storage hiccup — please send that again in a few seconds.")
+                return None
+            context.user_data.pop("state_miss_once", None)
+            context.user_data.pop("review_message_id", None)
+            context.user_data.pop("review_chat_id", None)
         logger.info("🔎DIAG re-entry SKIPPED uid=%s db_state=%s (not phase1) -> falling through",
                     user_id, (_active or {}).get("state"))
     # A global supervisor can talk to the bot (ask about data, toggle settings,
@@ -4052,6 +4236,15 @@ async def handle_idle_lead_start(update: Update, context: ContextTypes.DEFAULT_T
             return ConversationHandler.END
         await msg.reply_text("Nothing to cancel — say “new client” or send the info to start a tag.")
         return ConversationHandler.END
+    # A lead is MID-DISPATCH per the DB but the in-memory conversation is gone
+    # (redeploy). Starting a new lead here would WIPE it — protect it and point
+    # back to the buttons (which re-enter via entry points on their own).
+    if _active and _active.get("state") in _LEAD_MID_DISPATCH_STATES:
+        await msg.reply_text(
+            "⏳ Your current tag is mid-dispatch — use the buttons on the messages "
+            "above to continue, or say “restart” to drop it and start a new one."
+        )
+        return None
     # Bare trigger word ("start", "lead", "new client", "new entry", "tag") → empty
     # lead shown as the review card, so they immediately see what's needed.
     if _PURE_TRIGGER_RE.match(text):
@@ -13120,6 +13313,10 @@ def main():
             if not hasattr(error_handler, f'_logged_{error_type}'):
                 logger.error(f"Exception while handling an update: {error}", exc_info=error)
                 setattr(error_handler, f'_logged_{error_type}', True)
+            else:
+                # Full traceback only once per type, but NEVER hide recurrences —
+                # invisible repeats made prod failures look like "does nothing".
+                logger.error(f"Exception while handling an update ({error_type}): {error}")
     
     # Add error handler - must be added before handlers
     application.add_error_handler(error_handler)
@@ -13166,6 +13363,12 @@ def main():
                 MessageHandler(filters.TEXT & ~filters.COMMAND, handle_phase1_review_message),
                 MessageHandler(filters.PHOTO, handle_phase1_review_message),
                 MessageHandler(filters.Document.ALL, handle_phase1_review_message),
+                # A picker posted while in a SELECT state stays tappable after a typed
+                # edit pulled the conversation back here (its patterns are otherwise
+                # only entry points, which an ACTIVE conversation never consults).
+                CallbackQueryHandler(handle_group_selection, pattern="^select_group_"),
+                CallbackQueryHandler(handle_driver_selection, pattern="^select_driver_"),
+                CallbackQueryHandler(handle_contact_source_selection, pattern="^contact_source_"),
             ],
             STATE_ADJUST_INPUT: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, handle_phase1_adjust_input),
@@ -13175,6 +13378,10 @@ def main():
             ],
             STATE_AI_EDIT_MENU: [
                 CallbackQueryHandler(handle_phase1_edit_menu_callback, pattern=r"^(ph1_back|ph1_accept|ph1edit_[a-z]+)$"),
+                # Single-line typed/voice edits keep working while the edit picker is
+                # open ('name John Damian', 'price 150') — they apply and re-render the
+                # review card instead of dying in a button-only state.
+                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_phase1_review_message),
             ],
             STATE_AI_EDIT_INPUT: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, handle_phase1_edit_input),
@@ -13214,9 +13421,20 @@ def main():
                 MessageHandler(filters.TEXT & ~filters.COMMAND, handle_vin_choice_text),
             ],
             STATE_VIN_RETYPE: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_vin_retype)],
-            STATE_SELECT_GROUP: [CallbackQueryHandler(handle_group_selection, pattern="^select_group_")],
-            STATE_SELECT_DRIVER: [CallbackQueryHandler(handle_driver_selection, pattern="^(select_driver_|driver_suspended_)")],
-            STATE_SELECT_CONTACT_SOURCE: [CallbackQueryHandler(handle_contact_source_selection, pattern="^contact_source_")],
+            # Typed/voice text during the pickers routes through the review editor
+            # (live lead) or a button nudge — never a silent drop.
+            STATE_SELECT_GROUP: [
+                CallbackQueryHandler(handle_group_selection, pattern="^select_group_"),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_select_state_text),
+            ],
+            STATE_SELECT_DRIVER: [
+                CallbackQueryHandler(handle_driver_selection, pattern="^(select_driver_|driver_suspended_)"),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_select_state_text),
+            ],
+            STATE_SELECT_CONTACT_SOURCE: [
+                CallbackQueryHandler(handle_contact_source_selection, pattern="^contact_source_"),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_select_state_text),
+            ],
         },
         fallbacks=[
             CommandHandler("cancel", cancel_from_lead_conversation),
@@ -13330,6 +13548,10 @@ def main():
 
     application.add_handler(conv_handler)
 
+    # Let the group -2 safety net read/repair this conversation's in-memory state.
+    global _MAIN_CONV_HANDLER
+    _MAIN_CONV_HANDLER = conv_handler
+
     # Supervisor plate-from-image reader — works in ANY state (like voice). At group -1 it
     # inspects a supervisor's photo/PDF FIRST: if the AI reads a temp-tag number it stages a
     # plate-counter update and stops; if it's NOT a tag (a lead's title/license image) it
@@ -13349,12 +13571,25 @@ def main():
         group=-1,
     )
 
-    # Voice notes work EVERYWHERE: group -1 runs before every conversation handler,
+    # Voice notes work EVERYWHERE: group -3 runs before everything else,
     # transcribes any private-chat voice/audio note, injects the transcript as the
-    # message text, then lets the update flow to whatever text handler is active.
+    # message text, then lets the update flow on — first through the group -2
+    # review-edit safety net below, then to whatever text handler is active.
     application.add_handler(
         MessageHandler(filters.VOICE | filters.AUDIO, _global_voice_to_text),
-        group=-1,
+        group=-3,
+    )
+
+    # Review-edit safety net (group -2: after voice transcription, before every
+    # conversation): a typed/spoken field edit for a live review card is applied
+    # even when the conversation sits in a button-only state, so a single-line
+    # edit ('name John Damian', 'price 150') is never silently dropped.
+    application.add_handler(
+        MessageHandler(
+            filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE,
+            handle_review_edit_anywhere,
+        ),
+        group=-2,
     )
 
     # /help + inline ❓ Help — outside ConversationHandler so they work during any flow.
