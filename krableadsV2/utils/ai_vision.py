@@ -443,6 +443,60 @@ FIELD_VALUE_PROMPT = (
 )
 
 
+ADDRESS_SPLIT_PROMPT = (
+    "Split the mailing address below into its STREET line and its CITY/STATE/ZIP line. "
+    'Reply with ONLY a JSON object exactly like {"street": "", "city_state_zip": ""}.\n\n'
+    "Rules:\n"
+    "- street = house/building number, street name, and any apartment/suite/unit/floor.\n"
+    "- city_state_zip = the city, the 2-letter state abbreviation, and the ZIP code.\n"
+    "- Convert a spelled-out state to its 2-letter abbreviation (New Jersey -> NJ).\n"
+    "- Copy the words as given. NEVER invent a city, state, or ZIP that is not there.\n"
+    "- If the address has no city/state/ZIP part, city_state_zip must be \"\".\n"
+    "- If it is only a city/state/ZIP with no street, street must be \"\".\n\n"
+    "Examples:\n"
+    "'123 Main St, Newark NJ 07102' -> "
+    '{"street":"123 Main St","city_state_zip":"Newark NJ 07102"}\n'
+    "'88 Ocean Ave Apt 3B Fort Lee New Jersey 07024' -> "
+    '{"street":"88 Ocean Ave Apt 3B","city_state_zip":"Fort Lee NJ 07024"}\n'
+    "'200 Broadway' -> {\"street\":\"200 Broadway\",\"city_state_zip\":\"\"}\n\n"
+    "ADDRESS:\n"
+)
+
+
+def split_address(address: str) -> Optional[dict]:
+    """AI-split one typed/spoken address into {"street", "city_state_zip"}.
+
+    Used only when the deterministic splitter can't find a city/state/ZIP tail, so an
+    unusual or dictated address ("… Fort Lee New Jersey oh seven oh two four") still
+    fills BOTH review fields. Returns None when unconfigured / errored / unparseable,
+    and drops any answer whose words the original address didn't contain (so the model
+    can never invent a city or ZIP).
+    """
+    txt = (address or "").strip()
+    if not txt:
+        return None
+    raw = _call_openai_text([{"role": "user", "content": ADDRESS_SPLIT_PROMPT + txt[:300]}])
+    if not raw:
+        return None
+    data = _parse_json_from_model(raw)
+    if not isinstance(data, dict):
+        return None
+    street = str(data.get("street") or "").strip().strip(",")
+    csz = str(data.get("city_state_zip") or "").strip().strip(",")
+    if not csz:
+        return None
+    # Anti-hallucination: every ZIP/number it returns must appear in the input, and the
+    # two halves together may not be longer than what the user actually said.
+    src_digits = re.findall(r"\d+", txt)
+    for num in re.findall(r"\d+", street + " " + csz):
+        if num not in src_digits:
+            logger.warning("split_address: invented number %r — discarding", num)
+            return None
+    if len((street + csz).replace(" ", "")) > len(txt.replace(" ", "")) + 4:
+        return None                      # more than a state-abbreviation's worth of new text
+    return {"street": street, "city_state_zip": csz}
+
+
 def classify_field_value(utterance: str) -> Optional[dict]:
     """AI-classify one free-text/voice command into a review edit-key + cleaned value.
 

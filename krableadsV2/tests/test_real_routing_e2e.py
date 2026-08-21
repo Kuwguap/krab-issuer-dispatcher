@@ -81,6 +81,10 @@ import bot  # noqa: E402
 import telegram  # noqa: E402
 from telegram import Update  # noqa: E402
 
+# bot.db is built at import time, so whichever test module imports bot FIRST decides
+# it. Bind our fake explicitly so this file works regardless of collection order.
+bot.db = FAKE_DB
+
 
 # -- fake Telegram transport: record every outgoing API call, answer plausibly --
 class Transport:

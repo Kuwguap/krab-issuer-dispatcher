@@ -1824,6 +1824,199 @@ def parse_phase1_structured(message_text: str) -> dict:
     }
 
 
+# ── Splitting a whole address into street + city/ST/ZIP ─────────────────────
+# The card keeps the street line and the city/state/ZIP line in SEPARATE fields, but
+# people type (and dictate) an address as one string: "123 Main St, Newark NJ 07102".
+# Without this the entire string landed in the street field and city/ST/ZIP stayed "-".
+_US_STATE_ABBR = frozenset("""
+AL AK AZ AR CA CO CT DE FL GA HI ID IL IN IA KS KY LA ME MD MA MI MN MS MO MT NE NV
+NH NJ NM NY NC ND OH OK OR PA RI SC SD TN TX UT VT VA WA WV WI WY DC PR VI GU AS MP
+""".split())
+# Full state names (incl. the multi-word ones) → abbreviation, so a spoken
+# "…Newark New Jersey 07102" still splits correctly.
+_US_STATE_NAMES = {
+    "alabama": "AL", "alaska": "AK", "arizona": "AZ", "arkansas": "AR", "california": "CA",
+    "colorado": "CO", "connecticut": "CT", "delaware": "DE", "florida": "FL", "georgia": "GA",
+    "hawaii": "HI", "idaho": "ID", "illinois": "IL", "indiana": "IN", "iowa": "IA",
+    "kansas": "KS", "kentucky": "KY", "louisiana": "LA", "maine": "ME", "maryland": "MD",
+    "massachusetts": "MA", "michigan": "MI", "minnesota": "MN", "mississippi": "MS",
+    "missouri": "MO", "montana": "MT", "nebraska": "NE", "nevada": "NV",
+    "new hampshire": "NH", "new jersey": "NJ", "new mexico": "NM", "new york": "NY",
+    "north carolina": "NC", "north dakota": "ND", "ohio": "OH", "oklahoma": "OK",
+    "oregon": "OR", "pennsylvania": "PA", "rhode island": "RI", "south carolina": "SC",
+    "south dakota": "SD", "tennessee": "TN", "texas": "TX", "utah": "UT", "vermont": "VT",
+    "virginia": "VA", "washington": "WA", "west virginia": "WV", "wisconsin": "WI",
+    "wyoming": "WY", "district of columbia": "DC", "puerto rico": "PR",
+}
+_ZIP_RE = re.compile(r"^\d{5}(?:-\d{4})?$")
+# Tokens that belong to the STREET half — the city walk stops when it meets one, so
+# "Ocean Ave" is never mistaken for a city name.
+# Deliberately NO bare compass directions here — they are handled separately below,
+# because a compass word can belong to EITHER half ("Pennsylvania Ave NW" is street,
+# "North Bergen" is city).
+# NOTE: no "park"/"heights"/"square"/"gardens" — those are common in CITY names
+# (Cliffside Park, Hasbrouck Heights), and mis-stopping there would split wrongly.
+_STREET_TOKEN_RE = re.compile(
+    r"^(?:st|street|ave|avenue|av|rd|road|blvd|boulevard|dr|drive|ln|lane|way|ct|court|"
+    r"pl|place|ter|terrace|cir|circle|pkwy|parkway|hwy|highway|route|rte|apt|apartment|"
+    r"suite|ste|unit|fl|floor|rm|room|box|po|turnpike|tpke|pike|expressway|expy|"
+    r"freeway|fwy|plaza|plz|trail|trl|crossing|xing|bypass|byp|extension|ext|loop|"
+    r"alley|aly|plaza)$",
+    re.I,
+)
+# An ABBREVIATED compass is practically always a street directional ("1600
+# Pennsylvania Ave NW"), never the start of a city name.
+_COMPASS_ABBR = frozenset({"n", "s", "e", "w", "ne", "nw", "se", "sw"})
+# A SPELLED-OUT compass usually starts a city ("North Bergen", "East Orange") — unless
+# it trails a numbered route ("500 Route 46 West"), which these two tests detect.
+_COMPASS_WORD = frozenset({"north", "south", "east", "west", "northeast",
+                           "northwest", "southeast", "southwest"})
+_ROUTE_WORD_RE = re.compile(r"^(?:route|rte|rt|highway|hwy|us|interstate|i|county|state)$", re.I)
+
+
+def _csz_tail_len(tokens: list) -> int:
+    """How many trailing tokens of `tokens` form a 'City ST ZIP' tail (0 = none).
+
+    Walks backwards: optional ZIP, then a state (abbreviation or full name), then up
+    to four city words — stopping at anything with a digit or a street-type word."""
+    i = len(tokens) - 1
+    if i < 0:
+        return 0
+    saw_zip = False
+    if _ZIP_RE.match(tokens[i].strip(",.")):
+        saw_zip = True
+        i -= 1
+    if i < 0:
+        return 0
+    # state: two-letter abbreviation, or a one/two-word full name
+    tok = tokens[i].strip(",.").upper()
+    two = " ".join(tokens[max(i - 1, 0):i + 1]).strip(",.").lower()
+    if len(tok) == 2 and tok in _US_STATE_ABBR:
+        i -= 1
+    elif two in _US_STATE_NAMES and i >= 1:
+        i -= 2
+    elif tokens[i].strip(",.").lower() in _US_STATE_NAMES:
+        i -= 1
+    elif not saw_zip:
+        return 0                      # neither state nor ZIP → no tail at all
+    # city words (bounded, and a comma right before the city ends the walk)
+    city_start = i + 1
+    words = 0
+    while i >= 0 and words < 4:
+        raw = tokens[i]
+        word = raw.strip(",.")
+        if not word or any(ch.isdigit() for ch in word):
+            break
+        if _STREET_TOKEN_RE.match(word):
+            break
+        low = word.lower()
+        if low in _COMPASS_ABBR:
+            break                     # "…Ave NW" — the directional belongs to the street
+        if low in _COMPASS_WORD:
+            prev = tokens[i - 1].strip(",.") if i >= 1 else ""
+            prev2 = tokens[i - 2].strip(",.") if i >= 2 else ""
+            # "500 Route 46 West" → street; "…Apt 2 North Bergen" → city
+            if any(ch.isdigit() for ch in prev) and _ROUTE_WORD_RE.match(prev2):
+                break
+        city_start = i
+        words += 1
+        if raw.endswith(","):         # "…Apt 3B, Fort Lee NJ" — comma is the boundary
+            break
+        i -= 1
+    return len(tokens) - city_start
+
+
+def _split_street_and_csz(value: str) -> tuple:
+    """Split one typed address into (street, city_state_zip).
+
+    '123 Main St, Newark NJ 07102' → ('123 Main St', 'Newark NJ 07102')
+    'Newark NJ 07102'              → ('', 'Newark NJ 07102')
+    '123 Main St'                  → ('123 Main St', '')
+    Returns ('', '') when there is nothing to split."""
+    v = " ".join((value or "").split()).strip().strip(",")
+    if not v:
+        return ("", "")
+    # A comma is the strongest boundary: take the EARLIEST one whose tail is a
+    # complete city/ST/ZIP, so "88 Ocean Ave Apt 3B, Fort Lee, NJ 07024" keeps the
+    # apartment on the street line.
+    if "," in v:
+        parts = v.split(",")
+        for k in range(len(parts) - 1):
+            tail = ",".join(parts[k + 1:]).strip()
+            street = ",".join(parts[: k + 1]).strip().strip(",")
+            tail_toks = tail.replace(",", " ").split()
+            if tail and tail_toks and _csz_tail_len(tail_toks) == len(tail_toks):
+                return (street, " ".join(tail.split()))
+    toks = v.split()
+    n = _csz_tail_len(toks)
+    if not n:
+        return (v, "")
+    cut = len(toks) - n
+    # A street of just a house number means the walk ate the street name too
+    # ("123 Broadway New York NY 10001"). Give one word back.
+    if cut == 1 and any(ch.isdigit() for ch in toks[0]) and n > 1:
+        cut += 1
+    street = " ".join(toks[:cut]).strip().strip(",")
+    csz = " ".join(toks[cut:]).strip().strip(",")
+    return (street, csz)
+
+
+# Which city/ST/ZIP field pairs with which street field.
+_ADDR_TO_CSZ_EK = {"addr": "csz", "daddr": "dcsz"}
+
+
+def _expand_address_pair(edit_key: str, value: str) -> list:
+    """Turn one (street-field, whole address) edit into the one or two edits it really
+    is, so 'address 123 Main St, Newark NJ 07102' fills BOTH the street line and the
+    city/ST/ZIP line — and both get reported as updated."""
+    csz_ek = _ADDR_TO_CSZ_EK.get(edit_key)
+    if not csz_ek:
+        return [(edit_key, value)]
+    street, csz = _split_street_and_csz(value)
+    if not csz:
+        return [(edit_key, value)]
+    if not street:                      # the value was ONLY a city/ST/ZIP
+        return [(csz_ek, csz)]
+    return [(edit_key, street), (csz_ek, csz)]
+
+
+async def _ai_split_addresses_if_needed(state_data: dict) -> list:
+    """Last resort for an address the deterministic splitter couldn't divide: ask the
+    AI to separate street from city/ST/ZIP. Only runs when a street field holds several
+    words while its city/ST/ZIP partner is still empty, so the normal case costs
+    nothing. Returns the labels that changed."""
+    if not Config.is_ai_vision_configured():
+        return []
+    changed: list = []
+    for street_ek, csz_ek in _ADDR_TO_CSZ_EK.items():
+        street_key = _INLINE_EK_STATE_KEY[street_ek]
+        csz_key = _INLINE_EK_STATE_KEY[csz_ek]
+        street_val = str(state_data.get(street_key) or "").strip()
+        csz_val = str(state_data.get(csz_key) or "").strip()
+        if csz_val and csz_val != "-":
+            continue                        # already split
+        if len(street_val.split()) < 4 or street_val == "-":
+            continue                        # too short to hold a city/ST/ZIP as well
+        try:
+            res = await asyncio.to_thread(ai_vision.split_address, street_val)
+        except Exception as e:
+            logger.warning("AI address split failed: %s", e)
+            continue
+        if not isinstance(res, dict):
+            continue
+        street, csz = res.get("street") or "", res.get("city_state_zip") or ""
+        if not csz:
+            continue
+        _apply_single_phase1_edit(state_data, csz_ek, csz)
+        changed.append(_INLINE_EDIT_KEY_LABEL[csz_ek])
+        if street and street != street_val:
+            _apply_single_phase1_edit(state_data, street_ek, street)
+            changed.append(_INLINE_EDIT_KEY_LABEL[street_ek])
+    if changed:
+        _apply_single_address_as_both(state_data)
+    return changed
+
+
 def _apply_single_address_as_both(state_data: dict) -> None:
     """When only one address is provided (registration or delivery), use it for both."""
     def _has(v: str) -> bool:
@@ -2733,6 +2926,19 @@ def _merge_phase1_adjust(state_data: dict, structured_text: str, only_empty: boo
         if val != str(state_data.get(key) or "").strip():
             state_data[key] = val
             updated.append(_PHASE1_ADJUST_LABELS.get(key, key))
+    # A dictated lead often puts the whole address on the street line and leaves the
+    # city/ST/ZIP line empty — split it so both review fields are filled.
+    for _street_key, _csz_key, _csz_label in (
+        ("address", "city_state_zip", "reg city/ST/ZIP"),
+        ("delivery_address", "delivery_city_state_zip", "delivery city/ST/ZIP"),
+    ):
+        if str(state_data.get(_csz_key) or "").strip().lower() in placeholders:
+            _street, _csz = _split_street_and_csz(str(state_data.get(_street_key) or ""))
+            if _csz:
+                state_data[_csz_key] = _csz
+                state_data[_street_key] = _street or "-"
+                if _csz_label not in updated:
+                    updated.append(_csz_label)
     # Labeled extra lines (12+): Phone / Price / Email / DriverLicenseID.
     for l in lines[ai_vision.PHASE1_LINE_COUNT:]:
         if ":" not in l:
@@ -3041,6 +3247,12 @@ def _apply_inline_review_text(state_data: dict, text: str) -> list[str]:
         pending.extend(parsed)
     if not pending:
         return []
+    # A whole address typed into the street field is really two edits (street +
+    # city/ST/ZIP) — expand before tracking so BOTH are applied and reported.
+    expanded: list[tuple[str, str]] = []
+    for ek, value in pending:
+        expanded.extend(_expand_address_pair(ek, value))
+    pending = expanded
 
     tracked = {_INLINE_EK_STATE_KEY[ek] for ek, _ in pending}
     before = {k: str(state_data.get(k) or "").strip() for k in tracked}
@@ -3208,26 +3420,34 @@ def _apply_ek_value(state_data: dict, ek: str, value: str) -> list:
     value = _clean_inline_value(ek, (value or "").strip())
     if not value:
         return []
-    sk = _INLINE_EK_STATE_KEY[ek]                 # tracked state key (fn/ln -> "name")
+    # One spoken/typed address covers the street line AND the city/ST/ZIP line.
+    pairs = _expand_address_pair(ek, value)
+
     def _norm(s: str) -> str:                     # compare content, not case/spacing
         return re.sub(r"\s+", " ", str(s or "")).strip().lower()
-    before = _norm(state_data.get(sk))
-    if ek == "name":
-        parts = value.split()
-        _set_full_name(state_data, parts[0], " ".join(parts[1:]))
-    else:
-        _apply_single_phase1_edit(state_data, ek, value)
+
+    before = {p_ek: _norm(state_data.get(_INLINE_EK_STATE_KEY[p_ek])) for p_ek, _ in pairs}
+    for p_ek, p_val in pairs:
+        if p_ek == "name":
+            parts = p_val.split()
+            _set_full_name(state_data, parts[0], " ".join(parts[1:]))
+        else:
+            _apply_single_phase1_edit(state_data, p_ek, p_val)
     # Same post-processing the labeled-edit path runs, so phone/price/vin/address are
     # normalized and a rejected value never reports a false change.
     _apply_single_address_as_both(state_data)
     _clean_vin_and_car(state_data)
     _sanitize_phase1_pending_phone_price(state_data)
-    now = str(state_data.get(sk) or "").strip()
     # Case/whitespace-insensitive diff — the applied value is re-normalized on write
     # (e.g. colors title-cased), so a pure re-normalization is not a real change.
-    if now and now != "-" and _norm(now) != before:
-        return [_INLINE_EDIT_KEY_LABEL.get(ek, ek)]
-    return []
+    changed: list = []
+    for p_ek, _ in pairs:
+        now = str(state_data.get(_INLINE_EK_STATE_KEY[p_ek]) or "").strip()
+        if now and now != "-" and _norm(now) != before.get(p_ek):
+            label = _INLINE_EDIT_KEY_LABEL.get(p_ek, p_ek)
+            if label not in changed:
+                changed.append(label)
+    return changed
 
 
 async def _smart_place_single_value(state_data: dict, value: str) -> list:
@@ -3733,6 +3953,7 @@ async def handle_phase1_review_message(update: Update, context: ContextTypes.DEF
     # 1. Labeled field edits (incl. multi-field one-liners) → apply, delete msg, toast.
     updated = _apply_inline_review_text(state_data, text)
     if updated:
+        updated += await _ai_split_addresses_if_needed(state_data)
         db.set_user_state(user_id, "phase1", state_data)
         chat_id = update.effective_chat.id if update.effective_chat else message.chat_id
         try:
@@ -3768,6 +3989,7 @@ async def handle_phase1_review_message(update: Update, context: ContextTypes.DEF
     chat_id = update.effective_chat.id if update.effective_chat else message.chat_id
     updated = [] if _COMMAND_LIKE_RE.search(text) else await _smart_place_single_value(state_data, text)
     if updated:
+        updated += await _ai_split_addresses_if_needed(state_data)
         db.set_user_state(user_id, "phase1", state_data)
         await _cleanup_voice_echo(context, chat_id)
         await _send_vanishing(context, chat_id, "✅ Updated: " + ", ".join(dict.fromkeys(updated)))
