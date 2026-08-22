@@ -2265,30 +2265,35 @@ PH1_EDIT_TO_STATE_KEY = {
 # Tapping a colour is far faster (and far less error-prone) than typing one, and the
 # same prompt still accepts typing, a voice note, or a photo of the car.
 PH1_COLOR_CB = "ph1col_"
+# Buttons show the colour NAME only. The 3-letter DMV code the tag PDF needs is
+# looked up separately (tag_pdf.color_code), never shown to the issuer.
 _PH1_COLORS = [
     "White", "Black",
     "Gray", "Silver",
     "Blue - Dark", "Blue - Light",
     "Red", "Burgundy",
-    "Green - Dark", "Green - Light",
+    "Green", "Green - Dark",
+    "Green - Light", "Teal",
     "Brown", "Beige",
+    "Bronze", "Copper",
     "Gold", "Tan",
+    "Cream", "Champagne",
     "Orange", "Yellow",
-    "Purple", "Pink",
+    "Purple", "Amethyst",
     "Navy", "Charcoal",
-    "Bronze", "Champagne",
-    "Maroon", "Teal",
-    "Cream", "Pearl",
+    "Maroon", "Pink",
+    "Pearl",
 ]
 # A dot that hints at the actual colour, so the list is scannable at a glance.
 _PH1_COLOR_DOT = {
     "White": "⚪", "Black": "⚫", "Gray": "🩶", "Silver": "🩶",
     "Blue - Dark": "🔵", "Blue - Light": "🔵", "Navy": "🔵", "Teal": "🩵",
     "Red": "🔴", "Burgundy": "🔴", "Maroon": "🔴", "Pink": "🩷",
-    "Green - Dark": "🟢", "Green - Light": "🟢",
-    "Brown": "🟤", "Beige": "🟤", "Tan": "🟤", "Bronze": "🟤",
+    "Green": "🟢", "Green - Dark": "🟢", "Green - Light": "🟢",
+    "Brown": "🟤", "Beige": "🟤", "Tan": "🟤", "Bronze": "🟤", "Copper": "🟤",
     "Gold": "🟡", "Yellow": "🟡", "Champagne": "🟡", "Cream": "🟡",
-    "Orange": "🟠", "Purple": "🟣", "Charcoal": "⚫", "Pearl": "⚪",
+    "Orange": "🟠", "Purple": "🟣", "Amethyst": "🟣",
+    "Charcoal": "⚫", "Pearl": "⚪",
 }
 
 

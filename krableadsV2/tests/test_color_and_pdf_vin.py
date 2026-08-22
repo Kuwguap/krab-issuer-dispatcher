@@ -57,6 +57,52 @@ class ColorPaletteTest(unittest.TestCase):
         self.assertIn("edit_cancel", datas)
 
 
+# The operator's official name -> 3-letter DMV code list. Buttons never show the
+# code; the tag PDF needs it.
+OFFICIAL_CODES = {
+    "Black": "BLK", "White": "WHT", "Gray": "GRY", "Silver": "SLV", "Red": "RED",
+    "Blue": "BLU", "Green": "GRN", "Brown": "BRN", "Beige": "BEG", "Gold": "GLD",
+    "Orange": "ORG", "Yellow": "YLW", "Purple": "PUR", "Tan": "TAN", "Cream": "CRM",
+    "Maroon": "MRN", "Navy": "NVY", "Bronze": "BRZ", "Copper": "CPR", "Teal": "TEL",
+}
+
+
+class ColorCodeForPdfTest(unittest.TestCase):
+    """Names on the buttons, codes on the tag."""
+
+    def test_official_codes_are_exact(self):
+        from utils import tag_pdf
+        wrong = {n: tag_pdf.color_code(n) for n, want in OFFICIAL_CODES.items()
+                 if tag_pdf.color_code(n) != want}
+        self.assertEqual({}, wrong)
+
+    def test_every_button_resolves_to_a_three_letter_code(self):
+        from utils import tag_pdf
+        bad = [c for c in bot._PH1_COLORS if len(tag_pdf.color_code(c) or "") != 3]
+        self.assertEqual([], bad, "every picker colour must print on the tag")
+
+    def test_newly_requested_colours_are_on_the_palette(self):
+        for c in ("Brown", "Bronze", "Beige", "Amethyst", "Gold",
+                  "Cream", "Copper", "Gray", "Green"):
+            self.assertIn(c, bot._PH1_COLORS, c)
+
+    def test_shade_variants_share_the_base_code(self):
+        from utils import tag_pdf
+        self.assertEqual(tag_pdf.color_code("Blue - Dark"), "BLU")
+        self.assertEqual(tag_pdf.color_code("Blue - Light"), "BLU")
+        self.assertEqual(tag_pdf.color_code("Green - Dark"), "GRN")
+
+    def test_buttons_never_show_the_code(self):
+        labels = [b.text for row in bot._color_picker_keyboard().inline_keyboard for b in row]
+        for label, code in [(l, c) for l in labels for c in OFFICIAL_CODES.values()]:
+            self.assertNotIn(f" {code}", label, f"{label} leaks the DMV code")
+
+    def test_old_codes_still_resolve_for_leads_saved_earlier(self):
+        from utils import tag_pdf
+        self.assertEqual(tag_pdf.color_code("WHI"), "WHT")   # old white code
+        self.assertEqual(tag_pdf.color_code("BGE"), "BEG")   # old beige code
+
+
 class SpokenColorTest(unittest.TestCase):
     """A dictated colour is a sentence; the field must get just the colour."""
 
