@@ -4374,12 +4374,30 @@ _RESTART_RE = re.compile(
 )
 
 
+# "New lead" / "New client" / "New tag" / "Temp tag" — spoken or typed, in ANY state —
+# mean the same as /lead: drop whatever is in progress and open a fresh review card.
+# A qualifier ("new", "another", "start a", "temp") is REQUIRED so a bare "tag" or
+# "client" inside a value can never wipe a card the issuer is filling in.
+_NEW_LEAD_RE = re.compile(
+    r"^\s*(?:(?:new|another|next|start|create|add|a|the)\s+)+"
+    r"(?:temp(?:orary)?\s+)?(?:lead|client|customer|tag|sale|entry|order)s?\s*[.!]*\s*$"
+    r"|^\s*temp(?:orary)?\s+tags?\s*[.!]*\s*$",
+    re.I,
+)
+
+
 def _cancel_restart_kind(text: str):
     """'restart' | 'cancel' | None for a whole-message cancel/restart phrase."""
     t = (text or "").strip()
     if not t:
         return None
     if _RESTART_RE.match(t):
+        return "restart"
+    # Asking for a new lead IS a restart: wipe the current card, open a fresh one.
+    # Handled here so it works in every state that already honours cancel/restart —
+    # the review card, the pickers, a field prompt, phase 1/2 and idle chat — instead
+    # of being filed as a field value (it used to become the client's NAME).
+    if _NEW_LEAD_RE.match(t):
         return "restart"
     if _CANCEL_RE.match(t):
         return "cancel"

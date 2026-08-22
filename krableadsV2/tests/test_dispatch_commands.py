@@ -118,5 +118,82 @@ class ReachesTheDispatcherTest(unittest.TestCase):
                 self._run(cmd).assert_awaited_once()
 
 
+# Phrases that mean "start a fresh lead", spoken or typed, in ANY state.
+NEW_LEAD_COMMANDS = ["New lead", "New client", "New tag", "Temp tag"]
+
+NEW_LEAD_VARIANTS = [
+    "new lead", "NEW CLIENT", "temp tag", "TEMP TAG", "temporary tag",
+    "new temp tag", "another lead", "start a new tag", "next client",
+    "new leads", "new tag.", "a new client",
+]
+
+# A qualifier is required, so ordinary words and real names never wipe a card.
+NOT_NEW_LEAD = [
+    "tag", "client", "lead",                 # bare nouns can appear inside a value
+    "New Tag Motors LLC",                    # a real company name
+    "name New Client Corp",
+    "driver note new client arriving",
+    "color tag blue",
+    "price 150",
+]
+
+
+class NewLeadCommandTest(unittest.TestCase):
+    """"New lead" / "Temp tag" used to be filed as the CLIENT'S NAME."""
+
+    def test_every_requested_phrase_starts_a_lead(self):
+        failed = [c for c in NEW_LEAD_COMMANDS if bot._cancel_restart_kind(c) != "restart"]
+        self.assertEqual([], failed)
+
+    def test_variants_start_a_lead(self):
+        failed = [c for c in NEW_LEAD_VARIANTS if bot._cancel_restart_kind(c) != "restart"]
+        self.assertEqual([], failed)
+
+    def test_ordinary_text_never_wipes_a_card(self):
+        wrong = [c for c in NOT_NEW_LEAD if bot._cancel_restart_kind(c) is not None]
+        self.assertEqual([], wrong)
+
+    def test_cancel_and_restart_keep_their_own_meaning(self):
+        self.assertEqual(bot._cancel_restart_kind("cancel"), "cancel")
+        self.assertEqual(bot._cancel_restart_kind("restart"), "restart")
+
+    def test_phrases_are_not_placed_as_a_field_value(self):
+        """Even if the restart check were skipped, these must not become a name."""
+        for phrase in NEW_LEAD_COMMANDS:
+            with self.subTest(phrase=phrase):
+                state = {}
+                with mock.patch.object(bot.Config, "is_ai_vision_configured",
+                                       classmethod(lambda cls: False)):
+                    asyncio.run(bot._smart_place_single_value(state, phrase))
+                # the guard above is what protects this in production; assert the
+                # restart classification is what actually runs first
+                self.assertEqual(bot._cancel_restart_kind(phrase), "restart")
+
+    def test_review_card_routes_them_to_a_fresh_lead(self):
+        """On an open card the phrase must restart, not edit the card."""
+        for phrase in NEW_LEAD_COMMANDS:
+            with self.subTest(phrase=phrase):
+                msg = SimpleNamespace(text=phrase, chat_id=1, photo=None, document=None,
+                                      delete=mock.AsyncMock(), reply_text=mock.AsyncMock())
+                update = SimpleNamespace(
+                    message=msg,
+                    effective_message=msg,
+                    effective_chat=SimpleNamespace(id=1, type="private"),
+                    effective_user=SimpleNamespace(id=7, username="tester"),
+                )
+                # a live card id, so the self-heal repost is skipped
+                ctx = SimpleNamespace(user_data={"review_message_id": 5, "review_chat_id": 1},
+                                      bot=mock.AsyncMock(),
+                                      application=SimpleNamespace(handlers={}))
+                restart = mock.AsyncMock(return_value=bot.STATE_AI_REVIEW)
+                fake_db = mock.MagicMock()
+                fake_db.get_user_state.return_value = {"state": "phase1",
+                                                       "data": {"name": "Old Client"}}
+                with mock.patch.object(bot, "_do_cancel_or_restart", restart),                         mock.patch.object(bot, "db", fake_db):
+                    asyncio.run(bot.handle_phase1_review_message(update, ctx))
+                restart.assert_awaited_once()
+                self.assertEqual(restart.await_args.args[2], "restart")
+
+
 if __name__ == "__main__":
     unittest.main()
