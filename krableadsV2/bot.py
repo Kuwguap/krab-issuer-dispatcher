@@ -610,8 +610,18 @@ def _parse_paired_short_uuids(callback_data: str, prefix: str) -> tuple[str, str
     return None
 
 
+def _bust_driver_caches() -> None:
+    """Drop the driver and suspension caches so a /settings change shows at once
+    (both are short-TTL memoizations, and a stale one makes an edit look ignored)."""
+    global _SUSP_DRIVER_IDS_CACHE, _ALL_DRIVERS_CACHE, _ALL_DRIVERS_CACHE_TS
+    _SUSP_DRIVER_IDS_CACHE = None
+    _ALL_DRIVERS_CACHE = None
+    _ALL_DRIVERS_CACHE_TS = 0.0
+
+
 def _get_suspended_driver_ids() -> set[str]:
-    """Driver IDs (as str) with 3+ pending receipts — suspended from receiving new leads."""
+    """Driver IDs (as str) that may not receive new leads: those owing
+    SUSPENSION_THRESHOLD+ receipts, plus anyone a supervisor suspended by hand."""
     global _SUSP_DRIVER_IDS_CACHE
     now = time.monotonic()
     if _SUSP_DRIVER_IDS_CACHE is not None:
@@ -623,6 +633,10 @@ def _get_suspended_driver_ids() -> set[str]:
     except Exception as e:
         logger.warning("_get_suspended_driver_ids: %s", e)
         return set()
+    try:
+        s = set(s) | db.get_manually_suspended_driver_ids()
+    except Exception as e:
+        logger.warning("manual suspensions unavailable: %s", e)
     _SUSP_DRIVER_IDS_CACHE = (s, now)
     return s
 
@@ -13566,9 +13580,79 @@ _PLATE_SET_LABELS = {
 def _settings_main_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("🔢 Plate Numbers", callback_data="tset_plates")],
-        [InlineKeyboardButton("👥 Groups", callback_data="tset_groups")],
+        # "Groups" in the schema are "Dispatchers" everywhere the user sees them.
+        [InlineKeyboardButton("🏢 Dispatchers", callback_data="tset_groups")],
+        [InlineKeyboardButton("🚗 Drivers", callback_data="tset_drivers")],
+        [InlineKeyboardButton("🚫 Suspensions", callback_data="tset_susp")],
+        [InlineKeyboardButton("📊 Client Sources", callback_data="tset_srcs")],
         [InlineKeyboardButton("✖️ Close", callback_data="tset_close")],
     ])
+
+
+async def _settings_render_drivers(query) -> None:
+    """Add a driver, or switch one off/on. Disabling removes them from the pickers
+    entirely; suspending (separate screen) keeps them visible but unassignable."""
+    drivers = await asyncio.to_thread(_get_all_drivers_cached)
+    lines = ["🚗 *Drivers*\n"]
+    rows = []
+    for d in (drivers or [])[:25]:
+        active = record_is_active(d)
+        lines.append(f"{'✅' if active else '⛔'} {d.get('driver_name') or '(unnamed)'}")
+        rows.append([InlineKeyboardButton(
+            f"{'Disable' if active else 'Enable'} {d.get('driver_name') or 'driver'}"[:40],
+            callback_data=f"tset_dtog:{d.get('id')}")])
+    if not drivers:
+        lines.append("_No drivers yet._")
+    rows.append([InlineKeyboardButton("➕ Add Driver", callback_data="tset_dadd")])
+    rows.append([InlineKeyboardButton("⬅️ Back", callback_data="tset_menu")])
+    await query.edit_message_text(
+        "\n".join(lines), parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(rows))
+
+
+async def _settings_render_suspensions(query) -> None:
+    """Suspend a driver, or lift a suspension — including one earned by unpaid
+    receipts, which is excused the same way an accepted appeal excuses it."""
+    drivers = await asyncio.to_thread(_get_all_drivers_cached)
+    suspended = await asyncio.to_thread(_get_suspended_driver_ids)
+    manual = await asyncio.to_thread(db.get_manually_suspended_driver_ids)
+    lines = ["🚫 *Suspensions*\n", "_Suspended drivers stay listed but get no new leads._\n"]
+    rows = []
+    for d in (drivers or [])[:25]:
+        did = str(d.get("id"))
+        name = d.get("driver_name") or "(unnamed)"
+        is_susp = did in suspended
+        why = ""
+        if is_susp:
+            why = " (by hand)" if did in manual else " (unpaid receipts)"
+        lines.append(f"{'🚫' if is_susp else '✅'} {name}{why}")
+        rows.append([InlineKeyboardButton(
+            f"{'Lift' if is_susp else 'Suspend'} {name}"[:40],
+            callback_data=f"tset_susp{'lift' if is_susp else 'on'}:{did}")])
+    if not drivers:
+        lines.append("_No drivers yet._")
+    rows.append([InlineKeyboardButton("⬅️ Back", callback_data="tset_menu")])
+    await query.edit_message_text(
+        "\n".join(lines), parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(rows))
+
+
+async def _settings_render_sources(query) -> None:
+    """Add or remove the client sources offered after a lead is dispatched.
+    Removing is a soft disable so already-sent picker buttons still resolve."""
+    sources = await asyncio.to_thread(db.get_all_contact_info_sources)
+    lines = ["📊 *Client Sources*\n"]
+    rows = []
+    for s in (sources or [])[:25]:
+        active = record_is_active(s)
+        lines.append(f"{'✅' if active else '⛔'} {s.get('label') or '(unnamed)'}")
+        rows.append([InlineKeyboardButton(
+            f"{'Remove' if active else 'Restore'} {s.get('label') or 'source'}"[:40],
+            callback_data=f"tset_stog:{s.get('id')}:{0 if active else 1}")])
+    if not sources:
+        lines.append("_No sources yet._")
+    rows.append([InlineKeyboardButton("➕ Add Source", callback_data="tset_sadd")])
+    rows.append([InlineKeyboardButton("⬅️ Back", callback_data="tset_menu")])
+    await query.edit_message_text(
+        "\n".join(lines), parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(rows))
 
 
 async def cmd_settings(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -13608,17 +13692,19 @@ async def _settings_render_plates(query) -> None:
 
 async def _settings_render_groups(query) -> None:
     groups = await asyncio.to_thread(db.get_all_groups)
-    lines = ["👥 *Groups*\n"]
+    lines = ["🏢 *Dispatchers*\n"]
     rows = []
     for g in (groups or [])[:25]:
-        active = g.get("is_active", True)
+        # record_is_active, not a raw get: a JSON-null is_active counts as ACTIVE on
+        # the dispatch path, and reading it raw showed those rows here as disabled.
+        active = record_is_active(g)
         lines.append(f"{'✅' if active else '⛔'} {g.get('group_name') or '(unnamed)'} `{g.get('group_telegram_id')}`")
         rows.append([InlineKeyboardButton(
-            f"{'Disable' if active else 'Enable'} {g.get('group_name') or 'group'}"[:40],
+            f"{'Disable' if active else 'Enable'} {g.get('group_name') or 'dispatcher'}"[:40],
             callback_data=f"tset_gtog:{g.get('id')}")])
     if not groups:
-        lines.append("_No groups yet._")
-    rows.append([InlineKeyboardButton("➕ Add Group", callback_data="tset_gadd")])
+        lines.append("_No dispatchers yet._")
+    rows.append([InlineKeyboardButton("➕ Add Dispatcher", callback_data="tset_gadd")])
     rows.append([InlineKeyboardButton("⬅️ Back", callback_data="tset_menu")])
     await query.edit_message_text("\n".join(lines), parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(rows))
 
@@ -13651,7 +13737,65 @@ async def handle_settings_cb(update: Update, context: ContextTypes.DEFAULT_TYPE)
         await _settings_render_groups(query); return SET_MENU
     if data == "tset_gadd":
         context.user_data["tset_await"] = {"kind": "add_group"}
-        await query.message.reply_text("Send the new group as: *Group Name | -100xxxxxxxxxx*", parse_mode="Markdown")
+        await query.message.reply_text(
+            "Send the new dispatcher as: *Name | -100xxxxxxxxxx*", parse_mode="Markdown")
+        return SET_INPUT
+    # --- drivers -------------------------------------------------------
+    if data == "tset_drivers":
+        await _settings_render_drivers(query); return SET_MENU
+    if data.startswith("tset_dtog:"):
+        await asyncio.to_thread(db.toggle_driver_status, data.split(":", 1)[1])
+        _bust_driver_caches()
+        await _settings_render_drivers(query); return SET_MENU
+    if data == "tset_dadd":
+        context.user_data["tset_await"] = {"kind": "add_driver"}
+        await query.message.reply_text(
+            "Send the new driver as: *Name | telegram_id* (phone optional: "
+            "*Name | telegram_id | 555-123-4567*)", parse_mode="Markdown")
+        return SET_INPUT
+    # --- suspensions ---------------------------------------------------
+    if data == "tset_susp":
+        await _settings_render_suspensions(query); return SET_MENU
+    if data.startswith("tset_suspon:"):
+        did = data.split(":", 1)[1]
+        ok = await asyncio.to_thread(db.set_driver_suspended, did, True)
+        _bust_driver_caches()
+        if not ok:
+            await query.message.reply_text(
+                "⚠️ Manual suspension needs one database change first — run "
+                "`database/migration_driver_manual_suspend.sql` in the Supabase SQL "
+                "editor. Receipt-debt suspensions work without it.",
+                parse_mode="Markdown")
+        await _settings_render_suspensions(query); return SET_MENU
+    if data.startswith("tset_susplift:"):
+        did = data.split(":", 1)[1]
+        await asyncio.to_thread(db.set_driver_suspended, did, False)
+        # A receipt-debt suspension only lifts once the debt stops counting, so
+        # excuse the outstanding receipts exactly as an accepted appeal does.
+        waived = await asyncio.to_thread(db.waive_driver_pending_receipts, did)
+        _bust_driver_caches()
+        driver = await asyncio.to_thread(_driver_row_by_id, did)
+        if driver:
+            try:
+                pending_after = await asyncio.to_thread(db.get_driver_pending_receipts, did)
+                await _notify_suspension_lifted(
+                    context, driver=driver, pending_after=pending_after)
+            except Exception as e:
+                logger.warning("suspension-lift notice failed: %s", e)
+        if waived:
+            await query.message.reply_text(f"✅ Lifted — excused {waived} outstanding receipt(s).")
+        await _settings_render_suspensions(query); return SET_MENU
+    # --- client sources ------------------------------------------------
+    if data == "tset_srcs":
+        await _settings_render_sources(query); return SET_MENU
+    if data.startswith("tset_stog:"):
+        _, sid, want = data.split(":", 2)
+        await asyncio.to_thread(db.set_contact_info_source_active, sid, want == "1")
+        await _settings_render_sources(query); return SET_MENU
+    if data == "tset_sadd":
+        context.user_data["tset_await"] = {"kind": "add_source"}
+        await query.message.reply_text("Send the new client source name (e.g. *Instagram*).",
+                                       parse_mode="Markdown")
         return SET_INPUT
     return SET_MENU
 
@@ -13662,11 +13806,39 @@ async def apply_settings_input(update: Update, context: ContextTypes.DEFAULT_TYP
         return ConversationHandler.END
     st = context.user_data.pop("tset_await", None) or {}
     text = (update.message.text or "").strip()
+
+    async def _retry(msg: str) -> int:
+        """Bad input keeps the prompt alive instead of dropping out of /settings."""
+        context.user_data["tset_await"] = st
+        await update.message.reply_text(msg)
+        return SET_INPUT
+
+    if st.get("kind") == "add_driver":
+        parts = [p.strip() for p in text.split("|")]
+        if len(parts) < 2 or not parts[0] or not parts[1]:
+            return await _retry("❌ Format: Name | telegram_id")
+        if not re.fullmatch(r"-?\d{5,}", parts[1]):
+            return await _retry("❌ The telegram_id must be digits — the driver can get theirs from /whoami.")
+        phone = parts[2] if len(parts) > 2 and parts[2] else None
+        ok = await asyncio.to_thread(db.create_driver, parts[0], parts[1], phone)
+        _bust_driver_caches()
+        await update.message.reply_text(
+            (f"✅ Added driver “{parts[0]}”." if ok else "❌ Could not add the driver."),
+            reply_markup=_settings_main_kb())
+        return SET_MENU
+    if st.get("kind") == "add_source":
+        label = text.strip()
+        if not label or len(label) > 60:
+            return await _retry("❌ Send a short source name (1–60 characters).")
+        ok = await asyncio.to_thread(db.create_contact_info_source, label)
+        await update.message.reply_text(
+            (f"✅ Added client source “{label}”." if ok else "❌ Could not add the source."),
+            reply_markup=_settings_main_kb())
+        return SET_MENU
     if st.get("kind") == "plate":
         digits = re.sub(r"\D", "", text)
         if not digits:
-            await update.message.reply_text("❌ Digits only. Open /settings again.")
-            return ConversationHandler.END
+            return await _retry("❌ Digits only — send the number again.")
         ok = await asyncio.to_thread(db.update_plate_settings, {st["field"]: int(digits)})
         await update.message.reply_text(
             (f"✅ {_PLATE_SET_LABELS.get(st['field'], st['field'])} set to {int(digits)}." if ok
@@ -13675,11 +13847,10 @@ async def apply_settings_input(update: Update, context: ContextTypes.DEFAULT_TYP
     if st.get("kind") == "add_group":
         parts = [p.strip() for p in text.split("|")]
         if len(parts) < 2 or not parts[0] or not parts[1]:
-            await update.message.reply_text("❌ Format: Group Name | -100xxxxxxxxxx.")
-            return ConversationHandler.END
+            return await _retry("❌ Format: Name | -100xxxxxxxxxx")
         ok = await asyncio.to_thread(db.create_group, parts[0], parts[1], parts[1])
         await update.message.reply_text(
-            (f"✅ Added group “{parts[0]}”." if ok else "❌ Could not add the group."),
+            (f"✅ Added dispatcher “{parts[0]}”." if ok else "❌ Could not add the dispatcher."),
             reply_markup=_settings_main_kb())
         return SET_MENU
     return ConversationHandler.END

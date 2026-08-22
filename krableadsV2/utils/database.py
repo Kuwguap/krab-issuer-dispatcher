@@ -1027,9 +1027,10 @@ class Database:
             return set()
         try:
             r = self.client.table("lead_assignments").select(
-                "driver_id, lead:leads(receipt_image_url)"
+                "driver_id, lead_id, lead:leads(receipt_image_url)"
             ).eq("status", "accepted").execute()
             counts: dict[str, int] = {}
+            unpaid: dict[str, str] = {}          # lead_id -> driver, for the waiver lookup
             for row in r.data or []:
                 lead = row.get("lead") or {}
                 if lead.get("receipt_image_url"):
@@ -1039,6 +1040,25 @@ class Database:
                     continue
                 ds = str(did)
                 counts[ds] = counts.get(ds, 0) + 1
+                if row.get("lead_id"):
+                    unpaid[str(row["lead_id"])] = ds
+            # Waived leads (appeal accepted, or a supervisor lifted the suspension)
+            # must stop counting. Tolerant second query: on a DB that has not run
+            # migration_lead_appeals.sql the column is absent and we simply skip the
+            # exclusion rather than returning nothing. Without this the waiver was
+            # written but never honored, so a lifted suspension never actually lifted.
+            if unpaid:
+                try:
+                    ex = self.client.table("leads").select(
+                        "id, exclude_from_count"
+                    ).in_("id", list(unpaid.keys())).execute()
+                    for row in (ex.data or []):
+                        if row.get("exclude_from_count"):
+                            ds = unpaid.get(str(row["id"]))
+                            if ds and counts.get(ds):
+                                counts[ds] -= 1
+                except Exception:
+                    pass
             return {did for did, c in counts.items() if c >= threshold}
         except Exception as e:
             logger.error("get_driver_ids_with_pending_receipt_count_at_least: %s", e)
@@ -1637,6 +1657,107 @@ class Database:
         except Exception as e:
             logger.error(f"Error getting contact info sources: {e}")
             return []
+
+    def get_all_contact_info_sources(self) -> list:
+        """Every source INCLUDING disabled ones — the settings screen needs the
+        disabled rows so they can be switched back on (the active-only getter would
+        make a disabled source unreachable from Telegram)."""
+        if not self._check_tables_exist():
+            return []
+        try:
+            r = self.client.table("contact_info_sources").select("*").order("sort_order").execute()
+            return r.data or []
+        except Exception as e:
+            logger.error(f"Error getting all contact info sources: {e}")
+            return []
+
+    def create_contact_info_source(self, label: str, sort_order: Optional[int] = None) -> bool:
+        """Add a client source. Sorts last unless a position is given."""
+        if not self._check_tables_exist():
+            return False
+        label = (label or "").strip()
+        if not label:
+            return False
+        try:
+            if sort_order is None:
+                existing = self.get_all_contact_info_sources()
+                sort_order = max(
+                    (int(r.get("sort_order") or 0) for r in existing), default=-1
+                ) + 1
+            self.client.table("contact_info_sources").insert({
+                "label": label,
+                "sort_order": int(sort_order),
+                "is_active": True,
+            }).execute()
+            return True
+        except Exception as e:
+            logger.error(f"Error creating contact info source: {e}")
+            return False
+
+    def set_contact_info_source_active(self, source_id: str, active: bool) -> bool:
+        """Enable/disable a client source. A SOFT delete on purpose: leads store the
+        source as a text label, and an already-sent picker button must still resolve."""
+        if not self._check_tables_exist():
+            return False
+        try:
+            self.client.table("contact_info_sources").update(
+                {"is_active": bool(active)}
+            ).eq("id", source_id).execute()
+            return True
+        except Exception as e:
+            logger.error(f"Error updating contact info source: {e}")
+            return False
+
+    def set_driver_suspended(self, driver_id: str, suspended: bool) -> bool:
+        """Manually suspend / un-suspend a driver.
+
+        Uses ``drivers.is_suspended`` (database/migration_driver_manual_suspend.sql).
+        Returns False when the column has not been added yet, so the caller can say
+        so instead of appearing to succeed."""
+        if not self._check_tables_exist():
+            return False
+        try:
+            self.client.table("drivers").update(
+                {"is_suspended": bool(suspended)}
+            ).eq("id", driver_id).execute()
+            return True
+        except Exception as e:
+            logger.warning("set_driver_suspended (run migration_driver_manual_suspend.sql?): %s", e)
+            return False
+
+    def get_manually_suspended_driver_ids(self) -> set:
+        """Driver ids flagged by a supervisor. Empty when the column is absent."""
+        if not self._check_tables_exist():
+            return set()
+        try:
+            r = self.client.table("drivers").select("id, is_suspended").execute()
+            return {str(x["id"]) for x in (r.data or []) if x.get("is_suspended")}
+        except Exception:
+            return set()          # column not migrated yet — nobody is manually suspended
+
+    def waive_driver_pending_receipts(self, driver_id: str) -> int:
+        """Lift a receipt-debt suspension by excusing that driver's outstanding
+        receipts (the same ``exclude_from_count`` flag an accepted appeal sets).
+        Returns how many leads were excused."""
+        if not self._check_tables_exist():
+            return 0
+        try:
+            r = self.client.table("lead_assignments").select(
+                "lead_id, lead:leads(receipt_image_url)"
+            ).eq("driver_id", driver_id).eq("status", "accepted").execute()
+            lead_ids = [
+                str(row["lead_id"]) for row in (r.data or [])
+                if row.get("lead_id") and not (row.get("lead") or {}).get("receipt_image_url")
+            ]
+            if not lead_ids:
+                return 0
+            self.client.table("leads").update(
+                {"exclude_from_count": True}
+            ).in_("id", lead_ids).execute()
+            return len(lead_ids)
+        except Exception as e:
+            logger.error("waive_driver_pending_receipts: %s", e)
+            return 0
 
     def get_contact_info_source_by_id(self, source_id: str) -> Optional[Dict[str, Any]]:
         """Get a single contact info source by id."""
