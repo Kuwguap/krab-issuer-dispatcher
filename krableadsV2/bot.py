@@ -3601,7 +3601,7 @@ async def _smart_place_single_value(state_data: dict, value: str) -> list:
 # instead of turning 'choose the driver kita' or 'submit' into a name.
 _COMMAND_LIKE_RE = re.compile(
     r"^\s*(?:choose|select|pick|assign|use|go\s+with|send|submit|dispatch|deploy|ship|"
-    r"done|finish|run|check|look\s*up|lookup|decode|verify)\b"
+    r"done|finish(?:ed|ing)?|run|check|look\s*up|lookup|decode|verify)\b"
     # a bare select-noun at the START ('driver', 'the dispatcher', 'group …') — anchored
     # so a real surname/company containing the word (e.g. 'Ryan Driver', 'Acme Group')
     # is still placed as a value.
@@ -3629,9 +3629,13 @@ _ALL_SELECT_RE = re.compile(r"^\s*(?:all|every\s*one|everybody|everything)\b", r
 # message match so "send to HighKage" (a group pick) and "send driver note …" are
 # NOT caught here.
 _SUBMIT_RE = re.compile(
-    r"^\s*(?:submit|send|dispatch|deploy|ship|done|go\s*ahead|finish(?:\s*up)?|"
-    r"send\s*out|push(?:\s*it)?)"
-    r"(?:\s+(?:the|this|that|my|it|out|now|please|lead|leads|tag|client|sale))*\s*[.!]*$",
+    # The verb. "finished"/"finishing" are spoken far more often than "finish".
+    r"^\s*(?:submit|send|dispatch|deploy|ship|done|go\s*ahead|"
+    r"finish(?:ed|ing)?(?:\s*up)?|send\s*out|push(?:\s*it)?)"
+    # Optional trailing nouns. "dispatch" is here as well as in the verb list so
+    # "send dispatch" and "finished dispatch" both read as one whole command.
+    r"(?:\s+(?:the|this|that|my|it|out|now|please|lead|leads|tag|tags|"
+    r"client|sale|dispatch))*\s*[.!,]*$",
     re.I,
 )
 
