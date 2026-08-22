@@ -13593,7 +13593,7 @@ def _settings_main_kb() -> InlineKeyboardMarkup:
     ])
 
 
-async def _settings_render_drivers(query) -> None:
+async def _settings_view_drivers() -> tuple:
     """Add a driver, or switch one off/on. Disabling removes them from the pickers
     entirely; suspending (separate screen) keeps them visible but unassignable."""
     drivers = await asyncio.to_thread(_get_all_drivers_cached)
@@ -13609,11 +13609,10 @@ async def _settings_render_drivers(query) -> None:
         lines.append("_No drivers yet._")
     rows.append([InlineKeyboardButton("➕ Add Driver", callback_data="tset_dadd")])
     rows.append([InlineKeyboardButton("⬅️ Back", callback_data="tset_menu")])
-    await query.edit_message_text(
-        "\n".join(lines), parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(rows))
+    return ("\n".join(lines), InlineKeyboardMarkup(rows))
 
 
-async def _settings_render_suspensions(query) -> None:
+async def _settings_view_suspensions() -> tuple:
     """Suspend a driver, or lift a suspension — including one earned by unpaid
     receipts, which is excused the same way an accepted appeal excuses it."""
     drivers = await asyncio.to_thread(_get_all_drivers_cached)
@@ -13635,11 +13634,10 @@ async def _settings_render_suspensions(query) -> None:
     if not drivers:
         lines.append("_No drivers yet._")
     rows.append([InlineKeyboardButton("⬅️ Back", callback_data="tset_menu")])
-    await query.edit_message_text(
-        "\n".join(lines), parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(rows))
+    return ("\n".join(lines), InlineKeyboardMarkup(rows))
 
 
-async def _settings_render_sources(query) -> None:
+async def _settings_view_sources() -> tuple:
     """Add or remove the client sources offered after a lead is dispatched.
     Removing is a soft disable so already-sent picker buttons still resolve."""
     sources = await asyncio.to_thread(db.get_all_contact_info_sources)
@@ -13655,8 +13653,7 @@ async def _settings_render_sources(query) -> None:
         lines.append("_No sources yet._")
     rows.append([InlineKeyboardButton("➕ Add Source", callback_data="tset_sadd")])
     rows.append([InlineKeyboardButton("⬅️ Back", callback_data="tset_menu")])
-    await query.edit_message_text(
-        "\n".join(lines), parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(rows))
+    return ("\n".join(lines), InlineKeyboardMarkup(rows))
 
 
 async def cmd_settings(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -13673,7 +13670,7 @@ async def cmd_settings(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
     return SET_MENU
 
 
-async def _settings_render_plates(query) -> None:
+async def _settings_view_plates() -> tuple:
     s = await asyncio.to_thread(db.get_plate_settings) or {}
     pre, suf = s.get("nj_plate_prefix", "H"), s.get("non_nj_plate_suffix", "V")
     txt = (
@@ -13691,10 +13688,10 @@ async def _settings_render_plates(query) -> None:
          InlineKeyboardButton("Set Non-Res control #", callback_data="tset_pf:non_nj_car_next_number")],
         [InlineKeyboardButton("⬅️ Back", callback_data="tset_menu")],
     ])
-    await query.edit_message_text(txt, parse_mode="Markdown", reply_markup=kb)
+    return (txt, kb)
 
 
-async def _settings_render_groups(query) -> None:
+async def _settings_view_groups() -> tuple:
     groups = await asyncio.to_thread(db.get_all_groups)
     lines = ["🏢 *Dispatchers*\n"]
     rows = []
@@ -13710,7 +13707,93 @@ async def _settings_render_groups(query) -> None:
         lines.append("_No dispatchers yet._")
     rows.append([InlineKeyboardButton("➕ Add Dispatcher", callback_data="tset_gadd")])
     rows.append([InlineKeyboardButton("⬅️ Back", callback_data="tset_menu")])
-    await query.edit_message_text("\n".join(lines), parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(rows))
+    return ("\n".join(lines), InlineKeyboardMarkup(rows))
+
+
+_SETTINGS_MENU_TEXT = "⚙️ *Settings*"
+# Every settings screen, keyed by the callback data its button carries — so a spoken
+# or typed request opens exactly the same view the button does.
+_SETTINGS_VIEWS = {
+    "tset_plates": _settings_view_plates,
+    "tset_groups": _settings_view_groups,
+    "tset_drivers": _settings_view_drivers,
+    "tset_susp": _settings_view_suspensions,
+    "tset_srcs": _settings_view_sources,
+}
+# Spoken/typed navigation. Ordered: "suspend driver kita" is about suspensions even
+# though it also says "driver", so suspensions is tested before drivers.
+_SETTINGS_NAV = [
+    # "suspen" not "suspend": suspension/suspensions do not contain the word suspend.
+    (re.compile(r"\b(?:suspen\w*|unsuspend\w*|lift|penalt\w*|block\w*)\b", re.I), "tset_susp"),
+    (re.compile(r"\b(?:plates?|tag\s*numbers?|control\s*numbers?)\b", re.I), "tset_plates"),
+    (re.compile(r"\b(?:dispatchers?|groups?|teams?|crews?)\b", re.I), "tset_groups"),
+    (re.compile(r"\b(?:drivers?|drv)\b", re.I), "tset_drivers"),
+    (re.compile(r"\b(?:sources?|client\s*source|lead\s*source|origin)\b", re.I), "tset_srcs"),
+]
+_SETTINGS_BACK_RE = re.compile(r"^\s*(?:back|menu|main|home|up|return)\b", re.I)
+_SETTINGS_CLOSE_RE = re.compile(r"^\s*(?:close|exit|quit|dismiss|finished|done)\b", re.I)
+_SETTINGS_HINT = (
+    "⚙️ Say or type what you want:\n"
+    "• *plate numbers*\n"
+    "• *dispatchers*\n"
+    "• *drivers*\n"
+    "• *suspensions*\n"
+    "• *client sources*\n"
+    "…or *back* / *close*."
+)
+
+
+def _settings_nav_target(text: str):
+    """Which settings screen a spoken/typed phrase asks for, or None."""
+    t = (text or "").strip()
+    if not t:
+        return None
+    for rx, target in _SETTINGS_NAV:
+        if rx.search(t):
+            return target
+    return None
+
+
+async def _show_settings_view(target: str, *, query=None, message=None) -> None:
+    """Render one settings screen — editing the card when it came from a button,
+    posting a fresh one when it was asked for by voice or typing."""
+    view = _SETTINGS_VIEWS.get(target)
+    if view is None:
+        text, kb = _SETTINGS_MENU_TEXT, _settings_main_kb()
+    else:
+        text, kb = await view()
+    if query is not None:
+        await query.edit_message_text(text, parse_mode="Markdown", reply_markup=kb)
+    elif message is not None:
+        await message.reply_text(text, parse_mode="Markdown", reply_markup=kb)
+
+
+async def handle_settings_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Voice/typed control of /settings, mirroring the lead card: say "plate numbers"
+    and that screen opens, with all of its buttons live. Voice arrives here already
+    transcribed by the global pre-processor, so speaking and typing behave the same."""
+    msg = update.effective_message
+    text = ((msg.text if msg else "") or "").strip()
+    if not msg or not text:
+        return SET_MENU
+    if not _user_is_global_supervisor(update.effective_user.id):
+        return ConversationHandler.END
+    if _SETTINGS_CLOSE_RE.match(text):
+        context.user_data.pop("tset_await", None)
+        await msg.reply_text("⚙️ Settings closed.")
+        return ConversationHandler.END
+    if _SETTINGS_BACK_RE.match(text):
+        context.user_data.pop("tset_await", None)
+        await msg.reply_text(_SETTINGS_MENU_TEXT, parse_mode="Markdown",
+                             reply_markup=_settings_main_kb())
+        return SET_MENU
+    target = _settings_nav_target(text)
+    if target:
+        await _show_settings_view(target, message=msg)
+        return SET_MENU
+    await msg.reply_text(_SETTINGS_HINT, parse_mode="Markdown",
+                         reply_markup=_settings_main_kb())
+    return SET_MENU
 
 
 async def handle_settings_cb(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -13724,9 +13807,9 @@ async def handle_settings_cb(update: Update, context: ContextTypes.DEFAULT_TYPE)
         await query.edit_message_text("⚙️ *Settings*", parse_mode="Markdown", reply_markup=_settings_main_kb())
         return SET_MENU
     if data == "tset_plates":
-        await _settings_render_plates(query); return SET_MENU
+        await _show_settings_view("tset_plates", query=query); return SET_MENU
     if data == "tset_groups":
-        await _settings_render_groups(query); return SET_MENU
+        await _show_settings_view("tset_groups", query=query); return SET_MENU
     if data == "tset_close":
         context.user_data.pop("tset_await", None)
         await query.edit_message_text("⚙️ Settings closed."); return ConversationHandler.END
@@ -13738,7 +13821,7 @@ async def handle_settings_cb(update: Update, context: ContextTypes.DEFAULT_TYPE)
         return SET_INPUT
     if data.startswith("tset_gtog:"):
         await asyncio.to_thread(db.toggle_group_status, data.split(":", 1)[1])
-        await _settings_render_groups(query); return SET_MENU
+        await _show_settings_view("tset_groups", query=query); return SET_MENU
     if data == "tset_gadd":
         context.user_data["tset_await"] = {"kind": "add_group"}
         await query.message.reply_text(
@@ -13746,11 +13829,11 @@ async def handle_settings_cb(update: Update, context: ContextTypes.DEFAULT_TYPE)
         return SET_INPUT
     # --- drivers -------------------------------------------------------
     if data == "tset_drivers":
-        await _settings_render_drivers(query); return SET_MENU
+        await _show_settings_view("tset_drivers", query=query); return SET_MENU
     if data.startswith("tset_dtog:"):
         await asyncio.to_thread(db.toggle_driver_status, data.split(":", 1)[1])
         _bust_driver_caches()
-        await _settings_render_drivers(query); return SET_MENU
+        await _show_settings_view("tset_drivers", query=query); return SET_MENU
     if data == "tset_dadd":
         context.user_data["tset_await"] = {"kind": "add_driver"}
         await query.message.reply_text(
@@ -13759,7 +13842,7 @@ async def handle_settings_cb(update: Update, context: ContextTypes.DEFAULT_TYPE)
         return SET_INPUT
     # --- suspensions ---------------------------------------------------
     if data == "tset_susp":
-        await _settings_render_suspensions(query); return SET_MENU
+        await _show_settings_view("tset_susp", query=query); return SET_MENU
     if data.startswith("tset_suspon:"):
         did = data.split(":", 1)[1]
         ok = await asyncio.to_thread(db.set_driver_suspended, did, True)
@@ -13770,7 +13853,7 @@ async def handle_settings_cb(update: Update, context: ContextTypes.DEFAULT_TYPE)
                 "`database/migration_driver_manual_suspend.sql` in the Supabase SQL "
                 "editor. Receipt-debt suspensions work without it.",
                 parse_mode="Markdown")
-        await _settings_render_suspensions(query); return SET_MENU
+        await _show_settings_view("tset_susp", query=query); return SET_MENU
     if data.startswith("tset_susplift:"):
         did = data.split(":", 1)[1]
         await asyncio.to_thread(db.set_driver_suspended, did, False)
@@ -13788,14 +13871,14 @@ async def handle_settings_cb(update: Update, context: ContextTypes.DEFAULT_TYPE)
                 logger.warning("suspension-lift notice failed: %s", e)
         if waived:
             await query.message.reply_text(f"✅ Lifted — excused {waived} outstanding receipt(s).")
-        await _settings_render_suspensions(query); return SET_MENU
+        await _show_settings_view("tset_susp", query=query); return SET_MENU
     # --- client sources ------------------------------------------------
     if data == "tset_srcs":
-        await _settings_render_sources(query); return SET_MENU
+        await _show_settings_view("tset_srcs", query=query); return SET_MENU
     if data.startswith("tset_stog:"):
         _, sid, want = data.split(":", 2)
         await asyncio.to_thread(db.set_contact_info_source_active, sid, want == "1")
-        await _settings_render_sources(query); return SET_MENU
+        await _show_settings_view("tset_srcs", query=query); return SET_MENU
     if data == "tset_sadd":
         context.user_data["tset_await"] = {"kind": "add_source"}
         await query.message.reply_text("Send the new client source name (e.g. *Instagram*).",
@@ -13810,6 +13893,15 @@ async def apply_settings_input(update: Update, context: ContextTypes.DEFAULT_TYP
         return ConversationHandler.END
     st = context.user_data.pop("tset_await", None) or {}
     text = (update.message.text or "").strip()
+    # "back" / "close" must escape an input prompt too, or a spoken command would be
+    # swallowed as the value being asked for.
+    if _SETTINGS_CLOSE_RE.match(text):
+        await update.message.reply_text("⚙️ Settings closed.")
+        return ConversationHandler.END
+    if _SETTINGS_BACK_RE.match(text):
+        await update.message.reply_text(_SETTINGS_MENU_TEXT, parse_mode="Markdown",
+                                        reply_markup=_settings_main_kb())
+        return SET_MENU
 
     async def _retry(msg: str) -> int:
         """Bad input keeps the prompt alive instead of dropping out of /settings."""
@@ -14184,7 +14276,12 @@ def main():
     settings_conv = ConversationHandler(
         entry_points=[CommandHandler(["settings", "setting"], cmd_settings)],
         states={
-            SET_MENU: [CallbackQueryHandler(handle_settings_cb, pattern=r"^tset_")],
+            SET_MENU: [
+                CallbackQueryHandler(handle_settings_cb, pattern=r"^tset_"),
+                # Say or type "plate numbers" and that screen opens — the state had
+                # button handlers only, so text here used to be dropped entirely.
+                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_settings_text),
+            ],
             SET_INPUT: [
                 CallbackQueryHandler(handle_settings_cb, pattern=r"^tset_"),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, apply_settings_input),

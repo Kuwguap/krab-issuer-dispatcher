@@ -40,8 +40,10 @@ def _cb_update(data):
 
 
 def _txt_update(text):
+    msg = SimpleNamespace(text=text, chat_id=SUP, reply_text=mock.AsyncMock())
     return SimpleNamespace(
-        message=SimpleNamespace(text=text, chat_id=SUP, reply_text=mock.AsyncMock()),
+        message=msg,
+        effective_message=msg,          # handlers read this one
         effective_user=SimpleNamespace(id=SUP),
         effective_chat=SimpleNamespace(id=SUP, type="private"),
     )
@@ -98,39 +100,43 @@ class MenuTest(unittest.TestCase):
 
 
 class RenderTest(unittest.TestCase):
-    def _render(self, fn):
+    def _render(self, view):
+        """Views return (text, keyboard), so the same screen can be edited in place
+        for a button tap or posted fresh when asked for by voice."""
         db = _fake_db()
-        q = _query("x")
+        db.get_plate_settings.return_value = {"nj_plate_next_number": 1}
         with mock.patch.object(bot, "db", db), \
                 mock.patch.object(bot, "_get_all_drivers_cached",
                                   mock.MagicMock(return_value=db.get_all_drivers())), \
                 mock.patch.object(bot, "_get_suspended_driver_ids",
                                   mock.MagicMock(return_value={"d1"})):
-            asyncio.run(fn(q))
-        return q.edit_message_text.await_args
+            return asyncio.run(view())
+
+    @staticmethod
+    def _datas(kb):
+        return [b.callback_data for row in kb.inline_keyboard for b in row]
 
     def test_dispatchers_null_is_active_shows_as_active(self):
         """A JSON-null is_active means ACTIVE to the dispatch path."""
-        text = self._render(bot._settings_render_groups).args[0]
+        text, _ = self._render(bot._settings_view_groups)
         self.assertIn("✅ NullState", text)
 
     def test_drivers_list_offers_add_and_toggle(self):
-        call = self._render(bot._settings_render_drivers)
-        datas = [b.callback_data for row in call.kwargs["reply_markup"].inline_keyboard for b in row]
+        _, kb = self._render(bot._settings_view_drivers)
+        datas = self._datas(kb)
         self.assertIn("tset_dadd", datas)
         self.assertTrue(any(d.startswith("tset_dtog:") for d in datas))
 
     def test_suspensions_show_reason_and_offer_lift(self):
-        call = self._render(bot._settings_render_suspensions)
-        text = call.args[0]
+        text, kb = self._render(bot._settings_view_suspensions)
         self.assertIn("unpaid receipts", text)      # d1 is suspended by debt
-        datas = [b.callback_data for row in call.kwargs["reply_markup"].inline_keyboard for b in row]
+        datas = self._datas(kb)
         self.assertIn("tset_susplift:d1", datas)    # suspended -> Lift
         self.assertIn("tset_suspon:d2", datas)      # not suspended -> Suspend
 
     def test_sources_can_be_restored_after_removal(self):
-        call = self._render(bot._settings_render_sources)
-        datas = [b.callback_data for row in call.kwargs["reply_markup"].inline_keyboard for b in row]
+        _, kb = self._render(bot._settings_view_sources)
+        datas = self._datas(kb)
         self.assertIn("tset_stog:s1:0", datas)      # active -> Remove
         self.assertIn("tset_stog:s2:1", datas)      # disabled -> Restore (recoverable)
         self.assertIn("tset_sadd", datas)
@@ -213,6 +219,86 @@ class ManualSuspensionIsEnforcedTest(unittest.TestCase):
             got = bot._get_suspended_driver_ids()
             bot._bust_driver_caches()
         self.assertEqual(got, {"d9"}, "receipt-debt suspension must survive un-migrated DBs")
+
+
+class VoiceAndTextNavigationTest(unittest.TestCase):
+    """Say or type "plate numbers" and that screen opens, exactly like the button."""
+
+    NAV = {
+        "plate numbers": "tset_plates", "plates": "tset_plates",
+        "tag numbers": "tset_plates", "control numbers": "tset_plates",
+        "dispatchers": "tset_groups", "groups": "tset_groups", "teams": "tset_groups",
+        "drivers": "tset_drivers", "driver": "tset_drivers",
+        "suspensions": "tset_susp", "suspension": "tset_susp",
+        "suspend kita": "tset_susp", "lift suspension": "tset_susp",
+        "client sources": "tset_srcs", "sources": "tset_srcs", "lead source": "tset_srcs",
+        "open plate numbers please": "tset_plates",
+        "show me the drivers": "tset_drivers",
+        "i want to suspend a driver": "tset_susp",
+    }
+
+    def test_phrases_resolve_to_the_right_screen(self):
+        wrong = {t: bot._settings_nav_target(t) for t, want in self.NAV.items()
+                 if bot._settings_nav_target(t) != want}
+        self.assertEqual({}, wrong)
+
+    def test_every_menu_button_is_reachable_by_voice(self):
+        """No screen may be button-only."""
+        for row in bot._settings_main_kb().inline_keyboard:
+            for b in row:
+                if b.callback_data == "tset_close":
+                    continue
+                self.assertIn(b.callback_data, bot._SETTINGS_VIEWS, b.text)
+        spoken = {bot._settings_nav_target(w) for w in
+                  ("plate numbers", "dispatchers", "drivers", "suspensions", "client sources")}
+        self.assertEqual(spoken, set(bot._SETTINGS_VIEWS))
+
+    def test_spoken_navigation_opens_the_screen(self):
+        db = _fake_db()
+        ctx = _ctx()
+        upd = _txt_update("plate numbers")
+        db.get_plate_settings.return_value = {"nj_plate_next_number": 1}
+        with mock.patch.object(bot, "db", db),                 mock.patch.object(bot, "_user_is_global_supervisor",
+                                  mock.MagicMock(return_value=True)):
+            state = asyncio.run(bot.handle_settings_text(upd, ctx))
+        self.assertEqual(state, bot.SET_MENU)
+        sent = upd.message.reply_text.await_args
+        self.assertIn("Plate Numbers", sent.args[0])
+        self.assertIsNotNone(sent.kwargs.get("reply_markup"), "buttons must come with it")
+
+    def test_unknown_phrase_gets_a_hint_not_silence(self):
+        db = _fake_db()
+        upd = _txt_update("hello there")
+        with mock.patch.object(bot, "db", db),                 mock.patch.object(bot, "_user_is_global_supervisor",
+                                  mock.MagicMock(return_value=True)):
+            state = asyncio.run(bot.handle_settings_text(upd, _ctx()))
+        self.assertEqual(state, bot.SET_MENU)
+        self.assertIn("plate numbers", upd.message.reply_text.await_args.args[0].lower())
+
+    def test_back_and_close(self):
+        db = _fake_db()
+        with mock.patch.object(bot, "db", db),                 mock.patch.object(bot, "_user_is_global_supervisor",
+                                  mock.MagicMock(return_value=True)):
+            self.assertEqual(asyncio.run(bot.handle_settings_text(_txt_update("back"), _ctx())),
+                             bot.SET_MENU)
+            self.assertEqual(asyncio.run(bot.handle_settings_text(_txt_update("close"), _ctx())),
+                             bot.ConversationHandler.END)
+
+    def test_back_escapes_an_input_prompt(self):
+        """A spoken command must not be swallowed as the value being asked for."""
+        db = _fake_db()
+        ctx = _ctx()
+        ctx.user_data["tset_await"] = {"kind": "add_driver"}
+        state = _run(_txt_update("back"), ctx, bot.apply_settings_input, db)
+        db.create_driver.assert_not_called()
+        self.assertEqual(state, bot.SET_MENU)
+
+    def test_non_supervisor_gets_nothing(self):
+        upd = _txt_update("drivers")
+        with mock.patch.object(bot, "db", _fake_db()),                 mock.patch.object(bot, "_user_is_global_supervisor",
+                                  mock.MagicMock(return_value=False)):
+            state = asyncio.run(bot.handle_settings_text(upd, _ctx()))
+        self.assertEqual(state, bot.ConversationHandler.END)
 
 
 if __name__ == "__main__":
