@@ -2225,6 +2225,57 @@ PH1_EDIT_TO_STATE_KEY = {
     "email": "email",
     "dl": "driver_license_id",
 }
+# ── Colour picker for the review card's Color field ─────────────────────────
+# Tapping a colour is far faster (and far less error-prone) than typing one, and the
+# same prompt still accepts typing, a voice note, or a photo of the car.
+PH1_COLOR_CB = "ph1col_"
+_PH1_COLORS = [
+    "White", "Black",
+    "Gray", "Silver",
+    "Blue - Dark", "Blue - Light",
+    "Red", "Burgundy",
+    "Green - Dark", "Green - Light",
+    "Brown", "Beige",
+    "Gold", "Tan",
+    "Orange", "Yellow",
+    "Purple", "Pink",
+    "Navy", "Charcoal",
+    "Bronze", "Champagne",
+    "Maroon", "Teal",
+    "Cream", "Pearl",
+]
+# A dot that hints at the actual colour, so the list is scannable at a glance.
+_PH1_COLOR_DOT = {
+    "White": "⚪", "Black": "⚫", "Gray": "🩶", "Silver": "🩶",
+    "Blue - Dark": "🔵", "Blue - Light": "🔵", "Navy": "🔵", "Teal": "🩵",
+    "Red": "🔴", "Burgundy": "🔴", "Maroon": "🔴", "Pink": "🩷",
+    "Green - Dark": "🟢", "Green - Light": "🟢",
+    "Brown": "🟤", "Beige": "🟤", "Tan": "🟤", "Bronze": "🟤",
+    "Gold": "🟡", "Yellow": "🟡", "Champagne": "🟡", "Cream": "🟡",
+    "Orange": "🟠", "Purple": "🟣", "Charcoal": "⚫", "Pearl": "⚪",
+}
+
+
+def _color_picker_keyboard() -> InlineKeyboardMarkup:
+    """Two-per-row colour buttons, then Cancel. Callback data is the colour itself
+    (short enough for Telegram's 64-byte limit)."""
+    rows = []
+    for i in range(0, len(_PH1_COLORS), 2):
+        rows.append([
+            InlineKeyboardButton(
+                f"{_PH1_COLOR_DOT.get(c, '🎨')} {c}",
+                callback_data=f"{PH1_COLOR_CB}{c}",
+            )
+            for c in _PH1_COLORS[i:i + 2]
+        ])
+    rows.append([InlineKeyboardButton("❌ Cancel", callback_data="edit_cancel")])
+    return InlineKeyboardMarkup(rows)
+
+
+# What the Color prompt says: every input route spelled out, because all four work.
+_PH1_COLOR_PROMPT = "✏️ type, speak, click, or upload a picture to read the color"
+
+
 PH1_EDIT_PROMPT_LABEL = {
     "fn": "First name",
     "ln": "Last name",
@@ -2992,6 +3043,7 @@ async def handle_phase1_adjust_input(update: Update, context: ContextTypes.DEFAU
 
     note = await message.reply_text("🤖 Reading…")
     structured = None
+    pdf_vin = None                      # exact VIN from a PDF text layer, if any
     adjust_caption = (message.caption or "").strip() or None
     # Keep the downloaded bytes so the SAME upload can both be read for fields AND ride
     # along to the dispatch group (no second download, no separate button).
@@ -3018,6 +3070,9 @@ async def handle_phase1_adjust_input(update: Update, context: ContextTypes.DEFAU
             attach_blob = raw
             if "pdf" in mime or (doc.file_name or "").lower().endswith(".pdf"):
                 attach_ftype, attach_mime, attach_filename = "document", "application/pdf", (doc.file_name or "attachment.pdf")
+                # Read the VIN from the PDF's TEXT layer — exact, where reading 17
+                # small characters off a page render regularly missed or mangled it.
+                pdf_vin = await asyncio.to_thread(ai_vision.vin_from_pdf, raw)
                 png = await asyncio.to_thread(ai_vision.pdf_first_page_to_png_bytes, raw)
                 if png:
                     structured = await asyncio.to_thread(
@@ -3061,6 +3116,13 @@ async def handle_phase1_adjust_input(update: Update, context: ContextTypes.DEFAU
         return STATE_AI_REVIEW
 
     updated = _merge_phase1_adjust(state_data, structured, only_empty=fill_only_empty) if structured else []
+    # A VIN read from the PDF's text layer is exact — it beats whatever vision made of
+    # the page render (this is the "PDF parse misses the VIN" fix).
+    if pdf_vin and str(state_data.get("vin") or "").strip().upper() != pdf_vin:
+        state_data["vin"] = pdf_vin
+        _clean_vin_and_car(state_data)
+        if "VIN" not in updated:
+            updated.append("VIN")
     db.set_user_state(user_id, "phase1", state_data)
     await _autoclean_user_msg(update, context)  # text is cleared; media is always kept
 
@@ -6006,6 +6068,7 @@ async def _phase1_finish_vision_extraction(
     *,
     source_label: str = "image",
     typed_text: Optional[str] = None,
+    pdf_vin: Optional[str] = None,
 ) -> int:
     """Normalize AI vision output, validate, then AI review — shared by photo and PDF.
 
@@ -6102,6 +6165,11 @@ async def _phase1_finish_vision_extraction(
     vin_from_raw = _extract_vin_17(raw_text)
     if vin_from_raw:
         state_data["vin"] = vin_from_raw
+    # A VIN lifted from the PDF's own text layer is exact, so it OVERRIDES whatever
+    # vision made of the page render — reading 17 small characters off an image is
+    # what was missing/mangling the VIN on PDF uploads.
+    if pdf_vin:
+        state_data["vin"] = pdf_vin
 
     # Rebuild vehicle_details with correct VIN
     state_data["vehicle_details"] = "\n".join([
@@ -6269,6 +6337,7 @@ async def _execute_phase1_vision_batch_extraction(
         ) or None
         parts: list[tuple[bytes, str]] = []
         pending_media: list[dict] = []
+        pdf_vin = None                  # exact VIN from a PDF text layer, if any
         for item in batch:
             if item.get("kind") == "image":
                 img_bytes = item["bytes"]
@@ -6276,6 +6345,10 @@ async def _execute_phase1_vision_batch_extraction(
                 parts.append((img_bytes, img_mime))
                 pending_media.append({"kind": "image", "bytes": img_bytes, "mime": img_mime})
             elif item.get("kind") == "pdf":
+                # The PDF's text layer gives the VIN exactly; a page render makes
+                # vision guess at 17 small characters, which is what missed it.
+                if not pdf_vin:
+                    pdf_vin = await asyncio.to_thread(ai_vision.vin_from_pdf, item["bytes"])
                 png = await asyncio.to_thread(ai_vision.pdf_first_page_to_png_bytes, item["bytes"])
                 if png:
                     parts.append((png, "image/png"))
@@ -6316,7 +6389,8 @@ async def _execute_phase1_vision_batch_extraction(
 
         label = "files" if n > 1 else "photo"
         return await _phase1_finish_vision_extraction(
-            context, user_id, raw_text, status, source_label=label, typed_text=typed_text
+            context, user_id, raw_text, status, source_label=label,
+            typed_text=typed_text, pdf_vin=pdf_vin,
         )
     finally:
         if context.user_data:
@@ -6554,6 +6628,100 @@ async def handle_phase1(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
         return await _ensure_phone_price_before_files(update.message, context, update.effective_user.id)
 
 
+# A spoken colour arrives as a sentence ("the color is dark blue", "it's white") —
+# strip the lead-in so the field gets the colour itself.
+_SPOKEN_COLOR_LEAD_RE = re.compile(
+    r"^\s*(?:the\s+)?(?:car(?:'s)?\s+)?(?:colou?r\s*)?(?:is\s+|it'?s\s+|its\s+)?", re.I
+)
+
+
+def _clean_spoken_color(text: str) -> str:
+    """'the color is dark blue' -> 'Dark Blue'. Returns '' when nothing is left."""
+    v = _SPOKEN_COLOR_LEAD_RE.sub("", (text or "").strip(), count=1).strip(" .,!")
+    if not v:
+        return ""
+    # The palette writes "Blue - Dark"; speech says "dark blue". Keep both readable.
+    if len(v.split()) > 1:
+        return v.title()
+    # A spoken colour word reads as "Red", not the DMV code "RED" the normalizer
+    # produces for three-letter tokens — the palette writes "Red" too.
+    if v.lower() in _COMMON_COLORS:
+        return v.title()
+    return ai_vision.normalize_phase1_color(v)
+
+
+async def _finish_field_edit(context, user_id, state_data, chat_id) -> None:
+    """Shared tail of a field edit: save, drop the prompt, re-render the picker."""
+    db.set_user_state(user_id, "phase1", state_data)
+    prompt_id = context.user_data.pop("edit_prompt_msg_id", None)
+    if prompt_id:
+        await _safe_delete_chat_message(context, chat_id, prompt_id)
+    await _show_edit_picker(context, state_data)
+
+
+async def handle_phase1_color_pick(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """A colour tapped from the palette — apply it and return to the field picker."""
+    query = update.callback_query
+    await _safe_answer_callback_query(query)
+    user_id = query.from_user.id
+    color = (query.data or "").replace(PH1_COLOR_CB, "", 1).strip()
+    state = db.get_user_state(user_id)
+    if not state or not state.get("data") or not color:
+        return STATE_AI_REVIEW
+    state_data = state["data"]
+    _apply_single_phase1_edit(state_data, "col", color)
+    _clean_vin_and_car(state_data)
+    context.user_data.pop("phase1_pending_edit_key", None)
+    try:
+        await query.message.delete()          # the palette itself
+    except Exception:
+        pass
+    context.user_data.pop("edit_prompt_msg_id", None)
+    db.set_user_state(user_id, "phase1", state_data)
+    await _show_edit_picker(context, state_data)
+    chat_id = query.message.chat_id if query.message else None
+    if chat_id:
+        await _send_vanishing(context, chat_id, f"✅ Updated: color → {color}")
+    return STATE_AI_REVIEW
+
+
+async def handle_edit_field_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """A photo sent while a field prompt is open. For Color, the AI reads the car's
+    colour straight off the picture; for any other field the image goes through the
+    normal review parser so nothing sent here is ever lost."""
+    message = update.message
+    user_id = update.effective_user.id
+    ek = context.user_data.get("phase1_pending_edit_key")
+    if ek != "col":
+        result = await handle_phase1_adjust_input(update, context)
+        return STATE_AI_REVIEW if result == STATE_ADJUST_INPUT else result
+    state = db.get_user_state(user_id)
+    if not state or not state.get("data"):
+        return STATE_AI_REVIEW
+    state_data = state["data"]
+    note = await message.reply_text("🎨 Reading the colour…")
+    raw, mime = await _download_update_image_bytes(update, context)
+    color = None
+    if raw:
+        try:
+            color = await asyncio.to_thread(ai_vision.read_color_from_image, raw, mime)
+        except Exception as e:
+            logger.warning("colour read failed: %s", e)
+    await _safe_delete_chat_message(context, note.chat_id, note.message_id)
+    if not color:
+        await _send_vanishing(
+            context, message.chat_id,
+            "⚠️ Couldn't tell the colour from that picture — tap one below or type it.",
+        )
+        return STATE_EDIT_FIELD_PROMPT
+    _apply_single_phase1_edit(state_data, "col", color)
+    _clean_vin_and_car(state_data)
+    context.user_data.pop("phase1_pending_edit_key", None)
+    await _finish_field_edit(context, user_id, state_data, message.chat_id)
+    await _send_vanishing(context, message.chat_id, f"✅ Updated: color → {color}")
+    return STATE_AI_REVIEW
+
+
 async def handle_edit_field_text(update, context):
     user_id = update.effective_user.id
     _cr = _cancel_restart_kind_from_update(update)
@@ -6570,9 +6738,24 @@ async def handle_edit_field_text(update, context):
     state_data = state["data"]
 
     text = (update.message.text or "").strip()
+    if text and text != "-":
+        if ek == "col":
+            text = _clean_spoken_color(text) or text
+        elif ek in ("price", "phone", "email"):
+            # Same normalization the inline path uses — a price typed here as "150"
+            # was stored without the "$" the sanitizer requires and then wiped.
+            cleaned = _clean_inline_value(ek, text)
+            if not cleaned:
+                await _send_vanishing(
+                    context, update.effective_chat.id,
+                    f"⚠️ That doesn't look like a valid {PH1_EDIT_PROMPT_LABEL.get(ek, ek)} — try again.",
+                )
+                return STATE_EDIT_FIELD_PROMPT
+            text = cleaned
     _apply_single_phase1_edit(state_data, ek, text)
     _apply_single_address_as_both(state_data)
     _clean_vin_and_car(state_data)
+    _sanitize_phase1_pending_phone_price(state_data)
     db.set_user_state(user_id, "phase1", state_data)
 
     # Delete user message and prompt
@@ -6998,13 +7181,20 @@ async def handle_phase1_ai_review_callback(update, context):
         edit_key = data.replace("ph1edit_", "", 1)
         context.user_data["phase1_pending_edit_key"] = edit_key
         label = PH1_EDIT_PROMPT_LABEL.get(edit_key, edit_key)
-        prompt = await query.message.reply_text(
-            f"✏️ Send new text for: {label}\n\n"
-            "Type minus (-) to clear.",
-            reply_markup=InlineKeyboardMarkup([[
-                InlineKeyboardButton("❌ Cancel", callback_data="edit_cancel")
-            ]])
-        )
+        if edit_key == "col":
+            # Colour gets the tap-to-pick palette; typing, a voice note and a photo
+            # of the car all still work while this prompt is open.
+            prompt = await query.message.reply_text(
+                _PH1_COLOR_PROMPT, reply_markup=_color_picker_keyboard()
+            )
+        else:
+            prompt = await query.message.reply_text(
+                f"✏️ Send new text for: {label}\n\n"
+                "Type minus (-) to clear.",
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton("❌ Cancel", callback_data="edit_cancel")
+                ]])
+            )
         context.user_data["edit_prompt_msg_id"] = prompt.message_id
         return STATE_EDIT_FIELD_PROMPT
 
@@ -7164,10 +7354,13 @@ async def handle_phase1_edit_menu_callback(update: Update, context: ContextTypes
         return STATE_AI_EDIT_MENU
     context.user_data["phase1_pending_edit_key"] = edit_key
     label = PH1_EDIT_PROMPT_LABEL[edit_key]
-    await query.message.reply_text(
-        f"✏️ Send new text for: {label}\n\n"
-        "Type minus (-) to clear that field.",
-    )
+    if edit_key == "col":
+        await query.message.reply_text(_PH1_COLOR_PROMPT, reply_markup=_color_picker_keyboard())
+    else:
+        await query.message.reply_text(
+            f"✏️ Send new text for: {label}\n\n"
+            "Type minus (-) to clear that field.",
+        )
     return STATE_AI_EDIT_INPUT
 
 
@@ -13561,6 +13754,7 @@ def main():
             # or rare routing gaps) but Supabase ``states`` still holds select_group / select_driver data.
             CallbackQueryHandler(handle_group_selection, pattern="^select_group_"),
             CallbackQueryHandler(handle_driver_selection, pattern="^(select_driver_|driver_suspended_)"),
+            CallbackQueryHandler(handle_phase1_color_pick, pattern=f"^{PH1_COLOR_CB}"),
             # Idle natural-language / voice start: any substantive text starts a lead
             # and auto-fills what's given. MUST be last (only plain text reaches it).
             MessageHandler(filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE, handle_idle_lead_start),
@@ -13591,6 +13785,7 @@ def main():
                 CallbackQueryHandler(handle_group_selection, pattern="^select_group_"),
                 CallbackQueryHandler(handle_driver_selection, pattern="^select_driver_"),
                 CallbackQueryHandler(handle_contact_source_selection, pattern="^contact_source_"),
+                CallbackQueryHandler(handle_phase1_color_pick, pattern=f"^{PH1_COLOR_CB}"),
             ],
             STATE_ADJUST_INPUT: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, handle_phase1_adjust_input),
@@ -13607,6 +13802,9 @@ def main():
             ],
             STATE_AI_EDIT_INPUT: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, handle_phase1_edit_input),
+                MessageHandler(filters.PHOTO, handle_edit_field_photo),
+                MessageHandler(filters.Document.ALL, handle_edit_field_photo),
+                CallbackQueryHandler(handle_phase1_color_pick, pattern=f"^{PH1_COLOR_CB}"),
                 CallbackQueryHandler(
                     handle_phase1_edit_followup_callback,
                     pattern=f"^({PH1_EDIT_MORE}|{PH1_EDIT_DONE}|{PH1_FINAL_CONFIRM})$",
@@ -13614,6 +13812,11 @@ def main():
             ],
             STATE_EDIT_FIELD_PROMPT: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, handle_edit_field_text),
+                # A photo/PDF sent at a field prompt: for Color the AI reads the colour
+                # off the picture, anything else goes through the review parser.
+                MessageHandler(filters.PHOTO, handle_edit_field_photo),
+                MessageHandler(filters.Document.ALL, handle_edit_field_photo),
+                CallbackQueryHandler(handle_phase1_color_pick, pattern=f"^{PH1_COLOR_CB}"),
                 CallbackQueryHandler(handle_phase1_ai_review_callback, pattern="^edit_cancel$"),
             ],
             STATE_MISSING_FIELD: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_missing_field)],
