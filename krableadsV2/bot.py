@@ -418,6 +418,35 @@ def _tracking_link(token: str) -> str:
     return f"{Config.TRACKING_SITE_BASE_URL}/t/{token}"
 
 
+async def _forward_accepted_lead_files(context: ContextTypes.DEFAULT_TYPE, lead: dict, chat_id) -> None:
+    """Send the lead's parsed images/PDFs to a chat that just accepted it.
+
+    Reads the descriptors off the lead row (re-fetching when the caller passed a
+    trimmed dict), and remembers what it already sent so a re-sent details message
+    never duplicates the paperwork."""
+    if not lead or not chat_id:
+        return
+    lead_id = str(lead.get("id") or "")
+    att = lead.get("phase1_attached_files")
+    if not (isinstance(att, list) and att) and lead_id:
+        try:
+            att = (db.get_lead_by_id(lead_id) or {}).get("phase1_attached_files")
+        except Exception as e:
+            logger.warning("accepted-lead files lookup failed: %s", e)
+            att = None
+    if not (isinstance(att, list) and att):
+        return
+    sent_key = f"lead_files_sent_{lead_id}" if lead_id else None
+    if sent_key and context.user_data is not None:
+        if context.user_data.get(sent_key):
+            return
+        context.user_data[sent_key] = True
+    try:
+        await _forward_phase1_attached_files_to_targets(context, att, chat_id)
+    except Exception as e:
+        logger.warning("forwarding accepted-lead files failed: %s", e)
+
+
 async def _send_driver_lead_details(
     context: ContextTypes.DEFAULT_TYPE, lead: dict, chat_id, reassign_lead_id: str | None = None
 ) -> None:
@@ -435,6 +464,10 @@ async def _send_driver_lead_details(
     except BadRequest:
         plain = re.sub(r"<[^>]+>", "", confirmation_message)
         await context.bot.send_message(chat_id=chat_id, text=plain, reply_markup=add_lead_kb)
+    # Everything the issuer sent for parsing (title/registration/insurance shots and
+    # PDFs) follows the lead to the driver who accepted it — they are the one who
+    # needs the paperwork on the delivery.
+    await _forward_accepted_lead_files(context, lead, chat_id)
 
 
 async def _start_tracking_gate_or_send_details(
@@ -878,12 +911,15 @@ async def _finalize_phase1_media_for_dispatch(
 async def _forward_phase1_attached_files_to_targets(
     context: ContextTypes.DEFAULT_TYPE,
     attached_files: list,
-    group_chat_id: int | str | None,
+    target_chat_id: int | str | None,
 ) -> None:
-    """Forward Phase 1 files to the **accepting** group chat only.
+    """Forward the Phase 1 files to one **accepting** chat.
 
-    Invoked from ``handle_accept_group_offer`` after Accept — not during
-    approval broadcast or driver pick. Two payload shapes are supported:
+    Every image/PDF the issuer sent for parsing rides along to whoever takes the
+    lead: the group that accepts the offer, AND the driver who accepts it (they
+    are the one doing the delivery, so they need the title/registration shots).
+    Never sent during the approval broadcast or driver pick — only on Accept.
+    Two payload shapes are supported:
 
     - ``{"type": "photo|document", "file_id": ...}`` — legacy Telegram
       file-id reference (pre-redaction code path).
@@ -894,7 +930,7 @@ async def _forward_phase1_attached_files_to_targets(
     """
     if not attached_files:
         return
-    _group_cid = _parse_chat_id(group_chat_id) if group_chat_id is not None else None
+    _group_cid = _parse_chat_id(target_chat_id) if target_chat_id is not None else None
     if not _group_cid:
         return
     # If censored inline payloads exist, do not also send legacy raw ``file_id``
@@ -6703,6 +6739,15 @@ async def handle_edit_field_photo(update: Update, context: ContextTypes.DEFAULT_
     raw, mime = await _download_update_image_bytes(update, context)
     color = None
     if raw:
+        # Every file sent for parsing also rides along to whoever accepts the lead.
+        _add_extra_attachment(
+            context,
+            "document" if (mime or "").endswith("pdf") else "photo",
+            mime or "image/jpeg",
+            getattr(getattr(message, "document", None), "file_name", None) or "color.jpg",
+            raw,
+            "🎨 Colour reference",
+        )
         try:
             color = await asyncio.to_thread(ai_vision.read_color_from_image, raw, mime)
         except Exception as e:
@@ -10794,7 +10839,8 @@ async def handle_accept_group_offer(update: Update, context: ContextTypes.DEFAUL
             att,
             winner_group.get("group_telegram_id"),
         )
-        db.update_lead(lead_id, {"phase1_attached_files": []})
+        # Deliberately NOT cleared here any more: the driver who accepts next still
+        # needs the same paperwork, and wiping it left them with nothing.
 
     # Lead adder: one summary DM when a driver accepts (handle_accept_lead), not on group tap.
 
