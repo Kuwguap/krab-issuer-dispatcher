@@ -3004,6 +3004,20 @@ _PHASE1_ADJUST_LABELS = {
 }
 
 
+def _ai_vin_line(structured_text: str) -> str:
+    """Whatever the AI put on the VIN line of its 11-line reply, unvalidated.
+
+    Used only to tell the issuer what was mis-read when it isn't a usable VIN —
+    reading the line itself avoids guessing at random long tokens elsewhere."""
+    try:
+        normalized = _normalize_ai_phase1_text(structured_text or "")
+        lines = [l.strip() for l in normalized.splitlines()]
+        parsed = parse_phase1_structured("\n".join(lines[: ai_vision.PHASE1_LINE_COUNT]))
+        return re.sub(r"[^A-Za-z0-9]", "", str(parsed.get("vin") or "")).upper()
+    except Exception:
+        return ""
+
+
 def _merge_phase1_adjust(state_data: dict, structured_text: str, only_empty: bool = False) -> list[str]:
     """Merge an AI extraction into state_data — ONLY the fields actually found.
 
@@ -3170,6 +3184,9 @@ async def handle_phase1_adjust_input(update: Update, context: ContextTypes.DEFAU
         )
         return STATE_AI_REVIEW
 
+    # Captured BEFORE the merge — afterwards the new VIN is already in place and the
+    # comparison would never see a change (so the DMV check never ran).
+    vin_at_start = str(state_data.get("vin") or "").strip().upper()
     updated = _merge_phase1_adjust(state_data, structured, only_empty=fill_only_empty) if structured else []
     # A VIN read from the PDF's text layer is exact — it beats whatever vision made of
     # the page render (this is the "PDF parse misses the VIN" fix).
@@ -3178,6 +3195,35 @@ async def handle_phase1_adjust_input(update: Update, context: ContextTypes.DEFAU
         _clean_vin_and_car(state_data)
         if "VIN" not in updated:
             updated.append("VIN")
+    # A picture of just a VIN ("VIN:4S4…") is a normal thing to send, and it used to do
+    # nothing: the 11-line parser reads only its own VIN line, and a VIN of the wrong
+    # length was blanked to "-" while the toast still said "Read: VIN".
+    vin_warning = None
+    if structured and not pdf_vin:
+        if str(state_data.get("vin") or "").strip().upper() in ("", "-"):
+            # Nothing usable on the VIN line — scan the WHOLE reply, so a VIN written
+            # in prose or on another line still lands.
+            found = ai_vision.vin_from_text(structured)
+            if found:
+                state_data["vin"] = found
+                _clean_vin_and_car(state_data)
+                if "VIN" not in updated:
+                    updated.append("VIN")
+            else:
+                # Something VIN-shaped but the wrong length: say so instead of
+                # silently showing "-". Check the AI's own VIN line as well as any
+                # labelled token, since the 11-line block carries no "VIN:" label.
+                near = ai_vision.vin_near_miss_from_text(structured) or _ai_vin_line(structured)
+                if near and len(near) != 17:
+                    vin_warning = (
+                        f"⚠️ I read the VIN as `{near}` — that's {len(near)} characters "
+                        "and a VIN is 17, so I didn't save it.\nSend a clearer picture, "
+                        "or type `vin <the 17 characters>`."
+                    )
+                if "VIN" in updated:
+                    updated.remove("VIN")          # never claim a VIN we refused
+    vin_now = str(state_data.get("vin") or "").strip().upper()
+    vin_changed = bool(vin_now) and vin_now != "-" and vin_now != vin_at_start
     db.set_user_state(user_id, "phase1", state_data)
     await _autoclean_user_msg(update, context)  # text is cleared; media is always kept
 
@@ -3208,6 +3254,13 @@ async def handle_phase1_adjust_input(update: Update, context: ContextTypes.DEFAU
         toast = ("✅ Updated: " + ", ".join(dict.fromkeys(updated))) if updated else "ℹ️ Nothing new found — the review is unchanged."
         await _send_vanishing(context, message.chat_id, toast)
         await _update_review_message_text(context, state_data)
+    if vin_warning:
+        # Stays on screen: it needs an action, unlike the vanishing toasts.
+        await message.reply_text(vin_warning, parse_mode="Markdown")
+    elif vin_changed:
+        # A VIN that just arrived from a picture/PDF is exactly when the DMV decode is
+        # wanted — run it without making the issuer hunt for the button.
+        return await _run_vin_check_for_review(update, context, user_id, state_data)
     return STATE_AI_REVIEW
 
 
@@ -7700,6 +7753,24 @@ async def handle_vin_retype(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         await _send_vanishing(context, chat_id, alert_msg)
     await _update_review_message_text(context, state_data)
     return STATE_AI_REVIEW
+
+
+async def _run_vin_check_for_review(update, context: ContextTypes.DEFAULT_TYPE,
+                                    user_id: int, state_data: dict) -> int:
+    """Run the DMV decode automatically after a VIN arrives from a picture or PDF.
+
+    Silent no-op unless it can actually succeed — a 17-character VIN and a configured
+    lookup — so an upload never produces a stray "not configured" warning."""
+    vin = (state_data.get("vin") or "").strip()
+    if len(vin) != 17:
+        return STATE_AI_REVIEW
+    try:
+        if not Config.is_vin_lookup_configured():
+            return STATE_AI_REVIEW
+        return await _handle_phase1_vin_check_button(context, update, user_id, state_data)
+    except Exception as e:
+        logger.warning("auto VIN check failed: %s", e)
+        return STATE_AI_REVIEW
 
 
 async def _handle_phase1_vin_check_button(

@@ -844,6 +844,27 @@ def vin_from_text(text: str) -> Optional[str]:
     return candidates[0].group(0).upper()
 
 
+# A VIN-shaped run that is NOT 17 characters — almost always a mis-read (a doubled or
+# dropped character). Worth telling the user about instead of silently blanking the
+# field, which is what used to happen.
+_VIN_NEAR_MISS_RE = re.compile(
+    r"\bV\.?\s?I\.?\s?N\.?\s*[:#-]?\s*([A-HJ-NPR-Z0-9]{14,20})\b", re.I
+)
+
+
+def vin_near_miss_from_text(text: str) -> Optional[str]:
+    """A labelled VIN whose length is wrong (not 17), or None.
+
+    Only ever called after the strict search fails, so a good VIN never reaches it."""
+    if not text:
+        return None
+    for m in _VIN_NEAR_MISS_RE.finditer(text):
+        cand = m.group(1).upper()
+        if len(cand) != 17:
+            return cand
+    return None
+
+
 def vin_from_pdf(pdf_bytes: bytes) -> Optional[str]:
     """Read the VIN from a PDF's text layer — exact, unlike reading it off a render.
 
