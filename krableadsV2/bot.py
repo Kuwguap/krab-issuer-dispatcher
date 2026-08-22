@@ -4410,8 +4410,12 @@ def _cancel_restart_kind_from_update(update: Update):
 
 
 async def _do_cancel_or_restart(update: Update, context: ContextTypes.DEFAULT_TYPE, kind: str) -> int:
-    """Wipe the current lead flow. 'restart' opens a fresh empty review to enter a new
-    tag right away; 'cancel' drops to idle. Shared by the bare-word guard and /restart."""
+    """Wipe the current lead flow and open a fresh review card.
+
+    CANCEL AND RESTART ARE THE SAME ACTION — by request. Whether it arrives as
+    /cancel, /restart, or the spoken/typed word, the result is identical: drop
+    whatever is in progress and hand back an empty card, ready for the next tag.
+    ``kind`` only decides the wording of the confirmation."""
     msg = update.effective_message
     user_id = update.effective_user.id
     username = update.effective_user.username or "Unknown"
@@ -4421,12 +4425,7 @@ async def _do_cancel_or_restart(update: Update, context: ContextTypes.DEFAULT_TY
         pass
     _clear_lead_conversation_user_data(context)
     db.clear_user_state(user_id)
-    if kind == "restart":
-        return await _begin_lead_flow_with_review(context, user_id, username, msg)
-    await msg.reply_text(
-        "❌ Cancelled. Say “restart” or “new client” (or just send the info) to start a new tag."
-    )
-    return ConversationHandler.END
+    return await _begin_lead_flow_with_review(context, user_id, username, msg)
 
 
 async def restart_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -4581,22 +4580,13 @@ async def handle_idle_lead_start(update: Update, context: ContextTypes.DEFAULT_T
             handled = False
         if handled:
             raise ApplicationHandlerStop
-    # "restart" → open a fresh tag review; "cancel" → nothing to cancel when idle.
+    # "cancel" and "restart" are the SAME action: clear any saved lead (an orphaned
+    # card survives a redeploy in the DB) and hand back a fresh review card.
     _cr = _cancel_restart_kind(text)
-    if _cr == "restart":
+    if _cr:
+        _clear_lead_conversation_user_data(context)
+        db.clear_user_state(user_id)
         return await _begin_lead_flow_with_review(context, user_id, username, msg)
-    if _cr == "cancel":
-        # An orphaned "phase1" card (restart) can't be cancelled via the review handler
-        # because the conversation is gone — clear the saved lead here so it doesn't come
-        # back on the next message.
-        _act = db.get_user_state(user_id)
-        if _act and _act.get("state") == "phase1":
-            db.clear_user_state(user_id)
-            _clear_lead_conversation_user_data(context)
-            await msg.reply_text("✅ Cancelled — the lead was cleared. Send the info to start a new tag.")
-            return ConversationHandler.END
-        await msg.reply_text("Nothing to cancel — say “new client” or send the info to start a tag.")
-        return ConversationHandler.END
     # A lead is MID-DISPATCH per the DB but the in-memory conversation is gone
     # (redeploy). Starting a new lead here would WIPE it — protect it and point
     # back to the buttons (which re-enter via entry points on their own).
@@ -9953,16 +9943,11 @@ async def handle_contact_source_selection(update: Update, context: ContextTypes.
 
 
 async def cancel_from_lead_conversation(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Lead flow /cancel: wipe in-memory + DB flow state and restart like /start."""
-    msg = update.effective_message
-    if not msg:
+    """Lead flow /cancel — identical to /restart: wipe everything and open a fresh
+    review card, so the two commands never behave differently."""
+    if not update.effective_message:
         return ConversationHandler.END
-    user_id = update.effective_user.id
-    await _clear_phase1_vision_upload_state(context, msg.chat_id)
-    _clear_lead_conversation_user_data(context)
-    db.clear_user_state(user_id)
-    await msg.reply_text("❌ Cancelled — restarting from the top.")
-    return await _restart_bot_from_top(update, context)
+    return await _do_cancel_or_restart(update, context, "cancel")
 
 
 async def cancel_from_receipt_conversation(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -14080,7 +14065,8 @@ def main():
                 ["lead", "client", "newclient", "newsale", "enterlead", "enterclient", "newtag", "tag"],
                 begin_lead_command,
             ),
-            CommandHandler("restart", restart_command),
+            # /cancel and /restart are the same action, so both open the flow.
+            CommandHandler(["restart", "cancel"], restart_command),
             CallbackQueryHandler(handle_driver_add_lead_callback, pattern="^driver_add_lead$"),
             CallbackQueryHandler(handle_another_tag_callback, pattern="^another_tag_"),
             CallbackQueryHandler(handle_driver_add_receipt_callback, pattern="^driver_add_receipt$"),
