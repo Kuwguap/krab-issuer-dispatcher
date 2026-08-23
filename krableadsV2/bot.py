@@ -8123,11 +8123,11 @@ async def handle_vin_choice_text(update: Update, context: ContextTypes.DEFAULT_T
             pass
         await _cleanup_voice_echo(context, update.effective_chat.id if update.effective_chat else None)
         return result
-    await update.message.reply_text(
-        "Tap a button above, or say “yes” to use the DMV result and “no” to keep the "
-        "same VIN. You can also say “retype vin”."
-    )
-    return STATE_VIN_CHOICE
+    # Not an answer to the VIN question — so it is an ordinary edit. The DMV check is
+    # OPTIONAL: it must never block "price 150" or any other change. Apply it and
+    # leave the question on screen, still answerable by button or word.
+    result = await handle_phase1_review_message(update, context)
+    return STATE_VIN_CHOICE if result == STATE_AI_REVIEW else result
 
 
 async def handle_vin_retype(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -14613,6 +14613,10 @@ def main():
                 CallbackQueryHandler(handle_driver_selection, pattern="^select_driver_"),
                 CallbackQueryHandler(handle_contact_source_selection, pattern="^contact_source_"),
                 CallbackQueryHandler(handle_phase1_color_pick, pattern=f"^{PH1_COLOR_CB}"),
+                # The DMV Yes/No card stays on screen while other edits are made, so
+                # its buttons must still resolve if the conversation drifts back here.
+                CallbackQueryHandler(handle_vin_choice_callback,
+                                     pattern="^(vin_use|vin_keep|vin_retype)$"),
             ],
             STATE_ADJUST_INPUT: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, handle_phase1_adjust_input),

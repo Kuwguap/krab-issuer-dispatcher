@@ -124,11 +124,14 @@ class AnswerByTextOrVoiceTest(unittest.TestCase):
         self.assertEqual(self._answer("keep the same")[0], "keep")
         self.assertEqual(self._answer("retype vin")[0], "retype")
 
-    def test_anything_else_explains_the_two_answers(self):
-        choice, said = self._answer("what does that mean")
-        self.assertIsNone(choice)
-        self.assertIn("yes", said.lower())
-        self.assertIn("no", said.lower())
+    def test_anything_else_is_not_taken_as_an_answer(self):
+        """Non-answers are treated as ordinary edits instead (see
+        VinCheckIsOptionalTest) — the VIN question never nags or blocks."""
+        routed = mock.AsyncMock(return_value=bot.STATE_AI_REVIEW)
+        with mock.patch.object(bot, "handle_phase1_review_message", routed):
+            choice, _ = self._answer("what does that mean")
+        self.assertIsNone(choice, "it must not silently pick use or keep")
+        routed.assert_awaited_once()
 
 
 class StrayYesIsNeverAFieldValueTest(unittest.TestCase):
@@ -141,6 +144,71 @@ class StrayYesIsNeverAFieldValueTest(unittest.TestCase):
 
     def test_a_real_name_containing_yes_is_untouched(self):
         self.assertFalse(bot._COMMAND_LIKE_RE.search("Yes Motors LLC"))
+
+
+class VinCheckIsOptionalTest(unittest.TestCase):
+    """The DMV question must never gate ordinary edits."""
+
+    def _send(self, text):
+        import asyncio
+        from types import SimpleNamespace
+        msg = SimpleNamespace(text=text, caption=None, chat_id=1, photo=None,
+                              document=None, delete=mock.AsyncMock(),
+                              reply_text=mock.AsyncMock())
+        update = SimpleNamespace(
+            message=msg, effective_message=msg,
+            effective_chat=SimpleNamespace(id=1, type="private"),
+            effective_user=SimpleNamespace(id=7, username="tester"))
+        ctx = SimpleNamespace(user_data={"review_message_id": 5, "review_chat_id": 1},
+                              bot=mock.AsyncMock(),
+                              application=SimpleNamespace(handlers={}))
+        saved, chosen = {}, {}
+        fake_db = mock.MagicMock()
+        fake_db.get_user_state.return_value = {"state": "phase1",
+                                               "data": {"vin": "-", "car": "-"}}
+        fake_db.set_user_state.side_effect = lambda u, s, d: saved.update(d or {})
+
+        async def fake_apply(context, message, chat_id, user_id, choice):
+            chosen["choice"] = choice
+            return bot.STATE_AI_REVIEW
+
+        with mock.patch.object(bot, "db", fake_db), \
+                mock.patch.object(bot, "_apply_vin_choice", fake_apply), \
+                mock.patch.object(bot.Config, "is_ai_vision_configured",
+                                  classmethod(lambda cls: False)), \
+                mock.patch.object(bot, "_update_review_message_text", mock.AsyncMock()), \
+                mock.patch.object(bot, "_send_vanishing", mock.AsyncMock()), \
+                mock.patch.object(bot, "_autoclean_user_msg", mock.AsyncMock()), \
+                mock.patch.object(bot, "_cleanup_voice_echo", mock.AsyncMock()):
+            state = asyncio.run(bot.handle_vin_choice_text(update, ctx))
+        return state, saved, chosen.get("choice")
+
+    def test_a_price_edit_applies_while_the_question_is_open(self):
+        state, saved, _ = self._send("price 150")
+        self.assertEqual(saved.get("pending_price"), "$150")
+
+    def test_other_edits_apply_too(self):
+        for text, key, want in [("color white", "color", "White"),
+                                ("name John Damian", "name", "John Damian")]:
+            with self.subTest(text=text):
+                _, saved, _ = self._send(text)
+                self.assertEqual(saved.get(key), want)
+
+    def test_the_question_stays_open_after_an_edit(self):
+        """Its Yes/No buttons must still be answerable."""
+        state, _, _ = self._send("price 150")
+        self.assertEqual(state, bot.STATE_VIN_CHOICE)
+
+    def test_answers_are_unaffected(self):
+        for word, want in (("yes", "use"), ("no", "keep"), ("retype vin", "retype")):
+            with self.subTest(word=word):
+                self.assertEqual(self._send(word)[2], want)
+
+    def test_the_buttons_resolve_from_the_review_state_too(self):
+        src = (ROOT / "bot.py").read_text(encoding="utf-8")
+        review = src.split("STATE_AI_REVIEW: [", 1)[1].split("STATE_ADJUST_INPUT", 1)[0]
+        self.assertIn("vin_use|vin_keep|vin_retype", review,
+                      "the DMV card outlives the VIN state, so its buttons must work here")
 
 
 if __name__ == "__main__":
