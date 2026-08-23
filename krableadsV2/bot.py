@@ -4256,6 +4256,8 @@ _REVIEW_TEXT_CAPABLE_STATES = frozenset({
 # The main lead ConversationHandler, so the safety net can read (and repair) its
 # in-memory state. Set once in main(); stays None in unit tests.
 _MAIN_CONV_HANDLER = None
+# The /settings ConversationHandler — the plate-image reader must NOT defer to it.
+_SETTINGS_CONV_HANDLER = None
 
 
 def _main_conv_state(update: Update):
@@ -5135,20 +5137,24 @@ _PLATE_IMAGE_KIND_COL = {
 }
 
 
-def _user_in_active_conversation(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+def _user_in_active_conversation(update: Update, context: ContextTypes.DEFAULT_TYPE,
+                                 ignore=None) -> bool:
     """True when this user/chat is inside any registered ConversationHandler's active
     state, using PTB's in-memory conversation map (the authoritative truth — cleared on
     END, so never stale unlike the DB ``states`` shadow). Lets the idle plate-image
     reader stand down so it never grabs a photo that belongs to an in-progress flow
     (a text-only sub-state like 'send me the missing field' would otherwise fall
-    through to it). Degrades to False if PTB internals change, so behavior is safe."""
+    through to it). Degrades to False if PTB internals change, so behavior is safe.
+
+    ``ignore`` skips one handler — used for /settings, which has no image handling of
+    its own and is precisely where a plate photo IS the intended input."""
     try:
         groups = context.application.handlers
     except Exception:
         return False
     for group in groups.values():
         for h in group:
-            if isinstance(h, ConversationHandler):
+            if isinstance(h, ConversationHandler) and h is not ignore:
                 try:
                     if h._conversations.get(h._get_key(update)) is not None:
                         return True
@@ -5184,7 +5190,11 @@ async def handle_supervisor_plate_image(update: Update, context: ContextTypes.DE
     # lead image is never read as a tag or hijacked. Unless a plate update was explicitly
     # armed (forced_col). After a restart the in-memory conversation is gone, so an
     # orphaned-lead / idle plate photo is still read here — "no matter the state".
-    if not forced_col and _user_in_active_conversation(update, context):
+    # /settings is deliberately NOT deferred to: it has no image handler, so a plate
+    # photo sent there used to be swallowed and nothing happened. Reading the tag is
+    # exactly what the supervisor wants in that screen.
+    if not forced_col and _user_in_active_conversation(
+            update, context, ignore=_SETTINGS_CONV_HANDLER):
         return
     # Reading it as a tag now → consume the arming.
     context.user_data.pop("router_plate_followup", None)
@@ -14368,6 +14378,9 @@ def main():
         allow_reentry=True,
     )
     application.add_handler(settings_conv)
+    # A plate photo sent inside /settings must reach the tag reader, not be deferred.
+    global _SETTINGS_CONV_HANDLER
+    _SETTINGS_CONV_HANDLER = settings_conv
 
     application.add_handler(conv_handler)
 
