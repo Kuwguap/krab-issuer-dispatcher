@@ -1638,32 +1638,6 @@ async def _notify_initiator_and_supervisor(context: ContextTypes.DEFAULT_TYPE, l
             logger.warning("Could not notify supervisor %s: %s", sup_cid, e)
 
 
-def _driver_row_by_name(name: str) -> dict | None:
-    """Find a driver row by display name (the accept notice carries only the name)."""
-    n = (name or "").strip().casefold()
-    if not n:
-        return None
-    for d in (_get_all_drivers_cached() or []):
-        if str(d.get("driver_name") or "").strip().casefold() == n:
-            return d
-    return None
-
-
-def _driver_contact_plain(driver: dict | None) -> str:
-    """Driver phone/email as plain lines for a non-Markdown message. Empty when the
-    driver is unknown or has nothing on file, so the notice never grows a blank row."""
-    if not driver:
-        return ""
-    bits = []
-    phone = str(driver.get("phone_number") or "").strip()
-    email = str(driver.get("email") or "").strip()
-    if phone:
-        bits.append(f"📞 {phone}")
-    if email:
-        bits.append(f"📧 {email}")
-    return ("   " + "   ".join(bits) + "\n") if bits else ""
-
-
 async def _notify_initiator_lead_accepted_summary(
     context: ContextTypes.DEFAULT_TYPE,
     lead: dict,
@@ -1684,16 +1658,14 @@ async def _notify_initiator_lead_accepted_summary(
     ref = (lead_row.get("reference_id") or "N/A").strip() or "N/A"
     group_label = _group_display_name_from_lead(lead_row) or "N/A"
     dn = (accepting_driver_name or "Driver").strip() or "Driver"
-    # Reaching the driver who just took your lead is the whole point of this notice,
-    # so their phone and email go in it — looking them up elsewhere was the only way.
-    contact = _driver_contact_plain(_driver_row_by_name(dn))
+    # Deliberately NAME ONLY. A driver's phone and email live in /settings and nowhere
+    # near a lead — this notice can be forwarded, so keep their details out of it.
     text = (
         "Accepted! ✅ Lead 📈Notification🔔\n"
         "We start serving the client now\n\n"
         f"📋Reference🧾: {ref}\n"
         f"🙋Group Accepted✅: {group_label}\n"
-        f"🙋‍♀️Driver Accepted✅: {dn}\n"
-        f"{contact}\n"
+        f"🙋‍♀️Driver Accepted✅: {dn}\n\n"
         "🏁Automated🏎️Automotive💨"
     )
     # Dispatcher-side escape hatch: reassign the driver right from the summary.
@@ -5201,11 +5173,8 @@ def _fmt_router_drivers() -> str:
             flag = " ⛔ suspended"
         else:
             flag = ""
+        # Names only — contact details are read in /settings, not here.
         lines.append(f"• {d.get('driver_name') or '—'}{flag}")
-        # Asking "drivers" should give a usable directory, not just names.
-        contact = _driver_contact_plain(d)
-        if contact:
-            lines.append(contact.rstrip("\n"))
     return "\n".join(lines)
 
 
