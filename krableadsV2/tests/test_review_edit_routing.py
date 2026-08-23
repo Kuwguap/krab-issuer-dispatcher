@@ -297,17 +297,26 @@ class SelectStateTextTest(unittest.TestCase):
         self.assertEqual(result, bot.STATE_AI_REVIEW)
         review.assert_awaited_once()
 
-    def test_dispatch_pick_gets_nudge_and_keeps_state(self):
+    def test_dispatch_pick_treats_text_as_a_driver_name(self):
+        """Text during a driver pick is a NAME now, not a stray message. An
+        unmatched one keeps the picker open and says so — see
+        tests/test_reassign_by_name.py for the matching cases."""
         db = mock.MagicMock()
         db.get_user_state.return_value = _phase1_row(state="select_driver")
-        update = _mk_update("some text")
+        update = _mk_update("some text that matches no driver")
         context = _mk_context({})
         review = mock.AsyncMock()
-        vanish = mock.AsyncMock()
+        resend = mock.AsyncMock()
         patches = [
             mock.patch.object(bot, "db", db),
             mock.patch.object(bot, "handle_phase1_review_message", review),
-            mock.patch.object(bot, "_send_vanishing", vanish),
+            mock.patch.object(bot, "_handle_resend_to_drivers", resend),
+            mock.patch.object(bot, "_get_all_drivers_cached",
+                              mock.MagicMock(return_value=[
+                                  {"id": "d1", "driver_name": "Kita", "is_active": True}])),
+            mock.patch.object(bot, "_get_suspended_driver_ids",
+                              mock.MagicMock(return_value=set())),
+            mock.patch.object(bot, "_send_vanishing", mock.AsyncMock()),
         ]
         for p in patches:
             p.start()
@@ -317,8 +326,10 @@ class SelectStateTextTest(unittest.TestCase):
             for p in patches:
                 p.stop()
         self.assertIsNone(result)          # None keeps the picker state in PTB
-        review.assert_not_awaited()
-        vanish.assert_awaited_once()
+        review.assert_not_awaited()        # it is not a review edit
+        resend.assert_not_awaited()        # and nothing is reassigned on a miss
+        said = update.message.reply_text.await_args.args[0]
+        self.assertIn("No driver matched", said)
 
 
 class GhostStateSafetyNetTest(unittest.TestCase):

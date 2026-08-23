@@ -533,6 +533,33 @@ async def _start_tracking_gate_or_send_details(
         logger.warning("Could not send optional tracking link to %s: %s", chat_id, e)
 
 
+def _drivers_sent_label(state_data: dict, drivers_list: list) -> str:
+    """Who the lead went to, for the confirmation.
+
+    A bare count ("1 driver(s)") does not say WHO, which is the one thing worth
+    checking before walking away. Names are listed; when everyone was picked it says
+    "All drivers" rather than a wall of names."""
+    names = [str(d.get("driver_name") or "").strip()
+             for d in (drivers_list or []) if d and d.get("id")]
+    names = [n for n in names if n]
+    if not names:
+        return "no drivers"
+    picked = str((state_data or {}).get("selected_driver_names") or "").strip()
+    if picked.lower() == "all drivers":
+        return f"All drivers ({len(names)})"
+    # Everyone eligible got it even though it was not an explicit "all" pick.
+    try:
+        eligible = [d for d in _get_all_drivers_cached() if record_is_active(d)]
+        suspended = _get_suspended_driver_ids()
+        if len({str(d.get("id")) for d in eligible if str(d.get("id")) not in suspended}) == len(names) > 1:
+            return f"All drivers ({len(names)})"
+    except Exception:
+        pass
+    if len(names) <= 4:
+        return ", ".join(names)
+    return ", ".join(names[:4]) + f" +{len(names) - 4} more"
+
+
 def _after_send_keyboard(lead_id: str) -> InlineKeyboardMarkup:
     """Buttons on the "lead sent" confirmation.
 
@@ -4622,11 +4649,38 @@ async def handle_review_edit_anywhere(update: Update, context: ContextTypes.DEFA
     raise ApplicationHandlerStop
 
 
+class _TypedAsTap:
+    """Presents a typed or spoken answer to code written for a button tap.
+
+    Reassigning should not require tapping: saying the driver's name is faster, and
+    the resend/pick handlers only touch a handful of attributes, so a shim lets them
+    run unchanged instead of duplicating their logic."""
+
+    class _Query:
+        def __init__(self, message, data, from_user):
+            self.message = message
+            self.data = data
+            self.from_user = from_user
+
+        async def answer(self, *a, **k):
+            return None
+
+    def __init__(self, update: Update, data: str):
+        self.callback_query = self._Query(update.effective_message, data,
+                                          update.effective_user)
+        self.effective_user = update.effective_user
+        self.effective_chat = update.effective_chat
+        self.effective_message = update.effective_message
+        self.message = update.effective_message
+
+
 async def handle_select_state_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Optional[int]:
-    """Typed/voice text while a button picker (dispatcher/driver/source) is on
-    screen. With a live phase1 lead this is a review edit or spoken command
-    ("driver John", "price 150") — route it through the review handler. Without
-    one (e.g. a resend driver pick) nudge to the buttons instead of dropping it."""
+    """Typed/voice text while a button picker (dispatcher/driver/source) is on screen.
+
+    With a live phase1 lead it is a review edit or spoken command ("driver John",
+    "price 150"). While REASSIGNING an already-sent lead it is the name of the driver
+    or dispatcher to hand it to — matched the same way the buttons resolve, so
+    tapping, typing and speaking all reach the same code."""
     msg = update.effective_message
     text = ((msg.text if msg else "") or "").strip()
     if not text:
@@ -4639,8 +4693,47 @@ async def handle_select_state_text(update: Update, context: ContextTypes.DEFAULT
         st = db.get_user_state(update.effective_user.id) if update.effective_user else None
     except Exception as e:
         logger.warning("select-state text: get_user_state failed: %s", e)
-    if st and st.get("state") == "phase1" and st.get("data"):
+    state_name = (st or {}).get("state")
+    lead_data = (st or {}).get("data") or {}
+    if state_name == "phase1" and lead_data:
         return await handle_phase1_review_message(update, context)
+    user_id = update.effective_user.id if update.effective_user else 0
+
+    if state_name == "select_driver":
+        active = [d for d in _get_all_drivers_cached() if record_is_active(d)]
+        suspended = _get_suspended_driver_ids()
+        eligible = [d for d in active if str(d.get("id")) not in suspended]
+        if _ALL_SELECT_RE.match(text):
+            picked = "select_driver_all"
+        else:
+            d = _match_name(text, eligible, "driver_name")
+            if not d:
+                susp = _match_name(text, [x for x in active if str(x.get("id")) in suspended],
+                                   "driver_name")
+                if susp and msg:
+                    await msg.reply_text(
+                        f"🚫 {susp.get('driver_name', 'That driver')} is suspended (PENALTY). "
+                        "Pick someone else, or say another name.")
+                elif msg:
+                    await msg.reply_text(
+                        f"🤔 No driver matched “{text}”. Tap one above, or say the name again.")
+                return None
+            picked = f"select_driver_{d.get('id')}"
+        return await _handle_resend_to_drivers(
+            _TypedAsTap(update, picked), context, lead_data, picked, user_id)
+
+    if state_name == "select_group":
+        g = ("all" if _ALL_SELECT_RE.match(text)
+             else _match_name(text, [x for x in db.get_all_groups() if record_is_active(x)],
+                              "group_name"))
+        if not g:
+            if msg:
+                await msg.reply_text(
+                    f"🤔 No dispatcher matched “{text}”. Tap one above, or say the name again.")
+            return None
+        picked = "select_group_all" if g == "all" else f"select_group_{g.get('id')}"
+        return await handle_group_selection(_TypedAsTap(update, picked), context)
+
     if msg:
         await _send_vanishing(context, msg.chat_id, "☝️ Tap a button above to continue.")
     return None
@@ -8573,7 +8666,7 @@ async def _finalize_lead_after_notes(
     context.user_data.pop("phase1_pending_media", None)
     context.user_data.pop("phase1_attached_files", None)
     ref_h = html.escape(str(reference_id), quote=False)
-    drivers_count = len([d for d in drivers_list if d and d.get("id")])
+    drivers_label = html.escape(_drivers_sent_label(state_data, drivers_list), quote=False)
     source_label = html.escape((state_data.get("selected_source_label") or "—"), quote=False)
     _another = _after_send_keyboard(str(lead["id"]))
     if is_all_groups:
@@ -8581,7 +8674,7 @@ async def _finalize_lead_after_notes(
             "✅ Lead saved.\n\n"
             f"📋 Reference ID: <code>{ref_h}</code>\n"
             f"📣 Approval sent to <b>{len(active_groups)}</b> group(s)\n"
-            f"🚗 Approval sent to <b>{drivers_count}</b> driver(s)\n"
+            f"🚗 Approval sent to <b>{drivers_label}</b>\n"
             f"📊 Lead source: <b>{source_label}</b>",
             parse_mode="HTML",
             reply_markup=_another,
@@ -8591,7 +8684,7 @@ async def _finalize_lead_after_notes(
             "✅ Lead saved.\n\n"
             f"📋 Reference ID: <code>{ref_h}</code>\n"
             f"Approval sent to <b>{html.escape(selected_group.get('group_name') or 'group', quote=False)}</b>\n"
-            f"🚗 Approval sent to <b>{drivers_count}</b> driver(s)\n"
+            f"🚗 Approval sent to <b>{drivers_label}</b>\n"
             f"📊 Lead source: <b>{source_label}</b>",
             parse_mode="HTML",
             reply_markup=_another,
