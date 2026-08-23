@@ -2373,20 +2373,52 @@ _PH1_COLOR_PROMPT = "✏️ type, speak, click, or upload a picture to read the 
 # The same few prices come up all day, so tapping beats typing. Any other amount is
 # still typed or spoken at this prompt.
 PH1_PRICE_CB = "ph1prc_"
+PH1_PRICE_TOLL = "toll"          # the toggle rides the same callback prefix
 _PH1_PRICES = ["90", "100", "120", "150", "200", "250"]
 _PH1_PRICE_PROMPT = "💲 type, speak, or tap the price"
+# The same job is quoted with or without the toll, so the amount carries it rather
+# than living in a separate field: "$150" or "$150 + toll".
+_PH1_TOLL_SUFFIX = " + toll"
+_TOLL_RE = re.compile(r"\btolls?\b", re.IGNORECASE)
 
 
-def _price_picker_keyboard() -> InlineKeyboardMarkup:
-    """The common prices, three per row, then Cancel."""
+def _price_has_toll(price) -> bool:
+    return bool(_TOLL_RE.search(str(price or "")))
+
+
+def _price_with_toll(price: str, on: bool) -> str:
+    """Add or strip the toll on an amount, leaving the number itself alone."""
+    base = _TOLL_RE.sub("", str(price or "")).strip().rstrip("+&").strip()
+    base = re.sub(r"\s*(?:\+|plus|and|&)\s*$", "", base, flags=re.IGNORECASE).strip()
+    if not base:
+        return ""
+    return base + _PH1_TOLL_SUFFIX if on else base
+
+
+def _price_picker_keyboard(toll: bool = False) -> InlineKeyboardMarkup:
+    """The common prices three per row, then the toll toggle, then Cancel."""
     rows = []
     for i in range(0, len(_PH1_PRICES), 3):
         rows.append([
             InlineKeyboardButton(f"${p}", callback_data=f"{PH1_PRICE_CB}{p}")
             for p in _PH1_PRICES[i:i + 3]
         ])
+    rows.append([InlineKeyboardButton(
+        "✅ Toll added — tap to remove" if toll else "➕ Plus toll",
+        callback_data=f"{PH1_PRICE_CB}{PH1_PRICE_TOLL}",
+    )])
     rows.append([InlineKeyboardButton("❌ Cancel", callback_data="edit_cancel")])
     return InlineKeyboardMarkup(rows)
+
+
+def _fresh_price_picker(context, state_data) -> InlineKeyboardMarkup:
+    """Opening the prompt starts from the card: the toggle shows a toll only if the
+    amount already carries one, and any half-armed toll from last time is dropped."""
+    try:
+        context.user_data.pop("phase1_price_toll", None)
+    except Exception:
+        pass
+    return _price_picker_keyboard(_price_has_toll((state_data or {}).get("pending_price")))
 
 
 PH1_EDIT_PROMPT_LABEL = {
@@ -3433,7 +3465,11 @@ def _clean_inline_value(edit_key: str, value: str) -> str:
         return ""
     if edit_key == "price":
         m = re.search(r"\d[\d,]*(?:\.\d+)?", value)
-        return ("$" + m.group(0).replace(",", "")) if m else ""
+        if not m:
+            return ""
+        amount = "$" + m.group(0).replace(",", "")
+        # "150 + toll" / "150 plus tolls" quotes the same job with the toll on top.
+        return amount + _PH1_TOLL_SUFFIX if _price_has_toll(value) else amount
     if edit_key == "phone":
         return value if len(re.sub(r"\D", "", value)) >= 10 else ""
     if edit_key == "email":
@@ -7372,18 +7408,58 @@ async def handle_phase1_color_pick(update: Update, context: ContextTypes.DEFAULT
 
 
 async def handle_phase1_price_pick(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """A price tapped from the picker — apply it and return to the field picker."""
+    """A price tapped from the picker — apply it and return to the field picker.
+
+    The toll toggle rides the same callback: with an amount already on the card it
+    completes the edit (add/remove the toll and close); with nothing picked yet it
+    just arms itself and leaves the picker open for the amount.
+    """
     query = update.callback_query
     await _safe_answer_callback_query(query)
     user_id = query.from_user.id
     raw = (query.data or "").replace(PH1_PRICE_CB, "", 1).strip()
+    state = db.get_user_state(user_id)
+    if not state or state.get("data") is None:
+        return STATE_AI_REVIEW
+    state_data = state["data"]
+
+    if raw == PH1_PRICE_TOLL:
+        current = state_data.get("pending_price") or ""
+        want_toll = not (_price_has_toll(current) or context.user_data.get("phase1_price_toll"))
+        if _is_valid_pending_price(current):
+            price = _price_with_toll(current, want_toll)
+            state_data["pending_price"] = price
+            context.user_data.pop("phase1_price_toll", None)
+            context.user_data.pop("phase1_pending_edit_key", None)
+            try:
+                await query.message.delete()
+            except Exception:
+                pass
+            context.user_data.pop("edit_prompt_msg_id", None)
+            db.set_user_state(user_id, "phase1", state_data)
+            await _show_edit_picker(context, state_data)
+            if query.message:
+                await _send_vanishing(context, query.message.chat_id,
+                                      f"✅ Updated: price → {price}")
+            return STATE_AI_REVIEW
+        # No amount yet — remember the toll and keep the picker up for the number.
+        context.user_data["phase1_price_toll"] = want_toll
+        try:
+            await query.edit_message_reply_markup(
+                reply_markup=_price_picker_keyboard(want_toll))
+        except Exception:
+            pass
+        return None
+
     # Through the same cleaner the typed path uses, so it gains the "$" that
     # _is_valid_pending_price requires — without it the sanitizer would drop it.
     price = _clean_inline_value("price", raw)
-    state = db.get_user_state(user_id)
-    if not state or state.get("data") is None or not price:
+    if not price:
         return STATE_AI_REVIEW
-    state_data = state["data"]
+    # Toll carries over from the toggle, or from an amount that already had one.
+    if context.user_data.pop("phase1_price_toll", False) or _price_has_toll(
+            state_data.get("pending_price")):
+        price = _price_with_toll(price, True)
     _apply_single_phase1_edit(state_data, "price", price)
     _sanitize_phase1_pending_phone_price(state_data)
     context.user_data.pop("phase1_pending_edit_key", None)
@@ -7541,7 +7617,8 @@ def _normalize_ai_price(raw) -> str:
         return ""
     if "$" not in cleaned:
         cleaned = "$" + cleaned.lstrip("$")
-    return cleaned
+    # The toll is part of the quote, and stripping non-digits would have eaten it.
+    return cleaned + _PH1_TOLL_SUFFIX if _price_has_toll(p) else cleaned
 
 
 def _is_valid_pending_phone(raw) -> bool:
@@ -7934,7 +8011,8 @@ async def handle_phase1_ai_review_callback(update, context):
             )
         elif edit_key == "price":
             prompt = await query.message.reply_text(
-                _PH1_PRICE_PROMPT, reply_markup=_price_picker_keyboard()
+                _PH1_PRICE_PROMPT,
+                reply_markup=_fresh_price_picker(context, state_data),
             )
         else:
             prompt = await query.message.reply_text(
@@ -8106,7 +8184,9 @@ async def handle_phase1_edit_menu_callback(update: Update, context: ContextTypes
     if edit_key == "col":
         await query.message.reply_text(_PH1_COLOR_PROMPT, reply_markup=_color_picker_keyboard())
     elif edit_key == "price":
-        await query.message.reply_text(_PH1_PRICE_PROMPT, reply_markup=_price_picker_keyboard())
+        card = (db.get_user_state(user_id) or {}).get("data") or {}
+        await query.message.reply_text(
+            _PH1_PRICE_PROMPT, reply_markup=_fresh_price_picker(context, card))
     else:
         await query.message.reply_text(
             f"✏️ Send new text for: {label}\n\n"
