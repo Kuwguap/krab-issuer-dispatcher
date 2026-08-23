@@ -3004,6 +3004,46 @@ _PHASE1_ADJUST_LABELS = {
 }
 
 
+def _apply_caption_to_lead(state_data: dict, caption: str) -> list:
+    """Read the words sent WITH a picture.
+
+    An image and its caption are ONE message, so both must land. The caption used to
+    be handed to the model as loose context only, which meant a caption like
+    "name John Damian price 150" contributed nothing when the picture itself carried
+    the vehicle. Labeled values are applied deterministically and WIN over what vision
+    made of the picture (the person typed them on purpose); an unlabeled caption still
+    gives up its phone/price/email/licence, but only into fields that are still empty.
+    Returns the labels that changed."""
+    text = (caption or "").strip()
+    if not text:
+        return []
+    labeled = _apply_inline_review_text(state_data, text)
+    if labeled:
+        return labeled
+    changed: list = []
+
+    def _empty(key: str) -> bool:
+        return str(state_data.get(key) or "").strip() in ("", "-")
+
+    phone, price, issuer_note, driver_note = _extract_phone_price_notes_from_text(text)
+    if phone and _empty("pending_phone_number"):
+        state_data["pending_phone_number"] = phone
+        changed.append("phone")
+    if price and _empty("pending_price"):
+        state_data["pending_price"] = price
+        changed.append("price")
+    email, dl = _extract_email_and_dl_from_text(text)
+    if email and _empty("email"):
+        state_data["email"] = email
+        changed.append("email")
+    if dl and _empty("driver_license_id"):
+        state_data["driver_license_id"] = dl
+        changed.append("driver license")
+    if changed:
+        _sanitize_phase1_pending_phone_price(state_data)
+    return changed
+
+
 def _ai_vin_line(structured_text: str) -> str:
     """Whatever the AI put on the VIN line of its 11-line reply, unvalidated.
 
@@ -3188,6 +3228,12 @@ async def handle_phase1_adjust_input(update: Update, context: ContextTypes.DEFAU
     # comparison would never see a change (so the DMV check never ran).
     vin_at_start = str(state_data.get("vin") or "").strip().upper()
     updated = _merge_phase1_adjust(state_data, structured, only_empty=fill_only_empty) if structured else []
+    # The caption is part of the same message as the picture — apply it AFTER the
+    # image so anything the sender labeled by hand wins over the vision read.
+    if is_media and adjust_caption:
+        for _lbl in _apply_caption_to_lead(state_data, adjust_caption):
+            if _lbl not in updated:
+                updated.append(_lbl)
     # A VIN read from the PDF's text layer is exact — it beats whatever vision made of
     # the page render (this is the "PDF parse misses the VIN" fix).
     if pdf_vin and str(state_data.get("vin") or "").strip().upper() != pdf_vin:
@@ -6359,6 +6405,11 @@ async def _phase1_finish_vision_extraction(
                 state_data["email"] = raw_email
             if raw_dl and not (state_data.get("driver_license_id") or "").strip():
                 state_data["driver_license_id"] = raw_dl
+
+    # The captions typed alongside the pictures are part of the same message: apply
+    # anything labeled by hand so it lands even when vision did not repeat it.
+    if typed_text:
+        _apply_caption_to_lead(state_data, typed_text)
 
     # Robust VIN extraction from whole raw output
     vin_from_raw = _extract_vin_17(raw_text)
