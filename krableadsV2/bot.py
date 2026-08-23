@@ -3446,6 +3446,53 @@ def _parse_multi_field_line(line: str):
     return pairs or None
 
 
+def _apply_bulk_review_text(state_data: dict, text: str):
+    """Apply a MULTI-LINE paste line by line, keeping what each line gives.
+
+    The strict parser is all-or-nothing on purpose (mixed prose belongs to the AI),
+    but for a bulk send that meant one unreadable line threw away every readable one:
+    "rrod782@gmail.com / Email now / Color white" lost the colour as well. Here each
+    line is tried on its own; what is not a labeled edit comes back as leftovers for
+    the caller to place or hand to the AI. Returns (labels_applied, leftover_lines)."""
+    labels: list[str] = []
+    leftovers: list[str] = []
+    for line in [l.strip() for l in re.split(r"[\n;]+", text or "") if l.strip()]:
+        got = _apply_inline_review_text(state_data, line)
+        if got:
+            labels.extend(l for l in got if l not in labels)
+        else:
+            leftovers.append(line)
+    return labels, leftovers
+
+
+async def _place_bulk_leftover(state_data: dict, line: str) -> list:
+    """Place ONE leftover line from a bulk paste — conservatively.
+
+    Strong structured signals (email, phone, price, VIN, street address) or a
+    confident AI classification only. Deliberately NOT the loose "one to four plain
+    words must be a name" guess used for a single typed value: in a bulk paste that
+    turned a stray note into the client's name, and overwrote a good one that came
+    from an earlier line in the SAME message. A field already filled is never
+    replaced by a leftover."""
+    ek = _structured_value_ek(line)
+    value = line
+    if not ek and Config.is_ai_vision_configured():
+        try:
+            res = await asyncio.to_thread(ai_vision.classify_field_value, line)
+        except Exception as e:
+            logger.warning("bulk leftover classify failed: %s", e)
+            res = None
+        if isinstance(res, dict) and res.get("field") and res.get("field") != "unknown":
+            ek = res["field"]
+            value = str(res.get("value") or line)
+    if not ek:
+        return []
+    sk = _INLINE_EK_STATE_KEY.get(ek)
+    if sk and str(state_data.get(sk) or "").strip() not in ("", "-"):
+        return []                      # keep what the labeled lines already set
+    return _apply_ek_value(state_data, ek, value)
+
+
 def _apply_inline_review_text(state_data: dict, text: str) -> list[str]:
     """Apply typed labeled edits directly to the review. Supports MULTIPLE fields on
     one line ('price 200 address 321 Main St …') and per-line edits. EVERY non-empty
@@ -4331,6 +4378,32 @@ async def handle_phase1_review_message(update: Update, context: ContextTypes.DEF
     handled = await _interpret_review_command(update, context, user_id, state_data, text)
     if handled is not None:
         return handled
+
+    # 2b. BULK PASTE: several lines where only some are labeled edits. Apply those,
+    #     then let each remaining line find its own field (a bare email, phone, price
+    #     or colour places itself). Only what is still unplaced goes to the AI — one
+    #     unreadable line used to discard every readable one in the same message.
+    if "\n" in text or ";" in text:
+        bulk_labels, leftovers = _apply_bulk_review_text(state_data, text)
+        if bulk_labels:
+            still: list[str] = []
+            for line in leftovers:
+                placed = ([] if _COMMAND_LIKE_RE.search(line)
+                          else await _place_bulk_leftover(state_data, line))
+                if placed:
+                    bulk_labels.extend(p for p in placed if p not in bulk_labels)
+                else:
+                    still.append(line)
+            bulk_labels += await _ai_split_addresses_if_needed(state_data)
+            db.set_user_state(user_id, "phase1", state_data)
+            chat_id = update.effective_chat.id if update.effective_chat else message.chat_id
+            await _cleanup_voice_echo(context, chat_id)
+            note = "✅ Updated: " + ", ".join(dict.fromkeys(bulk_labels))
+            if still:
+                note += "\n🤔 Not understood: " + "; ".join(still[:3])
+            await _send_vanishing(context, chat_id, note, delay=8.0)
+            await _update_review_message_text(context, state_data)
+            return STATE_AI_REVIEW
 
     # 3a. A real multi-field block (a paste OR a dictated lead naming several fields,
     #     e.g. a whole lead spoken in one voice note) → AI re-parse fills every field.
@@ -6628,6 +6701,7 @@ async def _clear_phase1_vision_upload_state(
     context.user_data.pop("phase1_vision_reply_chat_id", None)
     context.user_data.pop("phase1_vision_extracting", None)
     context.user_data.pop("phase1_pending_media", None)
+    context.user_data.pop("phase1_typed_notes", None)   # text queued with the uploads
 
 
 async def _refresh_phase1_batch_status_message(
@@ -6724,8 +6798,11 @@ async def _execute_phase1_vision_batch_extraction(
     context.user_data["phase1_vision_extracting"] = True
     try:
         # Photo captions typed alongside the files feed the extraction too.
+        # Captions AND any text typed alongside the uploads — the whole message is
+        # one submission, so the extraction reads the pictures and the words together.
         typed_text = "\n".join(
-            (it.get("caption") or "").strip() for it in batch if (it.get("caption") or "").strip()
+            [(it.get("caption") or "").strip() for it in batch if (it.get("caption") or "").strip()]
+            + [t for t in (context.user_data.get("phase1_typed_notes") or []) if t]
         ) or None
         parts: list[tuple[bytes, str]] = []
         pending_media: list[dict] = []
@@ -6908,6 +6985,13 @@ async def handle_phase1(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
     _cr = _cancel_restart_kind(message_text)
     if _cr:
         return await _do_cancel_or_restart(update, context, _cr)
+
+    # Photos already queued? Then this text belongs WITH them — a bundle of images
+    # followed by the details is how leads actually arrive. Read them together
+    # instead of discarding the uploads, which is what clearing the batch here did.
+    if (context.user_data or {}).get("phase1_vision_batch"):
+        context.user_data.setdefault("phase1_typed_notes", []).append(message_text)
+        return await _execute_phase1_vision_batch_extraction(context, user_id)
 
     await _clear_phase1_vision_upload_state(
         context, update.effective_chat.id if update.effective_chat else None
