@@ -363,5 +363,61 @@ class AddDriverWithEmailTest(unittest.TestCase):
         db.create_driver.assert_called_once_with("Kita", "12345678", None, None)
 
 
+class DriverContactEverywhereTest(unittest.TestCase):
+    """Phone and email must be reachable where the driver is actually mentioned,
+    not only on the /settings screen."""
+
+    D = [{"id": "d1", "driver_name": "Kita", "is_active": True,
+          "phone_number": "551-374-0027", "email": "kita@example.com"},
+         {"id": "d2", "driver_name": "Sam Okafor", "is_active": True,
+          "phone_number": "", "email": ""}]
+
+    def test_asking_for_drivers_gives_a_directory(self):
+        with mock.patch.object(bot, "_get_all_drivers_cached",
+                               mock.MagicMock(return_value=self.D)),                 mock.patch.object(bot, "_get_suspended_driver_ids",
+                                  mock.MagicMock(return_value=set())):
+            text = bot._fmt_router_drivers()
+        self.assertIn("551-374-0027", text)
+        self.assertIn("kita@example.com", text)
+
+    def _accept_notice(self, driver_name):
+        sent = {}
+
+        async def fake_send(chat_id=None, text=None, **k):
+            sent["text"] = text
+
+        ctx = SimpleNamespace(bot=SimpleNamespace(send_message=fake_send))
+        db = mock.MagicMock()
+        db.get_lead_by_id.return_value = {"id": "L1", "reference_id": "REF1", "user_id": 7}
+        with mock.patch.object(bot, "db", db),                 mock.patch.object(bot, "_get_all_drivers_cached",
+                                  mock.MagicMock(return_value=self.D)),                 mock.patch.object(bot, "_group_display_name_from_lead",
+                                  mock.MagicMock(return_value="Sensei's Team")):
+            asyncio.run(bot._notify_initiator_lead_accepted_summary(
+                ctx, {"id": "L1", "user_id": 7}, accepting_driver_name=driver_name))
+        return sent.get("text") or ""
+
+    def test_the_accept_notice_carries_the_drivers_number(self):
+        """The moment you most need it: someone just took your lead."""
+        text = self._accept_notice("Kita")
+        self.assertIn("551-374-0027", text)
+        self.assertIn("kita@example.com", text)
+
+    def test_a_driver_with_nothing_on_file_adds_no_blank_row(self):
+        text = self._accept_notice("Sam Okafor")
+        self.assertIn("Sam Okafor", text)
+        self.assertNotIn("\n   \n", text, "an empty contact row must not appear")
+
+    def test_an_unknown_driver_name_is_harmless(self):
+        text = self._accept_notice("Somebody Else")
+        self.assertIn("Somebody Else", text)
+
+    def test_lookup_by_name_is_case_insensitive(self):
+        with mock.patch.object(bot, "_get_all_drivers_cached",
+                               mock.MagicMock(return_value=self.D)):
+            self.assertEqual(bot._driver_row_by_name("kita")["id"], "d1")
+            self.assertIsNone(bot._driver_row_by_name(""))
+            self.assertIsNone(bot._driver_row_by_name("nobody"))
+
+
 if __name__ == "__main__":
     unittest.main()
