@@ -533,6 +533,20 @@ async def _start_tracking_gate_or_send_details(
         logger.warning("Could not send optional tracking link to %s: %s", chat_id, e)
 
 
+def _after_send_keyboard(lead_id: str) -> InlineKeyboardMarkup:
+    """Buttons on the "lead sent" confirmation.
+
+    Reassigning right after sending is routine — the driver is unavailable, or it
+    belongs to a different dispatcher — and previously it meant waiting for a timeout
+    or digging for the earlier message. Both callbacks are conversation ENTRY points,
+    so they still work after the lead flow has ended."""
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🚗 Reassign driver", callback_data=f"resend_driver_{lead_id}"),
+         InlineKeyboardButton("🏢 Reassign dispatcher", callback_data=f"reassign_group_{lead_id}")],
+        [InlineKeyboardButton("➕ Another tag (same client)", callback_data=f"another_tag_{lead_id}")],
+    ])
+
+
 def _keyboard_lead_accept_decline(lead_id: str) -> InlineKeyboardMarkup:
     """New-lead offer: Accept / Different Driver (decline callback)."""
     return InlineKeyboardMarkup([
@@ -6560,20 +6574,9 @@ async def _phase1_finish_vision_extraction(
     normalized_11 = "\n".join(lines[: ai_vision.PHASE1_LINE_COUNT]) if len(lines) >= ai_vision.PHASE1_LINE_COUNT else normalized
     state_data = parse_phase1_structured(normalized_11)
     _apply_single_address_as_both(state_data)
-    valid, validation_errors = ai_vision.validate_phase1_extraction(normalized_11, state_data)
-    if not valid:
-        err_blurb = "\n• ".join(validation_errors)
-        preview = (
-            f"Name: {state_data.get('name') or '-'}\n"
-            f"VIN: {state_data.get('vin') or '-'}\n"
-            f"Delivery: {state_data.get('delivery_address') or '-'} / {state_data.get('delivery_city_state_zip') or '-'}"
-        )
-        await msg.reply_text(
-            "⚠️ Extraction didn’t pass validation:\n\n• " + err_blurb + "\n\n"
-            "Extracted preview:\n" + preview + "\n\n"
-            "Please send the details as text in the required 11-line structure, or try another photo or PDF."
-        )
-        return STATE_PHASE1
+    # Same as the typed path: no completeness gate. Whatever the picture gave goes to
+    # the review card, where a gap is visible and one edit away from fixed — rejecting
+    # it here also threw away the fields that WERE read.
     # Parse extra fields (phone, price, notes, email, driver-license id) from lines 12+
     phone = price = issuer_note = driver_note = None
     email_val = dl_val = None
@@ -7031,14 +7034,9 @@ async def handle_phase1(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
         normalized_11 = "\n".join(lines[: ai_vision.PHASE1_LINE_COUNT]) if len(lines) >= ai_vision.PHASE1_LINE_COUNT else normalized
         state_data = parse_phase1_structured(normalized_11)
         _apply_single_address_as_both(state_data)
-        valid, validation_errors = ai_vision.validate_phase1_extraction(normalized_11, state_data)
-        if not valid:
-            err_blurb = "\n• ".join(validation_errors)
-            await update.message.reply_text(
-                "⚠️ I couldn't find enough info:\n\n• " + err_blurb + "\n\n"
-                "Please include at least name and delivery address/city."
-            )
-            return STATE_PHASE1
+        # No completeness gate here any more. It rejected the message AND threw away
+        # everything that had been extracted, so a lead with a gap could not even get
+        # to the card — where the gap is visible and one edit away from fixed.
         db.set_user_state(user_id, "phase1", state_data)
         message_text = update.message.text or update.message.caption or ""
 
@@ -8577,9 +8575,7 @@ async def _finalize_lead_after_notes(
     ref_h = html.escape(str(reference_id), quote=False)
     drivers_count = len([d for d in drivers_list if d and d.get("id")])
     source_label = html.escape((state_data.get("selected_source_label") or "—"), quote=False)
-    _another = InlineKeyboardMarkup(
-        [[InlineKeyboardButton("➕ Another tag (same client)", callback_data=f"another_tag_{lead['id']}")]]
-    )
+    _another = _after_send_keyboard(str(lead["id"]))
     if is_all_groups:
         await message.reply_text(
             "✅ Lead saved.\n\n"
@@ -8803,9 +8799,7 @@ async def _submit_lead_from_review(message, context, user_id, data):
         f"In **Krab Dispatch**, name the tag PDF **similar to this client’s name** (first line of details) so it auto‑links to reference `{ref_id}`.\n\n"
         f"Use /lead to add another.",
         parse_mode="Markdown",
-        reply_markup=InlineKeyboardMarkup(
-            [[InlineKeyboardButton("➕ Another tag (same client)", callback_data=f"another_tag_{lead['id']}")]]
-        ),
+        reply_markup=_after_send_keyboard(str(lead["id"])),
     )
     await _maybe_offer_insurance_card(
         context, message, lead_id=str(lead["id"]), reference_id=str(ref_id),
