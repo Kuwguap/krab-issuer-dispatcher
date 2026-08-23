@@ -891,10 +891,14 @@ PLATE_READ_PROMPT = (
     "Reply with ONLY a JSON object exactly like "
     '{"is_temp_tag": true, "plate": "H553300", "number": "553300", "kind": "resident"}.\n'
     "Rules:\n"
-    "- If the image is NOT a temporary vehicle tag — e.g. a driver's license, a vehicle "
-    "title, an insurance/ID card, a receipt, a photo of a car, or any other document — reply "
-    'EXACTLY {"is_temp_tag": false, "plate": "", "number": "", "kind": "unknown"} and read '
-    "NOTHING. Do NOT guess a plate number from a license, title, or receipt.\n"
+    "- A PHOTO OF A VEHICLE counts when a temporary paper tag is visible on it — that is "
+    "the usual way these are sent, so read the number straight off the tag. Only the tag "
+    "matters; ignore the rest of the car.\n"
+    "- If NO temporary tag is visible — e.g. a driver's license, a vehicle title, an "
+    "insurance/ID card, a receipt, a car with an ordinary metal plate, or any other "
+    'document — reply EXACTLY {"is_temp_tag": false, "plate": "", "number": "", '
+    '"kind": "unknown"} and read NOTHING. Do NOT guess a plate number from a license, '
+    "title, receipt or a permanent plate.\n"
     "- If it IS a temp tag: number = the main plate digits only (no letters); kind = "
     '"resident" if it starts with H, "nonresident" if it ends with V, otherwise "unknown".\n'
     "- If it clearly is a temp tag but you cannot read the number, use is_temp_tag true with "

@@ -5606,6 +5606,18 @@ def _user_in_active_conversation(update: Update, context: ContextTypes.DEFAULT_T
     return False
 
 
+def _in_settings_conversation(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    """True while this user is inside /settings — where a photo is always meant for a
+    plate counter, never for a lead."""
+    h = _SETTINGS_CONV_HANDLER
+    if h is None:
+        return False
+    try:
+        return h._conversations.get(h._get_key(update)) is not None
+    except Exception:
+        return False
+
+
 async def handle_supervisor_plate_image(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Supervisor photo/PDF → read a temp-tag number and stage a plate-counter update —
     works in ANY state. Registered at group -1 (before every conversation), it reads the
@@ -5671,11 +5683,13 @@ async def handle_supervisor_plate_image(update: Update, context: ContextTypes.DE
             # Keep the pinned counter armed so the next photo/text still targets it.
             context.user_data["router_plate_followup"] = {"col": forced_col, "ts": time.time()}
             extra = f" (still updating {_PLATE_SET_LABELS.get(forced_col, 'that counter')})"
-        if not forced_col:
-            # Not a tag, and no counter update was requested — it is a lead image.
-            # Fall through silently so the lead flow reads it; replying here used to
-            # eat every forwarded screenshot with "couldn't read a tag number".
+        if not forced_col and not _in_settings_conversation(update, context):
+            # Not a tag, no counter update requested, and not inside /settings — it is
+            # a lead image. Fall through silently so the lead flow reads it; replying
+            # here used to eat every forwarded screenshot.
             return
+        # Inside /settings the picture was plainly meant for a counter, so a failed
+        # read must say so — falling through would start a LEAD from a tag photo.
         await msg.reply_text(
             "⚠️ I couldn't read a tag number. Send a clearer photo, or type it — "
             f"e.g. “update resident tag number 553300”.{extra}"
@@ -5848,6 +5862,28 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     if not update.message:
         return ConversationHandler.END
     return await _restart_bot_from_top(update, context)
+
+
+# When a picture holds nothing the extractor recognises, some models answer in prose
+# ("I'm unable to extract any personal details from this image…") instead of the field
+# block. That sentence was being split across the name lines and shown as the client.
+_AI_REFUSAL_RE = re.compile(
+    r"\b(?:i'?m\s+unable|i\s+am\s+unable|unable\s+to\s+(?:extract|read|determine|identify)|"
+    r"cannot\s+(?:extract|read|determine|identify|assist)|can'?t\s+(?:extract|read|determine)|"
+    r"no\s+(?:personal\s+)?details?\s+(?:are\s+)?(?:visible|found|present)|"
+    r"does\s+not\s+contain\s+(?:any\s+)?(?:personal|required)|"
+    r"please\s+provide\s+(?:a\s+)?(?:document|image|clearer))\b",
+    re.I,
+)
+
+
+def _looks_like_ai_refusal(text: str) -> bool:
+    """True when the model answered in prose instead of the field block.
+
+    Checked on the FIRST few lines only: a genuine extraction can legitimately carry
+    such words inside a note, but never as the name/address lines."""
+    head = "\n".join((text or "").strip().splitlines()[:3])
+    return bool(head) and bool(_AI_REFUSAL_RE.search(head))
 
 
 def _normalize_ai_phase1_text(text: str) -> str:
@@ -6656,10 +6692,12 @@ async def _phase1_finish_vision_extraction(
     """
     if not msg:
         return STATE_PHASE1
-    if not raw_text or not raw_text.strip():
+    if not raw_text or not raw_text.strip() or _looks_like_ai_refusal(raw_text):
+        # A prose refusal is the same as nothing read — never build a card from it,
+        # or the apology itself ends up shown as the client's name.
         await msg.reply_text(
-            f"❌ Could not extract details from the {source_label}. "
-            "Please send the details as text in the required structure."
+            f"❌ Could not read any lead details from that {source_label}. "
+            "Send a clearer picture, or type the details."
         )
         return STATE_PHASE1
     normalized = _normalize_ai_phase1_text(raw_text)
