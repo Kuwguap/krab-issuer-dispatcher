@@ -2421,6 +2421,44 @@ def _fresh_price_picker(context, state_data) -> InlineKeyboardMarkup:
     return _price_picker_keyboard(_price_has_toll((state_data or {}).get("pending_price")))
 
 
+# Every button on the review card, in one place: the conversation state and the
+# entry point MUST offer the same set, or a card outlives the conversation that can
+# answer it (see _adopt_review_message).
+PH1_REVIEW_CB_PATTERN = (
+    r"^(ph1_accept|ph1_edit|ph1_vin_check|ph1_add_image|ph1_adjust|ph1_attach|"
+    r"ph1_ins_toggle|adjust_cancel|ph1_back|ph1_pick_group|ph1_pick_driver|"
+    r"ph1_pick_source|selgrp_|seldrv_|selsrc_|ph1_sel_back|driver_suspended_|"
+    r"edit_cancel|ph1edit_)"
+)
+PH1_EDIT_MENU_CB_PATTERN = r"^(ph1_back|ph1_accept|ph1edit_[a-z]+)$"
+PH1_VIN_CHOICE_CB_PATTERN = r"^(vin_use|vin_keep|vin_retype)$"
+
+
+def _adopt_review_message(context, query) -> None:
+    """Re-learn WHICH message is the review card from the card itself.
+
+    The handlers edit the card by remembered message id, and a restart wipes that
+    memory — so every button on a card that outlived the restart did nothing at all,
+    with no reply and no log. The tapped message identifies itself: only the review
+    card and its edit picker carry ph1_accept / ph1edit_ buttons."""
+    try:
+        if context.user_data.get("review_message_id"):
+            return
+    except Exception:
+        return
+    msg = getattr(query, "message", None)
+    rows = getattr(getattr(msg, "reply_markup", None), "inline_keyboard", None)
+    if not msg or not rows:
+        return
+    on_the_card = any(
+        str(getattr(b, "callback_data", "") or "").startswith(("ph1edit_", "ph1_accept", "ph1_edit"))
+        for row in rows for b in row
+    )
+    if on_the_card:
+        context.user_data["review_message_id"] = msg.message_id
+        context.user_data["review_chat_id"] = msg.chat_id
+
+
 PH1_EDIT_PROMPT_LABEL = {
     "fn": "First name",
     "ln": "Last name",
@@ -2763,13 +2801,17 @@ def _phase1_edit_fields_keyboard(state_data: dict) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(rows)
 
 
-async def _show_edit_picker(context, state_data) -> None:
+async def _show_edit_picker(context, state_data, fallback_chat_id=None) -> None:
     """Render the review message as the field-by-field edit picker (with current
     values on every button), so the issuer can edit one field after another and
     then tap ✅ Submit — without re-opening Edit each time."""
     chat_id = context.user_data.get("review_chat_id")
     mid = context.user_data.get("review_message_id")
     if not chat_id or not mid:
+        # A restart lost track of the card. Draw a fresh one rather than no-op —
+        # silence here is what made the edit buttons look dead.
+        if fallback_chat_id:
+            await _reanchor_review_card(context, fallback_chat_id, state_data)
         return
     try:
         await context.bot.edit_message_text(
@@ -7611,6 +7653,7 @@ async def handle_phase1_color_pick(update: Update, context: ContextTypes.DEFAULT
     """A colour tapped from the palette — apply it and return to the field picker."""
     query = update.callback_query
     await _safe_answer_callback_query(query)
+    _adopt_review_message(context, query)
     user_id = query.from_user.id
     color = (query.data or "").replace(PH1_COLOR_CB, "", 1).strip()
     state = db.get_user_state(user_id)
@@ -7626,8 +7669,8 @@ async def handle_phase1_color_pick(update: Update, context: ContextTypes.DEFAULT
         pass
     context.user_data.pop("edit_prompt_msg_id", None)
     db.set_user_state(user_id, "phase1", state_data)
-    await _show_edit_picker(context, state_data)
     chat_id = query.message.chat_id if query.message else None
+    await _show_edit_picker(context, state_data, fallback_chat_id=chat_id)
     if chat_id:
         await _send_vanishing(context, chat_id, f"✅ Updated: color → {color}")
     return STATE_AI_REVIEW
@@ -7642,6 +7685,7 @@ async def handle_phase1_price_pick(update: Update, context: ContextTypes.DEFAULT
     """
     query = update.callback_query
     await _safe_answer_callback_query(query)
+    _adopt_review_message(context, query)
     user_id = query.from_user.id
     raw = (query.data or "").replace(PH1_PRICE_CB, "", 1).strip()
     state = db.get_user_state(user_id)
@@ -7695,8 +7739,8 @@ async def handle_phase1_price_pick(update: Update, context: ContextTypes.DEFAULT
         pass
     context.user_data.pop("edit_prompt_msg_id", None)
     db.set_user_state(user_id, "phase1", state_data)
-    await _show_edit_picker(context, state_data)
     chat_id = query.message.chat_id if query.message else None
+    await _show_edit_picker(context, state_data, fallback_chat_id=chat_id)
     if chat_id:
         await _send_vanishing(context, chat_id, f"✅ Updated: price → {price}")
     return STATE_AI_REVIEW
@@ -8159,6 +8203,7 @@ async def handle_another_file_callback(update: Update, context: ContextTypes.DEF
 async def handle_phase1_ai_review_callback(update, context):
     query = update.callback_query
     await _safe_answer_callback_query(query)
+    _adopt_review_message(context, query)
     user_id = query.from_user.id
     data = query.data
 
@@ -8378,6 +8423,7 @@ async def handle_phase1_edit_menu_callback(update: Update, context: ContextTypes
     """Choose field to edit or go back to summary."""
     query = update.callback_query
     await _safe_answer_callback_query(query)
+    _adopt_review_message(context, query)
     user_id = query.from_user.id
     if query.data == PH1_REVIEW_ACCEPT:
         state = db.get_user_state(user_id)
@@ -8610,6 +8656,7 @@ async def handle_vin_choice_callback(update: Update, context: ContextTypes.DEFAU
     """Handle VIN conflict choice button: use API result, keep stated car, or retype."""
     query = update.callback_query
     await query.answer()
+    _adopt_review_message(context, query)
     choice = {"vin_use": "use", "vin_keep": "keep", "vin_retype": "retype"}.get(query.data, "keep")
     return await _apply_vin_choice(context, query.message, update.effective_chat.id, update.effective_user.id, choice)
 
@@ -15116,6 +15163,14 @@ def main():
             CallbackQueryHandler(handle_driver_selection, pattern="^(select_driver_|driver_suspended_)"),
             CallbackQueryHandler(handle_phase1_color_pick, pattern=f"^{PH1_COLOR_CB}"),
             CallbackQueryHandler(handle_phase1_price_pick, pattern=f"^{PH1_PRICE_CB}"),
+            # A review card outlives the process that drew it. Every button on it is
+            # an entry point too, so a redeploy (or a second worker) can still answer
+            # the tap by reading the lead back out of Supabase.
+            CallbackQueryHandler(handle_phase1_ai_review_callback,
+                                 pattern=PH1_REVIEW_CB_PATTERN),
+            CallbackQueryHandler(handle_vin_choice_callback,
+                                 pattern=PH1_VIN_CHOICE_CB_PATTERN),
+            CallbackQueryHandler(handle_contact_source_selection, pattern="^contact_source_"),
             # Idle natural-language / voice start: any substantive text starts a lead
             # and auto-fills what's given. MUST be last (only plain text reaches it).
             MessageHandler(filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE, handle_idle_lead_start),
@@ -15139,7 +15194,7 @@ def main():
             STATE_AI_REVIEW: [
                 CallbackQueryHandler(
                     handle_phase1_ai_review_callback,
-                    pattern=r"^(ph1_accept|ph1_edit|ph1_vin_check|ph1_add_image|ph1_adjust|ph1_attach|ph1_ins_toggle|adjust_cancel|ph1_back|ph1_pick_group|ph1_pick_driver|ph1_pick_source|selgrp_|seldrv_|selsrc_|ph1_sel_back|driver_suspended_|edit_cancel|ph1edit_)"
+                    pattern=PH1_REVIEW_CB_PATTERN,
                 ),
                 # Inline edits with no Edit button: type 'price $50' / 'phone 555-1234'
                 # or send a photo/PDF, and it's parsed straight into the review.
@@ -15166,7 +15221,8 @@ def main():
                 CallbackQueryHandler(handle_phase1_ai_review_callback, pattern="^adjust_cancel$"),
             ],
             STATE_AI_EDIT_MENU: [
-                CallbackQueryHandler(handle_phase1_edit_menu_callback, pattern=r"^(ph1_back|ph1_accept|ph1edit_[a-z]+)$"),
+                CallbackQueryHandler(handle_phase1_edit_menu_callback,
+                                     pattern=PH1_EDIT_MENU_CB_PATTERN),
                 # Single-line typed/voice edits keep working while the edit picker is
                 # open ('name John Damian', 'price 150') — they apply and re-render the
                 # review card instead of dying in a button-only state.
