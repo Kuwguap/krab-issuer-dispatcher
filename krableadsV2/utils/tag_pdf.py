@@ -110,7 +110,8 @@ def _load_font(kind: str) -> fitz.Font:
 # lead saved before the list was fixed still resolves.
 _COLOR_MAP = {
     "black": "BLK", "blk": "BLK", "bk": "BLK",
-    "white": "WHT", "wht": "WHT", "whi": "WHT",
+    # WHI, not WHT — confirmed against the printed tag samples.
+    "white": "WHI", "whi": "WHI", "wht": "WHI",
     "red": "RED",
     "blue": "BLU", "blu": "BLU",
     "yellow": "YLW", "ylw": "YLW", "yel": "YLW",
@@ -120,7 +121,8 @@ _COLOR_MAP = {
     "brown": "BRN", "brn": "BRN",
     "orange": "ORG", "org": "ORG",
     "gold": "GLD", "gld": "GLD",
-    "beige": "BEG", "beg": "BEG", "bge": "BEG",
+    # BGE, not BEG — confirmed against the printed tag samples.
+    "beige": "BGE", "bge": "BGE", "beg": "BGE",
     "tan": "TAN",
     "purple": "PUR", "pur": "PUR",
     "amethyst": "PUR",          # a purple on the DMV list — no code of its own
@@ -132,7 +134,7 @@ _COLOR_MAP = {
     "burgundy": "BRG", "brg": "BRG",
     "cream": "CRM", "crm": "CRM",
     "champagne": "CRM",         # cream family
-    "pearl": "WHT",             # a white on the DMV list
+    "pearl": "WHI",             # a white on the tag
     "bronze": "BRZ", "brz": "BRZ",
     "copper": "CPR", "cpr": "CPR",
 }

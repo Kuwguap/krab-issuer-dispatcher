@@ -60,8 +60,8 @@ class ColorPaletteTest(unittest.TestCase):
 # The operator's official name -> 3-letter DMV code list. Buttons never show the
 # code; the tag PDF needs it.
 OFFICIAL_CODES = {
-    "Black": "BLK", "White": "WHT", "Gray": "GRY", "Silver": "SLV", "Red": "RED",
-    "Blue": "BLU", "Green": "GRN", "Brown": "BRN", "Beige": "BEG", "Gold": "GLD",
+    "Black": "BLK", "White": "WHI", "Gray": "GRY", "Silver": "SLV", "Red": "RED",
+    "Blue": "BLU", "Green": "GRN", "Brown": "BRN", "Beige": "BGE", "Gold": "GLD",
     "Orange": "ORG", "Yellow": "YLW", "Purple": "PUR", "Tan": "TAN", "Cream": "CRM",
     "Maroon": "MRN", "Navy": "NVY", "Bronze": "BRZ", "Copper": "CPR", "Teal": "TEL",
 }
@@ -97,10 +97,11 @@ class ColorCodeForPdfTest(unittest.TestCase):
         for label, code in [(l, c) for l in labels for c in OFFICIAL_CODES.values()]:
             self.assertNotIn(f" {code}", label, f"{label} leaks the DMV code")
 
-    def test_old_codes_still_resolve_for_leads_saved_earlier(self):
+    def test_the_other_spelling_is_tolerated_as_input(self):
+        """Anything already stored as WHT/BEG still prints the right code."""
         from utils import tag_pdf
-        self.assertEqual(tag_pdf.color_code("WHI"), "WHT")   # old white code
-        self.assertEqual(tag_pdf.color_code("BGE"), "BEG")   # old beige code
+        self.assertEqual(tag_pdf.color_code("WHT"), "WHI")
+        self.assertEqual(tag_pdf.color_code("BEG"), "BGE")
 
 
 class SpokenColorTest(unittest.TestCase):
