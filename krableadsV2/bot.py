@@ -3410,6 +3410,204 @@ async def handle_phase1_adjust_input(update: Update, context: ContextTypes.DEFAU
 # date, time, driver, issuer, city, street, client, number, cell, license …) are
 # intentionally NOT aliases, so casual chat like "driver is en route" or "email me
 # later" isn't misread as an edit — use the fuller label ("driver note", "first name").
+# ── Car insurance carriers ──────────────────────────────────────────────────
+# "policy", "policy name", "insurance policy" and "company policy" all get said for
+# BOTH halves of the insurance, so the VALUE decides which one is meant: a carrier
+# name goes to the company field, a number to the policy #, and "geico 8829301"
+# fills both.
+#
+# Split in two because some carriers are ordinary English words. A STRONG name is
+# unmistakable and counts on its own ("Geico" typed alone is the carrier, never the
+# client's name). A WEAK one only counts once insurance is in play — either the user
+# labelled it, or the word "insurance" is in the value — so a driver note reading
+# "root of the problem" or a client named Shelter is left alone.
+_INSURERS_STRONG = {
+    "GEICO": ("geico", "gieco", "geiko", "gieko", "geico general"),
+    "State Farm": ("state farm", "statefarm", "state farm mutual"),
+    "Progressive": ("progressive", "progresive"),
+    "Allstate": ("allstate", "all state"),
+    "USAA": ("usaa",),
+    "Liberty Mutual": ("liberty mutual", "liberty mutual fire"),
+    "Farmers": ("farmers", "farmers insurance"),
+    "Nationwide": ("nationwide", "nation wide"),
+    "Travelers": ("travelers", "travellers"),
+    "American Family": ("american family", "amfam"),
+    "Auto-Owners": ("auto owners", "auto-owners"),
+    "Safeco": ("safeco", "safe co"),
+    "Esurance": ("esurance", "e surance"),
+    "Kemper": ("kemper",),
+    "Plymouth Rock": ("plymouth rock", "plymouth rock assurance"),
+    "NJM": ("njm", "new jersey manufacturers", "nj manufacturers"),
+    "The Hanover": ("hanover",),
+    "MetLife": ("metlife", "met life"),
+    "Amica": ("amica",),
+    "Chubb": ("chubb",),
+    "The Hartford": ("hartford",),
+    "National General": ("national general", "natgen", "nat gen"),
+    "Dairyland": ("dairyland", "dairy land"),
+    "Bristol West": ("bristol west",),
+    "21st Century": ("21st century", "twenty first century"),
+    "Clearcover": ("clearcover", "clear cover"),
+    "GAINSCO": ("gainsco",),
+    "CURE": ("cure auto", "cure insurance", "cure auto insurance"),
+    "Palisades": ("palisades",),
+    "High Point": ("high point",),
+    "Rutgers Casualty": ("rutgers casualty", "rutgers"),
+    "Franklin Mutual": ("franklin mutual",),
+    "Preferred Mutual": ("preferred mutual",),
+    "Wawanesa": ("wawanesa",),
+    "Donegal": ("donegal",),
+    "Penn National": ("penn national",),
+    "Utica National": ("utica", "utica national"),
+    "Trexis": ("trexis",),
+    "SafeAuto": ("safeauto", "safe auto"),
+    "Fred Loya": ("fred loya",),
+    "Mendota": ("mendota",),
+    "Ocean Harbor": ("ocean harbor", "ocean harbour"),
+    "Good2Go": ("good2go", "good to go"),
+    "Assurance America": ("assurance america",),
+    "Alliance United": ("alliance united",),
+    "Bluefire": ("bluefire", "blue fire"),
+    "Wawa Casualty": ("wawa casualty",),
+    "Amtrust": ("amtrust", "am trust",),
+    "Direct Auto": ("direct auto", "direct general"),
+    "Anchor General": ("anchor general",),
+    "Aspire General": ("aspire general",),
+    "First Chicago": ("first chicago",),
+    "Home State": ("home state county mutual",),
+    "United Automobile": ("united automobile", "united auto"),
+    "Star Casualty": ("star casualty",),
+    "Pronto": ("pronto insurance",),
+    "Hallmark": ("hallmark insurance",),
+    "Freeway": ("freeway insurance",),
+    "Acceptance": ("acceptance insurance",),
+    "Infinity": ("infinity insurance",),
+    "Titan": ("titan insurance",),
+}
+_INSURERS_WEAK = {
+    # Car makes (Mercury, Plymouth), towns (Erie, Westfield) and everyday words —
+    # all real carriers, none of them safe to assume from a bare value.
+    "Mercury": ("mercury",),
+    "Erie": ("erie",),
+    "Selective": ("selective",),
+    "Encompass": ("encompass",),
+    "Foremost": ("foremost",),
+    "Midvale": ("midvale",),
+    "Westfield": ("westfield",),
+    "Grange": ("grange",),
+    "Redpoint": ("redpoint",),
+    "Victoria": ("victoria",),
+    "Root": ("root",),
+    "Hugo": ("hugo",),
+    "Elephant": ("elephant",),
+    "Lemonade": ("lemonade",),
+    "Shelter": ("shelter",),
+    "Sentry": ("sentry",),
+    "The General": ("the general", "general"),
+    "AAA": ("aaa", "triple a", "auto club"),
+    "Alfa": ("alfa",),
+    "Country Financial": ("country financial", "country"),
+    "Slide": ("slide",),
+    "Loya": ("loya",),
+    "Cure": ("cure",),
+}
+# Words a carrier is routinely said with, dropped before matching so
+# "Geico Insurance Company" and "geico" are the same carrier.
+_INSURER_NOISE_RE = re.compile(
+    r"\b(insurance|insurances|insurer|ins|company|companies|co|corp|corporation|"
+    r"group|agency|mutual|casualty|indemnity|underwriters|assurance|auto|automobile|"
+    r"car|vehicle|policy|carrier|coverage|the|of|my|is|for)\b",
+    re.IGNORECASE,
+)
+# The value itself says this is insurance, even for a carrier we don't know.
+_INSURANCE_WORD_RE = re.compile(
+    r"\b(insurance|insurer|assurance|casualty|indemnity|underwriters)\b", re.IGNORECASE)
+
+
+def _insurer_lookup(table: dict) -> dict:
+    return {alias: canon for canon, aliases in table.items() for alias in aliases}
+
+
+_INSURER_STRONG_MAP = _insurer_lookup(_INSURERS_STRONG)
+_INSURER_WEAK_MAP = _insurer_lookup(_INSURERS_WEAK)
+
+
+def _insurer_re(lookup: dict) -> "re.Pattern":
+    # Longest alias first so "liberty mutual fire" wins over "liberty mutual".
+    return re.compile(
+        r"\b(" + "|".join(re.escape(a) for a in sorted(lookup, key=len, reverse=True)) + r")\b",
+        re.IGNORECASE,
+    )
+
+
+_INSURER_STRONG_RE = _insurer_re(_INSURER_STRONG_MAP)
+_INSURER_WEAK_RE = _insurer_re(_INSURER_WEAK_MAP)
+
+
+def _insurer_name(value, labeled_insurance: bool = False) -> str:
+    """The carrier this value names, canonically spelled, or "" if it names none.
+
+    ``labeled_insurance`` = the user already said insurance/policy, which is what
+    lets the everyday-word carriers (Root, Hugo, The General) count."""
+    raw = re.sub(r"\s+", " ", str(value or "")).strip()
+    if not raw:
+        return ""
+    m = _INSURER_STRONG_RE.search(raw)
+    if m:
+        return _INSURER_STRONG_MAP[m.group(1).lower()]
+    said_insurance = bool(_INSURANCE_WORD_RE.search(raw))
+    if not (labeled_insurance or said_insurance):
+        return ""
+    m = _INSURER_WEAK_RE.search(raw)
+    if m:
+        return _INSURER_WEAK_MAP[m.group(1).lower()]
+    # A carrier we simply don't have on the list — "Ocean Harbor Insurance". Keep
+    # the user's own spelling; only the noise words come off.
+    if said_insurance:
+        core = _INSURER_NOISE_RE.sub(" ", raw)
+        core = re.sub(r"[^\w&/\- ]+", " ", core)
+        core = re.sub(r"\s+", " ", core).strip(" .,-")
+        if core and len(core.split()) <= 5 and not re.search(r"\d", core):
+            return core
+    return ""
+
+
+# A policy / binder number: 5+ characters with at least one digit.
+_POLICY_NUM_RE = re.compile(r"\b(?=[A-Za-z0-9][A-Za-z0-9\-]*\d)[A-Za-z0-9\-]{5,}\b")
+
+
+def _expand_insurance_pair(edit_key: str, value: str):
+    """Turn one insurance edit into the field(s) it really is, or None when this
+    isn't an insurance edit at all.
+
+    "policy geico" is the carrier, "policy 8829301" is the number, and
+    "policy geico 8829301" is both — all three get said."""
+    if edit_key not in ("ins", "pol"):
+        return None
+    raw = str(value or "").strip()
+    if not raw or raw == "-":
+        return None
+    carrier = _insurer_name(raw, labeled_insurance=True)
+    number = ""
+    rest = raw
+    if carrier:
+        # Don't mistake part of the carrier's own name for the policy number.
+        for alias in sorted(set(_INSURER_STRONG_MAP) | set(_INSURER_WEAK_MAP) | {carrier.lower()},
+                            key=len, reverse=True):
+            rest = re.sub(r"\b" + re.escape(alias) + r"\b", " ", rest, flags=re.IGNORECASE)
+    m = _POLICY_NUM_RE.search(rest)
+    if m:
+        number = m.group(0)
+    if carrier and number:
+        return [("ins", carrier), ("pol", number)]
+    if carrier:
+        return [("ins", carrier)]
+    if number:
+        return [("pol", number)]
+    # Neither — a bare word after "insurance"/"policy". Keep the field they named.
+    return None
+
+
 _INLINE_EDIT_ALIASES = {
     "first name": "fn", "firstname": "fn",
     "last name": "ln", "lastname": "ln",
@@ -3422,7 +3620,13 @@ _INLINE_EDIT_ALIASES = {
     "car": "car", "make/model": "car",
     "color": "col", "colour": "col",
     "insurance": "ins", "insurance company": "ins", "carrier": "ins",
+    "insurance carrier": "ins", "insurance name": "ins", "insurer": "ins",
+    "insurance co": "ins", "company name": "ins",
     "policy number": "pol", "policy #": "pol", "policy": "pol", "binder": "pol", "binder #": "pol",
+    # Said for either half — _expand_insurance_pair reads the value to tell
+    # the carrier ("policy geico") from the number ("policy 8829301").
+    "policy name": "ins", "insurance policy": "pol", "company policy": "ins",
+    "policy company": "ins",
     "date/time": "xtra", "delivery time": "xtra", "extra info": "xtra",
     "phone number": "phone", "phone": "phone",
     "price": "price", "cost": "price", "amount": "price", "quote": "price",
@@ -3470,6 +3674,9 @@ def _clean_inline_value(edit_key: str, value: str) -> str:
         amount = "$" + m.group(0).replace(",", "")
         # "150 + toll" / "150 plus tolls" quotes the same job with the toll on top.
         return amount + _PH1_TOLL_SUFFIX if _price_has_toll(value) else amount
+    if edit_key == "ins":
+        # "gieco" / "state farm insurance co" -> the carrier's real name.
+        return _insurer_name(value, labeled_insurance=True) or value
     if edit_key == "phone":
         return value if len(re.sub(r"\D", "", value)) >= 10 else ""
     if edit_key == "email":
@@ -3533,6 +3740,14 @@ def _parse_multi_field_line(line: str):
         m = matches[mi]
         end = matches[boundaries[bi + 1][0]].start() if bi + 1 < len(boundaries) else len(line)
         raw = re.sub(r"^\s*[:=]?\s*", "", line[m.end():end])
+        # "policy geico 8829301" is the carrier AND the number, whichever of the
+        # insurance words was used to say it. Split before cleaning: cleaning an
+        # insurance value canonicalises the carrier and would drop the number.
+        ins = _expand_insurance_pair(ek, raw.strip())
+        if ins:
+            pairs.extend((p_ek, _clean_inline_value(p_ek, p_val) or p_val)
+                         for p_ek, p_val in ins)
+            continue
         val = _clean_inline_value(ek, raw)
         if val:
             pairs.append((ek, val))
@@ -3719,6 +3934,11 @@ def _structured_value_ek(v: str):
         return None
     if re.search(r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}", v):
         return "email"
+    # "Geico" on its own is the carrier. Without this the 1-to-4-plain-words rule
+    # below filed it as the client's name. A value that reads as a vehicle is a
+    # vehicle, whatever it shares a name with.
+    if not (_CAR_MAKE_RE.search(v) or re.search(r"\b(19|20)\d{2}\b", v)) and _insurer_name(v):
+        return "ins"
     if _extract_vin_17(v):
         return "vin"
     digits = re.sub(r"\D", "", v)
@@ -3777,11 +3997,17 @@ def _apply_ek_value(state_data: dict, ek: str, value: str) -> list:
     # Same per-field validation/normalization the labeled path uses ('500' -> '$500',
     # phone needs >=10 digits, email needs '@', …). Returns '' when the value doesn't
     # fit the field, so a mis-guess is dropped instead of written.
-    value = _clean_inline_value(ek, (value or "").strip())
-    if not value:
-        return []
-    # One spoken/typed address covers the street line AND the city/ST/ZIP line.
-    pairs = _expand_address_pair(ek, value)
+    # One insurance value can be the carrier, the policy number, or both — split it
+    # before cleaning, which canonicalises the carrier and would drop the number.
+    ins_pairs = _expand_insurance_pair(ek, (value or "").strip())
+    if ins_pairs:
+        pairs = [(p_ek, _clean_inline_value(p_ek, p_val) or p_val) for p_ek, p_val in ins_pairs]
+    else:
+        value = _clean_inline_value(ek, (value or "").strip())
+        if not value:
+            return []
+        # One spoken/typed address covers the street line AND the city/ST/ZIP line.
+        pairs = _expand_address_pair(ek, value)
 
     def _norm(s: str) -> str:                     # compare content, not case/spacing
         return re.sub(r"\s+", " ", str(s or "")).strip().lower()

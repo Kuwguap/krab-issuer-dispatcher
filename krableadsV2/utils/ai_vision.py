@@ -364,7 +364,10 @@ _FIELD_VALUE_TO_EK = {
     "car": "car", "vehicle": "car",
     "col": "col", "color": "col", "colour": "col",
     "ins": "ins", "insurance": "ins", "insurance_company": "ins",
+    "carrier": "ins", "insurer": "ins", "policy_name": "ins",
+    "company_policy": "ins", "insurance_carrier": "ins",
     "pol": "pol", "policy": "pol", "policy_number": "pol",
+    "insurance_policy": "pol", "binder": "pol",
     "phone": "phone",
     "price": "price",
     "email": "email",
@@ -390,8 +393,11 @@ FIELD_VALUE_PROMPT = (
     "  vin     - a 17-character vehicle identification number\n"
     "  car     - vehicle year / make / model ('2019 Honda Accord', 'Camry')\n"
     "  col     - paint color, even two words ('midnight blue')\n"
-    "  ins     - insurance company / carrier ('Geico')\n"
-    "  pol     - insurance policy or binder number\n"
+    "  ins     - insurance company / carrier. Any car insurer counts: Geico, "
+    "State Farm, Allstate, Progressive, USAA, Liberty Mutual, Travelers, "
+    "Nationwide, NJM, Plymouth Rock, Farmers, Erie, Mercury, Root and the rest. "
+    "A carrier named on its own is THIS field, never the client name.\n"
+    "  pol     - insurance policy or binder NUMBER (it has digits)\n"
     "  phone   - a phone number\n"
     "  price   - a price / quote / amount ('$500', '500')\n"
     "  email   - an email address\n"
