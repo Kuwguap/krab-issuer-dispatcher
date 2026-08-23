@@ -3739,6 +3739,120 @@ _SUBMIT_RE = re.compile(
 )
 
 
+# ── Several selections in one message ───────────────────────────────────────
+# "driver Kita dispatch HighKage" is TWO instructions. The single-selection regexes
+# are greedy — the first noun swallowed the rest, so the bot hunted for a driver
+# literally called "Kita dispatch HighKage" and the dispatcher was lost. This splits
+# the line at each selection noun, the same way labeled field edits are split.
+_SELECT_ALIAS_KIND = {
+    "driver": "SELECT_DRIVER", "drivers": "SELECT_DRIVER", "drv": "SELECT_DRIVER",
+    "dispatcher": "SELECT_GROUP", "dispatchers": "SELECT_GROUP",
+    "dispatch": "SELECT_GROUP", "disp": "SELECT_GROUP",
+    "group": "SELECT_GROUP", "groups": "SELECT_GROUP",
+    "team": "SELECT_GROUP", "teams": "SELECT_GROUP",
+    "crew": "SELECT_GROUP", "crews": "SELECT_GROUP",
+    "contact source": "SELECT_SOURCE", "lead source": "SELECT_SOURCE",
+    "contact info": "SELECT_SOURCE", "source": "SELECT_SOURCE", "origin": "SELECT_SOURCE",
+}
+# Longest first so "contact source" wins over "source".
+_SELECT_ALIAS_RE = re.compile(
+    r"\b(" + "|".join(re.escape(k) for k in sorted(_SELECT_ALIAS_KIND, key=len, reverse=True))
+    + r")\b", re.I)
+# Words allowed before the first noun without making the line prose.
+_SELECT_LEAD_FILLERS = frozenset({
+    "choose", "select", "pick", "set", "use", "assign", "send", "dispatch", "to", "the",
+    "a", "an", "my", "this", "and", "please", "for", "with", "go", "id",
+})
+# Separators between one selection and the next ("Kita and dispatcher HighKage").
+_SELECT_TAIL_RE = re.compile(r"(?:\s+and|\s*[,;/]+)\s*$", re.I)
+# Words that never appear in a dispatcher/driver/source NAME. Their presence means the
+# line is prose that happens to contain "driver" and "dispatch" ("the driver said
+# dispatch was late"), not a list of picks.
+_SELECT_NOT_A_NAME = frozenset({
+    "said", "says", "say", "was", "were", "is", "are", "am", "be", "been", "being",
+    "will", "would", "should", "could", "can", "cant", "has", "have", "had", "did",
+    "does", "do", "went", "going", "came", "coming", "arrived", "arriving", "called",
+    "calling", "told", "tell", "late", "early", "needs", "need", "wants", "wanted",
+    "because", "when", "then", "why", "how", "not", "no", "yet", "still", "just",
+})
+
+
+def _looks_like_a_pick_name(name: str) -> bool:
+    """A dispatcher/driver/source name: a few words, none of them sentence words."""
+    words = [w.strip(".,;:'\"").lower() for w in (name or "").split()]
+    if not words or len(words) > 4:
+        return False
+    return not any(w in _SELECT_NOT_A_NAME for w in words)
+
+
+def _parse_multi_select_line(text: str):
+    """Split "driver Kita dispatch HighKage" into [(SELECT_DRIVER,'Kita'),
+    (SELECT_GROUP,'HighKage')]. Returns None unless the line really is two or more
+    clean selections, so a single one keeps its existing (tested) handling."""
+    line = (text or "").strip()
+    matches = list(_SELECT_ALIAS_RE.finditer(line))
+    if len(matches) < 2:
+        return None
+    head = line[: matches[0].start()]
+    for tok in re.split(r"[\s,]+", head.strip().lower()):
+        tok = tok.strip(".:;-_'\"")
+        if tok and tok not in _SELECT_LEAD_FILLERS:
+            return None                       # prose, not a list of selections
+    out = []
+    for i, m in enumerate(matches):
+        kind = _SELECT_ALIAS_KIND.get(re.sub(r"\s+", " ", m.group(1).lower().strip()))
+        end = matches[i + 1].start() if i + 1 < len(matches) else len(line)
+        name = line[m.end():end]
+        name = re.sub(r"^\s*(?:to|is|are|=|:)\s+", " ", name).strip(" ,:;-")
+        name = _SELECT_TAIL_RE.sub("", name).strip(" ,:;-")
+        if not kind or not name:
+            continue
+        if not _looks_like_a_pick_name(name):
+            return None                       # prose, not a list of picks
+        out.append((kind, name))
+    # Two nouns but one had no name ("driver dispatch Kita") is not a clean list.
+    return out if len(out) >= 2 else None
+
+
+async def _apply_selection(kind: str, payload: str, state_data: dict, user_id: int):
+    """Apply ONE dispatcher/driver/source pick. Returns (ok, note) so the single and
+    multi paths share the same matching rules and can never drift apart."""
+    payload = (payload or "").strip()
+    if kind == "SELECT_GROUP":
+        if _ALL_SELECT_RE.match(payload):
+            _select_group(state_data, user_id, "all")
+            return True, "Dispatcher → All Dispatchers"
+        g = _match_name(payload, [x for x in db.get_all_groups() if record_is_active(x)],
+                        "group_name")
+        if not g:
+            return False, f"No dispatcher matched “{payload}”"
+        _select_group(state_data, user_id, g)
+        return True, f"Dispatcher → {g.get('group_name', '?')}"
+    if kind == "SELECT_DRIVER":
+        if _ALL_SELECT_RE.match(payload):
+            _select_driver(state_data, user_id, "all")
+            return True, "Driver → All Drivers"
+        active = [d for d in _get_all_drivers_cached() if record_is_active(d)]
+        suspended = _get_suspended_driver_ids()
+        eligible = [d for d in active if str(d.get("id")) not in suspended]
+        d = _match_name(payload, eligible, "driver_name")
+        if not d:
+            susp = _match_name(payload, [x for x in active if str(x.get("id")) in suspended],
+                               "driver_name")
+            if susp:
+                return False, f"{susp.get('driver_name', 'Driver')} is suspended (PENALTY)"
+            return False, f"No driver matched “{payload}”"
+        _select_driver(state_data, user_id, d)
+        return True, f"Driver → {d.get('driver_name', '?')}"
+    if kind == "SELECT_SOURCE":
+        s = _match_name(payload, db.get_contact_info_sources(), "label")
+        if not s:
+            return False, f"No source matched “{payload}”"
+        _select_source(state_data, user_id, s)
+        return True, f"Source → {s.get('label', '?')}"
+    return False, ""
+
+
 def _classify_review_command(text: str):
     """Classify a review-screen message into an action. Returns (kind, payload) where
     kind ∈ FIELD_EDITS | SUBMIT | SELECT_GROUP | SELECT_DRIVER | SELECT_SOURCE | RUN_VIN |
@@ -3764,6 +3878,11 @@ def _classify_review_command(text: str):
     # A2) submit / send the lead
     if _SUBMIT_RE.match(t):
         return ("SUBMIT", None)
+    # B0) several selections in one message ("driver Kita dispatch HighKage") —
+    # checked before the single-selection regexes, which would swallow the rest.
+    multi = _parse_multi_select_line(t)
+    if multi:
+        return ("SELECTIONS", multi)
     # B) selections: source → group → driver (distinct nouns, order avoids overlap)
     m = _SELECT_SOURCE_RE.match(t)
     if m:
@@ -3949,6 +4068,29 @@ async def _interpret_review_command(update, context, user_id, state_data, text):
             pass
         await _cleanup_voice_echo(context, chat_id)
         return await _continue_phase1_after_ai_review(update.message, context, user_id)
+
+    if kind == "SELECTIONS":
+        # "driver Kita dispatch HighKage" — apply every pick in one go, then report
+        # once. Anything that didn't match is named, so nothing fails silently.
+        done, failed = [], []
+        for one_kind, one_name in payload:
+            ok, note = await _apply_selection(one_kind, one_name, state_data, user_id)
+            (done if ok else failed).append(note)
+        db.set_user_state(user_id, "phase1", state_data)
+        await _update_review_message_text(context, state_data)
+        lines = ([f"✅ {n}" for n in done] + [f"🤔 {n}" for n in failed])
+        await _finish("\n".join(lines) if lines else None)
+        if failed and chat_id:
+            # Offer a picker for whichever kind didn't match, so a typo is one tap
+            # from being fixed rather than needing the whole line retyped.
+            joined = " ".join(failed).lower()
+            if "driver" in joined:
+                await _open_driver_picker(context)
+            elif "dispatcher" in joined:
+                await _open_group_picker(context)
+            elif "source" in joined:
+                await _open_source_picker(context)
+        return STATE_AI_REVIEW
 
     if kind == "SELECT_GROUP":
         if _ALL_SELECT_RE.match(payload or ""):
