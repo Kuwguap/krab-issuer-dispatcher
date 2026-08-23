@@ -4676,6 +4676,33 @@ class _TypedAsTap:
         self.message = update.effective_message
 
 
+async def handle_media_in_any_state(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Optional[int]:
+    """A picture or PDF sent at ANY step of the lead flow is read into the card.
+
+    Eight states accepted typed text but registered no photo handler, so an image sent
+    while (say) the DMV question or a picker was on screen was dropped by PTB with no
+    reply at all. Returns None so the conversation STAYS where it was — the question or
+    picker above is still answerable once the image has been read."""
+    msg = update.effective_message
+    if not msg or not (msg.photo or msg.document):
+        return None
+    try:
+        st = db.get_user_state(update.effective_user.id) if update.effective_user else None
+    except Exception as e:
+        logger.warning("media-any-state: get_user_state failed: %s", e)
+        st = None
+    if st and st.get("state") in _LEAD_REVIEWABLE_DB_STATES and st.get("data"):
+        await handle_phase1_adjust_input(update, context)
+        return None
+    # Past the review (a dispatch pick, a resend) there is no card to fold it into.
+    await _send_vanishing(
+        context, msg.chat_id,
+        "📎 This lead is already out — use the buttons above, or start a new tag to add files.",
+        delay=8.0,
+    )
+    return None
+
+
 async def handle_select_state_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Optional[int]:
     """Typed/voice text while a button picker (dispatcher/driver/source) is on screen.
 
@@ -14782,6 +14809,8 @@ def main():
                 # open ('name John Damian', 'price 150') — they apply and re-render the
                 # review card instead of dying in a button-only state.
                 MessageHandler(filters.TEXT & ~filters.COMMAND, handle_phase1_review_message),
+                MessageHandler(filters.PHOTO, handle_media_in_any_state),
+                MessageHandler(filters.Document.ALL, handle_media_in_any_state),
             ],
             STATE_AI_EDIT_INPUT: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, handle_phase1_edit_input),
@@ -14802,7 +14831,11 @@ def main():
                 CallbackQueryHandler(handle_phase1_color_pick, pattern=f"^{PH1_COLOR_CB}"),
                 CallbackQueryHandler(handle_phase1_ai_review_callback, pattern="^edit_cancel$"),
             ],
-            STATE_MISSING_FIELD: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_missing_field)],
+            STATE_MISSING_FIELD: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_missing_field),
+                MessageHandler(filters.PHOTO, handle_media_in_any_state),
+                MessageHandler(filters.Document.ALL, handle_media_in_any_state),
+            ],
             STATE_PHASE2: [
                 MessageHandler(
                     (
@@ -14820,28 +14853,44 @@ def main():
             ],
             STATE_SPECIAL_REQUEST_ISSUERS: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, handle_special_request_issuers),
+                MessageHandler(filters.PHOTO, handle_media_in_any_state),
+                MessageHandler(filters.Document.ALL, handle_media_in_any_state),
             ],
             STATE_SPECIAL_REQUEST_DRIVERS: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, handle_special_request_drivers),
+                MessageHandler(filters.PHOTO, handle_media_in_any_state),
+                MessageHandler(filters.Document.ALL, handle_media_in_any_state),
             ],
             STATE_VIN_CHOICE: [
                 CallbackQueryHandler(handle_vin_choice_callback, pattern="^(vin_use|vin_keep|vin_retype)$"),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, handle_vin_choice_text),
+                MessageHandler(filters.PHOTO, handle_media_in_any_state),
+                MessageHandler(filters.Document.ALL, handle_media_in_any_state),
             ],
-            STATE_VIN_RETYPE: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_vin_retype)],
+            STATE_VIN_RETYPE: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_vin_retype),
+                MessageHandler(filters.PHOTO, handle_media_in_any_state),
+                MessageHandler(filters.Document.ALL, handle_media_in_any_state),
+            ],
             # Typed/voice text during the pickers routes through the review editor
             # (live lead) or a button nudge — never a silent drop.
             STATE_SELECT_GROUP: [
                 CallbackQueryHandler(handle_group_selection, pattern="^select_group_"),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, handle_select_state_text),
+                MessageHandler(filters.PHOTO, handle_media_in_any_state),
+                MessageHandler(filters.Document.ALL, handle_media_in_any_state),
             ],
             STATE_SELECT_DRIVER: [
                 CallbackQueryHandler(handle_driver_selection, pattern="^(select_driver_|driver_suspended_)"),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, handle_select_state_text),
+                MessageHandler(filters.PHOTO, handle_media_in_any_state),
+                MessageHandler(filters.Document.ALL, handle_media_in_any_state),
             ],
             STATE_SELECT_CONTACT_SOURCE: [
                 CallbackQueryHandler(handle_contact_source_selection, pattern="^contact_source_"),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, handle_select_state_text),
+                MessageHandler(filters.PHOTO, handle_media_in_any_state),
+                MessageHandler(filters.Document.ALL, handle_media_in_any_state),
             ],
         },
         fallbacks=[
