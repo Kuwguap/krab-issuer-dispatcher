@@ -7136,6 +7136,28 @@ def _phase1_has_phone_and_price(state_data: dict) -> bool:
     )
 
 
+def _phase2_missing(state_data: dict) -> tuple:
+    """(phone_missing, price_missing) — so we only ever ask for what is absent."""
+    return (
+        not _is_valid_pending_phone((state_data or {}).get("pending_phone_number")),
+        not _is_valid_pending_price((state_data or {}).get("pending_price")),
+    )
+
+
+def _phase2_prompt(state_data: dict) -> str:
+    """Ask for the missing piece ONLY. Asking for both when one was already given
+    reads like the bot ignored what was sent, and invites re-typing a good value."""
+    needs_phone, needs_price = _phase2_missing(state_data)
+    if needs_phone and needs_price:
+        return ("📞💲 Phone number and price missing: please enter the client's phone "
+                "number then the price\n(example: +1234567890 $150)")
+    if needs_phone:
+        return "📞 Client phone number missing: please enter the client's phone number"
+    if needs_price:
+        return "💲 Price missing: please enter the price (example: $150)"
+    return ""
+
+
 async def _safe_delete_chat_message(context: ContextTypes.DEFAULT_TYPE, chat_id, message_id) -> None:
     """Best-effort delete; ignore Telegram restrictions (already gone, too old, etc.)."""
     if not chat_id or not message_id:
@@ -7203,10 +7225,7 @@ async def _ensure_phone_price_before_files(message, context: ContextTypes.DEFAUL
         return await _prompt_issuer_special_request(message, context, user_id)
     context.user_data.pop("phase2_before_files", None)
     db.set_user_state(user_id, "phase1", state_data)
-    await message.reply_text(
-        "📞 **Phone number is required to continue.**\n\n" + PHASE2_INTRO_MESSAGE,
-        parse_mode="Markdown",
-    )
+    await message.reply_text(_phase2_prompt(state_data))
     return STATE_PHASE2
 
 
@@ -7234,10 +7253,11 @@ async def handle_add_files_callback(update: Update, context: ContextTypes.DEFAUL
                 finally:
                     await _safe_delete_chat_message(context, chat_id, prompt_msg_id)
         await _safe_delete_chat_message(context, chat_id, prompt_msg_id)
+        _ask = _phase2_prompt((state or {}).get("data") or {}) or PHASE2_INTRO_MESSAGE
         if chat_id:
-            await context.bot.send_message(chat_id=chat_id, text=PHASE2_INTRO_MESSAGE)
+            await context.bot.send_message(chat_id=chat_id, text=_ask)
         else:
-            await query.message.reply_text(PHASE2_INTRO_MESSAGE)
+            await query.message.reply_text(_ask)
         return STATE_PHASE2
 
     # add_files_yes
@@ -7370,10 +7390,11 @@ async def handle_another_file_callback(update: Update, context: ContextTypes.DEF
                 finally:
                     await _safe_delete_chat_message(context, chat_id, prompt_msg_id)
             await _safe_delete_chat_message(context, chat_id, prompt_msg_id)
+            _ask = _phase2_prompt(d) or PHASE2_INTRO_MESSAGE
             if chat_id:
-                await context.bot.send_message(chat_id=chat_id, text=PHASE2_INTRO_MESSAGE)
+                await context.bot.send_message(chat_id=chat_id, text=_ask)
             else:
-                await query.message.reply_text(PHASE2_INTRO_MESSAGE)
+                await query.message.reply_text(_ask)
             return STATE_PHASE2
 
     await _safe_delete_chat_message(context, chat_id, prompt_msg_id)
@@ -8002,6 +8023,11 @@ async def handle_phase2(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
 
     phase1_data = state.get("data", {})
 
+    # Only ever ask for what is absent: if the phone already came in with the lead,
+    # the reply here is just the price (and vice versa). Requiring both meant a good
+    # value had to be re-typed.
+    needs_phone, needs_price = _phase2_missing(phase1_data)
+
     # Parse phone and price: any token containing $ is the price; phone = any format accepted (digits only)
     parts = message_text.split()
     price = next((p for p in parts if "$" in p), None)
@@ -8013,18 +8039,26 @@ async def handle_phase2(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
     # NOTE: Do NOT strip leading "1" from 10-digit numbers.
     # Example: "+1234567890" is already a valid 10-digit number (area code can start with 1),
     # and stripping would corrupt it and break encryption/unlock downstream.
-    if len(digits_only) not in (9, 10) or not price:
-        await msg.reply_text(
-            "❌ Please provide both phone number and price.\n"
-            "Phone in any format (e.g. +1 (732) 534-2659, 732-534-2659, 732 534 2659) and price with $ (e.g. $500)."
-        )
-        return STATE_PHASE2
-    # Normalize to +1XXXXXXXXXX for storage (no double 1)
-    phone_number = "+1" + digits_only
+    phone_number = "+1" + digits_only if len(digits_only) in (9, 10) else None
+    # When the PRICE is the only thing outstanding, a bare number is the price — no
+    # "$" needed. Capped at six digits so a mistakenly pasted phone number is not
+    # accepted as a price.
+    if needs_price and not needs_phone and not price:
+        bare = re.sub(r"[^\d.]", "", message_text)
+        if bare and len(re.sub(r"\D", "", bare)) <= 6:
+            price = _clean_inline_value("price", bare) or None
+            phone_number = None
 
     state_data = phase1_data.copy()
-    state_data["pending_phone_number"] = phone_number
-    state_data["pending_price"] = price
+    if phone_number and needs_phone:
+        state_data["pending_phone_number"] = phone_number
+    if price and needs_price:
+        state_data["pending_price"] = price
+    still_phone, still_price = _phase2_missing(state_data)
+    if still_phone or still_price:
+        db.set_user_state(user_id, "phase1", state_data)
+        await msg.reply_text(_phase2_prompt(state_data))
+        return STATE_PHASE2
     context.user_data.pop("phase2_before_files", None)
     # Notes are optional and editable from the AI review screen — never block
     # dispatch on them. Save state then jump straight into finalize/review.
@@ -8044,8 +8078,7 @@ async def handle_special_request_issuers(update: Update, context: ContextTypes.D
     if not _phase1_has_phone_and_price(state_data):
         db.set_user_state(user_id, "phase1", state_data)
         await update.message.reply_text(
-            "📞💲 **Phone number and price are required.**\n\n" + PHASE2_INTRO_MESSAGE,
-            parse_mode="Markdown",
+            _phase2_prompt(state_data),
         )
         return STATE_PHASE2
 
@@ -8079,8 +8112,7 @@ async def handle_special_request_drivers(update: Update, context: ContextTypes.D
     if not _phase1_has_phone_and_price(state_data):
         db.set_user_state(user_id, "phase1", state_data)
         await update.message.reply_text(
-            "📞💲 **Phone number and price are required.**\n\n" + PHASE2_INTRO_MESSAGE,
-            parse_mode="Markdown",
+            _phase2_prompt(state_data),
         )
         return STATE_PHASE2
 
@@ -8115,8 +8147,7 @@ async def _finalize_lead_after_notes(
     if not _phase1_has_phone_and_price(state_data):
         db.set_user_state(user_id, "phase1", state_data)
         await message.reply_text(
-            "📞💲 **Phone number and price are required.**\n\n" + PHASE2_INTRO_MESSAGE,
-            parse_mode="Markdown",
+            _phase2_prompt(state_data),
         )
         return STATE_PHASE2
 
@@ -8333,10 +8364,7 @@ async def _submit_lead_from_review(message, context, user_id, data):
     if not _is_valid_pending_phone(data.get("pending_phone_number")):
         _sanitize_phase1_pending_phone_price(data)
         db.set_user_state(user_id, "phase1", data)
-        await message.reply_text(
-            "📞 **Phone number is required** before sending the lead.\n\n" + PHASE2_INTRO_MESSAGE,
-            parse_mode="Markdown",
-        )
+        await message.reply_text(_phase2_prompt(data))
         return STATE_PHASE2
     phone = data.pop("pending_phone_number", None)
     price = data.pop("pending_price", None)
