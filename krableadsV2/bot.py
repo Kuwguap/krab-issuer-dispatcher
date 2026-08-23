@@ -557,18 +557,12 @@ def _keyboard_receipt_plus_rows(extra_rows: list) -> InlineKeyboardMarkup:
     """Per-reference upload rows only (no extra global receipt row — drivers use /receipts)."""
     return InlineKeyboardMarkup(list(extra_rows))
 
-_VIN_CONFLICT_INTRO = (
-    "Pulling up 17 Digit Vin in DMV portal🧐\n\n"
-    "Success ! Your Vehicle pulls up in the Motor Vehicle system!\n"
-)
-
-
 def _vin_conflict_body(_stated_car: str, api_car: str) -> str:
-    return (
-        f"{_VIN_CONFLICT_INTRO}"
-        f"• VIN result in DMV : {api_car}\n\n"
-        "Choose which to use:"
-    )
+    """One short question instead of the old three-line preamble.
+
+    The decoded vehicle is still shown on its own line — it is the same fact the
+    long version ended with, and without it Yes/No would be a blind choice."""
+    return f"Would you like to use DMV system?\n• DMV: {api_car}"
 
 
 def _short_uuid(u: str) -> str:
@@ -2133,13 +2127,15 @@ def _vin_check_after_phase1(state_data: dict) -> tuple:
 
 
 def _vin_choice_keyboard(api_car: str, stated_car: str) -> InlineKeyboardMarkup:
-    """Build keyboard for VIN conflict: DMV result, keep entered vehicle line, or retype VIN."""
-    _ = api_car, stated_car  # context shown in message body above the buttons
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("Use DMV system VIN", callback_data="vin_use")],
-        [InlineKeyboardButton("Continue with Same Vin", callback_data="vin_keep")],
-        [InlineKeyboardButton("Retype VIN", callback_data="vin_retype")],
-    ])
+    """Yes takes the DMV decode; No keeps the vehicle already on the card.
+
+    Retyping no longer needs a button of its own — saying or typing "retype vin"
+    still reaches the same handler, which stays registered."""
+    _ = api_car, stated_car  # context shown in the message body above the buttons
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton("✅ Yes", callback_data="vin_use"),
+        InlineKeyboardButton("❌ No", callback_data="vin_keep"),
+    ]])
 
 def _extract_email_and_dl_from_text(text: str) -> tuple[Optional[str], Optional[str]]:
     """Best-effort email + driver-license-id extraction from freeform text.
@@ -8176,9 +8172,8 @@ async def _handle_phase1_vin_check_button(
 ) -> int:
     """Run the DMV VIN decode on demand from the review screen.
 
-    Shows the "Pulling up 17 Digit Vin in DMV portal..." message and the same
-    three inline buttons (Use DMV / Continue / Retype) as the legacy
-    auto-decode flow; after the user picks one, we return to the AI review
+    Asks "Would you like to use DMV system?" with Yes/No, the same prompt the
+    auto-decode flow uses; after the user picks one, we return to the AI review
     rather than continuing to phone/notes — Submit is the only path forward.
     """
     vin = (state_data.get("vin") or "").strip()
