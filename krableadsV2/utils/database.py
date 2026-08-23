@@ -624,19 +624,37 @@ class Database:
             return False
 
     # Driver management methods
-    def create_driver(self, driver_name: str, driver_telegram_id: str, phone_number: Optional[str] = None) -> bool:
-        """Create a new driver."""
+    def create_driver(self, driver_name: str, driver_telegram_id: str,
+                      phone_number: Optional[str] = None,
+                      email: Optional[str] = None) -> bool:
+        """Create a new driver.
+
+        ``email`` is only sent when given, and a DB that has not run
+        migration_drivers_email.sql retries without it rather than losing the driver.
+        """
         if not self._check_tables_exist():
             return False
-        
+
+        payload = {
+            "driver_name": driver_name,
+            "driver_telegram_id": driver_telegram_id,
+            "phone_number": phone_number,
+        }
+        if email:
+            payload["email"] = email
         try:
-            self.client.table("drivers").insert({
-                "driver_name": driver_name,
-                "driver_telegram_id": driver_telegram_id,
-                "phone_number": phone_number
-            }).execute()
+            self.client.table("drivers").insert(payload).execute()
             return True
         except Exception as e:
+            if "email" in payload and "email" in str(e).lower():
+                payload.pop("email", None)
+                try:
+                    self.client.table("drivers").insert(payload).execute()
+                    logger.warning("create_driver: saved without email — run "
+                                   "database/migration_drivers_email.sql")
+                    return True
+                except Exception as e2:
+                    e = e2
             logger.error(f"Error creating driver: {e}")
             return False
     

@@ -178,7 +178,8 @@ class ActionTest(unittest.TestCase):
         ctx = _ctx()
         ctx.user_data["tset_await"] = {"kind": "add_driver"}
         state = _run(_txt_update("Kita | 12345678 | 555-123-4567"), ctx, bot.apply_settings_input, db)
-        db.create_driver.assert_called_once_with("Kita", "12345678", "555-123-4567")
+        # email is an optional fourth field, passed as None when not given
+        db.create_driver.assert_called_once_with("Kita", "12345678", "555-123-4567", None)
         self.assertEqual(state, bot.SET_MENU)
 
     def test_add_source_succeeds(self):
@@ -299,6 +300,67 @@ class VoiceAndTextNavigationTest(unittest.TestCase):
                                   mock.MagicMock(return_value=False)):
             state = asyncio.run(bot.handle_settings_text(upd, _ctx()))
         self.assertEqual(state, bot.ConversationHandler.END)
+
+
+class DriverContactDetailsTest(unittest.TestCase):
+    """The driver's own phone and email must be readable inside Telegram."""
+
+    CONTACTS = [
+        {"id": "d1", "driver_name": "Kita", "is_active": True,
+         "phone_number": "551-374-0027", "email": "kita_d@example.com"},
+        {"id": "d2", "driver_name": "Sam Okafor", "is_active": False,
+         "phone_number": "", "email": ""},
+    ]
+
+    def _screen(self):
+        db = _fake_db()
+        with mock.patch.object(bot, "db", db),                 mock.patch.object(bot, "_get_all_drivers_cached",
+                                  mock.MagicMock(return_value=self.CONTACTS)):
+            return asyncio.run(bot._settings_view_drivers())
+
+    def test_phone_and_email_are_shown(self):
+        text, _ = self._screen()
+        self.assertIn("551-374-0027", text)
+        self.assertIn("@example.com", text)
+
+    def test_values_are_tap_to_copy(self):
+        text, _ = self._screen()
+        self.assertIn("`551-374-0027`", text, "backticks make one tap copy it")
+
+    def test_markdown_special_characters_are_escaped(self):
+        """An underscore in an email would otherwise break the whole message."""
+        text, _ = self._screen()
+        self.assertIn(r"kita\_d@example.com", text)
+
+    def test_a_driver_with_nothing_on_file_says_so(self):
+        text, _ = self._screen()
+        self.assertIn("no phone or email on file", text)
+
+    def test_contact_lines_helper_handles_missing_values(self):
+        self.assertIn("no phone or email on file",
+                      " ".join(bot._driver_contact_lines({})))
+        only_phone = " ".join(bot._driver_contact_lines({"phone_number": "555"}))
+        self.assertIn("555", only_phone)
+        self.assertNotIn("no phone", only_phone)
+
+
+class AddDriverWithEmailTest(unittest.TestCase):
+
+    def test_email_is_accepted_as_a_fourth_field(self):
+        db = _fake_db()
+        ctx = _ctx()
+        ctx.user_data["tset_await"] = {"kind": "add_driver"}
+        _run(_txt_update("Kita | 12345678 | 555-123-4567 | kita@example.com"),
+             ctx, bot.apply_settings_input, db)
+        db.create_driver.assert_called_once_with(
+            "Kita", "12345678", "555-123-4567", "kita@example.com")
+
+    def test_phone_and_email_stay_optional(self):
+        db = _fake_db()
+        ctx = _ctx()
+        ctx.user_data["tset_await"] = {"kind": "add_driver"}
+        _run(_txt_update("Kita | 12345678"), ctx, bot.apply_settings_input, db)
+        db.create_driver.assert_called_once_with("Kita", "12345678", None, None)
 
 
 if __name__ == "__main__":

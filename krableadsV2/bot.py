@@ -14220,15 +14220,36 @@ def _settings_main_kb() -> InlineKeyboardMarkup:
     ])
 
 
+def _driver_contact_lines(driver: dict) -> list:
+    """The driver's own phone and email, as tap-to-copy lines.
+
+    They were stored but never shown anywhere, so reaching a driver meant leaving
+    Telegram. Wrapped in backticks so one tap copies the value; unrelated to the
+    /driverblock redaction, which hides the CLIENT's number from drivers."""
+    out = []
+    phone = str(driver.get("phone_number") or "").strip()
+    email = str(driver.get("email") or "").strip()
+    if phone:
+        out.append(f"   📞 `{_telegram_md1_escape(phone)}`")
+    if email:
+        out.append(f"   📧 `{_telegram_md1_escape(email)}`")
+    if not out:
+        out.append("   _no phone or email on file_")
+    return out
+
+
 async def _settings_view_drivers() -> tuple:
-    """Add a driver, or switch one off/on. Disabling removes them from the pickers
-    entirely; suspending (separate screen) keeps them visible but unassignable."""
+    """Add a driver, or switch one off/on, and read their contact details. Disabling
+    removes them from the pickers entirely; suspending (separate screen) keeps them
+    visible but unassignable."""
     drivers = await asyncio.to_thread(_get_all_drivers_cached)
     lines = ["🚗 *Drivers*\n"]
     rows = []
     for d in (drivers or [])[:25]:
         active = record_is_active(d)
-        lines.append(f"{'✅' if active else '⛔'} {d.get('driver_name') or '(unnamed)'}")
+        name = _telegram_md1_escape(d.get("driver_name") or "(unnamed)")
+        lines.append(f"{'✅' if active else '⛔'} {name}")
+        lines.extend(_driver_contact_lines(d))
         rows.append([InlineKeyboardButton(
             f"{'Disable' if active else 'Enable'} {d.get('driver_name') or 'driver'}"[:40],
             callback_data=f"tset_dtog:{d.get('id')}")])
@@ -14464,8 +14485,10 @@ async def handle_settings_cb(update: Update, context: ContextTypes.DEFAULT_TYPE)
     if data == "tset_dadd":
         context.user_data["tset_await"] = {"kind": "add_driver"}
         await query.message.reply_text(
-            "Send the new driver as: *Name | telegram_id* (phone optional: "
-            "*Name | telegram_id | 555-123-4567*)", parse_mode="Markdown")
+            "Send the new driver as: *Name | telegram_id*\n"
+            "Phone and email are optional and shown on this screen:\n"
+            "*Name | telegram_id | 555-123-4567 | driver@example.com*",
+            parse_mode="Markdown")
         return SET_INPUT
     # --- suspensions ---------------------------------------------------
     if data == "tset_susp":
@@ -14543,7 +14566,8 @@ async def apply_settings_input(update: Update, context: ContextTypes.DEFAULT_TYP
         if not re.fullmatch(r"-?\d{5,}", parts[1]):
             return await _retry("❌ The telegram_id must be digits — the driver can get theirs from /whoami.")
         phone = parts[2] if len(parts) > 2 and parts[2] else None
-        ok = await asyncio.to_thread(db.create_driver, parts[0], parts[1], phone)
+        email = parts[3] if len(parts) > 3 and parts[3] else None
+        ok = await asyncio.to_thread(db.create_driver, parts[0], parts[1], phone, email)
         _bust_driver_caches()
         await update.message.reply_text(
             (f"✅ Added driver “{parts[0]}”." if ok else "❌ Could not add the driver."),
