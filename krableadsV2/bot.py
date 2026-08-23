@@ -3614,6 +3614,12 @@ def _insurer_name(value, labeled_insurance: bool = False) -> str:
     return ""
 
 
+# A US phone as it appears inside a sentence: optional +1, then 3-3-4 with any of
+# the usual separators. Used to lift the number out of surrounding words.
+_PHONE_IN_TEXT_RE = re.compile(
+    r"(?:\+?1[\s.\-]?)?\(?\d{3}\)?[\s.\-]?\d{3}[\s.\-]?\d{4}\b")
+
+
 # A policy / binder number: 5+ characters with at least one digit.
 _POLICY_NUM_RE = re.compile(r"\b(?=[A-Za-z0-9][A-Za-z0-9\-]*\d)[A-Za-z0-9\-]{5,}\b")
 
@@ -3692,10 +3698,14 @@ _INLINE_EK_STATE_KEY = {
     "phone": "pending_phone_number", "price": "pending_price", "email": "email", "dl": "driver_license_id",
     "issuer": "special_request_issuers", "driver": "special_request_drivers",
 }
+# A label said in the plural or possessive is the same label: "the colors is black",
+# "phone numbers", "client's name". Kept OUTSIDE the capture group so the alias
+# lookup still sees the singular it was written as.
+_ALIAS_PLURAL = r"(?:'s|e?s)?"
 # Label, then a separator (":", "=", or whitespace), then the value.
 _INLINE_LABEL_RE = re.compile(
     r"^\s*(" + "|".join(re.escape(k) for k in sorted(_INLINE_EDIT_ALIASES, key=len, reverse=True))
-    + r")\s*(?:[:=]|\s)\s*(.+)$",
+    + r")" + _ALIAS_PLURAL + r"\s*(?:[:=]|\s)\s*(.+)$",
     re.IGNORECASE,
 )
 
@@ -3720,6 +3730,12 @@ def _clean_inline_value(edit_key: str, value: str) -> str:
         # "gieco" / "state farm insurance co" -> the carrier's real name.
         return _insurer_name(value, labeled_insurance=True) or value
     if edit_key == "phone":
+        # Pull the number OUT rather than accept the whole string: a phone said
+        # mid-sentence used to be stored with the rest of the sentence attached
+        # ("551-301-3737. The colors is black.").
+        m = _PHONE_IN_TEXT_RE.search(value)
+        if m:
+            return re.sub(r"\s+", " ", m.group(0)).strip(" .,-")
         return value if len(re.sub(r"\D", "", value)) >= 10 else ""
     if edit_key == "email":
         return value if "@" in value else ""
@@ -3728,7 +3744,8 @@ def _clean_inline_value(edit_key: str, value: str) -> str:
         return v if (len(v) >= 11 and v.isalnum()) else ""
     if edit_key == "dl":
         return value if len(value.split()) <= 4 else ""
-    return value
+    # "…is black." — the full stop belongs to the sentence, not to the colour.
+    return value.rstrip(" .,;:!").strip() or value
 
 
 # Words that may precede the first field label without making it "prose"
@@ -3740,7 +3757,8 @@ _FIELD_LEAD_FILLERS = frozenset({
 })
 # Every alias as a standalone word, longest-first (so "delivery address" beats "address").
 _MULTIFIELD_ALIAS_RE = re.compile(
-    r"\b(" + "|".join(re.escape(k) for k in sorted(_INLINE_EDIT_ALIASES, key=len, reverse=True)) + r")\b",
+    r"\b(" + "|".join(re.escape(k) for k in sorted(_INLINE_EDIT_ALIASES, key=len, reverse=True))
+    + r")" + _ALIAS_PLURAL + r"\b",
     re.IGNORECASE,
 )
 # Structured fields whose value is a number/code — a strong signal a new field starts.
@@ -3762,7 +3780,7 @@ def _parse_multi_field_line(line: str):
     # Text before the first alias must be only filler words — else it's prose.
     head = line[: matches[0].start()]
     for tok in re.split(r"[\s,]+", head.strip().lower()):
-        tok = tok.strip(".:;-_'\"")
+        tok = re.sub(r"'s$", "", tok.strip(".:;-_'\""))   # "client's name …"
         if tok and tok not in _FIELD_LEAD_FILLERS:
             return None
     # Decide which alias matches actually START a new field (are boundaries).
