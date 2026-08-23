@@ -2369,6 +2369,25 @@ def _color_picker_keyboard() -> InlineKeyboardMarkup:
 # What the Color prompt says: every input route spelled out, because all four work.
 _PH1_COLOR_PROMPT = "✏️ type, speak, click, or upload a picture to read the color"
 
+# ── Price picker ────────────────────────────────────────────────────────────
+# The same few prices come up all day, so tapping beats typing. Any other amount is
+# still typed or spoken at this prompt.
+PH1_PRICE_CB = "ph1prc_"
+_PH1_PRICES = ["90", "100", "120", "150", "200", "250"]
+_PH1_PRICE_PROMPT = "💲 type, speak, or tap the price"
+
+
+def _price_picker_keyboard() -> InlineKeyboardMarkup:
+    """The common prices, three per row, then Cancel."""
+    rows = []
+    for i in range(0, len(_PH1_PRICES), 3):
+        rows.append([
+            InlineKeyboardButton(f"${p}", callback_data=f"{PH1_PRICE_CB}{p}")
+            for p in _PH1_PRICES[i:i + 3]
+        ])
+    rows.append([InlineKeyboardButton("❌ Cancel", callback_data="edit_cancel")])
+    return InlineKeyboardMarkup(rows)
+
 
 PH1_EDIT_PROMPT_LABEL = {
     "fn": "First name",
@@ -7333,7 +7352,7 @@ async def handle_phase1_color_pick(update: Update, context: ContextTypes.DEFAULT
     user_id = query.from_user.id
     color = (query.data or "").replace(PH1_COLOR_CB, "", 1).strip()
     state = db.get_user_state(user_id)
-    if not state or not state.get("data") or not color:
+    if not state or state.get("data") is None or not color:
         return STATE_AI_REVIEW
     state_data = state["data"]
     _apply_single_phase1_edit(state_data, "col", color)
@@ -7349,6 +7368,35 @@ async def handle_phase1_color_pick(update: Update, context: ContextTypes.DEFAULT
     chat_id = query.message.chat_id if query.message else None
     if chat_id:
         await _send_vanishing(context, chat_id, f"✅ Updated: color → {color}")
+    return STATE_AI_REVIEW
+
+
+async def handle_phase1_price_pick(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """A price tapped from the picker — apply it and return to the field picker."""
+    query = update.callback_query
+    await _safe_answer_callback_query(query)
+    user_id = query.from_user.id
+    raw = (query.data or "").replace(PH1_PRICE_CB, "", 1).strip()
+    # Through the same cleaner the typed path uses, so it gains the "$" that
+    # _is_valid_pending_price requires — without it the sanitizer would drop it.
+    price = _clean_inline_value("price", raw)
+    state = db.get_user_state(user_id)
+    if not state or state.get("data") is None or not price:
+        return STATE_AI_REVIEW
+    state_data = state["data"]
+    _apply_single_phase1_edit(state_data, "price", price)
+    _sanitize_phase1_pending_phone_price(state_data)
+    context.user_data.pop("phase1_pending_edit_key", None)
+    try:
+        await query.message.delete()          # the picker itself
+    except Exception:
+        pass
+    context.user_data.pop("edit_prompt_msg_id", None)
+    db.set_user_state(user_id, "phase1", state_data)
+    await _show_edit_picker(context, state_data)
+    chat_id = query.message.chat_id if query.message else None
+    if chat_id:
+        await _send_vanishing(context, chat_id, f"✅ Updated: price → {price}")
     return STATE_AI_REVIEW
 
 
@@ -7884,6 +7932,10 @@ async def handle_phase1_ai_review_callback(update, context):
             prompt = await query.message.reply_text(
                 _PH1_COLOR_PROMPT, reply_markup=_color_picker_keyboard()
             )
+        elif edit_key == "price":
+            prompt = await query.message.reply_text(
+                _PH1_PRICE_PROMPT, reply_markup=_price_picker_keyboard()
+            )
         else:
             prompt = await query.message.reply_text(
                 f"✏️ Send new text for: {label}\n\n"
@@ -8053,6 +8105,8 @@ async def handle_phase1_edit_menu_callback(update: Update, context: ContextTypes
     label = PH1_EDIT_PROMPT_LABEL[edit_key]
     if edit_key == "col":
         await query.message.reply_text(_PH1_COLOR_PROMPT, reply_markup=_color_picker_keyboard())
+    elif edit_key == "price":
+        await query.message.reply_text(_PH1_PRICE_PROMPT, reply_markup=_price_picker_keyboard())
     else:
         await query.message.reply_text(
             f"✏️ Send new text for: {label}\n\n"
@@ -14755,6 +14809,7 @@ def main():
             CallbackQueryHandler(handle_group_selection, pattern="^select_group_"),
             CallbackQueryHandler(handle_driver_selection, pattern="^(select_driver_|driver_suspended_)"),
             CallbackQueryHandler(handle_phase1_color_pick, pattern=f"^{PH1_COLOR_CB}"),
+            CallbackQueryHandler(handle_phase1_price_pick, pattern=f"^{PH1_PRICE_CB}"),
             # Idle natural-language / voice start: any substantive text starts a lead
             # and auto-fills what's given. MUST be last (only plain text reaches it).
             MessageHandler(filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE, handle_idle_lead_start),
@@ -14792,6 +14847,7 @@ def main():
                 CallbackQueryHandler(handle_driver_selection, pattern="^select_driver_"),
                 CallbackQueryHandler(handle_contact_source_selection, pattern="^contact_source_"),
                 CallbackQueryHandler(handle_phase1_color_pick, pattern=f"^{PH1_COLOR_CB}"),
+                CallbackQueryHandler(handle_phase1_price_pick, pattern=f"^{PH1_PRICE_CB}"),
                 # The DMV Yes/No card stays on screen while other edits are made, so
                 # its buttons must still resolve if the conversation drifts back here.
                 CallbackQueryHandler(handle_vin_choice_callback,
@@ -14817,6 +14873,7 @@ def main():
                 MessageHandler(filters.PHOTO, handle_edit_field_photo),
                 MessageHandler(filters.Document.ALL, handle_edit_field_photo),
                 CallbackQueryHandler(handle_phase1_color_pick, pattern=f"^{PH1_COLOR_CB}"),
+                CallbackQueryHandler(handle_phase1_price_pick, pattern=f"^{PH1_PRICE_CB}"),
                 CallbackQueryHandler(
                     handle_phase1_edit_followup_callback,
                     pattern=f"^({PH1_EDIT_MORE}|{PH1_EDIT_DONE}|{PH1_FINAL_CONFIRM})$",
@@ -14829,6 +14886,7 @@ def main():
                 MessageHandler(filters.PHOTO, handle_edit_field_photo),
                 MessageHandler(filters.Document.ALL, handle_edit_field_photo),
                 CallbackQueryHandler(handle_phase1_color_pick, pattern=f"^{PH1_COLOR_CB}"),
+                CallbackQueryHandler(handle_phase1_price_pick, pattern=f"^{PH1_PRICE_CB}"),
                 CallbackQueryHandler(handle_phase1_ai_review_callback, pattern="^edit_cancel$"),
             ],
             STATE_MISSING_FIELD: [
