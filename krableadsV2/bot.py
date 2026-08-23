@@ -3742,7 +3742,10 @@ async def _smart_place_single_value(state_data: dict, value: str) -> list:
 # a field value. So a select/submit/VIN command that didn't classify shows the hint
 # instead of turning 'choose the driver kita' or 'submit' into a name.
 _COMMAND_LIKE_RE = re.compile(
-    r"^\s*(?:choose|select|pick|assign|use|go\s+with|send|submit|dispatch|deploy|ship|"
+    # A bare yes/no is an ANSWER, never a field value — without this a stray "yes"
+    # (e.g. after a redeploy dropped the question) was filed as the client's name.
+    r"^\s*(?:y|n|yes|no|yeah|yep|yup|nope|nah|sure|ok|okay)\b[\s.!,]*$"
+    r"|^\s*(?:choose|select|pick|assign|use|go\s+with|send|submit|dispatch|deploy|ship|"
     r"done|finish(?:ed|ing)?|run|check|look\s*up|lookup|decode|verify)\b"
     # a bare select-noun at the START ('driver', 'the dispatcher', 'group …') — anchored
     # so a real surname/company containing the word (e.g. 'Ryan Driver', 'Acme Group')
@@ -3760,6 +3763,15 @@ _SELECT_SOURCE_RE = re.compile(rf"^\s*{_CMD_VERB}\s*{_ART}(?:contact\s+source|le
 # group. The DELIVERY people stay "drivers": 'choose driver X' selects a driver.
 _SELECT_GROUP_RE = re.compile(rf"^\s*{_CMD_VERB}\s*{_ART}(?:group|team|crew|dispatchers?|dispatch|disp)\s+(.+)$", re.I)
 _SELECT_DRIVER_RE = re.compile(rf"^\s*{_CMD_VERB}\s*{_ART}(?:drivers?|drv)\s+(.+)$", re.I)
+# The VIN prompt asks a Yes/No question, so it must accept those words — typed or
+# spoken. Deliberately NOT part of the general review classifier: a bare "yes" only
+# means "use the DMV result" while that question is actually on screen.
+_YES_RE = re.compile(
+    r"^\s*(?:y|ya|yes|yea|yeah|yep|yup|sure|ok|okay|correct|right|affirmative|"
+    r"use\s+it|use\s+that|do\s+it|go\s+ahead|please\s+do)\b[\s.!,]*$", re.I)
+_NO_RE = re.compile(
+    r"^\s*(?:n|no|nope|nah|negative|don'?t|do\s+not|keep\s+it|keep\s+mine|"
+    r"leave\s+it|skip|pass)\b[\s.!,]*$", re.I)
 _VIN_KEEP_RE = re.compile(r"\b(keep|same|leave\s+it|leave\s+alone|as\s+is|as-is|don'?t\s+change|current|mine|stated|original)\b", re.I)
 _VIN_RETYPE_RE = re.compile(r"\b(retype|re-?enter|redo|fix|correct)\b.*\bvin\b|\btype\b.*\bvin\b.*\bagain\b", re.I)
 _VIN_USE_RE = re.compile(r"\buse\b.*\b(vin|dmv|new|decoded|lookup|api|theirs?|that)\b", re.I)
@@ -8088,7 +8100,14 @@ async def handle_vin_choice_text(update: Update, context: ContextTypes.DEFAULT_T
     if _cr:
         return await _do_cancel_or_restart(update, context, _cr)
     await _autoclean_user_msg(update, context)
-    kind, _ = _classify_review_command(text)
+    # The question on screen is "Would you like to use DMV system?", so plain yes/no
+    # answers it — checked before the older phrasing, which stays supported.
+    if _YES_RE.match(text):
+        kind = "VIN_USE"
+    elif _NO_RE.match(text):
+        kind = "VIN_KEEP"
+    else:
+        kind, _ = _classify_review_command(text)
     mapping = {"VIN_USE": "use", "VIN_KEEP": "keep", "VIN_RETYPE": "retype"}
     if kind in mapping:
         result = await _apply_vin_choice(
@@ -8101,7 +8120,10 @@ async def handle_vin_choice_text(update: Update, context: ContextTypes.DEFAULT_T
             pass
         await _cleanup_voice_echo(context, update.effective_chat.id if update.effective_chat else None)
         return result
-    await update.message.reply_text("Say “use the new”, “keep the same”, or “retype vin”.")
+    await update.message.reply_text(
+        "Tap a button above, or say “yes” to use the DMV result and “no” to keep the "
+        "same VIN. You can also say “retype vin”."
+    )
     return STATE_VIN_CHOICE
 
 

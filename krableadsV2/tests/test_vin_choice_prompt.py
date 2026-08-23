@@ -78,5 +78,70 @@ class ButtonsTest(unittest.TestCase):
         self.assertEqual(bot._classify_review_command("retype vin")[0], "VIN_RETYPE")
 
 
+class AnswerByTextOrVoiceTest(unittest.TestCase):
+    """The prompt asks Yes/No, so those words must answer it — typed or spoken.
+
+    Voice needs no separate wiring: it is transcribed before routing, so it reaches
+    this same handler as text."""
+
+    def _answer(self, text):
+        import asyncio
+        from types import SimpleNamespace
+        msg = SimpleNamespace(text=text, chat_id=1, delete=mock.AsyncMock(),
+                              reply_text=mock.AsyncMock())
+        update = SimpleNamespace(
+            message=msg, effective_message=msg,
+            effective_chat=SimpleNamespace(id=1, type="private"),
+            effective_user=SimpleNamespace(id=7, username="tester"))
+        ctx = SimpleNamespace(user_data={}, bot=mock.AsyncMock(),
+                              application=SimpleNamespace(handlers={}))
+        got = {}
+
+        async def fake_apply(context, message, chat_id, user_id, choice):
+            got["choice"] = choice
+            return bot.STATE_AI_REVIEW
+
+        with mock.patch.object(bot, "_apply_vin_choice", fake_apply), \
+                mock.patch.object(bot, "_autoclean_user_msg", mock.AsyncMock()), \
+                mock.patch.object(bot, "_cleanup_voice_echo", mock.AsyncMock()):
+            asyncio.run(bot.handle_vin_choice_text(update, ctx))
+        said = msg.reply_text.await_args.args[0] if msg.reply_text.await_args else None
+        return got.get("choice"), said
+
+    def test_yes_uses_the_dmv_result(self):
+        for word in ("yes", "Yes", "YES", "yeah", "yep", "yup", "sure", "y",
+                     "ok", "okay", "use it", "go ahead", "yes."):
+            with self.subTest(word=word):
+                self.assertEqual(self._answer(word)[0], "use")
+
+    def test_no_keeps_the_same_vin(self):
+        for word in ("no", "No", "NO", "nope", "nah", "n", "keep it", "leave it", "no."):
+            with self.subTest(word=word):
+                self.assertEqual(self._answer(word)[0], "keep")
+
+    def test_the_older_phrasing_still_works(self):
+        self.assertEqual(self._answer("use the new")[0], "use")
+        self.assertEqual(self._answer("keep the same")[0], "keep")
+        self.assertEqual(self._answer("retype vin")[0], "retype")
+
+    def test_anything_else_explains_the_two_answers(self):
+        choice, said = self._answer("what does that mean")
+        self.assertIsNone(choice)
+        self.assertIn("yes", said.lower())
+        self.assertIn("no", said.lower())
+
+
+class StrayYesIsNeverAFieldValueTest(unittest.TestCase):
+
+    def test_bare_yes_no_are_treated_as_answers(self):
+        for word in ("yes", "no", "y", "n", "yeah", "nope", "ok"):
+            with self.subTest(word=word):
+                self.assertTrue(bot._COMMAND_LIKE_RE.search(word),
+                                "a bare answer must never be filed as a field value")
+
+    def test_a_real_name_containing_yes_is_untouched(self):
+        self.assertFalse(bot._COMMAND_LIKE_RE.search("Yes Motors LLC"))
+
+
 if __name__ == "__main__":
     unittest.main()
