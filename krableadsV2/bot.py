@@ -15,7 +15,7 @@ import time
 from datetime import datetime, time as dt_time, timedelta
 import pytz
 from typing import Optional
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, InputFile
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, InputFile, MessageEntity
 from telegram.error import BadRequest, Conflict, RetryAfter
 from telegram.ext import (
     Application,
@@ -4358,6 +4358,70 @@ async def handle_select_state_text(update: Update, context: ContextTypes.DEFAULT
     if msg:
         await _send_vanishing(context, msg.chat_id, "☝️ Tap a button above to continue.")
     return None
+
+
+# ── Commands without the slash ───────────────────────────────────────────────
+# Saying or typing the bare word runs the command: "settings" == "/settings". The
+# message is rewritten into a real command (text + bot_command entity) and allowed to
+# flow on, so PTB routes it through the SAME handler as the typed slash — identical
+# behaviour everywhere, with no per-handler wiring to drift.
+# Only the whole message counts, so a value that merely contains one of these words
+# is untouched.
+_BARE_COMMANDS = {
+    "help": "help", "commands": "help", "how do i use this": "help",
+    "settings": "settings", "setting": "settings",
+    "receipt": "receipt", "receipts": "receipt", "recipts": "receipt",
+    "whoami": "whoami", "who am i": "whoami", "my id": "whoami", "me": "whoami",
+    "followup": "followup", "follow up": "followup", "prospect": "followup",
+    "followups": "followups", "follow ups": "followups", "my clients": "followups",
+    "all followups": "allfollowups", "allfollowups": "allfollowups",
+    "announce": "announce", "announcement": "announce", "broadcast": "announce",
+    "driverblock": "driverblock", "driver block": "driverblock",
+    "appeal": "appeal",
+    "test": "test",
+}
+# Filler that speech puts on either end ("open settings", "settings, please.").
+_BARE_CMD_LEAD_RE = re.compile(r"^(?:please|open|show\s+me|show|go\s+to|take\s+me\s+to)\s+", re.I)
+_BARE_CMD_TAIL_RE = re.compile(r"[\s,]*please$", re.I)
+
+
+def _bare_command_for(text: str):
+    """The command a bare word means, or None. Whole-message match only."""
+    phrase = re.sub(r"\s+", " ", (text or "").strip().lower()).strip(" .,!?")
+    phrase = _BARE_CMD_LEAD_RE.sub("", phrase).strip()
+    phrase = _BARE_CMD_TAIL_RE.sub("", phrase).strip(" .,!?")
+    if not phrase:
+        return None
+    return _BARE_COMMANDS.get(phrase)
+
+
+async def _bare_command_to_slash(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Rewrite a bare command word into the real command, then let it flow on.
+
+    Runs after voice transcription, so a SPOKEN command works the same as a typed
+    one. Never consumes the update: PTB's own CommandHandlers do the work."""
+    msg = update.effective_message
+    text = ((msg.text if msg else "") or "").strip()
+    if not msg or not text or text.startswith("/"):
+        return
+    # cancel / restart (and "new lead", "temp tag", …) already have a tested word
+    # family — reuse it so those phrases behave identically to their slash command.
+    cmd = _cancel_restart_kind(text) or None
+    if cmd is None:
+        # A prompt that is explicitly waiting for a typed VALUE must keep it: a client
+        # source really could be called "Test", and a field value could be "Me".
+        if context.user_data and (context.user_data.get("tset_await")
+                                  or context.user_data.get("phase1_pending_edit_key")):
+            return
+        cmd = _bare_command_for(text)
+    if not cmd:
+        return
+    slash = f"/{cmd}"
+    object.__setattr__(msg, "text", slash)
+    object.__setattr__(msg, "entities", (
+        MessageEntity(type=MessageEntity.BOT_COMMAND, offset=0, length=len(slash)),
+    ))
+    logger.info("bare command %r -> %s", text[:40], slash)
 
 
 async def _begin_lead_flow(
@@ -14413,6 +14477,17 @@ def main():
     # review-edit safety net below, then to whatever text handler is active.
     application.add_handler(
         MessageHandler(filters.VOICE | filters.AUDIO, _global_voice_to_text),
+        group=-4,
+    )
+
+    # Commands without the slash (group -3: after transcription, before everything
+    # else): "settings" runs /settings, spoken or typed. Rewrites the message into a
+    # real command and lets it flow on, so PTB routes it through the same handler.
+    application.add_handler(
+        MessageHandler(
+            filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE,
+            _bare_command_to_slash,
+        ),
         group=-3,
     )
 
