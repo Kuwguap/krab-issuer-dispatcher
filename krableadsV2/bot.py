@@ -5292,6 +5292,11 @@ async def handle_supervisor_plate_image(update: Update, context: ContextTypes.DE
             # Keep the pinned counter armed so the next photo/text still targets it.
             context.user_data["router_plate_followup"] = {"col": forced_col, "ts": time.time()}
             extra = f" (still updating {_PLATE_SET_LABELS.get(forced_col, 'that counter')})"
+        if not forced_col:
+            # Not a tag, and no counter update was requested — it is a lead image.
+            # Fall through silently so the lead flow reads it; replying here used to
+            # eat every forwarded screenshot with "couldn't read a tag number".
+            return
         await msg.reply_text(
             "⚠️ I couldn't read a tag number. Send a clearer photo, or type it — "
             f"e.g. “update resident tag number 553300”.{extra}"
@@ -6590,6 +6595,27 @@ async def _execute_phase1_vision_batch_extraction(
         if context.user_data:
             context.user_data.pop("phase1_vision_extracting", None)
             context.user_data.pop("phase1_batch_status_msg_id", None)
+
+
+async def handle_idle_media_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """A photo/PDF sent (or forwarded) with no lead in progress STARTS one and queues
+    the file for extraction — the image is the lead details.
+
+    Text arriving on its own already starts a lead; an image did not, so a forwarded
+    screenshot or a photo with a caption produced nothing at all."""
+    msg = update.effective_message
+    if not msg or not update.effective_user:
+        return ConversationHandler.END
+    if update.effective_chat is not None and update.effective_chat.type != "private":
+        return ConversationHandler.END
+    user_id = update.effective_user.id
+    username = update.effective_user.username or "Unknown"
+    # A caption rides along as typed context for the extraction, so "text + image"
+    # is read as one thing.
+    await _begin_lead_flow(context, user_id, username, msg, send_welcome=False)
+    if msg.photo:
+        return await handle_phase1_photo(update, context)
+    return await handle_phase1_document(update, context)
 
 
 async def handle_phase1_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -14225,6 +14251,12 @@ def main():
             # Idle natural-language / voice start: any substantive text starts a lead
             # and auto-fills what's given. MUST be last (only plain text reaches it).
             MessageHandler(filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE, handle_idle_lead_start),
+            # Same for a photo/PDF: a forwarded screenshot IS the lead details, and
+            # with no lead running it previously reached nothing at all.
+            MessageHandler(
+                (filters.PHOTO | filters.Document.ALL) & ~filters.COMMAND & filters.ChatType.PRIVATE,
+                handle_idle_media_start,
+            ),
         ],
         states={
             STATE_PHASE1: [
