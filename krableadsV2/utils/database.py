@@ -2,6 +2,7 @@
 import logging
 import re
 import secrets
+import time
 from supabase import create_client, Client
 from config import Config
 from typing import Optional, Dict, Any
@@ -74,10 +75,16 @@ class Database:
         self._error_logged = False
     
     def _check_tables_exist(self) -> bool:
-        """Check if required tables exist in the database."""
+        """Check if required tables exist in the database.
+
+        Only a DEFINITIVE "table missing" answer is cached. A transient failure
+        (network blip / timeout right after a cold start) must not poison the
+        cache: it used to cache False for the process lifetime, silently killing
+        every state read/write — orphaned review cards, "Data lost", edits that
+        do nothing — until the next redeploy."""
         if self._tables_checked:
             return self._tables_exist
-        
+
         try:
             # Try a simple query to check if tables exist
             self.client.table("states").select("user_id").limit(1).execute()
@@ -86,60 +93,77 @@ class Database:
             return True
         except Exception as e:
             error_msg = str(e)
-            if ("Could not find the table" in error_msg or "PGRST205" in error_msg) and not self._error_logged:
-                logger.error(
-                    "\n" + "="*60 + "\n"
-                    "DATABASE ERROR: Tables not found!\n\n"
-                    "Please run the SQL schema from 'database/schema.sql' in your Supabase SQL Editor.\n"
-                    "Go to: https://supabase.com/dashboard -> Your Project -> SQL Editor\n"
-                    "="*60
-                )
-                self._error_logged = True
-            self._tables_checked = True
-            self._tables_exist = False
-            return False
+            if "Could not find the table" in error_msg or "PGRST205" in error_msg:
+                if not self._error_logged:
+                    logger.error(
+                        "\n" + "="*60 + "\n"
+                        "DATABASE ERROR: Tables not found!\n\n"
+                        "Please run the SQL schema from 'database/schema.sql' in your Supabase SQL Editor.\n"
+                        "Go to: https://supabase.com/dashboard -> Your Project -> SQL Editor\n"
+                        "="*60
+                    )
+                    self._error_logged = True
+                self._tables_checked = True
+                self._tables_exist = False
+                return False
+            # Transient — don't cache; let the real query run (it has its own
+            # error handling) and re-probe on the next call.
+            logger.warning(f"Table check failed transiently (will retry): {e}")
+            return True
     
     def get_user_state(self, user_id: int) -> Optional[Dict[str, Any]]:
-        """Get the current state for a user."""
+        """Get the current state for a user.
+
+        One quick retry on transient errors: a lost read here is indistinguishable
+        from "no lead" to the bot, which then wipes or restarts a live review card."""
         if not self._check_tables_exist():
             return None
-        
-        try:
-            response = self.client.table("states").select("*").eq("user_id", user_id).execute()
-            if response.data:
-                return response.data[0]
-            return None
-        except Exception as e:
-            error_msg = str(e)
-            if "Could not find the table" not in error_msg and "PGRST205" not in error_msg:
+
+        for attempt in (0, 1):
+            try:
+                response = self.client.table("states").select("*").eq("user_id", user_id).execute()
+                if response.data:
+                    return response.data[0]
+                return None
+            except Exception as e:
+                error_msg = str(e)
+                if "Could not find the table" in error_msg or "PGRST205" in error_msg:
+                    return None
+                if attempt == 0:
+                    time.sleep(0.4)
+                    continue
                 logger.error(f"Error getting user state: {e}")
-            return None
+        return None
     
     def set_user_state(self, user_id: int, state: str, data: Optional[Dict[str, Any]] = None) -> bool:
-        """Set or update the state for a user."""
+        """Set or update the state for a user.
+
+        One quick retry on transient errors — a silently dropped write here loses
+        the user's just-applied review edit."""
         if not self._check_tables_exist():
             return False
-        
-        try:
-            state_data = {
-                "user_id": user_id,
-                "state": state,
-                "data": data or {}
-            }
-            
-            # Try to update first
-            existing = self.get_user_state(user_id)
-            if existing:
-                self.client.table("states").update(state_data).eq("user_id", user_id).execute()
-            else:
-                self.client.table("states").insert(state_data).execute()
-            
-            return True
-        except Exception as e:
-            error_msg = str(e)
-            if "Could not find the table" not in error_msg and "PGRST205" not in error_msg:
+
+        state_data = {
+            "user_id": user_id,
+            "state": state,
+            "data": data or {}
+        }
+        for attempt in (0, 1):
+            try:
+                # Single atomic upsert on the user_id PK — the old read-then-write
+                # turned a transient read failure into a PK-violating INSERT that
+                # silently lost the edit (the card then "reverted" after a restart).
+                self.client.table("states").upsert(state_data, on_conflict="user_id").execute()
+                return True
+            except Exception as e:
+                error_msg = str(e)
+                if "Could not find the table" in error_msg or "PGRST205" in error_msg:
+                    return False
+                if attempt == 0:
+                    time.sleep(0.4)
+                    continue
                 logger.error(f"Error setting user state: {e}")
-            return False
+        return False
     
     def clear_user_state(self, user_id: int) -> bool:
         """Clear the state for a user."""
@@ -600,19 +624,37 @@ class Database:
             return False
 
     # Driver management methods
-    def create_driver(self, driver_name: str, driver_telegram_id: str, phone_number: Optional[str] = None) -> bool:
-        """Create a new driver."""
+    def create_driver(self, driver_name: str, driver_telegram_id: str,
+                      phone_number: Optional[str] = None,
+                      email: Optional[str] = None) -> bool:
+        """Create a new driver.
+
+        ``email`` is only sent when given, and a DB that has not run
+        migration_drivers_email.sql retries without it rather than losing the driver.
+        """
         if not self._check_tables_exist():
             return False
-        
+
+        payload = {
+            "driver_name": driver_name,
+            "driver_telegram_id": driver_telegram_id,
+            "phone_number": phone_number,
+        }
+        if email:
+            payload["email"] = email
         try:
-            self.client.table("drivers").insert({
-                "driver_name": driver_name,
-                "driver_telegram_id": driver_telegram_id,
-                "phone_number": phone_number
-            }).execute()
+            self.client.table("drivers").insert(payload).execute()
             return True
         except Exception as e:
+            if "email" in payload and "email" in str(e).lower():
+                payload.pop("email", None)
+                try:
+                    self.client.table("drivers").insert(payload).execute()
+                    logger.warning("create_driver: saved without email — run "
+                                   "database/migration_drivers_email.sql")
+                    return True
+                except Exception as e2:
+                    e = e2
             logger.error(f"Error creating driver: {e}")
             return False
     
@@ -1003,9 +1045,10 @@ class Database:
             return set()
         try:
             r = self.client.table("lead_assignments").select(
-                "driver_id, lead:leads(receipt_image_url)"
+                "driver_id, lead_id, lead:leads(receipt_image_url)"
             ).eq("status", "accepted").execute()
             counts: dict[str, int] = {}
+            unpaid: dict[str, str] = {}          # lead_id -> driver, for the waiver lookup
             for row in r.data or []:
                 lead = row.get("lead") or {}
                 if lead.get("receipt_image_url"):
@@ -1015,6 +1058,25 @@ class Database:
                     continue
                 ds = str(did)
                 counts[ds] = counts.get(ds, 0) + 1
+                if row.get("lead_id"):
+                    unpaid[str(row["lead_id"])] = ds
+            # Waived leads (appeal accepted, or a supervisor lifted the suspension)
+            # must stop counting. Tolerant second query: on a DB that has not run
+            # migration_lead_appeals.sql the column is absent and we simply skip the
+            # exclusion rather than returning nothing. Without this the waiver was
+            # written but never honored, so a lifted suspension never actually lifted.
+            if unpaid:
+                try:
+                    ex = self.client.table("leads").select(
+                        "id, exclude_from_count"
+                    ).in_("id", list(unpaid.keys())).execute()
+                    for row in (ex.data or []):
+                        if row.get("exclude_from_count"):
+                            ds = unpaid.get(str(row["id"]))
+                            if ds and counts.get(ds):
+                                counts[ds] -= 1
+                except Exception:
+                    pass
             return {did for did, c in counts.items() if c >= threshold}
         except Exception as e:
             logger.error("get_driver_ids_with_pending_receipt_count_at_least: %s", e)
@@ -1613,6 +1675,107 @@ class Database:
         except Exception as e:
             logger.error(f"Error getting contact info sources: {e}")
             return []
+
+    def get_all_contact_info_sources(self) -> list:
+        """Every source INCLUDING disabled ones — the settings screen needs the
+        disabled rows so they can be switched back on (the active-only getter would
+        make a disabled source unreachable from Telegram)."""
+        if not self._check_tables_exist():
+            return []
+        try:
+            r = self.client.table("contact_info_sources").select("*").order("sort_order").execute()
+            return r.data or []
+        except Exception as e:
+            logger.error(f"Error getting all contact info sources: {e}")
+            return []
+
+    def create_contact_info_source(self, label: str, sort_order: Optional[int] = None) -> bool:
+        """Add a client source. Sorts last unless a position is given."""
+        if not self._check_tables_exist():
+            return False
+        label = (label or "").strip()
+        if not label:
+            return False
+        try:
+            if sort_order is None:
+                existing = self.get_all_contact_info_sources()
+                sort_order = max(
+                    (int(r.get("sort_order") or 0) for r in existing), default=-1
+                ) + 1
+            self.client.table("contact_info_sources").insert({
+                "label": label,
+                "sort_order": int(sort_order),
+                "is_active": True,
+            }).execute()
+            return True
+        except Exception as e:
+            logger.error(f"Error creating contact info source: {e}")
+            return False
+
+    def set_contact_info_source_active(self, source_id: str, active: bool) -> bool:
+        """Enable/disable a client source. A SOFT delete on purpose: leads store the
+        source as a text label, and an already-sent picker button must still resolve."""
+        if not self._check_tables_exist():
+            return False
+        try:
+            self.client.table("contact_info_sources").update(
+                {"is_active": bool(active)}
+            ).eq("id", source_id).execute()
+            return True
+        except Exception as e:
+            logger.error(f"Error updating contact info source: {e}")
+            return False
+
+    def set_driver_suspended(self, driver_id: str, suspended: bool) -> bool:
+        """Manually suspend / un-suspend a driver.
+
+        Uses ``drivers.is_suspended`` (database/migration_driver_manual_suspend.sql).
+        Returns False when the column has not been added yet, so the caller can say
+        so instead of appearing to succeed."""
+        if not self._check_tables_exist():
+            return False
+        try:
+            self.client.table("drivers").update(
+                {"is_suspended": bool(suspended)}
+            ).eq("id", driver_id).execute()
+            return True
+        except Exception as e:
+            logger.warning("set_driver_suspended (run migration_driver_manual_suspend.sql?): %s", e)
+            return False
+
+    def get_manually_suspended_driver_ids(self) -> set:
+        """Driver ids flagged by a supervisor. Empty when the column is absent."""
+        if not self._check_tables_exist():
+            return set()
+        try:
+            r = self.client.table("drivers").select("id, is_suspended").execute()
+            return {str(x["id"]) for x in (r.data or []) if x.get("is_suspended")}
+        except Exception:
+            return set()          # column not migrated yet — nobody is manually suspended
+
+    def waive_driver_pending_receipts(self, driver_id: str) -> int:
+        """Lift a receipt-debt suspension by excusing that driver's outstanding
+        receipts (the same ``exclude_from_count`` flag an accepted appeal sets).
+        Returns how many leads were excused."""
+        if not self._check_tables_exist():
+            return 0
+        try:
+            r = self.client.table("lead_assignments").select(
+                "lead_id, lead:leads(receipt_image_url)"
+            ).eq("driver_id", driver_id).eq("status", "accepted").execute()
+            lead_ids = [
+                str(row["lead_id"]) for row in (r.data or [])
+                if row.get("lead_id") and not (row.get("lead") or {}).get("receipt_image_url")
+            ]
+            if not lead_ids:
+                return 0
+            self.client.table("leads").update(
+                {"exclude_from_count": True}
+            ).in_("id", lead_ids).execute()
+            return len(lead_ids)
+        except Exception as e:
+            logger.error("waive_driver_pending_receipts: %s", e)
+            return 0
 
     def get_contact_info_source_by_id(self, source_id: str) -> Optional[Dict[str, Any]]:
         """Get a single contact info source by id."""

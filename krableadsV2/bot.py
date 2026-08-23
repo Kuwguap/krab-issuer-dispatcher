@@ -15,7 +15,7 @@ import time
 from datetime import datetime, time as dt_time, timedelta
 import pytz
 from typing import Optional
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, InputFile
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, InputFile, MessageEntity
 from telegram.error import BadRequest, Conflict, RetryAfter
 from telegram.ext import (
     Application,
@@ -418,6 +418,35 @@ def _tracking_link(token: str) -> str:
     return f"{Config.TRACKING_SITE_BASE_URL}/t/{token}"
 
 
+async def _forward_accepted_lead_files(context: ContextTypes.DEFAULT_TYPE, lead: dict, chat_id) -> None:
+    """Send the lead's parsed images/PDFs to a chat that just accepted it.
+
+    Reads the descriptors off the lead row (re-fetching when the caller passed a
+    trimmed dict), and remembers what it already sent so a re-sent details message
+    never duplicates the paperwork."""
+    if not lead or not chat_id:
+        return
+    lead_id = str(lead.get("id") or "")
+    att = lead.get("phase1_attached_files")
+    if not (isinstance(att, list) and att) and lead_id:
+        try:
+            att = (db.get_lead_by_id(lead_id) or {}).get("phase1_attached_files")
+        except Exception as e:
+            logger.warning("accepted-lead files lookup failed: %s", e)
+            att = None
+    if not (isinstance(att, list) and att):
+        return
+    sent_key = f"lead_files_sent_{lead_id}" if lead_id else None
+    if sent_key and context.user_data is not None:
+        if context.user_data.get(sent_key):
+            return
+        context.user_data[sent_key] = True
+    try:
+        await _forward_phase1_attached_files_to_targets(context, att, chat_id)
+    except Exception as e:
+        logger.warning("forwarding accepted-lead files failed: %s", e)
+
+
 async def _send_driver_lead_details(
     context: ContextTypes.DEFAULT_TYPE, lead: dict, chat_id, reassign_lead_id: str | None = None
 ) -> None:
@@ -435,6 +464,10 @@ async def _send_driver_lead_details(
     except BadRequest:
         plain = re.sub(r"<[^>]+>", "", confirmation_message)
         await context.bot.send_message(chat_id=chat_id, text=plain, reply_markup=add_lead_kb)
+    # Everything the issuer sent for parsing (title/registration/insurance shots and
+    # PDFs) follows the lead to the driver who accepted it — they are the one who
+    # needs the paperwork on the delivery.
+    await _forward_accepted_lead_files(context, lead, chat_id)
 
 
 async def _start_tracking_gate_or_send_details(
@@ -500,6 +533,47 @@ async def _start_tracking_gate_or_send_details(
         logger.warning("Could not send optional tracking link to %s: %s", chat_id, e)
 
 
+def _drivers_sent_label(state_data: dict, drivers_list: list) -> str:
+    """Who the lead went to, for the confirmation.
+
+    A bare count ("1 driver(s)") does not say WHO, which is the one thing worth
+    checking before walking away. Names are listed; when everyone was picked it says
+    "All drivers" rather than a wall of names."""
+    names = [str(d.get("driver_name") or "").strip()
+             for d in (drivers_list or []) if d and d.get("id")]
+    names = [n for n in names if n]
+    if not names:
+        return "no drivers"
+    picked = str((state_data or {}).get("selected_driver_names") or "").strip()
+    if picked.lower() == "all drivers":
+        return f"All drivers ({len(names)})"
+    # Everyone eligible got it even though it was not an explicit "all" pick.
+    try:
+        eligible = [d for d in _get_all_drivers_cached() if record_is_active(d)]
+        suspended = _get_suspended_driver_ids()
+        if len({str(d.get("id")) for d in eligible if str(d.get("id")) not in suspended}) == len(names) > 1:
+            return f"All drivers ({len(names)})"
+    except Exception:
+        pass
+    if len(names) <= 4:
+        return ", ".join(names)
+    return ", ".join(names[:4]) + f" +{len(names) - 4} more"
+
+
+def _after_send_keyboard(lead_id: str) -> InlineKeyboardMarkup:
+    """Buttons on the "lead sent" confirmation.
+
+    Reassigning right after sending is routine — the driver is unavailable, or it
+    belongs to a different dispatcher — and previously it meant waiting for a timeout
+    or digging for the earlier message. Both callbacks are conversation ENTRY points,
+    so they still work after the lead flow has ended."""
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🚗 Reassign driver", callback_data=f"resend_driver_{lead_id}"),
+         InlineKeyboardButton("🏢 Reassign dispatcher", callback_data=f"reassign_group_{lead_id}")],
+        [InlineKeyboardButton("➕ Another tag (same client)", callback_data=f"another_tag_{lead_id}")],
+    ])
+
+
 def _keyboard_lead_accept_decline(lead_id: str) -> InlineKeyboardMarkup:
     """New-lead offer: Accept / Different Driver (decline callback)."""
     return InlineKeyboardMarkup([
@@ -524,18 +598,12 @@ def _keyboard_receipt_plus_rows(extra_rows: list) -> InlineKeyboardMarkup:
     """Per-reference upload rows only (no extra global receipt row — drivers use /receipts)."""
     return InlineKeyboardMarkup(list(extra_rows))
 
-_VIN_CONFLICT_INTRO = (
-    "Pulling up 17 Digit Vin in DMV portal🧐\n\n"
-    "Success ! Your Vehicle pulls up in the Motor Vehicle system!\n"
-)
-
-
 def _vin_conflict_body(_stated_car: str, api_car: str) -> str:
-    return (
-        f"{_VIN_CONFLICT_INTRO}"
-        f"• VIN result in DMV : {api_car}\n\n"
-        "Choose which to use:"
-    )
+    """One short question instead of the old three-line preamble.
+
+    The decoded vehicle is still shown on its own line — it is the same fact the
+    long version ended with, and without it Yes/No would be a blind choice."""
+    return f"Would you like to use DMV system?\n• DMV: {api_car}"
 
 
 def _short_uuid(u: str) -> str:
@@ -577,8 +645,18 @@ def _parse_paired_short_uuids(callback_data: str, prefix: str) -> tuple[str, str
     return None
 
 
+def _bust_driver_caches() -> None:
+    """Drop the driver and suspension caches so a /settings change shows at once
+    (both are short-TTL memoizations, and a stale one makes an edit look ignored)."""
+    global _SUSP_DRIVER_IDS_CACHE, _ALL_DRIVERS_CACHE, _ALL_DRIVERS_CACHE_TS
+    _SUSP_DRIVER_IDS_CACHE = None
+    _ALL_DRIVERS_CACHE = None
+    _ALL_DRIVERS_CACHE_TS = 0.0
+
+
 def _get_suspended_driver_ids() -> set[str]:
-    """Driver IDs (as str) with 3+ pending receipts — suspended from receiving new leads."""
+    """Driver IDs (as str) that may not receive new leads: those owing
+    SUSPENSION_THRESHOLD+ receipts, plus anyone a supervisor suspended by hand."""
     global _SUSP_DRIVER_IDS_CACHE
     now = time.monotonic()
     if _SUSP_DRIVER_IDS_CACHE is not None:
@@ -590,6 +668,10 @@ def _get_suspended_driver_ids() -> set[str]:
     except Exception as e:
         logger.warning("_get_suspended_driver_ids: %s", e)
         return set()
+    try:
+        s = set(s) | db.get_manually_suspended_driver_ids()
+    except Exception as e:
+        logger.warning("manual suspensions unavailable: %s", e)
     _SUSP_DRIVER_IDS_CACHE = (s, now)
     return s
 
@@ -878,12 +960,15 @@ async def _finalize_phase1_media_for_dispatch(
 async def _forward_phase1_attached_files_to_targets(
     context: ContextTypes.DEFAULT_TYPE,
     attached_files: list,
-    group_chat_id: int | str | None,
+    target_chat_id: int | str | None,
 ) -> None:
-    """Forward Phase 1 files to the **accepting** group chat only.
+    """Forward the Phase 1 files to one **accepting** chat.
 
-    Invoked from ``handle_accept_group_offer`` after Accept — not during
-    approval broadcast or driver pick. Two payload shapes are supported:
+    Every image/PDF the issuer sent for parsing rides along to whoever takes the
+    lead: the group that accepts the offer, AND the driver who accepts it (they
+    are the one doing the delivery, so they need the title/registration shots).
+    Never sent during the approval broadcast or driver pick — only on Accept.
+    Two payload shapes are supported:
 
     - ``{"type": "photo|document", "file_id": ...}`` — legacy Telegram
       file-id reference (pre-redaction code path).
@@ -894,7 +979,7 @@ async def _forward_phase1_attached_files_to_targets(
     """
     if not attached_files:
         return
-    _group_cid = _parse_chat_id(group_chat_id) if group_chat_id is not None else None
+    _group_cid = _parse_chat_id(target_chat_id) if target_chat_id is not None else None
     if not _group_cid:
         return
     # If censored inline payloads exist, do not also send legacy raw ``file_id``
@@ -1573,6 +1658,8 @@ async def _notify_initiator_lead_accepted_summary(
     ref = (lead_row.get("reference_id") or "N/A").strip() or "N/A"
     group_label = _group_display_name_from_lead(lead_row) or "N/A"
     dn = (accepting_driver_name or "Driver").strip() or "Driver"
+    # Deliberately NAME ONLY. A driver's phone and email live in /settings and nowhere
+    # near a lead — this notice can be forwarded, so keep their details out of it.
     text = (
         "Accepted! ✅ Lead 📈Notification🔔\n"
         "We start serving the client now\n\n"
@@ -1824,6 +1911,199 @@ def parse_phase1_structured(message_text: str) -> dict:
     }
 
 
+# ── Splitting a whole address into street + city/ST/ZIP ─────────────────────
+# The card keeps the street line and the city/state/ZIP line in SEPARATE fields, but
+# people type (and dictate) an address as one string: "123 Main St, Newark NJ 07102".
+# Without this the entire string landed in the street field and city/ST/ZIP stayed "-".
+_US_STATE_ABBR = frozenset("""
+AL AK AZ AR CA CO CT DE FL GA HI ID IL IN IA KS KY LA ME MD MA MI MN MS MO MT NE NV
+NH NJ NM NY NC ND OH OK OR PA RI SC SD TN TX UT VT VA WA WV WI WY DC PR VI GU AS MP
+""".split())
+# Full state names (incl. the multi-word ones) → abbreviation, so a spoken
+# "…Newark New Jersey 07102" still splits correctly.
+_US_STATE_NAMES = {
+    "alabama": "AL", "alaska": "AK", "arizona": "AZ", "arkansas": "AR", "california": "CA",
+    "colorado": "CO", "connecticut": "CT", "delaware": "DE", "florida": "FL", "georgia": "GA",
+    "hawaii": "HI", "idaho": "ID", "illinois": "IL", "indiana": "IN", "iowa": "IA",
+    "kansas": "KS", "kentucky": "KY", "louisiana": "LA", "maine": "ME", "maryland": "MD",
+    "massachusetts": "MA", "michigan": "MI", "minnesota": "MN", "mississippi": "MS",
+    "missouri": "MO", "montana": "MT", "nebraska": "NE", "nevada": "NV",
+    "new hampshire": "NH", "new jersey": "NJ", "new mexico": "NM", "new york": "NY",
+    "north carolina": "NC", "north dakota": "ND", "ohio": "OH", "oklahoma": "OK",
+    "oregon": "OR", "pennsylvania": "PA", "rhode island": "RI", "south carolina": "SC",
+    "south dakota": "SD", "tennessee": "TN", "texas": "TX", "utah": "UT", "vermont": "VT",
+    "virginia": "VA", "washington": "WA", "west virginia": "WV", "wisconsin": "WI",
+    "wyoming": "WY", "district of columbia": "DC", "puerto rico": "PR",
+}
+_ZIP_RE = re.compile(r"^\d{5}(?:-\d{4})?$")
+# Tokens that belong to the STREET half — the city walk stops when it meets one, so
+# "Ocean Ave" is never mistaken for a city name.
+# Deliberately NO bare compass directions here — they are handled separately below,
+# because a compass word can belong to EITHER half ("Pennsylvania Ave NW" is street,
+# "North Bergen" is city).
+# NOTE: no "park"/"heights"/"square"/"gardens" — those are common in CITY names
+# (Cliffside Park, Hasbrouck Heights), and mis-stopping there would split wrongly.
+_STREET_TOKEN_RE = re.compile(
+    r"^(?:st|street|ave|avenue|av|rd|road|blvd|boulevard|dr|drive|ln|lane|way|ct|court|"
+    r"pl|place|ter|terrace|cir|circle|pkwy|parkway|hwy|highway|route|rte|apt|apartment|"
+    r"suite|ste|unit|fl|floor|rm|room|box|po|turnpike|tpke|pike|expressway|expy|"
+    r"freeway|fwy|plaza|plz|trail|trl|crossing|xing|bypass|byp|extension|ext|loop|"
+    r"alley|aly|plaza)$",
+    re.I,
+)
+# An ABBREVIATED compass is practically always a street directional ("1600
+# Pennsylvania Ave NW"), never the start of a city name.
+_COMPASS_ABBR = frozenset({"n", "s", "e", "w", "ne", "nw", "se", "sw"})
+# A SPELLED-OUT compass usually starts a city ("North Bergen", "East Orange") — unless
+# it trails a numbered route ("500 Route 46 West"), which these two tests detect.
+_COMPASS_WORD = frozenset({"north", "south", "east", "west", "northeast",
+                           "northwest", "southeast", "southwest"})
+_ROUTE_WORD_RE = re.compile(r"^(?:route|rte|rt|highway|hwy|us|interstate|i|county|state)$", re.I)
+
+
+def _csz_tail_len(tokens: list) -> int:
+    """How many trailing tokens of `tokens` form a 'City ST ZIP' tail (0 = none).
+
+    Walks backwards: optional ZIP, then a state (abbreviation or full name), then up
+    to four city words — stopping at anything with a digit or a street-type word."""
+    i = len(tokens) - 1
+    if i < 0:
+        return 0
+    saw_zip = False
+    if _ZIP_RE.match(tokens[i].strip(",.")):
+        saw_zip = True
+        i -= 1
+    if i < 0:
+        return 0
+    # state: two-letter abbreviation, or a one/two-word full name
+    tok = tokens[i].strip(",.").upper()
+    two = " ".join(tokens[max(i - 1, 0):i + 1]).strip(",.").lower()
+    if len(tok) == 2 and tok in _US_STATE_ABBR:
+        i -= 1
+    elif two in _US_STATE_NAMES and i >= 1:
+        i -= 2
+    elif tokens[i].strip(",.").lower() in _US_STATE_NAMES:
+        i -= 1
+    elif not saw_zip:
+        return 0                      # neither state nor ZIP → no tail at all
+    # city words (bounded, and a comma right before the city ends the walk)
+    city_start = i + 1
+    words = 0
+    while i >= 0 and words < 4:
+        raw = tokens[i]
+        word = raw.strip(",.")
+        if not word or any(ch.isdigit() for ch in word):
+            break
+        if _STREET_TOKEN_RE.match(word):
+            break
+        low = word.lower()
+        if low in _COMPASS_ABBR:
+            break                     # "…Ave NW" — the directional belongs to the street
+        if low in _COMPASS_WORD:
+            prev = tokens[i - 1].strip(",.") if i >= 1 else ""
+            prev2 = tokens[i - 2].strip(",.") if i >= 2 else ""
+            # "500 Route 46 West" → street; "…Apt 2 North Bergen" → city
+            if any(ch.isdigit() for ch in prev) and _ROUTE_WORD_RE.match(prev2):
+                break
+        city_start = i
+        words += 1
+        if raw.endswith(","):         # "…Apt 3B, Fort Lee NJ" — comma is the boundary
+            break
+        i -= 1
+    return len(tokens) - city_start
+
+
+def _split_street_and_csz(value: str) -> tuple:
+    """Split one typed address into (street, city_state_zip).
+
+    '123 Main St, Newark NJ 07102' → ('123 Main St', 'Newark NJ 07102')
+    'Newark NJ 07102'              → ('', 'Newark NJ 07102')
+    '123 Main St'                  → ('123 Main St', '')
+    Returns ('', '') when there is nothing to split."""
+    v = " ".join((value or "").split()).strip().strip(",")
+    if not v:
+        return ("", "")
+    # A comma is the strongest boundary: take the EARLIEST one whose tail is a
+    # complete city/ST/ZIP, so "88 Ocean Ave Apt 3B, Fort Lee, NJ 07024" keeps the
+    # apartment on the street line.
+    if "," in v:
+        parts = v.split(",")
+        for k in range(len(parts) - 1):
+            tail = ",".join(parts[k + 1:]).strip()
+            street = ",".join(parts[: k + 1]).strip().strip(",")
+            tail_toks = tail.replace(",", " ").split()
+            if tail and tail_toks and _csz_tail_len(tail_toks) == len(tail_toks):
+                return (street, " ".join(tail.split()))
+    toks = v.split()
+    n = _csz_tail_len(toks)
+    if not n:
+        return (v, "")
+    cut = len(toks) - n
+    # A street of just a house number means the walk ate the street name too
+    # ("123 Broadway New York NY 10001"). Give one word back.
+    if cut == 1 and any(ch.isdigit() for ch in toks[0]) and n > 1:
+        cut += 1
+    street = " ".join(toks[:cut]).strip().strip(",")
+    csz = " ".join(toks[cut:]).strip().strip(",")
+    return (street, csz)
+
+
+# Which city/ST/ZIP field pairs with which street field.
+_ADDR_TO_CSZ_EK = {"addr": "csz", "daddr": "dcsz"}
+
+
+def _expand_address_pair(edit_key: str, value: str) -> list:
+    """Turn one (street-field, whole address) edit into the one or two edits it really
+    is, so 'address 123 Main St, Newark NJ 07102' fills BOTH the street line and the
+    city/ST/ZIP line — and both get reported as updated."""
+    csz_ek = _ADDR_TO_CSZ_EK.get(edit_key)
+    if not csz_ek:
+        return [(edit_key, value)]
+    street, csz = _split_street_and_csz(value)
+    if not csz:
+        return [(edit_key, value)]
+    if not street:                      # the value was ONLY a city/ST/ZIP
+        return [(csz_ek, csz)]
+    return [(edit_key, street), (csz_ek, csz)]
+
+
+async def _ai_split_addresses_if_needed(state_data: dict) -> list:
+    """Last resort for an address the deterministic splitter couldn't divide: ask the
+    AI to separate street from city/ST/ZIP. Only runs when a street field holds several
+    words while its city/ST/ZIP partner is still empty, so the normal case costs
+    nothing. Returns the labels that changed."""
+    if not Config.is_ai_vision_configured():
+        return []
+    changed: list = []
+    for street_ek, csz_ek in _ADDR_TO_CSZ_EK.items():
+        street_key = _INLINE_EK_STATE_KEY[street_ek]
+        csz_key = _INLINE_EK_STATE_KEY[csz_ek]
+        street_val = str(state_data.get(street_key) or "").strip()
+        csz_val = str(state_data.get(csz_key) or "").strip()
+        if csz_val and csz_val != "-":
+            continue                        # already split
+        if len(street_val.split()) < 4 or street_val == "-":
+            continue                        # too short to hold a city/ST/ZIP as well
+        try:
+            res = await asyncio.to_thread(ai_vision.split_address, street_val)
+        except Exception as e:
+            logger.warning("AI address split failed: %s", e)
+            continue
+        if not isinstance(res, dict):
+            continue
+        street, csz = res.get("street") or "", res.get("city_state_zip") or ""
+        if not csz:
+            continue
+        _apply_single_phase1_edit(state_data, csz_ek, csz)
+        changed.append(_INLINE_EDIT_KEY_LABEL[csz_ek])
+        if street and street != street_val:
+            _apply_single_phase1_edit(state_data, street_ek, street)
+            changed.append(_INLINE_EDIT_KEY_LABEL[street_ek])
+    if changed:
+        _apply_single_address_as_both(state_data)
+    return changed
+
+
 def _apply_single_address_as_both(state_data: dict) -> None:
     """When only one address is provided (registration or delivery), use it for both."""
     def _has(v: str) -> bool:
@@ -1890,13 +2170,15 @@ def _vin_check_after_phase1(state_data: dict) -> tuple:
 
 
 def _vin_choice_keyboard(api_car: str, stated_car: str) -> InlineKeyboardMarkup:
-    """Build keyboard for VIN conflict: DMV result, keep entered vehicle line, or retype VIN."""
-    _ = api_car, stated_car  # context shown in message body above the buttons
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("Use DMV system VIN", callback_data="vin_use")],
-        [InlineKeyboardButton("Continue with Same Vin", callback_data="vin_keep")],
-        [InlineKeyboardButton("Retype VIN", callback_data="vin_retype")],
-    ])
+    """Yes takes the DMV decode; No keeps the vehicle already on the card.
+
+    Retyping no longer needs a button of its own — saying or typing "retype vin"
+    still reaches the same handler, which stays registered."""
+    _ = api_car, stated_car  # context shown in the message body above the buttons
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton("✅ Yes", callback_data="vin_use"),
+        InlineKeyboardButton("❌ No", callback_data="vin_keep"),
+    ]])
 
 def _extract_email_and_dl_from_text(text: str) -> tuple[Optional[str], Optional[str]]:
     """Best-effort email + driver-license-id extraction from freeform text.
@@ -2032,6 +2314,62 @@ PH1_EDIT_TO_STATE_KEY = {
     "email": "email",
     "dl": "driver_license_id",
 }
+# ── Colour picker for the review card's Color field ─────────────────────────
+# Tapping a colour is far faster (and far less error-prone) than typing one, and the
+# same prompt still accepts typing, a voice note, or a photo of the car.
+PH1_COLOR_CB = "ph1col_"
+# Buttons show the colour NAME only. The 3-letter DMV code the tag PDF needs is
+# looked up separately (tag_pdf.color_code), never shown to the issuer.
+_PH1_COLORS = [
+    "White", "Black",
+    "Gray", "Silver",
+    "Blue - Dark", "Blue - Light",
+    "Red", "Burgundy",
+    "Green", "Green - Dark",
+    "Green - Light", "Teal",
+    "Brown", "Beige",
+    "Bronze", "Copper",
+    "Gold", "Tan",
+    "Cream", "Champagne",
+    "Orange", "Yellow",
+    "Purple", "Amethyst",
+    "Navy", "Charcoal",
+    "Maroon", "Pink",
+    "Pearl",
+]
+# A dot that hints at the actual colour, so the list is scannable at a glance.
+_PH1_COLOR_DOT = {
+    "White": "⚪", "Black": "⚫", "Gray": "🩶", "Silver": "🩶",
+    "Blue - Dark": "🔵", "Blue - Light": "🔵", "Navy": "🔵", "Teal": "🩵",
+    "Red": "🔴", "Burgundy": "🔴", "Maroon": "🔴", "Pink": "🩷",
+    "Green": "🟢", "Green - Dark": "🟢", "Green - Light": "🟢",
+    "Brown": "🟤", "Beige": "🟤", "Tan": "🟤", "Bronze": "🟤", "Copper": "🟤",
+    "Gold": "🟡", "Yellow": "🟡", "Champagne": "🟡", "Cream": "🟡",
+    "Orange": "🟠", "Purple": "🟣", "Amethyst": "🟣",
+    "Charcoal": "⚫", "Pearl": "⚪",
+}
+
+
+def _color_picker_keyboard() -> InlineKeyboardMarkup:
+    """Two-per-row colour buttons, then Cancel. Callback data is the colour itself
+    (short enough for Telegram's 64-byte limit)."""
+    rows = []
+    for i in range(0, len(_PH1_COLORS), 2):
+        rows.append([
+            InlineKeyboardButton(
+                f"{_PH1_COLOR_DOT.get(c, '🎨')} {c}",
+                callback_data=f"{PH1_COLOR_CB}{c}",
+            )
+            for c in _PH1_COLORS[i:i + 2]
+        ])
+    rows.append([InlineKeyboardButton("❌ Cancel", callback_data="edit_cancel")])
+    return InlineKeyboardMarkup(rows)
+
+
+# What the Color prompt says: every input route spelled out, because all four work.
+_PH1_COLOR_PROMPT = "✏️ type, speak, click, or upload a picture to read the color"
+
+
 PH1_EDIT_PROMPT_LABEL = {
     "fn": "First name",
     "ln": "Last name",
@@ -2672,26 +3010,24 @@ def _clean_vin_and_car(state_data: dict) -> None:
     co = state_data.get("color")
     if co is not None and str(co).strip() and str(co).strip() != "-":
         state_data["color"] = ai_vision.normalize_phase1_color(str(co))
-    # Rebuild derived fields
+    # Rebuild derived fields. Every line is coerced to a string with a "-" fallback:
+    # a card that is still EMPTY (only dispatch selections saved, no field keys yet)
+    # has these keys MISSING, and joining a None crashed the whole edit — the handler
+    # died mid-apply and the typed edit silently did nothing.
     vehicle_lines = [
-        state_data.get("name"),
-        state_data.get("address"),
-        state_data.get("city_state_zip"),
-        state_data.get("delivery_address") or "-",
-        state_data.get("delivery_city_state_zip") or "-",
-        state_data.get("vin"),
-        state_data.get("car"),
-        state_data.get("color"),
-        state_data.get("insurance_company"),
-        state_data.get("insurance_policy_number"),
-        state_data.get("extra_info"),
+        str(state_data.get(k) or "-")
+        for k in (
+            "name", "address", "city_state_zip", "delivery_address",
+            "delivery_city_state_zip", "vin", "car", "color",
+            "insurance_company", "insurance_policy_number", "extra_info",
+        )
     ]
     state_data["vehicle_details"] = "\n".join(vehicle_lines)
     delivery_lines = [
         state_data.get("delivery_address"),
         state_data.get("delivery_city_state_zip"),
     ]
-    state_data["delivery_details"] = "\n".join([l for l in delivery_lines if l])
+    state_data["delivery_details"] = "\n".join([str(l) for l in delivery_lines if l])
 
 
 _PHASE1_ADJUST_FIELD_ORDER = (
@@ -2705,6 +3041,60 @@ _PHASE1_ADJUST_LABELS = {
     "vin": "VIN", "car": "car", "color": "color", "insurance_company": "insurance",
     "insurance_policy_number": "policy #", "extra_info": "date/time",
 }
+
+
+def _apply_caption_to_lead(state_data: dict, caption: str) -> list:
+    """Read the words sent WITH a picture.
+
+    An image and its caption are ONE message, so both must land. The caption used to
+    be handed to the model as loose context only, which meant a caption like
+    "name John Damian price 150" contributed nothing when the picture itself carried
+    the vehicle. Labeled values are applied deterministically and WIN over what vision
+    made of the picture (the person typed them on purpose); an unlabeled caption still
+    gives up its phone/price/email/licence, but only into fields that are still empty.
+    Returns the labels that changed."""
+    text = (caption or "").strip()
+    if not text:
+        return []
+    labeled = _apply_inline_review_text(state_data, text)
+    if labeled:
+        return labeled
+    changed: list = []
+
+    def _empty(key: str) -> bool:
+        return str(state_data.get(key) or "").strip() in ("", "-")
+
+    phone, price, issuer_note, driver_note = _extract_phone_price_notes_from_text(text)
+    if phone and _empty("pending_phone_number"):
+        state_data["pending_phone_number"] = phone
+        changed.append("phone")
+    if price and _empty("pending_price"):
+        state_data["pending_price"] = price
+        changed.append("price")
+    email, dl = _extract_email_and_dl_from_text(text)
+    if email and _empty("email"):
+        state_data["email"] = email
+        changed.append("email")
+    if dl and _empty("driver_license_id"):
+        state_data["driver_license_id"] = dl
+        changed.append("driver license")
+    if changed:
+        _sanitize_phase1_pending_phone_price(state_data)
+    return changed
+
+
+def _ai_vin_line(structured_text: str) -> str:
+    """Whatever the AI put on the VIN line of its 11-line reply, unvalidated.
+
+    Used only to tell the issuer what was mis-read when it isn't a usable VIN —
+    reading the line itself avoids guessing at random long tokens elsewhere."""
+    try:
+        normalized = _normalize_ai_phase1_text(structured_text or "")
+        lines = [l.strip() for l in normalized.splitlines()]
+        parsed = parse_phase1_structured("\n".join(lines[: ai_vision.PHASE1_LINE_COUNT]))
+        return re.sub(r"[^A-Za-z0-9]", "", str(parsed.get("vin") or "")).upper()
+    except Exception:
+        return ""
 
 
 def _merge_phase1_adjust(state_data: dict, structured_text: str, only_empty: bool = False) -> list[str]:
@@ -2735,6 +3125,19 @@ def _merge_phase1_adjust(state_data: dict, structured_text: str, only_empty: boo
         if val != str(state_data.get(key) or "").strip():
             state_data[key] = val
             updated.append(_PHASE1_ADJUST_LABELS.get(key, key))
+    # A dictated lead often puts the whole address on the street line and leaves the
+    # city/ST/ZIP line empty — split it so both review fields are filled.
+    for _street_key, _csz_key, _csz_label in (
+        ("address", "city_state_zip", "reg city/ST/ZIP"),
+        ("delivery_address", "delivery_city_state_zip", "delivery city/ST/ZIP"),
+    ):
+        if str(state_data.get(_csz_key) or "").strip().lower() in placeholders:
+            _street, _csz = _split_street_and_csz(str(state_data.get(_street_key) or ""))
+            if _csz:
+                state_data[_csz_key] = _csz
+                state_data[_street_key] = _street or "-"
+                if _csz_label not in updated:
+                    updated.append(_csz_label)
     # Labeled extra lines (12+): Phone / Price / Email / DriverLicenseID.
     for l in lines[ai_vision.PHASE1_LINE_COUNT:]:
         if ":" not in l:
@@ -2766,7 +3169,10 @@ def _merge_phase1_adjust(state_data: dict, structured_text: str, only_empty: boo
         for key in _PHASE1_ADJUST_FIELD_ORDER:
             if state_data.get(key) is None:
                 state_data[key] = "-"
-        _clean_vin_and_car(state_data)  # rebuilds vehicle/delivery details
+        # Only one address given? Use it for both. The typed and edit paths already
+        # did this; an AI extraction (a photo of a registration, a dictated lead)
+        # did not, so the delivery line stayed "-" and the driver got no address.
+        _apply_single_address_as_both(state_data)   # also rebuilds the derived lines
     return updated
 
 
@@ -2788,6 +3194,7 @@ async def handle_phase1_adjust_input(update: Update, context: ContextTypes.DEFAU
 
     note = await message.reply_text("🤖 Reading…")
     structured = None
+    pdf_vin = None                      # exact VIN from a PDF text layer, if any
     adjust_caption = (message.caption or "").strip() or None
     # Keep the downloaded bytes so the SAME upload can both be read for fields AND ride
     # along to the dispatch group (no second download, no separate button).
@@ -2814,6 +3221,9 @@ async def handle_phase1_adjust_input(update: Update, context: ContextTypes.DEFAU
             attach_blob = raw
             if "pdf" in mime or (doc.file_name or "").lower().endswith(".pdf"):
                 attach_ftype, attach_mime, attach_filename = "document", "application/pdf", (doc.file_name or "attachment.pdf")
+                # Read the VIN from the PDF's TEXT layer — exact, where reading 17
+                # small characters off a page render regularly missed or mangled it.
+                pdf_vin = await asyncio.to_thread(ai_vision.vin_from_pdf, raw)
                 png = await asyncio.to_thread(ai_vision.pdf_first_page_to_png_bytes, raw)
                 if png:
                     structured = await asyncio.to_thread(
@@ -2856,7 +3266,52 @@ async def handle_phase1_adjust_input(update: Update, context: ContextTypes.DEFAU
         )
         return STATE_AI_REVIEW
 
+    # Captured BEFORE the merge — afterwards the new VIN is already in place and the
+    # comparison would never see a change (so the DMV check never ran).
+    vin_at_start = str(state_data.get("vin") or "").strip().upper()
     updated = _merge_phase1_adjust(state_data, structured, only_empty=fill_only_empty) if structured else []
+    # The caption is part of the same message as the picture — apply it AFTER the
+    # image so anything the sender labeled by hand wins over the vision read.
+    if is_media and adjust_caption:
+        for _lbl in _apply_caption_to_lead(state_data, adjust_caption):
+            if _lbl not in updated:
+                updated.append(_lbl)
+    # A VIN read from the PDF's text layer is exact — it beats whatever vision made of
+    # the page render (this is the "PDF parse misses the VIN" fix).
+    if pdf_vin and str(state_data.get("vin") or "").strip().upper() != pdf_vin:
+        state_data["vin"] = pdf_vin
+        _clean_vin_and_car(state_data)
+        if "VIN" not in updated:
+            updated.append("VIN")
+    # A picture of just a VIN ("VIN:4S4…") is a normal thing to send, and it used to do
+    # nothing: the 11-line parser reads only its own VIN line, and a VIN of the wrong
+    # length was blanked to "-" while the toast still said "Read: VIN".
+    vin_warning = None
+    if structured and not pdf_vin:
+        if str(state_data.get("vin") or "").strip().upper() in ("", "-"):
+            # Nothing usable on the VIN line — scan the WHOLE reply, so a VIN written
+            # in prose or on another line still lands.
+            found = ai_vision.vin_from_text(structured)
+            if found:
+                state_data["vin"] = found
+                _clean_vin_and_car(state_data)
+                if "VIN" not in updated:
+                    updated.append("VIN")
+            else:
+                # Something VIN-shaped but the wrong length: say so instead of
+                # silently showing "-". Check the AI's own VIN line as well as any
+                # labelled token, since the 11-line block carries no "VIN:" label.
+                near = ai_vision.vin_near_miss_from_text(structured) or _ai_vin_line(structured)
+                if near and len(near) != 17:
+                    vin_warning = (
+                        f"⚠️ I read the VIN as `{near}` — that's {len(near)} characters "
+                        "and a VIN is 17, so I didn't save it.\nSend a clearer picture, "
+                        "or type `vin <the 17 characters>`."
+                    )
+                if "VIN" in updated:
+                    updated.remove("VIN")          # never claim a VIN we refused
+    vin_now = str(state_data.get("vin") or "").strip().upper()
+    vin_changed = bool(vin_now) and vin_now != "-" and vin_now != vin_at_start
     db.set_user_state(user_id, "phase1", state_data)
     await _autoclean_user_msg(update, context)  # text is cleared; media is always kept
 
@@ -2887,6 +3342,13 @@ async def handle_phase1_adjust_input(update: Update, context: ContextTypes.DEFAU
         toast = ("✅ Updated: " + ", ".join(dict.fromkeys(updated))) if updated else "ℹ️ Nothing new found — the review is unchanged."
         await _send_vanishing(context, message.chat_id, toast)
         await _update_review_message_text(context, state_data)
+    if vin_warning:
+        # Stays on screen: it needs an action, unlike the vanishing toasts.
+        await message.reply_text(vin_warning, parse_mode="Markdown")
+    elif vin_changed:
+        # A VIN that just arrived from a picture/PDF is exactly when the DMV decode is
+        # wanted — run it without making the issuer hunt for the button.
+        return await _run_vin_check_for_review(update, context, user_id, state_data)
     return STATE_AI_REVIEW
 
 
@@ -3026,6 +3488,53 @@ def _parse_multi_field_line(line: str):
     return pairs or None
 
 
+def _apply_bulk_review_text(state_data: dict, text: str):
+    """Apply a MULTI-LINE paste line by line, keeping what each line gives.
+
+    The strict parser is all-or-nothing on purpose (mixed prose belongs to the AI),
+    but for a bulk send that meant one unreadable line threw away every readable one:
+    "rrod782@gmail.com / Email now / Color white" lost the colour as well. Here each
+    line is tried on its own; what is not a labeled edit comes back as leftovers for
+    the caller to place or hand to the AI. Returns (labels_applied, leftover_lines)."""
+    labels: list[str] = []
+    leftovers: list[str] = []
+    for line in [l.strip() for l in re.split(r"[\n;]+", text or "") if l.strip()]:
+        got = _apply_inline_review_text(state_data, line)
+        if got:
+            labels.extend(l for l in got if l not in labels)
+        else:
+            leftovers.append(line)
+    return labels, leftovers
+
+
+async def _place_bulk_leftover(state_data: dict, line: str) -> list:
+    """Place ONE leftover line from a bulk paste — conservatively.
+
+    Strong structured signals (email, phone, price, VIN, street address) or a
+    confident AI classification only. Deliberately NOT the loose "one to four plain
+    words must be a name" guess used for a single typed value: in a bulk paste that
+    turned a stray note into the client's name, and overwrote a good one that came
+    from an earlier line in the SAME message. A field already filled is never
+    replaced by a leftover."""
+    ek = _structured_value_ek(line)
+    value = line
+    if not ek and Config.is_ai_vision_configured():
+        try:
+            res = await asyncio.to_thread(ai_vision.classify_field_value, line)
+        except Exception as e:
+            logger.warning("bulk leftover classify failed: %s", e)
+            res = None
+        if isinstance(res, dict) and res.get("field") and res.get("field") != "unknown":
+            ek = res["field"]
+            value = str(res.get("value") or line)
+    if not ek:
+        return []
+    sk = _INLINE_EK_STATE_KEY.get(ek)
+    if sk and str(state_data.get(sk) or "").strip() not in ("", "-"):
+        return []                      # keep what the labeled lines already set
+    return _apply_ek_value(state_data, ek, value)
+
+
 def _apply_inline_review_text(state_data: dict, text: str) -> list[str]:
     """Apply typed labeled edits directly to the review. Supports MULTIPLE fields on
     one line ('price 200 address 321 Main St …') and per-line edits. EVERY non-empty
@@ -3043,6 +3552,12 @@ def _apply_inline_review_text(state_data: dict, text: str) -> list[str]:
         pending.extend(parsed)
     if not pending:
         return []
+    # A whole address typed into the street field is really two edits (street +
+    # city/ST/ZIP) — expand before tracking so BOTH are applied and reported.
+    expanded: list[tuple[str, str]] = []
+    for ek, value in pending:
+        expanded.extend(_expand_address_pair(ek, value))
+    pending = expanded
 
     tracked = {_INLINE_EK_STATE_KEY[ek] for ek, _ in pending}
     before = {k: str(state_data.get(k) or "").strip() for k in tracked}
@@ -3210,26 +3725,34 @@ def _apply_ek_value(state_data: dict, ek: str, value: str) -> list:
     value = _clean_inline_value(ek, (value or "").strip())
     if not value:
         return []
-    sk = _INLINE_EK_STATE_KEY[ek]                 # tracked state key (fn/ln -> "name")
+    # One spoken/typed address covers the street line AND the city/ST/ZIP line.
+    pairs = _expand_address_pair(ek, value)
+
     def _norm(s: str) -> str:                     # compare content, not case/spacing
         return re.sub(r"\s+", " ", str(s or "")).strip().lower()
-    before = _norm(state_data.get(sk))
-    if ek == "name":
-        parts = value.split()
-        _set_full_name(state_data, parts[0], " ".join(parts[1:]))
-    else:
-        _apply_single_phase1_edit(state_data, ek, value)
+
+    before = {p_ek: _norm(state_data.get(_INLINE_EK_STATE_KEY[p_ek])) for p_ek, _ in pairs}
+    for p_ek, p_val in pairs:
+        if p_ek == "name":
+            parts = p_val.split()
+            _set_full_name(state_data, parts[0], " ".join(parts[1:]))
+        else:
+            _apply_single_phase1_edit(state_data, p_ek, p_val)
     # Same post-processing the labeled-edit path runs, so phone/price/vin/address are
     # normalized and a rejected value never reports a false change.
     _apply_single_address_as_both(state_data)
     _clean_vin_and_car(state_data)
     _sanitize_phase1_pending_phone_price(state_data)
-    now = str(state_data.get(sk) or "").strip()
     # Case/whitespace-insensitive diff — the applied value is re-normalized on write
     # (e.g. colors title-cased), so a pure re-normalization is not a real change.
-    if now and now != "-" and _norm(now) != before:
-        return [_INLINE_EDIT_KEY_LABEL.get(ek, ek)]
-    return []
+    changed: list = []
+    for p_ek, _ in pairs:
+        now = str(state_data.get(_INLINE_EK_STATE_KEY[p_ek]) or "").strip()
+        if now and now != "-" and _norm(now) != before.get(p_ek):
+            label = _INLINE_EDIT_KEY_LABEL.get(p_ek, p_ek)
+            if label not in changed:
+                changed.append(label)
+    return changed
 
 
 async def _smart_place_single_value(state_data: dict, value: str) -> list:
@@ -3265,8 +3788,11 @@ async def _smart_place_single_value(state_data: dict, value: str) -> list:
 # a field value. So a select/submit/VIN command that didn't classify shows the hint
 # instead of turning 'choose the driver kita' or 'submit' into a name.
 _COMMAND_LIKE_RE = re.compile(
-    r"^\s*(?:choose|select|pick|assign|use|go\s+with|send|submit|dispatch|deploy|ship|"
-    r"done|finish|run|check|look\s*up|lookup|decode|verify)\b"
+    # A bare yes/no is an ANSWER, never a field value — without this a stray "yes"
+    # (e.g. after a redeploy dropped the question) was filed as the client's name.
+    r"^\s*(?:y|n|yes|no|yeah|yep|yup|nope|nah|sure|ok|okay)\b[\s.!,]*$"
+    r"|^\s*(?:choose|select|pick|assign|use|go\s+with|send|submit|dispatch|deploy|ship|"
+    r"done|finish(?:ed|ing)?|run|check|look\s*up|lookup|decode|verify)\b"
     # a bare select-noun at the START ('driver', 'the dispatcher', 'group …') — anchored
     # so a real surname/company containing the word (e.g. 'Ryan Driver', 'Acme Group')
     # is still placed as a value.
@@ -3283,6 +3809,15 @@ _SELECT_SOURCE_RE = re.compile(rf"^\s*{_CMD_VERB}\s*{_ART}(?:contact\s+source|le
 # group. The DELIVERY people stay "drivers": 'choose driver X' selects a driver.
 _SELECT_GROUP_RE = re.compile(rf"^\s*{_CMD_VERB}\s*{_ART}(?:group|team|crew|dispatchers?|dispatch|disp)\s+(.+)$", re.I)
 _SELECT_DRIVER_RE = re.compile(rf"^\s*{_CMD_VERB}\s*{_ART}(?:drivers?|drv)\s+(.+)$", re.I)
+# The VIN prompt asks a Yes/No question, so it must accept those words — typed or
+# spoken. Deliberately NOT part of the general review classifier: a bare "yes" only
+# means "use the DMV result" while that question is actually on screen.
+_YES_RE = re.compile(
+    r"^\s*(?:y|ya|yes|yea|yeah|yep|yup|sure|ok|okay|correct|right|affirmative|"
+    r"use\s+it|use\s+that|do\s+it|go\s+ahead|please\s+do)\b[\s.!,]*$", re.I)
+_NO_RE = re.compile(
+    r"^\s*(?:n|no|nope|nah|negative|don'?t|do\s+not|keep\s+it|keep\s+mine|"
+    r"leave\s+it|skip|pass)\b[\s.!,]*$", re.I)
 _VIN_KEEP_RE = re.compile(r"\b(keep|same|leave\s+it|leave\s+alone|as\s+is|as-is|don'?t\s+change|current|mine|stated|original)\b", re.I)
 _VIN_RETYPE_RE = re.compile(r"\b(retype|re-?enter|redo|fix|correct)\b.*\bvin\b|\btype\b.*\bvin\b.*\bagain\b", re.I)
 _VIN_USE_RE = re.compile(r"\buse\b.*\b(vin|dmv|new|decoded|lookup|api|theirs?|that)\b", re.I)
@@ -3294,11 +3829,129 @@ _ALL_SELECT_RE = re.compile(r"^\s*(?:all|every\s*one|everybody|everything)\b", r
 # message match so "send to HighKage" (a group pick) and "send driver note …" are
 # NOT caught here.
 _SUBMIT_RE = re.compile(
-    r"^\s*(?:submit|send|dispatch|deploy|ship|done|go\s*ahead|finish(?:\s*up)?|"
-    r"send\s*out|push(?:\s*it)?)"
-    r"(?:\s+(?:the|this|that|my|it|out|now|please|lead|leads|tag|client|sale))*\s*[.!]*$",
+    # The verb. "finished"/"finishing" are spoken far more often than "finish".
+    r"^\s*(?:submit|send|dispatch|deploy|ship|done|go\s*ahead|"
+    r"finish(?:ed|ing)?(?:\s*up)?|send\s*out|push(?:\s*it)?)"
+    # Optional trailing nouns. "dispatch" is here as well as in the verb list so
+    # "send dispatch" and "finished dispatch" both read as one whole command.
+    r"(?:\s+(?:the|this|that|my|it|out|now|please|lead|leads|tag|tags|"
+    r"client|sale|dispatch))*\s*[.!,]*$",
     re.I,
 )
+
+
+# ── Several selections in one message ───────────────────────────────────────
+# "driver Kita dispatch HighKage" is TWO instructions. The single-selection regexes
+# are greedy — the first noun swallowed the rest, so the bot hunted for a driver
+# literally called "Kita dispatch HighKage" and the dispatcher was lost. This splits
+# the line at each selection noun, the same way labeled field edits are split.
+_SELECT_ALIAS_KIND = {
+    "driver": "SELECT_DRIVER", "drivers": "SELECT_DRIVER", "drv": "SELECT_DRIVER",
+    "dispatcher": "SELECT_GROUP", "dispatchers": "SELECT_GROUP",
+    "dispatch": "SELECT_GROUP", "disp": "SELECT_GROUP",
+    "group": "SELECT_GROUP", "groups": "SELECT_GROUP",
+    "team": "SELECT_GROUP", "teams": "SELECT_GROUP",
+    "crew": "SELECT_GROUP", "crews": "SELECT_GROUP",
+    "contact source": "SELECT_SOURCE", "lead source": "SELECT_SOURCE",
+    "contact info": "SELECT_SOURCE", "source": "SELECT_SOURCE", "origin": "SELECT_SOURCE",
+}
+# Longest first so "contact source" wins over "source".
+_SELECT_ALIAS_RE = re.compile(
+    r"\b(" + "|".join(re.escape(k) for k in sorted(_SELECT_ALIAS_KIND, key=len, reverse=True))
+    + r")\b", re.I)
+# Words allowed before the first noun without making the line prose.
+_SELECT_LEAD_FILLERS = frozenset({
+    "choose", "select", "pick", "set", "use", "assign", "send", "dispatch", "to", "the",
+    "a", "an", "my", "this", "and", "please", "for", "with", "go", "id",
+})
+# Separators between one selection and the next ("Kita and dispatcher HighKage").
+_SELECT_TAIL_RE = re.compile(r"(?:\s+and|\s*[,;/]+)\s*$", re.I)
+# Words that never appear in a dispatcher/driver/source NAME. Their presence means the
+# line is prose that happens to contain "driver" and "dispatch" ("the driver said
+# dispatch was late"), not a list of picks.
+_SELECT_NOT_A_NAME = frozenset({
+    "said", "says", "say", "was", "were", "is", "are", "am", "be", "been", "being",
+    "will", "would", "should", "could", "can", "cant", "has", "have", "had", "did",
+    "does", "do", "went", "going", "came", "coming", "arrived", "arriving", "called",
+    "calling", "told", "tell", "late", "early", "needs", "need", "wants", "wanted",
+    "because", "when", "then", "why", "how", "not", "no", "yet", "still", "just",
+})
+
+
+def _looks_like_a_pick_name(name: str) -> bool:
+    """A dispatcher/driver/source name: a few words, none of them sentence words."""
+    words = [w.strip(".,;:'\"").lower() for w in (name or "").split()]
+    if not words or len(words) > 4:
+        return False
+    return not any(w in _SELECT_NOT_A_NAME for w in words)
+
+
+def _parse_multi_select_line(text: str):
+    """Split "driver Kita dispatch HighKage" into [(SELECT_DRIVER,'Kita'),
+    (SELECT_GROUP,'HighKage')]. Returns None unless the line really is two or more
+    clean selections, so a single one keeps its existing (tested) handling."""
+    line = (text or "").strip()
+    matches = list(_SELECT_ALIAS_RE.finditer(line))
+    if len(matches) < 2:
+        return None
+    head = line[: matches[0].start()]
+    for tok in re.split(r"[\s,]+", head.strip().lower()):
+        tok = tok.strip(".:;-_'\"")
+        if tok and tok not in _SELECT_LEAD_FILLERS:
+            return None                       # prose, not a list of selections
+    out = []
+    for i, m in enumerate(matches):
+        kind = _SELECT_ALIAS_KIND.get(re.sub(r"\s+", " ", m.group(1).lower().strip()))
+        end = matches[i + 1].start() if i + 1 < len(matches) else len(line)
+        name = line[m.end():end]
+        name = re.sub(r"^\s*(?:to|is|are|=|:)\s+", " ", name).strip(" ,:;-")
+        name = _SELECT_TAIL_RE.sub("", name).strip(" ,:;-")
+        if not kind or not name:
+            continue
+        if not _looks_like_a_pick_name(name):
+            return None                       # prose, not a list of picks
+        out.append((kind, name))
+    # Two nouns but one had no name ("driver dispatch Kita") is not a clean list.
+    return out if len(out) >= 2 else None
+
+
+async def _apply_selection(kind: str, payload: str, state_data: dict, user_id: int):
+    """Apply ONE dispatcher/driver/source pick. Returns (ok, note) so the single and
+    multi paths share the same matching rules and can never drift apart."""
+    payload = (payload or "").strip()
+    if kind == "SELECT_GROUP":
+        if _ALL_SELECT_RE.match(payload):
+            _select_group(state_data, user_id, "all")
+            return True, "Dispatcher → All Dispatchers"
+        g = _match_name(payload, [x for x in db.get_all_groups() if record_is_active(x)],
+                        "group_name")
+        if not g:
+            return False, f"No dispatcher matched “{payload}”"
+        _select_group(state_data, user_id, g)
+        return True, f"Dispatcher → {g.get('group_name', '?')}"
+    if kind == "SELECT_DRIVER":
+        if _ALL_SELECT_RE.match(payload):
+            _select_driver(state_data, user_id, "all")
+            return True, "Driver → All Drivers"
+        active = [d for d in _get_all_drivers_cached() if record_is_active(d)]
+        suspended = _get_suspended_driver_ids()
+        eligible = [d for d in active if str(d.get("id")) not in suspended]
+        d = _match_name(payload, eligible, "driver_name")
+        if not d:
+            susp = _match_name(payload, [x for x in active if str(x.get("id")) in suspended],
+                               "driver_name")
+            if susp:
+                return False, f"{susp.get('driver_name', 'Driver')} is suspended (PENALTY)"
+            return False, f"No driver matched “{payload}”"
+        _select_driver(state_data, user_id, d)
+        return True, f"Driver → {d.get('driver_name', '?')}"
+    if kind == "SELECT_SOURCE":
+        s = _match_name(payload, db.get_contact_info_sources(), "label")
+        if not s:
+            return False, f"No source matched “{payload}”"
+        _select_source(state_data, user_id, s)
+        return True, f"Source → {s.get('label', '?')}"
+    return False, ""
 
 
 def _classify_review_command(text: str):
@@ -3326,6 +3979,11 @@ def _classify_review_command(text: str):
     # A2) submit / send the lead
     if _SUBMIT_RE.match(t):
         return ("SUBMIT", None)
+    # B0) several selections in one message ("driver Kita dispatch HighKage") —
+    # checked before the single-selection regexes, which would swallow the rest.
+    multi = _parse_multi_select_line(t)
+    if multi:
+        return ("SELECTIONS", multi)
     # B) selections: source → group → driver (distinct nouns, order avoids overlap)
     m = _SELECT_SOURCE_RE.match(t)
     if m:
@@ -3512,6 +4170,29 @@ async def _interpret_review_command(update, context, user_id, state_data, text):
         await _cleanup_voice_echo(context, chat_id)
         return await _continue_phase1_after_ai_review(update.message, context, user_id)
 
+    if kind == "SELECTIONS":
+        # "driver Kita dispatch HighKage" — apply every pick in one go, then report
+        # once. Anything that didn't match is named, so nothing fails silently.
+        done, failed = [], []
+        for one_kind, one_name in payload:
+            ok, note = await _apply_selection(one_kind, one_name, state_data, user_id)
+            (done if ok else failed).append(note)
+        db.set_user_state(user_id, "phase1", state_data)
+        await _update_review_message_text(context, state_data)
+        lines = ([f"✅ {n}" for n in done] + [f"🤔 {n}" for n in failed])
+        await _finish("\n".join(lines) if lines else None)
+        if failed and chat_id:
+            # Offer a picker for whichever kind didn't match, so a typo is one tap
+            # from being fixed rather than needing the whole line retyped.
+            joined = " ".join(failed).lower()
+            if "driver" in joined:
+                await _open_driver_picker(context)
+            elif "dispatcher" in joined:
+                await _open_group_picker(context)
+            elif "source" in joined:
+                await _open_source_picker(context)
+        return STATE_AI_REVIEW
+
     if kind == "SELECT_GROUP":
         if _ALL_SELECT_RE.match(payload or ""):
             _select_group(state_data, user_id, "all")
@@ -3637,7 +4318,7 @@ async def handle_phase1_review_message(update: Update, context: ContextTypes.DEF
     if message and not context.user_data.get("review_message_id") and update.effective_user:
         try:
             _st = db.get_user_state(update.effective_user.id)
-            if _st and _st.get("state") == "phase1":
+            if _st and _st.get("state") in _LEAD_REVIEWABLE_DB_STATES:
                 await _repost_review_card(message, dict(_st.get("data") or {}), context, update.effective_user.id)
         except Exception as e:
             logger.warning("review card self-heal failed: %s", e)
@@ -3656,13 +4337,39 @@ async def handle_phase1_review_message(update: Update, context: ContextTypes.DEF
         return await _do_cancel_or_restart(update, context, _cr)
 
     user_id = update.effective_user.id
-    state = db.get_user_state(user_id)
+    try:
+        state = db.get_user_state(user_id)
+    except Exception as e:
+        # A storage hiccup must NOT kill the edit silently — tell the user to retry.
+        logger.warning("review_msg: get_user_state failed: %s", e)
+        await _send_vanishing(
+            context,
+            update.effective_chat.id if update.effective_chat else message.chat_id,
+            "⚠️ Storage hiccup — please send that again in a few seconds.",
+        )
+        return STATE_AI_REVIEW
     logger.info("🔎DIAG review_msg uid=%s text=%r has_review_id=%s db_state=%s data_empty=%s",
                 user_id, text[:60], bool(context.user_data.get("review_message_id")),
                 (state or {}).get("state"), not bool((state or {}).get("data")))
     if not state or not state.get("data"):
+        # A live card in RAM + an empty DB read is usually a transient storage miss,
+        # not a real wipe (a wipe clears user_data in the same process). Warn once
+        # and let the user resend; a SECOND consecutive miss means the row really
+        # is gone — drop the stale card ids so we never loop on the warning.
+        if context.user_data.get("review_message_id") and not context.user_data.get("state_miss_once"):
+            context.user_data["state_miss_once"] = True
+            await _send_vanishing(
+                context,
+                update.effective_chat.id if update.effective_chat else message.chat_id,
+                "⚠️ Storage hiccup — please send that again in a few seconds.",
+            )
+            return STATE_AI_REVIEW
+        context.user_data.pop("state_miss_once", None)
+        context.user_data.pop("review_message_id", None)
+        context.user_data.pop("review_chat_id", None)
         await message.reply_text("❌ Data lost. Please start over with /start")
         return ConversationHandler.END
+    context.user_data.pop("state_miss_once", None)
     state_data = state["data"]
 
     # 0. Insurance on/off by voice/text ("add insurance", "no insurance") — before the
@@ -3709,6 +4416,7 @@ async def handle_phase1_review_message(update: Update, context: ContextTypes.DEF
     # 1. Labeled field edits (incl. multi-field one-liners) → apply, delete msg, toast.
     updated = _apply_inline_review_text(state_data, text)
     if updated:
+        updated += await _ai_split_addresses_if_needed(state_data)
         db.set_user_state(user_id, "phase1", state_data)
         chat_id = update.effective_chat.id if update.effective_chat else message.chat_id
         try:
@@ -3724,6 +4432,32 @@ async def handle_phase1_review_message(update: Update, context: ContextTypes.DEF
     handled = await _interpret_review_command(update, context, user_id, state_data, text)
     if handled is not None:
         return handled
+
+    # 2b. BULK PASTE: several lines where only some are labeled edits. Apply those,
+    #     then let each remaining line find its own field (a bare email, phone, price
+    #     or colour places itself). Only what is still unplaced goes to the AI — one
+    #     unreadable line used to discard every readable one in the same message.
+    if "\n" in text or ";" in text:
+        bulk_labels, leftovers = _apply_bulk_review_text(state_data, text)
+        if bulk_labels:
+            still: list[str] = []
+            for line in leftovers:
+                placed = ([] if _COMMAND_LIKE_RE.search(line)
+                          else await _place_bulk_leftover(state_data, line))
+                if placed:
+                    bulk_labels.extend(p for p in placed if p not in bulk_labels)
+                else:
+                    still.append(line)
+            bulk_labels += await _ai_split_addresses_if_needed(state_data)
+            db.set_user_state(user_id, "phase1", state_data)
+            chat_id = update.effective_chat.id if update.effective_chat else message.chat_id
+            await _cleanup_voice_echo(context, chat_id)
+            note = "✅ Updated: " + ", ".join(dict.fromkeys(bulk_labels))
+            if still:
+                note += "\n🤔 Not understood: " + "; ".join(still[:3])
+            await _send_vanishing(context, chat_id, note, delay=8.0)
+            await _update_review_message_text(context, state_data)
+            return STATE_AI_REVIEW
 
     # 3a. A real multi-field block (a paste OR a dictated lead naming several fields,
     #     e.g. a whole lead spoken in one voice note) → AI re-parse fills every field.
@@ -3744,6 +4478,7 @@ async def handle_phase1_review_message(update: Update, context: ContextTypes.DEF
     chat_id = update.effective_chat.id if update.effective_chat else message.chat_id
     updated = [] if _COMMAND_LIKE_RE.search(text) else await _smart_place_single_value(state_data, text)
     if updated:
+        updated += await _ai_split_addresses_if_needed(state_data)
         db.set_user_state(user_id, "phase1", state_data)
         await _cleanup_voice_echo(context, chat_id)
         await _send_vanishing(context, chat_id, "✅ Updated: " + ", ".join(dict.fromkeys(updated)))
@@ -3762,7 +4497,13 @@ async def _transcribe_update_voice(update: Update, context: ContextTypes.DEFAULT
     media = getattr(msg, "voice", None) or getattr(msg, "audio", None)
     if not media:
         return None
-    note = await msg.reply_text("🎙️ Transcribing…")
+    # A failed status send must not abort the pipeline — the transcript injection
+    # below is what makes the voice note act as typed text.
+    note = None
+    try:
+        note = await msg.reply_text("🎙️ Transcribing…")
+    except Exception as e:
+        logger.warning("Transcribing note send failed: %s", e)
     transcript = None
     try:
         f = await context.bot.get_file(media.file_id)
@@ -3778,7 +4519,8 @@ async def _transcribe_update_voice(update: Update, context: ContextTypes.DEFAULT
     except Exception as e:
         logger.warning("Voice download/transcription failed: %s", e)
         transcript = None
-    await _safe_delete_chat_message(context, note.chat_id, note.message_id)
+    if note:
+        await _safe_delete_chat_message(context, note.chat_id, note.message_id)
     return transcript
 
 
@@ -3810,7 +4552,284 @@ async def _global_voice_to_text(update: Update, context: ContextTypes.DEFAULT_TY
     heard = await msg.reply_text("🎙️ Heard: " + transcript)
     # Stash the echo id so a review command can delete it ("my text disappears").
     context.user_data["voice_echo_msg_id"] = heard.message_id
-    # Return normally → update continues to group 0 handlers, now as a text message.
+    # Return normally → update continues to later groups, now as a text message.
+
+
+# ── Review edits from ANY state: the state-independent safety net ────────────
+# Conversation states that HAVE a text listener, so typed/voice edits are handled
+# by the conversation itself and the group -2 safety net below must stand down.
+# Any state NOT in this set (a legacy/future button-only state) would silently
+# swallow text — those are exactly what the safety net catches.
+_REVIEW_TEXT_CAPABLE_STATES = frozenset({
+    STATE_PHASE1, STATE_PHASE2, STATE_AI_REVIEW, STATE_ADJUST_INPUT,
+    STATE_AI_EDIT_MENU, STATE_AI_EDIT_INPUT, STATE_EDIT_FIELD_PROMPT,
+    STATE_MISSING_FIELD, STATE_SPECIAL_REQUEST_ISSUERS, STATE_SPECIAL_REQUEST_DRIVERS,
+    STATE_VIN_CHOICE, STATE_VIN_RETYPE,
+    STATE_SELECT_GROUP, STATE_SELECT_DRIVER, STATE_SELECT_CONTACT_SOURCE,
+})
+
+# The main lead ConversationHandler, so the safety net can read (and repair) its
+# in-memory state. Set once in main(); stays None in unit tests.
+_MAIN_CONV_HANDLER = None
+# The /settings ConversationHandler — the plate-image reader must NOT defer to it.
+_SETTINGS_CONV_HANDLER = None
+
+
+def _main_conv_state(update: Update):
+    """The main lead conversation's ACTIVE in-memory state for this chat/user, or
+    None when idle. Reads the same PTB internals as _user_in_active_conversation;
+    degrades to None if they ever change."""
+    h = _MAIN_CONV_HANDLER
+    if h is None:
+        return None
+    try:
+        return h._conversations.get(h._get_key(update))
+    except Exception:
+        return None
+
+
+def _nonlead_conv_active(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    """True when a conversation OTHER than the main lead flow (receipt, appeal,
+    follow-up, settings) is active for this chat/user — their text inputs must win."""
+    try:
+        groups = context.application.handlers
+    except Exception:
+        return False
+    for group in groups.values():
+        for h in group:
+            if isinstance(h, ConversationHandler) and h is not _MAIN_CONV_HANDLER:
+                try:
+                    if h._conversations.get(h._get_key(update)) is not None:
+                        return True
+                except Exception:
+                    continue
+    return False
+
+
+async def handle_review_edit_anywhere(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Group -2 safety net: a typed/spoken edit for a LIVE review card is never
+    dropped, no matter which state PTB's conversation is in. Fires only when the
+    main conversation sits in a state with no text listener while the DB still
+    holds the live "phase1" lead. Everything else passes through untouched: idle
+    text keeps flowing to handle_idle_lead_start (which re-enters the review),
+    and text-capable states keep their own handlers."""
+    msg = update.effective_message
+    if not msg or not update.effective_user:
+        return
+    text = (msg.text or "").strip()
+    if not text:
+        return
+    if _cancel_restart_kind(text):
+        return  # cancel/restart keep their normal (state-aware) handling
+    conv_state = _main_conv_state(update)
+    if conv_state is None or conv_state in _REVIEW_TEXT_CAPABLE_STATES:
+        return
+    if _nonlead_conv_active(update, context):
+        return
+    user_id = update.effective_user.id
+    try:
+        db_state = db.get_user_state(user_id)
+    except Exception as e:
+        logger.warning("review-anywhere: get_user_state failed: %s", e)
+        return
+    if not db_state or db_state.get("state") not in _LEAD_REVIEWABLE_DB_STATES or not db_state.get("data"):
+        return
+    logger.info("🔎DIAG review-anywhere FIRED uid=%s conv_state=%r text=%r",
+                user_id, conv_state, text[:60])
+    result = await handle_phase1_review_message(update, context)
+    # Re-arm (or clear) the conversation to match what the review handler decided,
+    # so the card's buttons work again after a ghost-state rescue.
+    try:
+        h = _MAIN_CONV_HANDLER
+        key = h._get_key(update)
+        if result == ConversationHandler.END:
+            h._conversations.pop(key, None)
+        else:
+            h._conversations[key] = result if result is not None else STATE_AI_REVIEW
+    except Exception:
+        pass  # edits still work (this net keeps catching them); only buttons lag
+    raise ApplicationHandlerStop
+
+
+class _TypedAsTap:
+    """Presents a typed or spoken answer to code written for a button tap.
+
+    Reassigning should not require tapping: saying the driver's name is faster, and
+    the resend/pick handlers only touch a handful of attributes, so a shim lets them
+    run unchanged instead of duplicating their logic."""
+
+    class _Query:
+        def __init__(self, message, data, from_user):
+            self.message = message
+            self.data = data
+            self.from_user = from_user
+
+        async def answer(self, *a, **k):
+            return None
+
+    def __init__(self, update: Update, data: str):
+        self.callback_query = self._Query(update.effective_message, data,
+                                          update.effective_user)
+        self.effective_user = update.effective_user
+        self.effective_chat = update.effective_chat
+        self.effective_message = update.effective_message
+        self.message = update.effective_message
+
+
+async def handle_media_in_any_state(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Optional[int]:
+    """A picture or PDF sent at ANY step of the lead flow is read into the card.
+
+    Eight states accepted typed text but registered no photo handler, so an image sent
+    while (say) the DMV question or a picker was on screen was dropped by PTB with no
+    reply at all. Returns None so the conversation STAYS where it was — the question or
+    picker above is still answerable once the image has been read."""
+    msg = update.effective_message
+    if not msg or not (msg.photo or msg.document):
+        return None
+    try:
+        st = db.get_user_state(update.effective_user.id) if update.effective_user else None
+    except Exception as e:
+        logger.warning("media-any-state: get_user_state failed: %s", e)
+        st = None
+    if st and st.get("state") in _LEAD_REVIEWABLE_DB_STATES and st.get("data"):
+        await handle_phase1_adjust_input(update, context)
+        return None
+    # Past the review (a dispatch pick, a resend) there is no card to fold it into.
+    await _send_vanishing(
+        context, msg.chat_id,
+        "📎 This lead is already out — use the buttons above, or start a new tag to add files.",
+        delay=8.0,
+    )
+    return None
+
+
+async def handle_select_state_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Optional[int]:
+    """Typed/voice text while a button picker (dispatcher/driver/source) is on screen.
+
+    With a live phase1 lead it is a review edit or spoken command ("driver John",
+    "price 150"). While REASSIGNING an already-sent lead it is the name of the driver
+    or dispatcher to hand it to — matched the same way the buttons resolve, so
+    tapping, typing and speaking all reach the same code."""
+    msg = update.effective_message
+    text = ((msg.text if msg else "") or "").strip()
+    if not text:
+        return None
+    _cr = _cancel_restart_kind(text)
+    if _cr:
+        return await _do_cancel_or_restart(update, context, _cr)
+    st = None
+    try:
+        st = db.get_user_state(update.effective_user.id) if update.effective_user else None
+    except Exception as e:
+        logger.warning("select-state text: get_user_state failed: %s", e)
+    state_name = (st or {}).get("state")
+    lead_data = (st or {}).get("data") or {}
+    if state_name == "phase1" and lead_data:
+        return await handle_phase1_review_message(update, context)
+    user_id = update.effective_user.id if update.effective_user else 0
+
+    if state_name == "select_driver":
+        active = [d for d in _get_all_drivers_cached() if record_is_active(d)]
+        suspended = _get_suspended_driver_ids()
+        eligible = [d for d in active if str(d.get("id")) not in suspended]
+        if _ALL_SELECT_RE.match(text):
+            picked = "select_driver_all"
+        else:
+            d = _match_name(text, eligible, "driver_name")
+            if not d:
+                susp = _match_name(text, [x for x in active if str(x.get("id")) in suspended],
+                                   "driver_name")
+                if susp and msg:
+                    await msg.reply_text(
+                        f"🚫 {susp.get('driver_name', 'That driver')} is suspended (PENALTY). "
+                        "Pick someone else, or say another name.")
+                elif msg:
+                    await msg.reply_text(
+                        f"🤔 No driver matched “{text}”. Tap one above, or say the name again.")
+                return None
+            picked = f"select_driver_{d.get('id')}"
+        return await _handle_resend_to_drivers(
+            _TypedAsTap(update, picked), context, lead_data, picked, user_id)
+
+    if state_name == "select_group":
+        g = ("all" if _ALL_SELECT_RE.match(text)
+             else _match_name(text, [x for x in db.get_all_groups() if record_is_active(x)],
+                              "group_name"))
+        if not g:
+            if msg:
+                await msg.reply_text(
+                    f"🤔 No dispatcher matched “{text}”. Tap one above, or say the name again.")
+            return None
+        picked = "select_group_all" if g == "all" else f"select_group_{g.get('id')}"
+        return await handle_group_selection(_TypedAsTap(update, picked), context)
+
+    if msg:
+        await _send_vanishing(context, msg.chat_id, "☝️ Tap a button above to continue.")
+    return None
+
+
+# ── Commands without the slash ───────────────────────────────────────────────
+# Saying or typing the bare word runs the command: "settings" == "/settings". The
+# message is rewritten into a real command (text + bot_command entity) and allowed to
+# flow on, so PTB routes it through the SAME handler as the typed slash — identical
+# behaviour everywhere, with no per-handler wiring to drift.
+# Only the whole message counts, so a value that merely contains one of these words
+# is untouched.
+_BARE_COMMANDS = {
+    "help": "help", "commands": "help", "how do i use this": "help",
+    "settings": "settings", "setting": "settings",
+    "receipt": "receipt", "receipts": "receipt", "recipts": "receipt",
+    "whoami": "whoami", "who am i": "whoami", "my id": "whoami", "me": "whoami",
+    "followup": "followup", "follow up": "followup", "prospect": "followup",
+    "followups": "followups", "follow ups": "followups", "my clients": "followups",
+    "all followups": "allfollowups", "allfollowups": "allfollowups",
+    "announce": "announce", "announcement": "announce", "broadcast": "announce",
+    "driverblock": "driverblock", "driver block": "driverblock",
+    "appeal": "appeal",
+    "test": "test",
+}
+# Filler that speech puts on either end ("open settings", "settings, please.").
+_BARE_CMD_LEAD_RE = re.compile(r"^(?:please|open|show\s+me|show|go\s+to|take\s+me\s+to)\s+", re.I)
+_BARE_CMD_TAIL_RE = re.compile(r"[\s,]*please$", re.I)
+
+
+def _bare_command_for(text: str):
+    """The command a bare word means, or None. Whole-message match only."""
+    phrase = re.sub(r"\s+", " ", (text or "").strip().lower()).strip(" .,!?")
+    phrase = _BARE_CMD_LEAD_RE.sub("", phrase).strip()
+    phrase = _BARE_CMD_TAIL_RE.sub("", phrase).strip(" .,!?")
+    if not phrase:
+        return None
+    return _BARE_COMMANDS.get(phrase)
+
+
+async def _bare_command_to_slash(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Rewrite a bare command word into the real command, then let it flow on.
+
+    Runs after voice transcription, so a SPOKEN command works the same as a typed
+    one. Never consumes the update: PTB's own CommandHandlers do the work."""
+    msg = update.effective_message
+    text = ((msg.text if msg else "") or "").strip()
+    if not msg or not text or text.startswith("/"):
+        return
+    # cancel / restart (and "new lead", "temp tag", …) already have a tested word
+    # family — reuse it so those phrases behave identically to their slash command.
+    cmd = _cancel_restart_kind(text) or None
+    if cmd is None:
+        # A prompt that is explicitly waiting for a typed VALUE must keep it: a client
+        # source really could be called "Test", and a field value could be "Me".
+        if context.user_data and (context.user_data.get("tset_await")
+                                  or context.user_data.get("phase1_pending_edit_key")):
+            return
+        cmd = _bare_command_for(text)
+    if not cmd:
+        return
+    slash = f"/{cmd}"
+    object.__setattr__(msg, "text", slash)
+    object.__setattr__(msg, "entities", (
+        MessageEntity(type=MessageEntity.BOT_COMMAND, offset=0, length=len(slash)),
+    ))
+    logger.info("bare command %r -> %s", text[:40], slash)
 
 
 async def _begin_lead_flow(
@@ -3882,12 +4901,30 @@ _RESTART_RE = re.compile(
 )
 
 
+# "New lead" / "New client" / "New tag" / "Temp tag" — spoken or typed, in ANY state —
+# mean the same as /lead: drop whatever is in progress and open a fresh review card.
+# A qualifier ("new", "another", "start a", "temp") is REQUIRED so a bare "tag" or
+# "client" inside a value can never wipe a card the issuer is filling in.
+_NEW_LEAD_RE = re.compile(
+    r"^\s*(?:(?:new|another|next|start|create|add|a|the)\s+)+"
+    r"(?:temp(?:orary)?\s+)?(?:lead|client|customer|tag|sale|entry|order)s?\s*[.!]*\s*$"
+    r"|^\s*temp(?:orary)?\s+tags?\s*[.!]*\s*$",
+    re.I,
+)
+
+
 def _cancel_restart_kind(text: str):
     """'restart' | 'cancel' | None for a whole-message cancel/restart phrase."""
     t = (text or "").strip()
     if not t:
         return None
     if _RESTART_RE.match(t):
+        return "restart"
+    # Asking for a new lead IS a restart: wipe the current card, open a fresh one.
+    # Handled here so it works in every state that already honours cancel/restart —
+    # the review card, the pickers, a field prompt, phase 1/2 and idle chat — instead
+    # of being filed as a field value (it used to become the client's NAME).
+    if _NEW_LEAD_RE.match(t):
         return "restart"
     if _CANCEL_RE.match(t):
         return "cancel"
@@ -3900,8 +4937,12 @@ def _cancel_restart_kind_from_update(update: Update):
 
 
 async def _do_cancel_or_restart(update: Update, context: ContextTypes.DEFAULT_TYPE, kind: str) -> int:
-    """Wipe the current lead flow. 'restart' opens a fresh empty review to enter a new
-    tag right away; 'cancel' drops to idle. Shared by the bare-word guard and /restart."""
+    """Wipe the current lead flow and open a fresh review card.
+
+    CANCEL AND RESTART ARE THE SAME ACTION — by request. Whether it arrives as
+    /cancel, /restart, or the spoken/typed word, the result is identical: drop
+    whatever is in progress and hand back an empty card, ready for the next tag.
+    ``kind`` only decides the wording of the confirmation."""
     msg = update.effective_message
     user_id = update.effective_user.id
     username = update.effective_user.username or "Unknown"
@@ -3911,12 +4952,7 @@ async def _do_cancel_or_restart(update: Update, context: ContextTypes.DEFAULT_TY
         pass
     _clear_lead_conversation_user_data(context)
     db.clear_user_state(user_id)
-    if kind == "restart":
-        return await _begin_lead_flow_with_review(context, user_id, username, msg)
-    await msg.reply_text(
-        "❌ Cancelled. Say “restart” or “new client” (or just send the info) to start a new tag."
-    )
-    return ConversationHandler.END
+    return await _begin_lead_flow_with_review(context, user_id, username, msg)
 
 
 async def restart_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -3962,6 +4998,21 @@ async def begin_lead_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
         return await handle_phase1(update, context)
     return await _begin_lead_flow_with_review(context, user_id, username, msg)
 
+
+# DB lead states with a live BUTTON PICKER (dispatcher/driver pick after the lead
+# was saved). A stray text while the in-memory conversation is gone (redeploy) must
+# never fall through to a NEW lead — _begin_lead_flow would clear the saved row and
+# destroy the in-flight pick. The pickers' buttons re-enter on their own. NOT here:
+# "special_request_drivers" (no lead row yet → safely re-enters the review card) and
+# "await_group_accept" (lead fully dispatched → the issuer's next text should start
+# their next lead, as before).
+_LEAD_MID_DISPATCH_STATES = frozenset({"select_group", "select_driver"})
+
+# DB states whose data blob is still the editable phase1 card: the plain review
+# window plus the driver-notes step (set on Accept BEFORE the lead row is created —
+# also where an OTS-encryption failure strands the flow). Restoring the review card
+# from these is always safe: nothing was dispatched yet.
+_LEAD_REVIEWABLE_DB_STATES = ("phase1", "special_request_drivers")
 
 # Words a bare idle message can be without starting a lead (greetings/acks).
 _IDLE_CHATTER = frozenset({
@@ -4013,8 +5064,14 @@ async def handle_idle_lead_start(update: Update, context: ContextTypes.DEFAULT_T
     # review handler, re-establishing STATE_AI_REVIEW. Without this, control fell through to
     # _begin_lead_flow which wiped the card to empty (the "it does nothing / stays -" bug).
     if not _cancel_restart_kind(text):  # let "restart"/"cancel" keep their own handling below
-        _active = db.get_user_state(user_id)
-        if _active and _active.get("state") == "phase1":
+        try:
+            _active = db.get_user_state(user_id)
+        except Exception as _e:
+            # Storage down must not crash the entry point (the message would die
+            # silently) — treat as "no active lead" and fall through.
+            logger.warning("idle re-entry: get_user_state failed: %s", _e)
+            _active = None
+        if _active and _active.get("state") in _LEAD_REVIEWABLE_DB_STATES:
             logger.info("🔎DIAG re-entry FIRED uid=%s text=%r -> restoring review card", user_id, text[:60])
             try:
                 await _repost_review_card(msg, dict(_active.get("data") or {}), context, user_id)
@@ -4023,6 +5080,20 @@ async def handle_idle_lead_start(update: Update, context: ContextTypes.DEFAULT_T
                 logger.exception("🔎DIAG re-entry CRASHED: %s", _e)
                 await msg.reply_text(f"⚠️ (diag) re-entry error: {type(_e).__name__}: {_e}")
             return STATE_AI_REVIEW
+        if _active:
+            context.user_data.pop("state_miss_once", None)
+        elif context.user_data.get("review_message_id"):
+            # RAM still shows a live review card but the DB read came back empty —
+            # more likely a storage miss than a real wipe. Never destroy the lead
+            # on a first miss: ask to retry. A SECOND consecutive miss means the
+            # row really is gone — drop the stale ids and route normally.
+            if not context.user_data.get("state_miss_once"):
+                context.user_data["state_miss_once"] = True
+                await msg.reply_text("⚠️ Storage hiccup — please send that again in a few seconds.")
+                return None
+            context.user_data.pop("state_miss_once", None)
+            context.user_data.pop("review_message_id", None)
+            context.user_data.pop("review_chat_id", None)
         logger.info("🔎DIAG re-entry SKIPPED uid=%s db_state=%s (not phase1) -> falling through",
                     user_id, (_active or {}).get("state"))
     # A global supervisor can talk to the bot (ask about data, toggle settings,
@@ -4036,22 +5107,22 @@ async def handle_idle_lead_start(update: Update, context: ContextTypes.DEFAULT_T
             handled = False
         if handled:
             raise ApplicationHandlerStop
-    # "restart" → open a fresh tag review; "cancel" → nothing to cancel when idle.
+    # "cancel" and "restart" are the SAME action: clear any saved lead (an orphaned
+    # card survives a redeploy in the DB) and hand back a fresh review card.
     _cr = _cancel_restart_kind(text)
-    if _cr == "restart":
+    if _cr:
+        _clear_lead_conversation_user_data(context)
+        db.clear_user_state(user_id)
         return await _begin_lead_flow_with_review(context, user_id, username, msg)
-    if _cr == "cancel":
-        # An orphaned "phase1" card (restart) can't be cancelled via the review handler
-        # because the conversation is gone — clear the saved lead here so it doesn't come
-        # back on the next message.
-        _act = db.get_user_state(user_id)
-        if _act and _act.get("state") == "phase1":
-            db.clear_user_state(user_id)
-            _clear_lead_conversation_user_data(context)
-            await msg.reply_text("✅ Cancelled — the lead was cleared. Send the info to start a new tag.")
-            return ConversationHandler.END
-        await msg.reply_text("Nothing to cancel — say “new client” or send the info to start a tag.")
-        return ConversationHandler.END
+    # A lead is MID-DISPATCH per the DB but the in-memory conversation is gone
+    # (redeploy). Starting a new lead here would WIPE it — protect it and point
+    # back to the buttons (which re-enter via entry points on their own).
+    if _active and _active.get("state") in _LEAD_MID_DISPATCH_STATES:
+        await msg.reply_text(
+            "⏳ Your current tag is mid-dispatch — use the buttons on the messages "
+            "above to continue, or say “restart” to drop it and start a new one."
+        )
+        return None
     # Bare trigger word ("start", "lead", "new client", "new entry", "tag") → empty
     # lead shown as the review card, so they immediately see what's needed.
     if _PURE_TRIGGER_RE.match(text):
@@ -4129,6 +5200,7 @@ def _fmt_router_drivers() -> str:
             flag = " ⛔ suspended"
         else:
             flag = ""
+        # Names only — contact details are read in /settings, not here.
         lines.append(f"• {d.get('driver_name') or '—'}{flag}")
     return "\n".join(lines)
 
@@ -4538,26 +5610,42 @@ _PLATE_IMAGE_KIND_COL = {
 }
 
 
-def _user_in_active_conversation(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+def _user_in_active_conversation(update: Update, context: ContextTypes.DEFAULT_TYPE,
+                                 ignore=None) -> bool:
     """True when this user/chat is inside any registered ConversationHandler's active
     state, using PTB's in-memory conversation map (the authoritative truth — cleared on
     END, so never stale unlike the DB ``states`` shadow). Lets the idle plate-image
     reader stand down so it never grabs a photo that belongs to an in-progress flow
     (a text-only sub-state like 'send me the missing field' would otherwise fall
-    through to it). Degrades to False if PTB internals change, so behavior is safe."""
+    through to it). Degrades to False if PTB internals change, so behavior is safe.
+
+    ``ignore`` skips one handler — used for /settings, which has no image handling of
+    its own and is precisely where a plate photo IS the intended input."""
     try:
         groups = context.application.handlers
     except Exception:
         return False
     for group in groups.values():
         for h in group:
-            if isinstance(h, ConversationHandler):
+            if isinstance(h, ConversationHandler) and h is not ignore:
                 try:
                     if h._conversations.get(h._get_key(update)) is not None:
                         return True
                 except Exception:
                     continue
     return False
+
+
+def _in_settings_conversation(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    """True while this user is inside /settings — where a photo is always meant for a
+    plate counter, never for a lead."""
+    h = _SETTINGS_CONV_HANDLER
+    if h is None:
+        return False
+    try:
+        return h._conversations.get(h._get_key(update)) is not None
+    except Exception:
+        return False
 
 
 async def handle_supervisor_plate_image(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -4587,7 +5675,11 @@ async def handle_supervisor_plate_image(update: Update, context: ContextTypes.DE
     # lead image is never read as a tag or hijacked. Unless a plate update was explicitly
     # armed (forced_col). After a restart the in-memory conversation is gone, so an
     # orphaned-lead / idle plate photo is still read here — "no matter the state".
-    if not forced_col and _user_in_active_conversation(update, context):
+    # /settings is deliberately NOT deferred to: it has no image handler, so a plate
+    # photo sent there used to be swallowed and nothing happened. Reading the tag is
+    # exactly what the supervisor wants in that screen.
+    if not forced_col and _user_in_active_conversation(
+            update, context, ignore=_SETTINGS_CONV_HANDLER):
         return
     # Reading it as a tag now → consume the arming.
     context.user_data.pop("router_plate_followup", None)
@@ -4621,6 +5713,13 @@ async def handle_supervisor_plate_image(update: Update, context: ContextTypes.DE
             # Keep the pinned counter armed so the next photo/text still targets it.
             context.user_data["router_plate_followup"] = {"col": forced_col, "ts": time.time()}
             extra = f" (still updating {_PLATE_SET_LABELS.get(forced_col, 'that counter')})"
+        if not forced_col and not _in_settings_conversation(update, context):
+            # Not a tag, no counter update requested, and not inside /settings — it is
+            # a lead image. Fall through silently so the lead flow reads it; replying
+            # here used to eat every forwarded screenshot.
+            return
+        # Inside /settings the picture was plainly meant for a counter, so a failed
+        # read must say so — falling through would start a LEAD from a tag photo.
         await msg.reply_text(
             "⚠️ I couldn't read a tag number. Send a clearer photo, or type it — "
             f"e.g. “update resident tag number 553300”.{extra}"
@@ -4793,6 +5892,28 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     if not update.message:
         return ConversationHandler.END
     return await _restart_bot_from_top(update, context)
+
+
+# When a picture holds nothing the extractor recognises, some models answer in prose
+# ("I'm unable to extract any personal details from this image…") instead of the field
+# block. That sentence was being split across the name lines and shown as the client.
+_AI_REFUSAL_RE = re.compile(
+    r"\b(?:i'?m\s+unable|i\s+am\s+unable|unable\s+to\s+(?:extract|read|determine|identify)|"
+    r"cannot\s+(?:extract|read|determine|identify|assist)|can'?t\s+(?:extract|read|determine)|"
+    r"no\s+(?:personal\s+)?details?\s+(?:are\s+)?(?:visible|found|present)|"
+    r"does\s+not\s+contain\s+(?:any\s+)?(?:personal|required)|"
+    r"please\s+provide\s+(?:a\s+)?(?:document|image|clearer))\b",
+    re.I,
+)
+
+
+def _looks_like_ai_refusal(text: str) -> bool:
+    """True when the model answered in prose instead of the field block.
+
+    Checked on the FIRST few lines only: a genuine extraction can legitimately carry
+    such words inside a note, but never as the name/address lines."""
+    head = "\n".join((text or "").strip().splitlines()[:3])
+    return bool(head) and bool(_AI_REFUSAL_RE.search(head))
 
 
 def _normalize_ai_phase1_text(text: str) -> str:
@@ -5591,6 +6712,7 @@ async def _phase1_finish_vision_extraction(
     *,
     source_label: str = "image",
     typed_text: Optional[str] = None,
+    pdf_vin: Optional[str] = None,
 ) -> int:
     """Normalize AI vision output, validate, then AI review — shared by photo and PDF.
 
@@ -5600,10 +6722,12 @@ async def _phase1_finish_vision_extraction(
     """
     if not msg:
         return STATE_PHASE1
-    if not raw_text or not raw_text.strip():
+    if not raw_text or not raw_text.strip() or _looks_like_ai_refusal(raw_text):
+        # A prose refusal is the same as nothing read — never build a card from it,
+        # or the apology itself ends up shown as the client's name.
         await msg.reply_text(
-            f"❌ Could not extract details from the {source_label}. "
-            "Please send the details as text in the required structure."
+            f"❌ Could not read any lead details from that {source_label}. "
+            "Send a clearer picture, or type the details."
         )
         return STATE_PHASE1
     normalized = _normalize_ai_phase1_text(raw_text)
@@ -5611,20 +6735,9 @@ async def _phase1_finish_vision_extraction(
     normalized_11 = "\n".join(lines[: ai_vision.PHASE1_LINE_COUNT]) if len(lines) >= ai_vision.PHASE1_LINE_COUNT else normalized
     state_data = parse_phase1_structured(normalized_11)
     _apply_single_address_as_both(state_data)
-    valid, validation_errors = ai_vision.validate_phase1_extraction(normalized_11, state_data)
-    if not valid:
-        err_blurb = "\n• ".join(validation_errors)
-        preview = (
-            f"Name: {state_data.get('name') or '-'}\n"
-            f"VIN: {state_data.get('vin') or '-'}\n"
-            f"Delivery: {state_data.get('delivery_address') or '-'} / {state_data.get('delivery_city_state_zip') or '-'}"
-        )
-        await msg.reply_text(
-            "⚠️ Extraction didn’t pass validation:\n\n• " + err_blurb + "\n\n"
-            "Extracted preview:\n" + preview + "\n\n"
-            "Please send the details as text in the required 11-line structure, or try another photo or PDF."
-        )
-        return STATE_PHASE1
+    # Same as the typed path: no completeness gate. Whatever the picture gave goes to
+    # the review card, where a gap is visible and one edit away from fixed — rejecting
+    # it here also threw away the fields that WERE read.
     # Parse extra fields (phone, price, notes, email, driver-license id) from lines 12+
     phone = price = issuer_note = driver_note = None
     email_val = dl_val = None
@@ -5683,10 +6796,20 @@ async def _phase1_finish_vision_extraction(
             if raw_dl and not (state_data.get("driver_license_id") or "").strip():
                 state_data["driver_license_id"] = raw_dl
 
+    # The captions typed alongside the pictures are part of the same message: apply
+    # anything labeled by hand so it lands even when vision did not repeat it.
+    if typed_text:
+        _apply_caption_to_lead(state_data, typed_text)
+
     # Robust VIN extraction from whole raw output
     vin_from_raw = _extract_vin_17(raw_text)
     if vin_from_raw:
         state_data["vin"] = vin_from_raw
+    # A VIN lifted from the PDF's own text layer is exact, so it OVERRIDES whatever
+    # vision made of the page render — reading 17 small characters off an image is
+    # what was missing/mangling the VIN on PDF uploads.
+    if pdf_vin:
+        state_data["vin"] = pdf_vin
 
     # Rebuild vehicle_details with correct VIN
     state_data["vehicle_details"] = "\n".join([
@@ -5753,6 +6876,7 @@ async def _clear_phase1_vision_upload_state(
     context.user_data.pop("phase1_vision_reply_chat_id", None)
     context.user_data.pop("phase1_vision_extracting", None)
     context.user_data.pop("phase1_pending_media", None)
+    context.user_data.pop("phase1_typed_notes", None)   # text queued with the uploads
 
 
 async def _refresh_phase1_batch_status_message(
@@ -5849,11 +6973,15 @@ async def _execute_phase1_vision_batch_extraction(
     context.user_data["phase1_vision_extracting"] = True
     try:
         # Photo captions typed alongside the files feed the extraction too.
+        # Captions AND any text typed alongside the uploads — the whole message is
+        # one submission, so the extraction reads the pictures and the words together.
         typed_text = "\n".join(
-            (it.get("caption") or "").strip() for it in batch if (it.get("caption") or "").strip()
+            [(it.get("caption") or "").strip() for it in batch if (it.get("caption") or "").strip()]
+            + [t for t in (context.user_data.get("phase1_typed_notes") or []) if t]
         ) or None
         parts: list[tuple[bytes, str]] = []
         pending_media: list[dict] = []
+        pdf_vin = None                  # exact VIN from a PDF text layer, if any
         for item in batch:
             if item.get("kind") == "image":
                 img_bytes = item["bytes"]
@@ -5861,6 +6989,10 @@ async def _execute_phase1_vision_batch_extraction(
                 parts.append((img_bytes, img_mime))
                 pending_media.append({"kind": "image", "bytes": img_bytes, "mime": img_mime})
             elif item.get("kind") == "pdf":
+                # The PDF's text layer gives the VIN exactly; a page render makes
+                # vision guess at 17 small characters, which is what missed it.
+                if not pdf_vin:
+                    pdf_vin = await asyncio.to_thread(ai_vision.vin_from_pdf, item["bytes"])
                 png = await asyncio.to_thread(ai_vision.pdf_first_page_to_png_bytes, item["bytes"])
                 if png:
                     parts.append((png, "image/png"))
@@ -5901,12 +7033,34 @@ async def _execute_phase1_vision_batch_extraction(
 
         label = "files" if n > 1 else "photo"
         return await _phase1_finish_vision_extraction(
-            context, user_id, raw_text, status, source_label=label, typed_text=typed_text
+            context, user_id, raw_text, status, source_label=label,
+            typed_text=typed_text, pdf_vin=pdf_vin,
         )
     finally:
         if context.user_data:
             context.user_data.pop("phase1_vision_extracting", None)
             context.user_data.pop("phase1_batch_status_msg_id", None)
+
+
+async def handle_idle_media_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """A photo/PDF sent (or forwarded) with no lead in progress STARTS one and queues
+    the file for extraction — the image is the lead details.
+
+    Text arriving on its own already starts a lead; an image did not, so a forwarded
+    screenshot or a photo with a caption produced nothing at all."""
+    msg = update.effective_message
+    if not msg or not update.effective_user:
+        return ConversationHandler.END
+    if update.effective_chat is not None and update.effective_chat.type != "private":
+        return ConversationHandler.END
+    user_id = update.effective_user.id
+    username = update.effective_user.username or "Unknown"
+    # A caption rides along as typed context for the extraction, so "text + image"
+    # is read as one thing.
+    await _begin_lead_flow(context, user_id, username, msg, send_welcome=False)
+    if msg.photo:
+        return await handle_phase1_photo(update, context)
+    return await handle_phase1_document(update, context)
 
 
 async def handle_phase1_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -6007,6 +7161,13 @@ async def handle_phase1(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
     if _cr:
         return await _do_cancel_or_restart(update, context, _cr)
 
+    # Photos already queued? Then this text belongs WITH them — a bundle of images
+    # followed by the details is how leads actually arrive. Read them together
+    # instead of discarding the uploads, which is what clearing the batch here did.
+    if (context.user_data or {}).get("phase1_vision_batch"):
+        context.user_data.setdefault("phase1_typed_notes", []).append(message_text)
+        return await _execute_phase1_vision_batch_extraction(context, user_id)
+
     await _clear_phase1_vision_upload_state(
         context, update.effective_chat.id if update.effective_chat else None
     )
@@ -6034,14 +7195,9 @@ async def handle_phase1(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
         normalized_11 = "\n".join(lines[: ai_vision.PHASE1_LINE_COUNT]) if len(lines) >= ai_vision.PHASE1_LINE_COUNT else normalized
         state_data = parse_phase1_structured(normalized_11)
         _apply_single_address_as_both(state_data)
-        valid, validation_errors = ai_vision.validate_phase1_extraction(normalized_11, state_data)
-        if not valid:
-            err_blurb = "\n• ".join(validation_errors)
-            await update.message.reply_text(
-                "⚠️ I couldn't find enough info:\n\n• " + err_blurb + "\n\n"
-                "Please include at least name and delivery address/city."
-            )
-            return STATE_PHASE1
+        # No completeness gate here any more. It rejected the message AND threw away
+        # everything that had been extracted, so a lead with a gap could not even get
+        # to the card — where the gap is visible and one edit away from fixed.
         db.set_user_state(user_id, "phase1", state_data)
         message_text = update.message.text or update.message.caption or ""
 
@@ -6139,6 +7295,109 @@ async def handle_phase1(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
         return await _ensure_phone_price_before_files(update.message, context, update.effective_user.id)
 
 
+# A spoken colour arrives as a sentence ("the color is dark blue", "it's white") —
+# strip the lead-in so the field gets the colour itself.
+_SPOKEN_COLOR_LEAD_RE = re.compile(
+    r"^\s*(?:the\s+)?(?:car(?:'s)?\s+)?(?:colou?r\s*)?(?:is\s+|it'?s\s+|its\s+)?", re.I
+)
+
+
+def _clean_spoken_color(text: str) -> str:
+    """'the color is dark blue' -> 'Dark Blue'. Returns '' when nothing is left."""
+    v = _SPOKEN_COLOR_LEAD_RE.sub("", (text or "").strip(), count=1).strip(" .,!")
+    if not v:
+        return ""
+    # The palette writes "Blue - Dark"; speech says "dark blue". Keep both readable.
+    if len(v.split()) > 1:
+        return v.title()
+    # A spoken colour word reads as "Red", not the DMV code "RED" the normalizer
+    # produces for three-letter tokens — the palette writes "Red" too.
+    if v.lower() in _COMMON_COLORS:
+        return v.title()
+    return ai_vision.normalize_phase1_color(v)
+
+
+async def _finish_field_edit(context, user_id, state_data, chat_id) -> None:
+    """Shared tail of a field edit: save, drop the prompt, re-render the picker."""
+    db.set_user_state(user_id, "phase1", state_data)
+    prompt_id = context.user_data.pop("edit_prompt_msg_id", None)
+    if prompt_id:
+        await _safe_delete_chat_message(context, chat_id, prompt_id)
+    await _show_edit_picker(context, state_data)
+
+
+async def handle_phase1_color_pick(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """A colour tapped from the palette — apply it and return to the field picker."""
+    query = update.callback_query
+    await _safe_answer_callback_query(query)
+    user_id = query.from_user.id
+    color = (query.data or "").replace(PH1_COLOR_CB, "", 1).strip()
+    state = db.get_user_state(user_id)
+    if not state or not state.get("data") or not color:
+        return STATE_AI_REVIEW
+    state_data = state["data"]
+    _apply_single_phase1_edit(state_data, "col", color)
+    _clean_vin_and_car(state_data)
+    context.user_data.pop("phase1_pending_edit_key", None)
+    try:
+        await query.message.delete()          # the palette itself
+    except Exception:
+        pass
+    context.user_data.pop("edit_prompt_msg_id", None)
+    db.set_user_state(user_id, "phase1", state_data)
+    await _show_edit_picker(context, state_data)
+    chat_id = query.message.chat_id if query.message else None
+    if chat_id:
+        await _send_vanishing(context, chat_id, f"✅ Updated: color → {color}")
+    return STATE_AI_REVIEW
+
+
+async def handle_edit_field_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """A photo sent while a field prompt is open. For Color, the AI reads the car's
+    colour straight off the picture; for any other field the image goes through the
+    normal review parser so nothing sent here is ever lost."""
+    message = update.message
+    user_id = update.effective_user.id
+    ek = context.user_data.get("phase1_pending_edit_key")
+    if ek != "col":
+        result = await handle_phase1_adjust_input(update, context)
+        return STATE_AI_REVIEW if result == STATE_ADJUST_INPUT else result
+    state = db.get_user_state(user_id)
+    if not state or not state.get("data"):
+        return STATE_AI_REVIEW
+    state_data = state["data"]
+    note = await message.reply_text("🎨 Reading the colour…")
+    raw, mime = await _download_update_image_bytes(update, context)
+    color = None
+    if raw:
+        # Every file sent for parsing also rides along to whoever accepts the lead.
+        _add_extra_attachment(
+            context,
+            "document" if (mime or "").endswith("pdf") else "photo",
+            mime or "image/jpeg",
+            getattr(getattr(message, "document", None), "file_name", None) or "color.jpg",
+            raw,
+            "🎨 Colour reference",
+        )
+        try:
+            color = await asyncio.to_thread(ai_vision.read_color_from_image, raw, mime)
+        except Exception as e:
+            logger.warning("colour read failed: %s", e)
+    await _safe_delete_chat_message(context, note.chat_id, note.message_id)
+    if not color:
+        await _send_vanishing(
+            context, message.chat_id,
+            "⚠️ Couldn't tell the colour from that picture — tap one below or type it.",
+        )
+        return STATE_EDIT_FIELD_PROMPT
+    _apply_single_phase1_edit(state_data, "col", color)
+    _clean_vin_and_car(state_data)
+    context.user_data.pop("phase1_pending_edit_key", None)
+    await _finish_field_edit(context, user_id, state_data, message.chat_id)
+    await _send_vanishing(context, message.chat_id, f"✅ Updated: color → {color}")
+    return STATE_AI_REVIEW
+
+
 async def handle_edit_field_text(update, context):
     user_id = update.effective_user.id
     _cr = _cancel_restart_kind_from_update(update)
@@ -6155,9 +7414,24 @@ async def handle_edit_field_text(update, context):
     state_data = state["data"]
 
     text = (update.message.text or "").strip()
+    if text and text != "-":
+        if ek == "col":
+            text = _clean_spoken_color(text) or text
+        elif ek in ("price", "phone", "email"):
+            # Same normalization the inline path uses — a price typed here as "150"
+            # was stored without the "$" the sanitizer requires and then wiped.
+            cleaned = _clean_inline_value(ek, text)
+            if not cleaned:
+                await _send_vanishing(
+                    context, update.effective_chat.id,
+                    f"⚠️ That doesn't look like a valid {PH1_EDIT_PROMPT_LABEL.get(ek, ek)} — try again.",
+                )
+                return STATE_EDIT_FIELD_PROMPT
+            text = cleaned
     _apply_single_phase1_edit(state_data, ek, text)
     _apply_single_address_as_both(state_data)
     _clean_vin_and_car(state_data)
+    _sanitize_phase1_pending_phone_price(state_data)
     db.set_user_state(user_id, "phase1", state_data)
 
     # Delete user message and prompt
@@ -6258,6 +7532,28 @@ def _phase1_has_phone_and_price(state_data: dict) -> bool:
     )
 
 
+def _phase2_missing(state_data: dict) -> tuple:
+    """(phone_missing, price_missing) — so we only ever ask for what is absent."""
+    return (
+        not _is_valid_pending_phone((state_data or {}).get("pending_phone_number")),
+        not _is_valid_pending_price((state_data or {}).get("pending_price")),
+    )
+
+
+def _phase2_prompt(state_data: dict) -> str:
+    """Ask for the missing piece ONLY. Asking for both when one was already given
+    reads like the bot ignored what was sent, and invites re-typing a good value."""
+    needs_phone, needs_price = _phase2_missing(state_data)
+    if needs_phone and needs_price:
+        return ("📞💲 Phone number and price missing: please enter the client's phone "
+                "number then the price\n(example: +1234567890 $150)")
+    if needs_phone:
+        return "📞 Client phone number missing: please enter the client's phone number"
+    if needs_price:
+        return "💲 Price missing: please enter the price (example: $150)"
+    return ""
+
+
 async def _safe_delete_chat_message(context: ContextTypes.DEFAULT_TYPE, chat_id, message_id) -> None:
     """Best-effort delete; ignore Telegram restrictions (already gone, too old, etc.)."""
     if not chat_id or not message_id:
@@ -6325,10 +7621,7 @@ async def _ensure_phone_price_before_files(message, context: ContextTypes.DEFAUL
         return await _prompt_issuer_special_request(message, context, user_id)
     context.user_data.pop("phase2_before_files", None)
     db.set_user_state(user_id, "phase1", state_data)
-    await message.reply_text(
-        "📞 **Phone number is required to continue.**\n\n" + PHASE2_INTRO_MESSAGE,
-        parse_mode="Markdown",
-    )
+    await message.reply_text(_phase2_prompt(state_data))
     return STATE_PHASE2
 
 
@@ -6356,10 +7649,11 @@ async def handle_add_files_callback(update: Update, context: ContextTypes.DEFAUL
                 finally:
                     await _safe_delete_chat_message(context, chat_id, prompt_msg_id)
         await _safe_delete_chat_message(context, chat_id, prompt_msg_id)
+        _ask = _phase2_prompt((state or {}).get("data") or {}) or PHASE2_INTRO_MESSAGE
         if chat_id:
-            await context.bot.send_message(chat_id=chat_id, text=PHASE2_INTRO_MESSAGE)
+            await context.bot.send_message(chat_id=chat_id, text=_ask)
         else:
-            await query.message.reply_text(PHASE2_INTRO_MESSAGE)
+            await query.message.reply_text(_ask)
         return STATE_PHASE2
 
     # add_files_yes
@@ -6492,10 +7786,11 @@ async def handle_another_file_callback(update: Update, context: ContextTypes.DEF
                 finally:
                     await _safe_delete_chat_message(context, chat_id, prompt_msg_id)
             await _safe_delete_chat_message(context, chat_id, prompt_msg_id)
+            _ask = _phase2_prompt(d) or PHASE2_INTRO_MESSAGE
             if chat_id:
-                await context.bot.send_message(chat_id=chat_id, text=PHASE2_INTRO_MESSAGE)
+                await context.bot.send_message(chat_id=chat_id, text=_ask)
             else:
-                await query.message.reply_text(PHASE2_INTRO_MESSAGE)
+                await query.message.reply_text(_ask)
             return STATE_PHASE2
 
     await _safe_delete_chat_message(context, chat_id, prompt_msg_id)
@@ -6583,13 +7878,20 @@ async def handle_phase1_ai_review_callback(update, context):
         edit_key = data.replace("ph1edit_", "", 1)
         context.user_data["phase1_pending_edit_key"] = edit_key
         label = PH1_EDIT_PROMPT_LABEL.get(edit_key, edit_key)
-        prompt = await query.message.reply_text(
-            f"✏️ Send new text for: {label}\n\n"
-            "Type minus (-) to clear.",
-            reply_markup=InlineKeyboardMarkup([[
-                InlineKeyboardButton("❌ Cancel", callback_data="edit_cancel")
-            ]])
-        )
+        if edit_key == "col":
+            # Colour gets the tap-to-pick palette; typing, a voice note and a photo
+            # of the car all still work while this prompt is open.
+            prompt = await query.message.reply_text(
+                _PH1_COLOR_PROMPT, reply_markup=_color_picker_keyboard()
+            )
+        else:
+            prompt = await query.message.reply_text(
+                f"✏️ Send new text for: {label}\n\n"
+                "Type minus (-) to clear.",
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton("❌ Cancel", callback_data="edit_cancel")
+                ]])
+            )
         context.user_data["edit_prompt_msg_id"] = prompt.message_id
         return STATE_EDIT_FIELD_PROMPT
 
@@ -6749,10 +8051,13 @@ async def handle_phase1_edit_menu_callback(update: Update, context: ContextTypes
         return STATE_AI_EDIT_MENU
     context.user_data["phase1_pending_edit_key"] = edit_key
     label = PH1_EDIT_PROMPT_LABEL[edit_key]
-    await query.message.reply_text(
-        f"✏️ Send new text for: {label}\n\n"
-        "Type minus (-) to clear that field.",
-    )
+    if edit_key == "col":
+        await query.message.reply_text(_PH1_COLOR_PROMPT, reply_markup=_color_picker_keyboard())
+    else:
+        await query.message.reply_text(
+            f"✏️ Send new text for: {label}\n\n"
+            "Type minus (-) to clear that field.",
+        )
     return STATE_AI_EDIT_INPUT
 
 
@@ -6957,7 +8262,14 @@ async def handle_vin_choice_text(update: Update, context: ContextTypes.DEFAULT_T
     if _cr:
         return await _do_cancel_or_restart(update, context, _cr)
     await _autoclean_user_msg(update, context)
-    kind, _ = _classify_review_command(text)
+    # The question on screen is "Would you like to use DMV system?", so plain yes/no
+    # answers it — checked before the older phrasing, which stays supported.
+    if _YES_RE.match(text):
+        kind = "VIN_USE"
+    elif _NO_RE.match(text):
+        kind = "VIN_KEEP"
+    else:
+        kind, _ = _classify_review_command(text)
     mapping = {"VIN_USE": "use", "VIN_KEEP": "keep", "VIN_RETYPE": "retype"}
     if kind in mapping:
         result = await _apply_vin_choice(
@@ -6970,8 +8282,11 @@ async def handle_vin_choice_text(update: Update, context: ContextTypes.DEFAULT_T
             pass
         await _cleanup_voice_echo(context, update.effective_chat.id if update.effective_chat else None)
         return result
-    await update.message.reply_text("Say “use the new”, “keep the same”, or “retype vin”.")
-    return STATE_VIN_CHOICE
+    # Not an answer to the VIN question — so it is an ordinary edit. The DMV check is
+    # OPTIONAL: it must never block "price 150" or any other change. Apply it and
+    # leave the question on screen, still answerable by button or word.
+    result = await handle_phase1_review_message(update, context)
+    return STATE_VIN_CHOICE if result == STATE_AI_REVIEW else result
 
 
 async def handle_vin_retype(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -7018,14 +8333,31 @@ async def handle_vin_retype(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     return STATE_AI_REVIEW
 
 
+async def _run_vin_check_for_review(update, context: ContextTypes.DEFAULT_TYPE,
+                                    user_id: int, state_data: dict) -> int:
+    """Run the DMV decode automatically after a VIN arrives from a picture or PDF.
+
+    Silent no-op unless it can actually succeed — a 17-character VIN and a configured
+    lookup — so an upload never produces a stray "not configured" warning."""
+    vin = (state_data.get("vin") or "").strip()
+    if len(vin) != 17:
+        return STATE_AI_REVIEW
+    try:
+        if not Config.is_vin_lookup_configured():
+            return STATE_AI_REVIEW
+        return await _handle_phase1_vin_check_button(context, update, user_id, state_data)
+    except Exception as e:
+        logger.warning("auto VIN check failed: %s", e)
+        return STATE_AI_REVIEW
+
+
 async def _handle_phase1_vin_check_button(
     context: ContextTypes.DEFAULT_TYPE, query, user_id: int, state_data: dict,
 ) -> int:
     """Run the DMV VIN decode on demand from the review screen.
 
-    Shows the "Pulling up 17 Digit Vin in DMV portal..." message and the same
-    three inline buttons (Use DMV / Continue / Retype) as the legacy
-    auto-decode flow; after the user picks one, we return to the AI review
+    Asks "Would you like to use DMV system?" with Yes/No, the same prompt the
+    auto-decode flow uses; after the user picks one, we return to the AI review
     rather than continuing to phone/notes — Submit is the only path forward.
     """
     vin = (state_data.get("vin") or "").strip()
@@ -7096,6 +8428,11 @@ async def handle_phase2(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
 
     phase1_data = state.get("data", {})
 
+    # Only ever ask for what is absent: if the phone already came in with the lead,
+    # the reply here is just the price (and vice versa). Requiring both meant a good
+    # value had to be re-typed.
+    needs_phone, needs_price = _phase2_missing(phase1_data)
+
     # Parse phone and price: any token containing $ is the price; phone = any format accepted (digits only)
     parts = message_text.split()
     price = next((p for p in parts if "$" in p), None)
@@ -7107,18 +8444,26 @@ async def handle_phase2(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
     # NOTE: Do NOT strip leading "1" from 10-digit numbers.
     # Example: "+1234567890" is already a valid 10-digit number (area code can start with 1),
     # and stripping would corrupt it and break encryption/unlock downstream.
-    if len(digits_only) not in (9, 10) or not price:
-        await msg.reply_text(
-            "❌ Please provide both phone number and price.\n"
-            "Phone in any format (e.g. +1 (732) 534-2659, 732-534-2659, 732 534 2659) and price with $ (e.g. $500)."
-        )
-        return STATE_PHASE2
-    # Normalize to +1XXXXXXXXXX for storage (no double 1)
-    phone_number = "+1" + digits_only
+    phone_number = "+1" + digits_only if len(digits_only) in (9, 10) else None
+    # When the PRICE is the only thing outstanding, a bare number is the price — no
+    # "$" needed. Capped at six digits so a mistakenly pasted phone number is not
+    # accepted as a price.
+    if needs_price and not needs_phone and not price:
+        bare = re.sub(r"[^\d.]", "", message_text)
+        if bare and len(re.sub(r"\D", "", bare)) <= 6:
+            price = _clean_inline_value("price", bare) or None
+            phone_number = None
 
     state_data = phase1_data.copy()
-    state_data["pending_phone_number"] = phone_number
-    state_data["pending_price"] = price
+    if phone_number and needs_phone:
+        state_data["pending_phone_number"] = phone_number
+    if price and needs_price:
+        state_data["pending_price"] = price
+    still_phone, still_price = _phase2_missing(state_data)
+    if still_phone or still_price:
+        db.set_user_state(user_id, "phase1", state_data)
+        await msg.reply_text(_phase2_prompt(state_data))
+        return STATE_PHASE2
     context.user_data.pop("phase2_before_files", None)
     # Notes are optional and editable from the AI review screen — never block
     # dispatch on them. Save state then jump straight into finalize/review.
@@ -7138,8 +8483,7 @@ async def handle_special_request_issuers(update: Update, context: ContextTypes.D
     if not _phase1_has_phone_and_price(state_data):
         db.set_user_state(user_id, "phase1", state_data)
         await update.message.reply_text(
-            "📞💲 **Phone number and price are required.**\n\n" + PHASE2_INTRO_MESSAGE,
-            parse_mode="Markdown",
+            _phase2_prompt(state_data),
         )
         return STATE_PHASE2
 
@@ -7173,8 +8517,7 @@ async def handle_special_request_drivers(update: Update, context: ContextTypes.D
     if not _phase1_has_phone_and_price(state_data):
         db.set_user_state(user_id, "phase1", state_data)
         await update.message.reply_text(
-            "📞💲 **Phone number and price are required.**\n\n" + PHASE2_INTRO_MESSAGE,
-            parse_mode="Markdown",
+            _phase2_prompt(state_data),
         )
         return STATE_PHASE2
 
@@ -7209,8 +8552,7 @@ async def _finalize_lead_after_notes(
     if not _phase1_has_phone_and_price(state_data):
         db.set_user_state(user_id, "phase1", state_data)
         await message.reply_text(
-            "📞💲 **Phone number and price are required.**\n\n" + PHASE2_INTRO_MESSAGE,
-            parse_mode="Markdown",
+            _phase2_prompt(state_data),
         )
         return STATE_PHASE2
 
@@ -7392,17 +8734,15 @@ async def _finalize_lead_after_notes(
     context.user_data.pop("phase1_pending_media", None)
     context.user_data.pop("phase1_attached_files", None)
     ref_h = html.escape(str(reference_id), quote=False)
-    drivers_count = len([d for d in drivers_list if d and d.get("id")])
+    drivers_label = html.escape(_drivers_sent_label(state_data, drivers_list), quote=False)
     source_label = html.escape((state_data.get("selected_source_label") or "—"), quote=False)
-    _another = InlineKeyboardMarkup(
-        [[InlineKeyboardButton("➕ Another tag (same client)", callback_data=f"another_tag_{lead['id']}")]]
-    )
+    _another = _after_send_keyboard(str(lead["id"]))
     if is_all_groups:
         await message.reply_text(
             "✅ Lead saved.\n\n"
             f"📋 Reference ID: <code>{ref_h}</code>\n"
             f"📣 Approval sent to <b>{len(active_groups)}</b> group(s)\n"
-            f"🚗 Approval sent to <b>{drivers_count}</b> driver(s)\n"
+            f"🚗 Approval sent to <b>{drivers_label}</b>\n"
             f"📊 Lead source: <b>{source_label}</b>",
             parse_mode="HTML",
             reply_markup=_another,
@@ -7412,7 +8752,7 @@ async def _finalize_lead_after_notes(
             "✅ Lead saved.\n\n"
             f"📋 Reference ID: <code>{ref_h}</code>\n"
             f"Approval sent to <b>{html.escape(selected_group.get('group_name') or 'group', quote=False)}</b>\n"
-            f"🚗 Approval sent to <b>{drivers_count}</b> driver(s)\n"
+            f"🚗 Approval sent to <b>{drivers_label}</b>\n"
             f"📊 Lead source: <b>{source_label}</b>",
             parse_mode="HTML",
             reply_markup=_another,
@@ -7423,14 +8763,14 @@ async def _finalize_lead_after_notes(
     return ConversationHandler.END
 
 async def _submit_lead_from_review(message, context, user_id, data):
+    # Last chance to mirror a single address across both lines, whatever route the
+    # lead took to get here — the driver must never receive a blank delivery address.
+    _apply_single_address_as_both(data)
     # Phone is the only hard requirement at submit; price may be "-".
     if not _is_valid_pending_phone(data.get("pending_phone_number")):
         _sanitize_phase1_pending_phone_price(data)
         db.set_user_state(user_id, "phase1", data)
-        await message.reply_text(
-            "📞 **Phone number is required** before sending the lead.\n\n" + PHASE2_INTRO_MESSAGE,
-            parse_mode="Markdown",
-        )
+        await message.reply_text(_phase2_prompt(data))
         return STATE_PHASE2
     phone = data.pop("pending_phone_number", None)
     price = data.pop("pending_price", None)
@@ -7620,9 +8960,7 @@ async def _submit_lead_from_review(message, context, user_id, data):
         f"In **Krab Dispatch**, name the tag PDF **similar to this client’s name** (first line of details) so it auto‑links to reference `{ref_id}`.\n\n"
         f"Use /lead to add another.",
         parse_mode="Markdown",
-        reply_markup=InlineKeyboardMarkup(
-            [[InlineKeyboardButton("➕ Another tag (same client)", callback_data=f"another_tag_{lead['id']}")]]
-        ),
+        reply_markup=_after_send_keyboard(str(lead["id"])),
     )
     await _maybe_offer_insurance_card(
         context, message, lead_id=str(lead["id"]), reference_id=str(ref_id),
@@ -9259,16 +10597,11 @@ async def handle_contact_source_selection(update: Update, context: ContextTypes.
 
 
 async def cancel_from_lead_conversation(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Lead flow /cancel: wipe in-memory + DB flow state and restart like /start."""
-    msg = update.effective_message
-    if not msg:
+    """Lead flow /cancel — identical to /restart: wipe everything and open a fresh
+    review card, so the two commands never behave differently."""
+    if not update.effective_message:
         return ConversationHandler.END
-    user_id = update.effective_user.id
-    await _clear_phase1_vision_upload_state(context, msg.chat_id)
-    _clear_lead_conversation_user_data(context)
-    db.clear_user_state(user_id)
-    await msg.reply_text("❌ Cancelled — restarting from the top.")
-    return await _restart_bot_from_top(update, context)
+    return await _do_cancel_or_restart(update, context, "cancel")
 
 
 async def cancel_from_receipt_conversation(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -10186,7 +11519,8 @@ async def handle_accept_group_offer(update: Update, context: ContextTypes.DEFAUL
             att,
             winner_group.get("group_telegram_id"),
         )
-        db.update_lead(lead_id, {"phase1_attached_files": []})
+        # Deliberately NOT cleared here any more: the driver who accepts next still
+        # needs the same paperwork, and wiping it left them with nothing.
 
     # Lead adder: one summary DM when a driver accepts (handle_accept_lead), not on group tap.
 
@@ -12907,9 +14241,97 @@ _PLATE_SET_LABELS = {
 def _settings_main_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("🔢 Plate Numbers", callback_data="tset_plates")],
-        [InlineKeyboardButton("👥 Groups", callback_data="tset_groups")],
+        # "Groups" in the schema are "Dispatchers" everywhere the user sees them.
+        [InlineKeyboardButton("🏢 Dispatchers", callback_data="tset_groups")],
+        [InlineKeyboardButton("🚗 Drivers", callback_data="tset_drivers")],
+        [InlineKeyboardButton("🚫 Suspensions", callback_data="tset_susp")],
+        [InlineKeyboardButton("📊 Client Sources", callback_data="tset_srcs")],
         [InlineKeyboardButton("✖️ Close", callback_data="tset_close")],
     ])
+
+
+def _driver_contact_lines(driver: dict) -> list:
+    """The driver's own phone and email, as tap-to-copy lines.
+
+    They were stored but never shown anywhere, so reaching a driver meant leaving
+    Telegram. Wrapped in backticks so one tap copies the value; unrelated to the
+    /driverblock redaction, which hides the CLIENT's number from drivers."""
+    out = []
+    phone = str(driver.get("phone_number") or "").strip()
+    email = str(driver.get("email") or "").strip()
+    if phone:
+        out.append(f"   📞 `{_telegram_md1_escape(phone)}`")
+    if email:
+        out.append(f"   📧 `{_telegram_md1_escape(email)}`")
+    if not out:
+        out.append("   _no phone or email on file_")
+    return out
+
+
+async def _settings_view_drivers() -> tuple:
+    """Add a driver, or switch one off/on, and read their contact details. Disabling
+    removes them from the pickers entirely; suspending (separate screen) keeps them
+    visible but unassignable."""
+    drivers = await asyncio.to_thread(_get_all_drivers_cached)
+    lines = ["🚗 *Drivers*\n"]
+    rows = []
+    for d in (drivers or [])[:25]:
+        active = record_is_active(d)
+        name = _telegram_md1_escape(d.get("driver_name") or "(unnamed)")
+        lines.append(f"{'✅' if active else '⛔'} {name}")
+        lines.extend(_driver_contact_lines(d))
+        rows.append([InlineKeyboardButton(
+            f"{'Disable' if active else 'Enable'} {d.get('driver_name') or 'driver'}"[:40],
+            callback_data=f"tset_dtog:{d.get('id')}")])
+    if not drivers:
+        lines.append("_No drivers yet._")
+    rows.append([InlineKeyboardButton("➕ Add Driver", callback_data="tset_dadd")])
+    rows.append([InlineKeyboardButton("⬅️ Back", callback_data="tset_menu")])
+    return ("\n".join(lines), InlineKeyboardMarkup(rows))
+
+
+async def _settings_view_suspensions() -> tuple:
+    """Suspend a driver, or lift a suspension — including one earned by unpaid
+    receipts, which is excused the same way an accepted appeal excuses it."""
+    drivers = await asyncio.to_thread(_get_all_drivers_cached)
+    suspended = await asyncio.to_thread(_get_suspended_driver_ids)
+    manual = await asyncio.to_thread(db.get_manually_suspended_driver_ids)
+    lines = ["🚫 *Suspensions*\n", "_Suspended drivers stay listed but get no new leads._\n"]
+    rows = []
+    for d in (drivers or [])[:25]:
+        did = str(d.get("id"))
+        name = d.get("driver_name") or "(unnamed)"
+        is_susp = did in suspended
+        why = ""
+        if is_susp:
+            why = " (by hand)" if did in manual else " (unpaid receipts)"
+        lines.append(f"{'🚫' if is_susp else '✅'} {name}{why}")
+        rows.append([InlineKeyboardButton(
+            f"{'Lift' if is_susp else 'Suspend'} {name}"[:40],
+            callback_data=f"tset_susp{'lift' if is_susp else 'on'}:{did}")])
+    if not drivers:
+        lines.append("_No drivers yet._")
+    rows.append([InlineKeyboardButton("⬅️ Back", callback_data="tset_menu")])
+    return ("\n".join(lines), InlineKeyboardMarkup(rows))
+
+
+async def _settings_view_sources() -> tuple:
+    """Add or remove the client sources offered after a lead is dispatched.
+    Removing is a soft disable so already-sent picker buttons still resolve."""
+    sources = await asyncio.to_thread(db.get_all_contact_info_sources)
+    lines = ["📊 *Client Sources*\n"]
+    rows = []
+    for s in (sources or [])[:25]:
+        active = record_is_active(s)
+        lines.append(f"{'✅' if active else '⛔'} {s.get('label') or '(unnamed)'}")
+        rows.append([InlineKeyboardButton(
+            f"{'Remove' if active else 'Restore'} {s.get('label') or 'source'}"[:40],
+            callback_data=f"tset_stog:{s.get('id')}:{0 if active else 1}")])
+    if not sources:
+        lines.append("_No sources yet._")
+    rows.append([InlineKeyboardButton("➕ Add Source", callback_data="tset_sadd")])
+    rows.append([InlineKeyboardButton("⬅️ Back", callback_data="tset_menu")])
+    return ("\n".join(lines), InlineKeyboardMarkup(rows))
 
 
 async def cmd_settings(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -12926,7 +14348,7 @@ async def cmd_settings(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
     return SET_MENU
 
 
-async def _settings_render_plates(query) -> None:
+async def _settings_view_plates() -> tuple:
     s = await asyncio.to_thread(db.get_plate_settings) or {}
     pre, suf = s.get("nj_plate_prefix", "H"), s.get("non_nj_plate_suffix", "V")
     txt = (
@@ -12944,24 +14366,112 @@ async def _settings_render_plates(query) -> None:
          InlineKeyboardButton("Set Non-Res control #", callback_data="tset_pf:non_nj_car_next_number")],
         [InlineKeyboardButton("⬅️ Back", callback_data="tset_menu")],
     ])
-    await query.edit_message_text(txt, parse_mode="Markdown", reply_markup=kb)
+    return (txt, kb)
 
 
-async def _settings_render_groups(query) -> None:
+async def _settings_view_groups() -> tuple:
     groups = await asyncio.to_thread(db.get_all_groups)
-    lines = ["👥 *Groups*\n"]
+    lines = ["🏢 *Dispatchers*\n"]
     rows = []
     for g in (groups or [])[:25]:
-        active = g.get("is_active", True)
+        # record_is_active, not a raw get: a JSON-null is_active counts as ACTIVE on
+        # the dispatch path, and reading it raw showed those rows here as disabled.
+        active = record_is_active(g)
         lines.append(f"{'✅' if active else '⛔'} {g.get('group_name') or '(unnamed)'} `{g.get('group_telegram_id')}`")
         rows.append([InlineKeyboardButton(
-            f"{'Disable' if active else 'Enable'} {g.get('group_name') or 'group'}"[:40],
+            f"{'Disable' if active else 'Enable'} {g.get('group_name') or 'dispatcher'}"[:40],
             callback_data=f"tset_gtog:{g.get('id')}")])
     if not groups:
-        lines.append("_No groups yet._")
-    rows.append([InlineKeyboardButton("➕ Add Group", callback_data="tset_gadd")])
+        lines.append("_No dispatchers yet._")
+    rows.append([InlineKeyboardButton("➕ Add Dispatcher", callback_data="tset_gadd")])
     rows.append([InlineKeyboardButton("⬅️ Back", callback_data="tset_menu")])
-    await query.edit_message_text("\n".join(lines), parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(rows))
+    return ("\n".join(lines), InlineKeyboardMarkup(rows))
+
+
+_SETTINGS_MENU_TEXT = "⚙️ *Settings*"
+# Every settings screen, keyed by the callback data its button carries — so a spoken
+# or typed request opens exactly the same view the button does.
+_SETTINGS_VIEWS = {
+    "tset_plates": _settings_view_plates,
+    "tset_groups": _settings_view_groups,
+    "tset_drivers": _settings_view_drivers,
+    "tset_susp": _settings_view_suspensions,
+    "tset_srcs": _settings_view_sources,
+}
+# Spoken/typed navigation. Ordered: "suspend driver kita" is about suspensions even
+# though it also says "driver", so suspensions is tested before drivers.
+_SETTINGS_NAV = [
+    # "suspen" not "suspend": suspension/suspensions do not contain the word suspend.
+    (re.compile(r"\b(?:suspen\w*|unsuspend\w*|lift|penalt\w*|block\w*)\b", re.I), "tset_susp"),
+    (re.compile(r"\b(?:plates?|tag\s*numbers?|control\s*numbers?)\b", re.I), "tset_plates"),
+    (re.compile(r"\b(?:dispatchers?|groups?|teams?|crews?)\b", re.I), "tset_groups"),
+    (re.compile(r"\b(?:drivers?|drv)\b", re.I), "tset_drivers"),
+    (re.compile(r"\b(?:sources?|client\s*source|lead\s*source|origin)\b", re.I), "tset_srcs"),
+]
+_SETTINGS_BACK_RE = re.compile(r"^\s*(?:back|menu|main|home|up|return)\b", re.I)
+_SETTINGS_CLOSE_RE = re.compile(r"^\s*(?:close|exit|quit|dismiss|finished|done)\b", re.I)
+_SETTINGS_HINT = (
+    "⚙️ Say or type what you want:\n"
+    "• *plate numbers*\n"
+    "• *dispatchers*\n"
+    "• *drivers*\n"
+    "• *suspensions*\n"
+    "• *client sources*\n"
+    "…or *back* / *close*."
+)
+
+
+def _settings_nav_target(text: str):
+    """Which settings screen a spoken/typed phrase asks for, or None."""
+    t = (text or "").strip()
+    if not t:
+        return None
+    for rx, target in _SETTINGS_NAV:
+        if rx.search(t):
+            return target
+    return None
+
+
+async def _show_settings_view(target: str, *, query=None, message=None) -> None:
+    """Render one settings screen — editing the card when it came from a button,
+    posting a fresh one when it was asked for by voice or typing."""
+    view = _SETTINGS_VIEWS.get(target)
+    if view is None:
+        text, kb = _SETTINGS_MENU_TEXT, _settings_main_kb()
+    else:
+        text, kb = await view()
+    if query is not None:
+        await query.edit_message_text(text, parse_mode="Markdown", reply_markup=kb)
+    elif message is not None:
+        await message.reply_text(text, parse_mode="Markdown", reply_markup=kb)
+
+
+async def handle_settings_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Voice/typed control of /settings, mirroring the lead card: say "plate numbers"
+    and that screen opens, with all of its buttons live. Voice arrives here already
+    transcribed by the global pre-processor, so speaking and typing behave the same."""
+    msg = update.effective_message
+    text = ((msg.text if msg else "") or "").strip()
+    if not msg or not text:
+        return SET_MENU
+    if not _user_is_global_supervisor(update.effective_user.id):
+        return ConversationHandler.END
+    if _SETTINGS_CLOSE_RE.match(text):
+        context.user_data.pop("tset_await", None)
+        await msg.reply_text("⚙️ Settings closed.")
+        return ConversationHandler.END
+    if _SETTINGS_BACK_RE.match(text):
+        context.user_data.pop("tset_await", None)
+        await msg.reply_text(_SETTINGS_MENU_TEXT, parse_mode="Markdown",
+                             reply_markup=_settings_main_kb())
+        return SET_MENU
+    target = _settings_nav_target(text)
+    if target:
+        await _show_settings_view(target, message=msg)
+        return SET_MENU
+    await msg.reply_text(_SETTINGS_HINT, parse_mode="Markdown",
+                         reply_markup=_settings_main_kb())
+    return SET_MENU
 
 
 async def handle_settings_cb(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -12975,9 +14485,9 @@ async def handle_settings_cb(update: Update, context: ContextTypes.DEFAULT_TYPE)
         await query.edit_message_text("⚙️ *Settings*", parse_mode="Markdown", reply_markup=_settings_main_kb())
         return SET_MENU
     if data == "tset_plates":
-        await _settings_render_plates(query); return SET_MENU
+        await _show_settings_view("tset_plates", query=query); return SET_MENU
     if data == "tset_groups":
-        await _settings_render_groups(query); return SET_MENU
+        await _show_settings_view("tset_groups", query=query); return SET_MENU
     if data == "tset_close":
         context.user_data.pop("tset_await", None)
         await query.edit_message_text("⚙️ Settings closed."); return ConversationHandler.END
@@ -12989,10 +14499,70 @@ async def handle_settings_cb(update: Update, context: ContextTypes.DEFAULT_TYPE)
         return SET_INPUT
     if data.startswith("tset_gtog:"):
         await asyncio.to_thread(db.toggle_group_status, data.split(":", 1)[1])
-        await _settings_render_groups(query); return SET_MENU
+        await _show_settings_view("tset_groups", query=query); return SET_MENU
     if data == "tset_gadd":
         context.user_data["tset_await"] = {"kind": "add_group"}
-        await query.message.reply_text("Send the new group as: *Group Name | -100xxxxxxxxxx*", parse_mode="Markdown")
+        await query.message.reply_text(
+            "Send the new dispatcher as: *Name | -100xxxxxxxxxx*", parse_mode="Markdown")
+        return SET_INPUT
+    # --- drivers -------------------------------------------------------
+    if data == "tset_drivers":
+        await _show_settings_view("tset_drivers", query=query); return SET_MENU
+    if data.startswith("tset_dtog:"):
+        await asyncio.to_thread(db.toggle_driver_status, data.split(":", 1)[1])
+        _bust_driver_caches()
+        await _show_settings_view("tset_drivers", query=query); return SET_MENU
+    if data == "tset_dadd":
+        context.user_data["tset_await"] = {"kind": "add_driver"}
+        await query.message.reply_text(
+            "Send the new driver as: *Name | telegram_id*\n"
+            "Phone and email are optional and shown on this screen:\n"
+            "*Name | telegram_id | 555-123-4567 | driver@example.com*",
+            parse_mode="Markdown")
+        return SET_INPUT
+    # --- suspensions ---------------------------------------------------
+    if data == "tset_susp":
+        await _show_settings_view("tset_susp", query=query); return SET_MENU
+    if data.startswith("tset_suspon:"):
+        did = data.split(":", 1)[1]
+        ok = await asyncio.to_thread(db.set_driver_suspended, did, True)
+        _bust_driver_caches()
+        if not ok:
+            await query.message.reply_text(
+                "⚠️ Manual suspension needs one database change first — run "
+                "`database/migration_driver_manual_suspend.sql` in the Supabase SQL "
+                "editor. Receipt-debt suspensions work without it.",
+                parse_mode="Markdown")
+        await _show_settings_view("tset_susp", query=query); return SET_MENU
+    if data.startswith("tset_susplift:"):
+        did = data.split(":", 1)[1]
+        await asyncio.to_thread(db.set_driver_suspended, did, False)
+        # A receipt-debt suspension only lifts once the debt stops counting, so
+        # excuse the outstanding receipts exactly as an accepted appeal does.
+        waived = await asyncio.to_thread(db.waive_driver_pending_receipts, did)
+        _bust_driver_caches()
+        driver = await asyncio.to_thread(_driver_row_by_id, did)
+        if driver:
+            try:
+                pending_after = await asyncio.to_thread(db.get_driver_pending_receipts, did)
+                await _notify_suspension_lifted(
+                    context, driver=driver, pending_after=pending_after)
+            except Exception as e:
+                logger.warning("suspension-lift notice failed: %s", e)
+        if waived:
+            await query.message.reply_text(f"✅ Lifted — excused {waived} outstanding receipt(s).")
+        await _show_settings_view("tset_susp", query=query); return SET_MENU
+    # --- client sources ------------------------------------------------
+    if data == "tset_srcs":
+        await _show_settings_view("tset_srcs", query=query); return SET_MENU
+    if data.startswith("tset_stog:"):
+        _, sid, want = data.split(":", 2)
+        await asyncio.to_thread(db.set_contact_info_source_active, sid, want == "1")
+        await _show_settings_view("tset_srcs", query=query); return SET_MENU
+    if data == "tset_sadd":
+        context.user_data["tset_await"] = {"kind": "add_source"}
+        await query.message.reply_text("Send the new client source name (e.g. *Instagram*).",
+                                       parse_mode="Markdown")
         return SET_INPUT
     return SET_MENU
 
@@ -13003,11 +14573,49 @@ async def apply_settings_input(update: Update, context: ContextTypes.DEFAULT_TYP
         return ConversationHandler.END
     st = context.user_data.pop("tset_await", None) or {}
     text = (update.message.text or "").strip()
+    # "back" / "close" must escape an input prompt too, or a spoken command would be
+    # swallowed as the value being asked for.
+    if _SETTINGS_CLOSE_RE.match(text):
+        await update.message.reply_text("⚙️ Settings closed.")
+        return ConversationHandler.END
+    if _SETTINGS_BACK_RE.match(text):
+        await update.message.reply_text(_SETTINGS_MENU_TEXT, parse_mode="Markdown",
+                                        reply_markup=_settings_main_kb())
+        return SET_MENU
+
+    async def _retry(msg: str) -> int:
+        """Bad input keeps the prompt alive instead of dropping out of /settings."""
+        context.user_data["tset_await"] = st
+        await update.message.reply_text(msg)
+        return SET_INPUT
+
+    if st.get("kind") == "add_driver":
+        parts = [p.strip() for p in text.split("|")]
+        if len(parts) < 2 or not parts[0] or not parts[1]:
+            return await _retry("❌ Format: Name | telegram_id")
+        if not re.fullmatch(r"-?\d{5,}", parts[1]):
+            return await _retry("❌ The telegram_id must be digits — the driver can get theirs from /whoami.")
+        phone = parts[2] if len(parts) > 2 and parts[2] else None
+        email = parts[3] if len(parts) > 3 and parts[3] else None
+        ok = await asyncio.to_thread(db.create_driver, parts[0], parts[1], phone, email)
+        _bust_driver_caches()
+        await update.message.reply_text(
+            (f"✅ Added driver “{parts[0]}”." if ok else "❌ Could not add the driver."),
+            reply_markup=_settings_main_kb())
+        return SET_MENU
+    if st.get("kind") == "add_source":
+        label = text.strip()
+        if not label or len(label) > 60:
+            return await _retry("❌ Send a short source name (1–60 characters).")
+        ok = await asyncio.to_thread(db.create_contact_info_source, label)
+        await update.message.reply_text(
+            (f"✅ Added client source “{label}”." if ok else "❌ Could not add the source."),
+            reply_markup=_settings_main_kb())
+        return SET_MENU
     if st.get("kind") == "plate":
         digits = re.sub(r"\D", "", text)
         if not digits:
-            await update.message.reply_text("❌ Digits only. Open /settings again.")
-            return ConversationHandler.END
+            return await _retry("❌ Digits only — send the number again.")
         ok = await asyncio.to_thread(db.update_plate_settings, {st["field"]: int(digits)})
         await update.message.reply_text(
             (f"✅ {_PLATE_SET_LABELS.get(st['field'], st['field'])} set to {int(digits)}." if ok
@@ -13016,11 +14624,10 @@ async def apply_settings_input(update: Update, context: ContextTypes.DEFAULT_TYP
     if st.get("kind") == "add_group":
         parts = [p.strip() for p in text.split("|")]
         if len(parts) < 2 or not parts[0] or not parts[1]:
-            await update.message.reply_text("❌ Format: Group Name | -100xxxxxxxxxx.")
-            return ConversationHandler.END
+            return await _retry("❌ Format: Name | -100xxxxxxxxxx")
         ok = await asyncio.to_thread(db.create_group, parts[0], parts[1], parts[1])
         await update.message.reply_text(
-            (f"✅ Added group “{parts[0]}”." if ok else "❌ Could not add the group."),
+            (f"✅ Added dispatcher “{parts[0]}”." if ok else "❌ Could not add the dispatcher."),
             reply_markup=_settings_main_kb())
         return SET_MENU
     return ConversationHandler.END
@@ -13120,6 +14727,10 @@ def main():
             if not hasattr(error_handler, f'_logged_{error_type}'):
                 logger.error(f"Exception while handling an update: {error}", exc_info=error)
                 setattr(error_handler, f'_logged_{error_type}', True)
+            else:
+                # Full traceback only once per type, but NEVER hide recurrences —
+                # invisible repeats made prod failures look like "does nothing".
+                logger.error(f"Exception while handling an update ({error_type}): {error}")
     
     # Add error handler - must be added before handlers
     application.add_error_handler(error_handler)
@@ -13132,7 +14743,8 @@ def main():
                 ["lead", "client", "newclient", "newsale", "enterlead", "enterclient", "newtag", "tag"],
                 begin_lead_command,
             ),
-            CommandHandler("restart", restart_command),
+            # /cancel and /restart are the same action, so both open the flow.
+            CommandHandler(["restart", "cancel"], restart_command),
             CallbackQueryHandler(handle_driver_add_lead_callback, pattern="^driver_add_lead$"),
             CallbackQueryHandler(handle_another_tag_callback, pattern="^another_tag_"),
             CallbackQueryHandler(handle_driver_add_receipt_callback, pattern="^driver_add_receipt$"),
@@ -13142,9 +14754,16 @@ def main():
             # or rare routing gaps) but Supabase ``states`` still holds select_group / select_driver data.
             CallbackQueryHandler(handle_group_selection, pattern="^select_group_"),
             CallbackQueryHandler(handle_driver_selection, pattern="^(select_driver_|driver_suspended_)"),
+            CallbackQueryHandler(handle_phase1_color_pick, pattern=f"^{PH1_COLOR_CB}"),
             # Idle natural-language / voice start: any substantive text starts a lead
             # and auto-fills what's given. MUST be last (only plain text reaches it).
             MessageHandler(filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE, handle_idle_lead_start),
+            # Same for a photo/PDF: a forwarded screenshot IS the lead details, and
+            # with no lead running it previously reached nothing at all.
+            MessageHandler(
+                (filters.PHOTO | filters.Document.ALL) & ~filters.COMMAND & filters.ChatType.PRIVATE,
+                handle_idle_media_start,
+            ),
         ],
         states={
             STATE_PHASE1: [
@@ -13166,6 +14785,17 @@ def main():
                 MessageHandler(filters.TEXT & ~filters.COMMAND, handle_phase1_review_message),
                 MessageHandler(filters.PHOTO, handle_phase1_review_message),
                 MessageHandler(filters.Document.ALL, handle_phase1_review_message),
+                # A picker posted while in a SELECT state stays tappable after a typed
+                # edit pulled the conversation back here (its patterns are otherwise
+                # only entry points, which an ACTIVE conversation never consults).
+                CallbackQueryHandler(handle_group_selection, pattern="^select_group_"),
+                CallbackQueryHandler(handle_driver_selection, pattern="^select_driver_"),
+                CallbackQueryHandler(handle_contact_source_selection, pattern="^contact_source_"),
+                CallbackQueryHandler(handle_phase1_color_pick, pattern=f"^{PH1_COLOR_CB}"),
+                # The DMV Yes/No card stays on screen while other edits are made, so
+                # its buttons must still resolve if the conversation drifts back here.
+                CallbackQueryHandler(handle_vin_choice_callback,
+                                     pattern="^(vin_use|vin_keep|vin_retype)$"),
             ],
             STATE_ADJUST_INPUT: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, handle_phase1_adjust_input),
@@ -13175,9 +14805,18 @@ def main():
             ],
             STATE_AI_EDIT_MENU: [
                 CallbackQueryHandler(handle_phase1_edit_menu_callback, pattern=r"^(ph1_back|ph1_accept|ph1edit_[a-z]+)$"),
+                # Single-line typed/voice edits keep working while the edit picker is
+                # open ('name John Damian', 'price 150') — they apply and re-render the
+                # review card instead of dying in a button-only state.
+                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_phase1_review_message),
+                MessageHandler(filters.PHOTO, handle_media_in_any_state),
+                MessageHandler(filters.Document.ALL, handle_media_in_any_state),
             ],
             STATE_AI_EDIT_INPUT: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, handle_phase1_edit_input),
+                MessageHandler(filters.PHOTO, handle_edit_field_photo),
+                MessageHandler(filters.Document.ALL, handle_edit_field_photo),
+                CallbackQueryHandler(handle_phase1_color_pick, pattern=f"^{PH1_COLOR_CB}"),
                 CallbackQueryHandler(
                     handle_phase1_edit_followup_callback,
                     pattern=f"^({PH1_EDIT_MORE}|{PH1_EDIT_DONE}|{PH1_FINAL_CONFIRM})$",
@@ -13185,9 +14824,18 @@ def main():
             ],
             STATE_EDIT_FIELD_PROMPT: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, handle_edit_field_text),
+                # A photo/PDF sent at a field prompt: for Color the AI reads the colour
+                # off the picture, anything else goes through the review parser.
+                MessageHandler(filters.PHOTO, handle_edit_field_photo),
+                MessageHandler(filters.Document.ALL, handle_edit_field_photo),
+                CallbackQueryHandler(handle_phase1_color_pick, pattern=f"^{PH1_COLOR_CB}"),
                 CallbackQueryHandler(handle_phase1_ai_review_callback, pattern="^edit_cancel$"),
             ],
-            STATE_MISSING_FIELD: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_missing_field)],
+            STATE_MISSING_FIELD: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_missing_field),
+                MessageHandler(filters.PHOTO, handle_media_in_any_state),
+                MessageHandler(filters.Document.ALL, handle_media_in_any_state),
+            ],
             STATE_PHASE2: [
                 MessageHandler(
                     (
@@ -13205,18 +14853,45 @@ def main():
             ],
             STATE_SPECIAL_REQUEST_ISSUERS: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, handle_special_request_issuers),
+                MessageHandler(filters.PHOTO, handle_media_in_any_state),
+                MessageHandler(filters.Document.ALL, handle_media_in_any_state),
             ],
             STATE_SPECIAL_REQUEST_DRIVERS: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, handle_special_request_drivers),
+                MessageHandler(filters.PHOTO, handle_media_in_any_state),
+                MessageHandler(filters.Document.ALL, handle_media_in_any_state),
             ],
             STATE_VIN_CHOICE: [
                 CallbackQueryHandler(handle_vin_choice_callback, pattern="^(vin_use|vin_keep|vin_retype)$"),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, handle_vin_choice_text),
+                MessageHandler(filters.PHOTO, handle_media_in_any_state),
+                MessageHandler(filters.Document.ALL, handle_media_in_any_state),
             ],
-            STATE_VIN_RETYPE: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_vin_retype)],
-            STATE_SELECT_GROUP: [CallbackQueryHandler(handle_group_selection, pattern="^select_group_")],
-            STATE_SELECT_DRIVER: [CallbackQueryHandler(handle_driver_selection, pattern="^(select_driver_|driver_suspended_)")],
-            STATE_SELECT_CONTACT_SOURCE: [CallbackQueryHandler(handle_contact_source_selection, pattern="^contact_source_")],
+            STATE_VIN_RETYPE: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_vin_retype),
+                MessageHandler(filters.PHOTO, handle_media_in_any_state),
+                MessageHandler(filters.Document.ALL, handle_media_in_any_state),
+            ],
+            # Typed/voice text during the pickers routes through the review editor
+            # (live lead) or a button nudge — never a silent drop.
+            STATE_SELECT_GROUP: [
+                CallbackQueryHandler(handle_group_selection, pattern="^select_group_"),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_select_state_text),
+                MessageHandler(filters.PHOTO, handle_media_in_any_state),
+                MessageHandler(filters.Document.ALL, handle_media_in_any_state),
+            ],
+            STATE_SELECT_DRIVER: [
+                CallbackQueryHandler(handle_driver_selection, pattern="^(select_driver_|driver_suspended_)"),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_select_state_text),
+                MessageHandler(filters.PHOTO, handle_media_in_any_state),
+                MessageHandler(filters.Document.ALL, handle_media_in_any_state),
+            ],
+            STATE_SELECT_CONTACT_SOURCE: [
+                CallbackQueryHandler(handle_contact_source_selection, pattern="^contact_source_"),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_select_state_text),
+                MessageHandler(filters.PHOTO, handle_media_in_any_state),
+                MessageHandler(filters.Document.ALL, handle_media_in_any_state),
+            ],
         },
         fallbacks=[
             CommandHandler("cancel", cancel_from_lead_conversation),
@@ -13315,7 +14990,12 @@ def main():
     settings_conv = ConversationHandler(
         entry_points=[CommandHandler(["settings", "setting"], cmd_settings)],
         states={
-            SET_MENU: [CallbackQueryHandler(handle_settings_cb, pattern=r"^tset_")],
+            SET_MENU: [
+                CallbackQueryHandler(handle_settings_cb, pattern=r"^tset_"),
+                # Say or type "plate numbers" and that screen opens — the state had
+                # button handlers only, so text here used to be dropped entirely.
+                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_settings_text),
+            ],
             SET_INPUT: [
                 CallbackQueryHandler(handle_settings_cb, pattern=r"^tset_"),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, apply_settings_input),
@@ -13327,8 +15007,15 @@ def main():
         allow_reentry=True,
     )
     application.add_handler(settings_conv)
+    # A plate photo sent inside /settings must reach the tag reader, not be deferred.
+    global _SETTINGS_CONV_HANDLER
+    _SETTINGS_CONV_HANDLER = settings_conv
 
     application.add_handler(conv_handler)
+
+    # Let the group -2 safety net read/repair this conversation's in-memory state.
+    global _MAIN_CONV_HANDLER
+    _MAIN_CONV_HANDLER = conv_handler
 
     # Supervisor plate-from-image reader — works in ANY state (like voice). At group -1 it
     # inspects a supervisor's photo/PDF FIRST: if the AI reads a temp-tag number it stages a
@@ -13349,12 +15036,36 @@ def main():
         group=-1,
     )
 
-    # Voice notes work EVERYWHERE: group -1 runs before every conversation handler,
+    # Voice notes work EVERYWHERE: group -3 runs before everything else,
     # transcribes any private-chat voice/audio note, injects the transcript as the
-    # message text, then lets the update flow to whatever text handler is active.
+    # message text, then lets the update flow on — first through the group -2
+    # review-edit safety net below, then to whatever text handler is active.
     application.add_handler(
         MessageHandler(filters.VOICE | filters.AUDIO, _global_voice_to_text),
-        group=-1,
+        group=-4,
+    )
+
+    # Commands without the slash (group -3: after transcription, before everything
+    # else): "settings" runs /settings, spoken or typed. Rewrites the message into a
+    # real command and lets it flow on, so PTB routes it through the same handler.
+    application.add_handler(
+        MessageHandler(
+            filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE,
+            _bare_command_to_slash,
+        ),
+        group=-3,
+    )
+
+    # Review-edit safety net (group -2: after voice transcription, before every
+    # conversation): a typed/spoken field edit for a live review card is applied
+    # even when the conversation sits in a button-only state, so a single-line
+    # edit ('name John Damian', 'price 150') is never silently dropped.
+    application.add_handler(
+        MessageHandler(
+            filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE,
+            handle_review_edit_anywhere,
+        ),
+        group=-2,
     )
 
     # /help + inline ❓ Help — outside ConversationHandler so they work during any flow.

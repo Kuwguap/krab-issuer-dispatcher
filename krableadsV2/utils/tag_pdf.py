@@ -104,27 +104,37 @@ def _load_font(kind: str) -> fitz.Font:
 
 # ── Field-value formatting (ported from normalize-pdf-fields.js) ──────────────
 
+# Codes are the operator's official list. The colour picker in the bot shows only the
+# NAME; this map turns whatever was picked, typed, spoken or read off a photo into the
+# 3-letter code the printed tag needs. Old codes stay as accepted INPUT aliases so a
+# lead saved before the list was fixed still resolves.
 _COLOR_MAP = {
     "black": "BLK", "blk": "BLK", "bk": "BLK",
-    "white": "WHI", "wht": "WHI", "whi": "WHI",
+    # WHI, not WHT — confirmed against the printed tag samples.
+    "white": "WHI", "whi": "WHI", "wht": "WHI",
     "red": "RED",
     "blue": "BLU", "blu": "BLU",
-    "yellow": "YLW", "yel": "YLW",
+    "yellow": "YLW", "ylw": "YLW", "yel": "YLW",
     "green": "GRN", "grn": "GRN",
     "gray": "GRY", "grey": "GRY", "gry": "GRY",
     "silver": "SLV", "sil": "SLV", "slv": "SLV",
     "brown": "BRN", "brn": "BRN",
     "orange": "ORG", "org": "ORG",
     "gold": "GLD", "gld": "GLD",
-    "beige": "BGE", "bge": "BGE",
+    # BGE, not BEG — confirmed against the printed tag samples.
+    "beige": "BGE", "bge": "BGE", "beg": "BGE",
     "tan": "TAN",
     "purple": "PUR", "pur": "PUR",
+    "amethyst": "PUR",          # a purple on the DMV list — no code of its own
     "pink": "PNK", "pnk": "PNK",
     "maroon": "MRN", "mrn": "MRN",
     "navy": "NVY", "nvy": "NVY",
+    "teal": "TEL", "tel": "TEL",
     "charcoal": "CHR", "chr": "CHR",
     "burgundy": "BRG", "brg": "BRG",
     "cream": "CRM", "crm": "CRM",
+    "champagne": "CRM",         # cream family
+    "pearl": "WHI",             # a white on the tag
     "bronze": "BRZ", "brz": "BRZ",
     "copper": "CPR", "cpr": "CPR",
 }

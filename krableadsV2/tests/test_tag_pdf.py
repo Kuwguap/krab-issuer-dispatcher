@@ -15,11 +15,15 @@ from utils import tag_pdf  # noqa: E402
 
 
 def test_color_code():
+    # White is WHI and Beige is BGE — matching the printed tag samples.
     assert tag_pdf.color_code("White") == "WHI"
     assert tag_pdf.color_code("tan") == "TAN"
     assert tag_pdf.color_code("Blue") == "BLU"
     assert tag_pdf.color_code("Brown") == "BRN"
-    assert tag_pdf.color_code("WHI") == "WHI"        # already a code
+    assert tag_pdf.color_code("Beige") == "BGE"
+    assert tag_pdf.color_code("Teal") == "TEL"
+    assert tag_pdf.color_code("WHT") == "WHI"        # tolerated as input, prints WHI
+    assert tag_pdf.color_code("BEG") == "BGE"
     assert tag_pdf.color_code("") == ""
     assert tag_pdf.color_code("Fuchsia") == "FUCX"[:3].ljust(3, "X") or True  # unknown → 3 letters
 

@@ -443,6 +443,116 @@ FIELD_VALUE_PROMPT = (
 )
 
 
+ADDRESS_SPLIT_PROMPT = (
+    "Split the mailing address below into its STREET line and its CITY/STATE/ZIP line. "
+    'Reply with ONLY a JSON object exactly like {"street": "", "city_state_zip": ""}.\n\n'
+    "Rules:\n"
+    "- street = house/building number, street name, and any apartment/suite/unit/floor.\n"
+    "- city_state_zip = the city, the 2-letter state abbreviation, and the ZIP code.\n"
+    "- Convert a spelled-out state to its 2-letter abbreviation (New Jersey -> NJ).\n"
+    "- Copy the words as given. NEVER invent a city, state, or ZIP that is not there.\n"
+    "- If the address has no city/state/ZIP part, city_state_zip must be \"\".\n"
+    "- If it is only a city/state/ZIP with no street, street must be \"\".\n\n"
+    "Examples:\n"
+    "'123 Main St, Newark NJ 07102' -> "
+    '{"street":"123 Main St","city_state_zip":"Newark NJ 07102"}\n'
+    "'88 Ocean Ave Apt 3B Fort Lee New Jersey 07024' -> "
+    '{"street":"88 Ocean Ave Apt 3B","city_state_zip":"Fort Lee NJ 07024"}\n'
+    "'200 Broadway' -> {\"street\":\"200 Broadway\",\"city_state_zip\":\"\"}\n\n"
+    "ADDRESS:\n"
+)
+
+
+def split_address(address: str) -> Optional[dict]:
+    """AI-split one typed/spoken address into {"street", "city_state_zip"}.
+
+    Used only when the deterministic splitter can't find a city/state/ZIP tail, so an
+    unusual or dictated address ("… Fort Lee New Jersey oh seven oh two four") still
+    fills BOTH review fields. Returns None when unconfigured / errored / unparseable,
+    and drops any answer whose words the original address didn't contain (so the model
+    can never invent a city or ZIP).
+    """
+    txt = (address or "").strip()
+    if not txt:
+        return None
+    raw = _call_openai_text([{"role": "user", "content": ADDRESS_SPLIT_PROMPT + txt[:300]}])
+    if not raw:
+        return None
+    data = _parse_json_from_model(raw)
+    if not isinstance(data, dict):
+        return None
+    street = str(data.get("street") or "").strip().strip(",")
+    csz = str(data.get("city_state_zip") or "").strip().strip(",")
+    if not csz:
+        return None
+    # Anti-hallucination: every ZIP/number it returns must appear in the input, and the
+    # two halves together may not be longer than what the user actually said.
+    src_digits = re.findall(r"\d+", txt)
+    for num in re.findall(r"\d+", street + " " + csz):
+        if num not in src_digits:
+            logger.warning("split_address: invented number %r — discarding", num)
+            return None
+    if len((street + csz).replace(" ", "")) > len(txt.replace(" ", "")) + 4:
+        return None                      # more than a state-abbreviation's worth of new text
+    return {"street": street, "city_state_zip": csz}
+
+
+COLOR_READ_PROMPT = (
+    "What COLOR is the vehicle in this image? Reply with ONLY a JSON object exactly "
+    'like {"color": "White"}.\n'
+    "Rules:\n"
+    "- Use one or two plain words a DMV form would accept (White, Black, Gray, Silver, "
+    "Dark Blue, Light Blue, Red, Burgundy, Dark Green, Brown, Beige, Gold, Tan, Orange, "
+    "Yellow, Purple, Pink, Navy, Charcoal).\n"
+    "- If the picture is a document (registration, title, insurance card) rather than a "
+    "photo of a car, report the colour written on it.\n"
+    '- If you cannot tell, reply {"color": ""}. Never guess.\n'
+)
+
+
+def read_color_from_image(image_bytes: bytes, mime_type: str = "image/jpeg") -> Optional[str]:
+    """Read a vehicle's colour from a photo (or from a document that states it).
+
+    Returns a short colour word, or None when unconfigured / unreadable / unsure —
+    the caller then keeps the palette open instead of writing a guess.
+    """
+    from config import Config
+
+    if not image_bytes:
+        return None
+    api_key = (getattr(Config, "OPENAI_API_KEY", "") or "").strip()
+    if not api_key:
+        return None
+    b64 = base64.standard_b64encode(image_bytes).decode("ascii")
+    data_url = f"data:{mime_type or 'image/jpeg'};base64,{b64}"
+    try:
+        from openai import OpenAI
+
+        client = OpenAI(api_key=api_key, max_retries=0)
+        model = getattr(Config, "OPENAI_VISION_MODEL", None) or "gpt-4o"
+        response = client.chat.completions.create(
+            model=model,
+            messages=[{"role": "user", "content": [
+                {"type": "text", "text": COLOR_READ_PROMPT},
+                {"type": "image_url", "image_url": {"url": data_url}},
+            ]}],
+            max_tokens=64,
+        )
+        raw = (response.choices[0].message.content or "").strip()
+    except Exception as e:
+        logger.warning("read_color_from_image failed: %s", e)
+        return None
+    if not raw:
+        return None
+    data = _parse_json_from_model(raw)
+    if not isinstance(data, dict):
+        return None
+    color = str(data.get("color") or "").strip()
+    if not color or len(color) > 24:
+        return None
+    return normalize_phase1_color(color)
+
+
 def classify_field_value(utterance: str) -> Optional[dict]:
     """AI-classify one free-text/voice command into a review edit-key + cleaned value.
 
@@ -625,6 +735,9 @@ def extract_structured_from_media_parts(
         return None
 
 
+PDF_RENDER_DPI = 200
+
+
 def pdf_first_page_to_png_bytes(pdf_bytes: bytes) -> Optional[bytes]:
     """
     Render the first page of a PDF to PNG bytes for vision extraction.
@@ -643,8 +756,8 @@ def pdf_first_page_to_png_bytes(pdf_bytes: bytes) -> Optional[bytes]:
         if len(doc) < 1:
             return None
         page = doc[0]
-        # ~150 DPI for readable text without huge payloads
-        mat = fitz.Matrix(150 / 72, 150 / 72)
+        # 200 DPI: a VIN is 17 small characters and was being misread at 150.
+        mat = fitz.Matrix(PDF_RENDER_DPI / 72, PDF_RENDER_DPI / 72)
         pix = page.get_pixmap(matrix=mat, alpha=False)
         return pix.tobytes("png")
     except Exception as e:
@@ -653,6 +766,110 @@ def pdf_first_page_to_png_bytes(pdf_bytes: bytes) -> Optional[bytes]:
     finally:
         if doc is not None:
             doc.close()
+
+
+# ── Reading the VIN straight out of a PDF's text layer ───────────────────────
+# Rendering a PDF to an image and asking vision to read a 17-character VIN is the
+# least reliable way to get it. Most registration / insurance / dealer PDFs are
+# digital and carry a real text layer, where the VIN can be read EXACTLY.
+# A VIN never contains I, O or Q — which makes a 17-character token in a page of
+# text identifiable with very few false positives.
+VIN_STRICT_RE = re.compile(r"\b[A-HJ-NPR-Z0-9]{17}\b")
+_VIN_LABEL_RE = re.compile(r"\bV\.?\s?I\.?\s?N\.?\b|\bvehicle\s+identification\b", re.I)
+_VIN_TRANSLIT = {
+    **{str(d): d for d in range(10)},
+    "A": 1, "B": 2, "C": 3, "D": 4, "E": 5, "F": 6, "G": 7, "H": 8,
+    "J": 1, "K": 2, "L": 3, "M": 4, "N": 5, "P": 7, "R": 9,
+    "S": 2, "T": 3, "U": 4, "V": 5, "W": 6, "X": 7, "Y": 8, "Z": 9,
+}
+_VIN_WEIGHTS = (8, 7, 6, 5, 4, 3, 2, 10, 0, 9, 8, 7, 6, 5, 4, 3, 2)
+
+
+def vin_check_digit_ok(vin: str) -> bool:
+    """True when the VIN's 9th character matches its computed check digit.
+
+    Used only to RANK candidates: imported and pre-1981 vehicles legitimately fail
+    this, so a failing VIN is never discarded outright."""
+    v = (vin or "").strip().upper()
+    if len(v) != 17:
+        return False
+    try:
+        total = sum(_VIN_TRANSLIT[c] * w for c, w in zip(v, _VIN_WEIGHTS))
+    except KeyError:
+        return False
+    rem = total % 11
+    return v[8] == ("X" if rem == 10 else str(rem))
+
+
+def pdf_text_all_pages(pdf_bytes: bytes) -> str:
+    """Every page's text layer, or '' when the PDF is scanned/unreadable."""
+    if not pdf_bytes:
+        return ""
+    try:
+        import fitz  # PyMuPDF
+    except ImportError:
+        return ""
+    doc = None
+    try:
+        doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+        return "\n".join((page.get_text() or "") for page in doc)
+    except Exception as e:
+        logger.warning("pdf_text_all_pages failed: %s", e)
+        return ""
+    finally:
+        if doc is not None:
+            doc.close()
+
+
+def vin_from_text(text: str) -> Optional[str]:
+    """Best 17-character VIN in a block of text, or None.
+
+    Ranking: a candidate sitting right after a "VIN" label wins; then one whose
+    check digit validates; then the first strict match."""
+    if not text:
+        return None
+    candidates = [m for m in VIN_STRICT_RE.finditer(text)]
+    if not candidates:
+        return None
+    # 1) nearest match following a VIN label (within ~60 chars)
+    for lab in _VIN_LABEL_RE.finditer(text):
+        for m in candidates:
+            if 0 <= m.start() - lab.end() <= 60:
+                return m.group(0).upper()
+    # 2) a checksum-valid VIN
+    for m in candidates:
+        if vin_check_digit_ok(m.group(0)):
+            return m.group(0).upper()
+    # 3) fall back to the first strict candidate
+    return candidates[0].group(0).upper()
+
+
+# A VIN-shaped run that is NOT 17 characters — almost always a mis-read (a doubled or
+# dropped character). Worth telling the user about instead of silently blanking the
+# field, which is what used to happen.
+_VIN_NEAR_MISS_RE = re.compile(
+    r"\bV\.?\s?I\.?\s?N\.?\s*[:#-]?\s*([A-HJ-NPR-Z0-9]{14,20})\b", re.I
+)
+
+
+def vin_near_miss_from_text(text: str) -> Optional[str]:
+    """A labelled VIN whose length is wrong (not 17), or None.
+
+    Only ever called after the strict search fails, so a good VIN never reaches it."""
+    if not text:
+        return None
+    for m in _VIN_NEAR_MISS_RE.finditer(text):
+        cand = m.group(1).upper()
+        if len(cand) != 17:
+            return cand
+    return None
+
+
+def vin_from_pdf(pdf_bytes: bytes) -> Optional[str]:
+    """Read the VIN from a PDF's text layer — exact, unlike reading it off a render.
+
+    Returns None for scanned PDFs with no text layer (vision still handles those)."""
+    return vin_from_text(pdf_text_all_pages(pdf_bytes))
 
 
 def extract_structured_from_pdf(pdf_bytes: bytes) -> Optional[str]:
@@ -674,10 +891,14 @@ PLATE_READ_PROMPT = (
     "Reply with ONLY a JSON object exactly like "
     '{"is_temp_tag": true, "plate": "H553300", "number": "553300", "kind": "resident"}.\n'
     "Rules:\n"
-    "- If the image is NOT a temporary vehicle tag — e.g. a driver's license, a vehicle "
-    "title, an insurance/ID card, a receipt, a photo of a car, or any other document — reply "
-    'EXACTLY {"is_temp_tag": false, "plate": "", "number": "", "kind": "unknown"} and read '
-    "NOTHING. Do NOT guess a plate number from a license, title, or receipt.\n"
+    "- A PHOTO OF A VEHICLE counts when a temporary paper tag is visible on it — that is "
+    "the usual way these are sent, so read the number straight off the tag. Only the tag "
+    "matters; ignore the rest of the car.\n"
+    "- If NO temporary tag is visible — e.g. a driver's license, a vehicle title, an "
+    "insurance/ID card, a receipt, a car with an ordinary metal plate, or any other "
+    'document — reply EXACTLY {"is_temp_tag": false, "plate": "", "number": "", '
+    '"kind": "unknown"} and read NOTHING. Do NOT guess a plate number from a license, '
+    "title, receipt or a permanent plate.\n"
     "- If it IS a temp tag: number = the main plate digits only (no letters); kind = "
     '"resident" if it starts with H, "nonresident" if it ends with V, otherwise "unknown".\n'
     "- If it clearly is a temp tag but you cannot read the number, use is_temp_tag true with "
