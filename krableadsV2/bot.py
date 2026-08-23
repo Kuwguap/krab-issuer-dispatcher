@@ -3126,7 +3126,10 @@ def _merge_phase1_adjust(state_data: dict, structured_text: str, only_empty: boo
         for key in _PHASE1_ADJUST_FIELD_ORDER:
             if state_data.get(key) is None:
                 state_data[key] = "-"
-        _clean_vin_and_car(state_data)  # rebuilds vehicle/delivery details
+        # Only one address given? Use it for both. The typed and edit paths already
+        # did this; an AI extraction (a photo of a registration, a dictated lead)
+        # did not, so the delivery line stayed "-" and the driver got no address.
+        _apply_single_address_as_both(state_data)   # also rebuilds the derived lines
     return updated
 
 
@@ -8603,6 +8606,9 @@ async def _finalize_lead_after_notes(
     return ConversationHandler.END
 
 async def _submit_lead_from_review(message, context, user_id, data):
+    # Last chance to mirror a single address across both lines, whatever route the
+    # lead took to get here — the driver must never receive a blank delivery address.
+    _apply_single_address_as_both(data)
     # Phone is the only hard requirement at submit; price may be "-".
     if not _is_valid_pending_phone(data.get("pending_phone_number")):
         _sanitize_phase1_pending_phone_price(data)
