@@ -178,7 +178,20 @@ class BothViewsShareOneRendererTest(unittest.TestCase):
 
     def test_a_block_is_a_name_plus_three_details(self):
         blocks = bot._driver_roster_blocks([FULL])
-        self.assertEqual(4, len(blocks[0]))
+        self.assertEqual(4, len([l for l in blocks[0] if l.strip()]))
+
+    def test_a_blank_line_separates_the_drivers(self):
+        """Four tight lines each read as one wall of text without it."""
+        blocks = bot._driver_roster_blocks([FULL, EMPTY])
+        self.assertEqual("", blocks[0][-1])
+        text, _ = _settings_screen(drivers=[FULL, EMPTY], suspended=())
+        self.assertIn("`123456789`" + "\n\n", text)
+
+    def test_no_blank_dangles_at_the_end(self):
+        text, _ = _settings_screen(drivers=[FULL], suspended=())
+        self.assertEqual(text, text.rstrip())
+        for m in _drivers_command(drivers=[FULL]):
+            self.assertEqual(m, m.rstrip())
 
     def test_no_drivers_gives_no_blocks(self):
         self.assertEqual([], bot._driver_roster_blocks([]))

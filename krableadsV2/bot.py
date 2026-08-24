@@ -14935,7 +14935,10 @@ def _driver_roster_blocks(drivers, suspended=None) -> list:
         else:
             mark, note = "⛔", " _(disabled)_"
         name = _telegram_md1_escape(d.get("driver_name") or "(unnamed)")
-        blocks.append([f"{mark} *{i}. {name}*{note}"] + _driver_contact_lines(d))
+        # The trailing blank keeps one driver from running into the next —
+        # four tight lines each read as a single wall of text without it.
+        blocks.append([f"{mark} *{i}. {name}*{note}"]
+                      + _driver_contact_lines(d) + [""])
     return blocks
 
 
@@ -14951,7 +14954,8 @@ def _pack_blocks(blocks, header="", limit=_TG_TEXT_LIMIT) -> list:
             cur = candidate
     if cur:
         msgs.append("\n".join(cur))
-    return msgs or [header or "_No drivers yet._"]
+    # The blank that separates drivers must not dangle at a message end.
+    return [m.rstrip() for m in msgs] or [header or "_No drivers yet._"]
 
 
 async def _settings_view_drivers() -> tuple:
@@ -14973,7 +14977,7 @@ async def _settings_view_drivers() -> tuple:
         lines.extend(block)
         shown += 1
     if shown < total:
-        lines.append(f"\n_…and {total - shown} more — see /drivers for the full list._")
+        lines.append(f"_…and {total - shown} more — see /drivers for the full list._")
     rows = []
     for d in (drivers or [])[:30]:      # Telegram caps the keyboard, not the text
         active = record_is_active(d)
@@ -14983,10 +14987,11 @@ async def _settings_view_drivers() -> tuple:
     if not drivers:
         lines.append("_No drivers yet._")
     elif total > 30:
-        lines.append(f"\n_Buttons shown for the first 30 of {total}._")
+        lines.append(f"_Buttons shown for the first 30 of {total}._")
     rows.append([InlineKeyboardButton("➕ Add Driver", callback_data="tset_dadd")])
     rows.append([InlineKeyboardButton("⬅️ Back", callback_data="tset_menu")])
-    return ("\n".join(lines), InlineKeyboardMarkup(rows))
+    # rstrip: the last driver's separating blank would otherwise dangle.
+    return ("\n".join(lines).rstrip(), InlineKeyboardMarkup(rows))
 
 
 async def _settings_view_suspensions() -> tuple:
