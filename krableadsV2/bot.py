@@ -3558,7 +3558,7 @@ _INSURERS_WEAK = {
 _INSURER_NOISE_RE = re.compile(
     r"\b(insurance|insurances|insurer|ins|company|companies|co|corp|corporation|"
     r"group|agency|mutual|casualty|indemnity|underwriters|assurance|auto|automobile|"
-    r"car|vehicle|policy|carrier|coverage|the|of|my|is|for)\b",
+    r"car|vehicle|policy|carrier|coverage|name|provider|the|of|my|is|for)\b",
     re.IGNORECASE,
 )
 # The value itself says this is insurance, even for a carrier we don't know.
@@ -3624,6 +3624,18 @@ _PHONE_IN_TEXT_RE = re.compile(
 _POLICY_NUM_RE = re.compile(r"\b(?=[A-Za-z0-9][A-Za-z0-9\-]*\d)[A-Za-z0-9\-]{5,}\b")
 
 
+def _carrier_is_never_a_person(edit_key: str, value: str) -> str:
+    """Send an unmistakable carrier to the insurance field even when the line said
+    "name". A company name and a person's name are different things, and however
+    the label was worded the VALUE settles which one this is.
+
+    Only the carriers we recognise outright move — an unknown company still
+    honours the label, so a real client is never dragged out of the name field."""
+    if edit_key not in ("name", "fn", "ln"):
+        return edit_key
+    return "ins" if _insurer_name(value) else edit_key
+
+
 def _expand_insurance_pair(edit_key: str, value: str):
     """Turn one insurance edit into the field(s) it really is, or None when this
     isn't an insurance edit at all.
@@ -3670,6 +3682,13 @@ _INLINE_EDIT_ALIASES = {
     "insurance": "ins", "insurance company": "ins", "carrier": "ins",
     "insurance carrier": "ins", "insurance name": "ins", "insurer": "ins",
     "insurance co": "ins", "company name": "ins",
+    # "name" is a field of its own, so these have to be listed whole or the phrase
+    # splits at it and the carrier is filed as the client (see _LABEL_TAIL_WORDS).
+    "insurance company name": "ins", "insurance company's name": "ins",
+    "insurance companys name": "ins", "carrier name": "ins",
+    "name of the insurance company": "ins", "name of insurance company": "ins",
+    "name of the insurance": "ins", "name of insurance": "ins",
+    "insurance provider": "ins", "provider": "ins",
     "policy number": "pol", "policy #": "pol", "policy": "pol", "binder": "pol", "binder #": "pol",
     # Said for either half — _expand_insurance_pair reads the value to tell
     # the carrier ("policy geico") from the number ("policy 8829301").
@@ -3726,6 +3745,10 @@ def _clean_inline_value(edit_key: str, value: str) -> str:
         amount = "$" + m.group(0).replace(",", "")
         # "150 + toll" / "150 plus tolls" quotes the same job with the toll on top.
         return amount + _PH1_TOLL_SUFFIX if _price_has_toll(value) else amount
+    if edit_key in ("name", "fn", "ln"):
+        # "name of the insurance company State Farm" left "of the" behind.
+        if all(w.strip(".,'").lower() in _FIELD_LEAD_FILLERS for w in value.split()):
+            return ""
     if edit_key == "ins":
         # "gieco" / "state farm insurance co" -> the carrier's real name.
         return _insurer_name(value, labeled_insurance=True) or value
@@ -3766,6 +3789,9 @@ _STRUCTURED_EK = frozenset({"phone", "price", "email", "vin", "pol", "dl"})
 # Common English words that ALSO happen to be aliases and routinely appear inside a
 # free-text value (a street "12 Car St", "30 Color Ave"). These only start a new field
 # when the field before them was structured (so they don't chop up an address/note).
+# Words that FINISH a label instead of starting a field when they follow one
+# immediately: "insurance company name", "policy number name".
+_LABEL_TAIL_WORDS = frozenset({"name", "names", "number", "numbers"})
 _WEAK_ALIASES = frozenset({"car", "color", "colour", "cost", "amount", "quote", "carrier", "binder"})
 
 
@@ -3791,6 +3817,12 @@ def _parse_multi_field_line(line: str):
         ek = _INLINE_EDIT_ALIASES.get(alias)
         if ek is None:
             return None
+        # "insurance company NAME Geico": the label ran straight into this one with
+        # no value between them, so this word finishes the label rather than
+        # starting a field. Without this the carrier was filed as the client.
+        if (alias in _LABEL_TAIL_WORDS and boundaries
+                and not line[matches[i - 1].end():m.start()].strip()):
+            continue
         if i == 0 or alias not in _WEAK_ALIASES or (cur_ek in _STRUCTURED_EK):
             boundaries.append((i, ek))
             cur_ek = ek
@@ -3808,6 +3840,7 @@ def _parse_multi_field_line(line: str):
             pairs.extend((p_ek, _clean_inline_value(p_ek, p_val) or p_val)
                          for p_ek, p_val in ins)
             continue
+        ek = _carrier_is_never_a_person(ek, raw)
         val = _clean_inline_value(ek, raw)
         if val:
             pairs.append((ek, val))
@@ -4054,6 +4087,7 @@ def _apply_ek_value(state_data: dict, ek: str, value: str) -> list:
     mis-split a mangled label back into the wrong field)."""
     if ek not in _INLINE_EDIT_KEY_LABEL:          # not one of the 19 review fields
         return []
+    ek = _carrier_is_never_a_person(ek, value)
     # Same per-field validation/normalization the labeled path uses ('500' -> '$500',
     # phone needs >=10 digits, email needs '@', …). Returns '' when the value doesn't
     # fit the field, so a mis-guess is dropped instead of written.
