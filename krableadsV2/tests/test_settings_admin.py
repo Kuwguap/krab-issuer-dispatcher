@@ -332,16 +332,20 @@ class DriverContactDetailsTest(unittest.TestCase):
         text, _ = self._screen()
         self.assertIn(r"kita\_d@example.com", text)
 
-    def test_a_driver_with_nothing_on_file_says_so(self):
+    def test_a_driver_with_nothing_on_file_shows_the_blanks(self):
+        """Every detail is listed either way — an omitted line read as "none
+        needed" rather than "go and add it". See test_driver_roster.py."""
         text, _ = self._screen()
-        self.assertIn("no phone or email on file", text)
+        self.assertIn("means nothing on file yet", text)
+        self.assertGreaterEqual(text.count("—"), 3)
 
-    def test_contact_lines_helper_handles_missing_values(self):
-        self.assertIn("no phone or email on file",
-                      " ".join(bot._driver_contact_lines({})))
-        only_phone = " ".join(bot._driver_contact_lines({"phone_number": "555"}))
-        self.assertIn("555", only_phone)
-        self.assertNotIn("no phone", only_phone)
+    def test_contact_lines_helper_always_gives_three_lines(self):
+        blank = bot._driver_contact_lines({})
+        self.assertEqual(3, len(blank))
+        self.assertTrue(all("—" in l for l in blank), blank)
+        only_phone = bot._driver_contact_lines({"phone_number": "555"})
+        self.assertIn("555", " ".join(only_phone))
+        self.assertEqual(2, sum(1 for l in only_phone if "—" in l))
 
 
 class AddDriverWithEmailTest(unittest.TestCase):

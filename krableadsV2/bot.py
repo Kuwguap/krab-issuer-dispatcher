@@ -296,6 +296,26 @@ async def cmd_test(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await msg.reply_text(_driverblock_status_text(_driverblock_enabled()), parse_mode="Markdown")
 
 
+async def cmd_drivers(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Supervisory-only roster: every driver with phone, email and chat id.
+
+    The /settings screen is one editable message and cannot grow past Telegram's
+    limit; this splits across messages so nobody is left off the list."""
+    msg = update.effective_message
+    user = update.effective_user
+    if not msg or not user:
+        return
+    if not _user_is_global_supervisor(user.id):
+        return
+    drivers = await asyncio.to_thread(_get_all_drivers_cached)
+    suspended = await asyncio.to_thread(_get_suspended_driver_ids)
+    total = len(drivers or [])
+    header = (f"🚗 *Drivers — {total} on file*\n"
+              "_Tap a value to copy. — means nothing on file yet._\n")
+    for chunk in _pack_blocks(_driver_roster_blocks(drivers, suspended), header):
+        await msg.reply_text(chunk, parse_mode="Markdown")
+
+
 async def cmd_driverblock(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Secret toggle: flip driver phone-redaction on/off. Supervisory-only."""
     msg = update.effective_message
@@ -14880,22 +14900,58 @@ def _settings_main_kb() -> InlineKeyboardMarkup:
     ])
 
 
-def _driver_contact_lines(driver: dict) -> list:
-    """The driver's own phone and email, as tap-to-copy lines.
+# Telegram rejects a message over this, so a long roster is split rather than clipped.
+_TG_TEXT_LIMIT = 4000
 
-    They were stored but never shown anywhere, so reaching a driver meant leaving
-    Telegram. Wrapped in backticks so one tap copies the value; unrelated to the
-    /driverblock redaction, which hides the CLIENT's number from drivers."""
-    out = []
-    phone = str(driver.get("phone_number") or "").strip()
-    email = str(driver.get("email") or "").strip()
-    if phone:
-        out.append(f"   📞 `{_telegram_md1_escape(phone)}`")
-    if email:
-        out.append(f"   📧 `{_telegram_md1_escape(email)}`")
-    if not out:
-        out.append("   _no phone or email on file_")
-    return out
+
+def _driver_contact_lines(driver: dict) -> list:
+    """Phone, email and chat id — ALWAYS all three, with a dash when not on file.
+
+    Printing only the details that existed made a half-filled record look complete,
+    so a missing number read as "none needed" instead of "go and add it". Wrapped in
+    backticks so one tap copies the value; unrelated to the /driverblock redaction,
+    which hides the CLIENT's number from drivers."""
+    def _val(key: str) -> str:
+        v = str(driver.get(key) or "").strip()
+        return f"`{_telegram_md1_escape(v)}`" if v and v != "-" else "—"
+    return [
+        f"   📞 {_val('phone_number')}",
+        f"   📧 {_val('email')}",
+        f"   🆔 {_val('driver_telegram_id')}",
+    ]
+
+
+def _driver_roster_blocks(drivers, suspended=None) -> list:
+    """One block of lines per driver, so a long roster can be split BETWEEN drivers
+    and never inside one. Shared by the /settings screen and /drivers."""
+    susp = {str(x) for x in (suspended or ())}
+    blocks = []
+    for i, d in enumerate(drivers or [], start=1):
+        did = str(d.get("id"))
+        if did in susp:
+            mark, note = "🚫", " _(suspended)_"
+        elif record_is_active(d):
+            mark, note = "✅", ""
+        else:
+            mark, note = "⛔", " _(disabled)_"
+        name = _telegram_md1_escape(d.get("driver_name") or "(unnamed)")
+        blocks.append([f"{mark} *{i}. {name}*{note}"] + _driver_contact_lines(d))
+    return blocks
+
+
+def _pack_blocks(blocks, header="", limit=_TG_TEXT_LIMIT) -> list:
+    """Group whole blocks into as few messages as fit, keeping each block intact."""
+    msgs, cur = [], ([header] if header else [])
+    for block in blocks:
+        candidate = cur + block
+        if cur and len("\n".join(candidate)) > limit:
+            msgs.append("\n".join(cur))
+            cur = list(block)
+        else:
+            cur = candidate
+    if cur:
+        msgs.append("\n".join(cur))
+    return msgs or [header or "_No drivers yet._"]
 
 
 async def _settings_view_drivers() -> tuple:
@@ -14903,18 +14959,31 @@ async def _settings_view_drivers() -> tuple:
     removes them from the pickers entirely; suspending (separate screen) keeps them
     visible but unassignable."""
     drivers = await asyncio.to_thread(_get_all_drivers_cached)
-    lines = ["🚗 *Drivers*\n"]
+    suspended = await asyncio.to_thread(_get_suspended_driver_ids)
+    total = len(drivers or [])
+    lines = [f"🚗 *Drivers — {total} on file*",
+             "_Tap a value to copy. — means nothing on file yet._\n"]
+    blocks = _driver_roster_blocks(drivers, suspended)
+    # One screen is one message, so a roster too long to fit says so and points at
+    # /drivers, which splits it instead of dropping anyone.
+    shown = 0
+    for block in blocks:
+        if len("\n".join(lines + block)) > _TG_TEXT_LIMIT - 120:
+            break
+        lines.extend(block)
+        shown += 1
+    if shown < total:
+        lines.append(f"\n_…and {total - shown} more — see /drivers for the full list._")
     rows = []
-    for d in (drivers or [])[:25]:
+    for d in (drivers or [])[:30]:      # Telegram caps the keyboard, not the text
         active = record_is_active(d)
-        name = _telegram_md1_escape(d.get("driver_name") or "(unnamed)")
-        lines.append(f"{'✅' if active else '⛔'} {name}")
-        lines.extend(_driver_contact_lines(d))
         rows.append([InlineKeyboardButton(
             f"{'Disable' if active else 'Enable'} {d.get('driver_name') or 'driver'}"[:40],
             callback_data=f"tset_dtog:{d.get('id')}")])
     if not drivers:
         lines.append("_No drivers yet._")
+    elif total > 30:
+        lines.append(f"\n_Buttons shown for the first 30 of {total}._")
     rows.append([InlineKeyboardButton("➕ Add Driver", callback_data="tset_dadd")])
     rows.append([InlineKeyboardButton("⬅️ Back", callback_data="tset_menu")])
     return ("\n".join(lines), InlineKeyboardMarkup(rows))
@@ -15747,6 +15816,9 @@ def main():
     # Self-check (anyone): shows your Telegram ID + supervisor/AI status.
     application.add_handler(CommandHandler(["whoami", "id", "me"], cmd_whoami))
     application.add_handler(CommandHandler("driverblock", cmd_driverblock))
+    # Supervisory-only driver roster (phone / email / chat id), split over as many
+    # messages as it takes — the /settings screen is capped at one.
+    application.add_handler(CommandHandler(["drivers", "driverlist", "roster"], cmd_drivers))
     # Supervisor broadcast to all groups + drivers + lead senders.
     application.add_handler(CommandHandler("announce", cmd_announce))
     # Confirm/cancel for the supervisor voice/text router's destructive actions.
