@@ -3672,6 +3672,10 @@ _INLINE_EDIT_ALIASES = {
     "first name": "fn", "firstname": "fn",
     "last name": "ln", "lastname": "ln",
     "name": "name", "full name": "name", "client name": "name",
+    # Both halves asked for together mean the whole name — see also
+    # _merge_double_name_labels for the phrasings not listed here.
+    "first and last name": "name", "first and last": "name",
+    "first last name": "name", "first name and last name": "name",
     "reg address": "addr", "registration address": "addr", "address": "addr", "addr": "addr",
     "reg city": "csz", "city/st/zip": "csz", "city state zip": "csz", "csz": "csz",
     "delivery address": "daddr", "deliv address": "daddr", "delivery addr": "daddr", "daddr": "daddr", "drop off": "daddr", "dropoff": "daddr",
@@ -3735,7 +3739,8 @@ def _clean_inline_value(edit_key: str, value: str) -> str:
     treated as edits, and 'price 50' becomes '$50' (the sanitizer needs the $)."""
     # Drop a leading filler word for every field ("color is white" -> "white",
     # "change name to john doe" -> "john doe", "phone: 555-123-4567" -> "555-123-4567").
-    value = re.sub(r"^(?:is|are|to|=|:)\s+", "", value.strip(), flags=re.IGNORECASE).strip()
+    value = value.strip().lstrip(",;:").strip()          # "…, john doe"
+    value = re.sub(r"^(?:is|are|to|=|:)\s+", "", value, flags=re.IGNORECASE).strip()
     if not value:
         return ""
     if edit_key == "price":
@@ -3795,6 +3800,32 @@ _LABEL_TAIL_WORDS = frozenset({"name", "names", "number", "numbers"})
 _WEAK_ALIASES = frozenset({"car", "color", "colour", "cost", "amount", "quote", "carrier", "binder"})
 
 
+_NAME_EKS = frozenset({"fn", "ln", "name"})
+
+
+def _merge_double_name_labels(boundaries, matches, line):
+    """"first name and last name, john doe" is ONE edit — the whole name.
+
+    Said that way the first label has no value of its own, so it used to be dropped
+    while the last label swallowed the lot ("Maria , john doe"). Where name labels
+    run together with nothing but filler between them, keep only the last and treat
+    what follows as the full name."""
+    if len(boundaries) < 2:
+        return boundaries
+    out = []
+    for i, (mi, ek) in enumerate(boundaries):
+        if i + 1 < len(boundaries) and ek in _NAME_EKS:
+            next_mi, next_ek = boundaries[i + 1]
+            if next_ek in _NAME_EKS:
+                between = line[matches[mi].end():matches[next_mi].start()]
+                tokens = [t for t in re.split(r"[\s,]+", between.strip().lower()) if t]
+                if all(t.strip(".,") in _FIELD_LEAD_FILLERS for t in tokens):
+                    boundaries[i + 1] = (next_mi, "name")   # the value is the whole name
+                    continue                                 # and this label carries none
+        out.append((mi, ek))
+    return out
+
+
 def _parse_multi_field_line(line: str):
     """Split one line into (edit_key, value) pairs, so 'price 200 address 321 Main St
     Fort Lee NJ 07024' sets BOTH fields. A weak alias (car/color/cost…) only starts a
@@ -3827,6 +3858,7 @@ def _parse_multi_field_line(line: str):
             boundaries.append((i, ek))
             cur_ek = ek
         # else: weak alias inside a free-text value → absorb into the current field
+    boundaries = _merge_double_name_labels(boundaries, matches, line)
     pairs: list[tuple[str, str]] = []
     for bi, (mi, ek) in enumerate(boundaries):
         m = matches[mi]
