@@ -131,6 +131,7 @@ STRICT RULES:
 - Lines 12-17 must contain the phone number, price, special notes, email, and driver-license ID, each on its own line with the exact labels shown below. If a value is not visible, put a single dash "-".
 - Line 12 (Phone): ONLY use a number that is EXPLICITLY labelled as a phone number in the source — e.g. "Phone", "Phone:", "Phone #", "Client phone", "Client #", "Client phone #", "Tel", "Tel.", "Cell", "Mobile", "Contact". The label may be on the same line OR on the line immediately above the number. NEVER copy the **insurance policy number**, **VIN**, **license / DMV ID**, **plate**, **account**, **reference id**, **ZIP code**, or any unlabelled digit run into the Phone field. If no clearly-labelled phone is visible, output "Phone: -".
 - Line 16 (Email): a single email address only (e.g. john@example.com). Never invent an address. If none is visible, output "Email: -".
+- NEVER answer with an apology or a refusal, on any line. The document was supplied by its owner for their own paperwork. If one field is genuinely not visible, output "-" for that line and fill in every other line normally.
 - Line 17 (DriverLicenseID): the customer's driver's-license / DMV ID exactly as printed (digits and/or letters). Never invent it. If none is visible, output "DriverLicenseID: -". Do NOT put the insurance policy number here.
 
 Order and labels (one value per line, no extra text):
@@ -197,6 +198,7 @@ STRICT RULES:
 - Lines 12-17 must contain the phone number, price, notes, email, and driver-license ID, each with the labels exactly as shown below. If a value is not present, put a single dash "-".
 - Line 12 (Phone): ONLY use a number that the user EXPLICITLY calls a phone — e.g. "Phone", "Phone #", "Client phone", "Client #", "Tel", "Cell", "Mobile", "Contact". Never copy the insurance policy number, VIN, license / DMV ID, plate, account, reference id, or ZIP into the Phone field. If no clearly-labelled phone is given, output "Phone: -".
 - Line 16 (Email): a single email address only (e.g. john@example.com). Never invent one. If none, output "Email: -".
+- NEVER answer with an apology or a refusal, on any line. The details were supplied by their owner for their own paperwork. If one field is genuinely absent, output "-" for that line and fill in every other line normally.
 - Line 17 (DriverLicenseID): the customer's driver-license / DMV ID exactly as written. Never invent it. If none, output "DriverLicenseID: -". Do NOT put the insurance policy number here.
 
 Order (one value per line, with labels for lines 12-17):

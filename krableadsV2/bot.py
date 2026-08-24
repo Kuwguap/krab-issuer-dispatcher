@@ -1880,17 +1880,23 @@ def parse_phase1_structured(message_text: str) -> dict:
     def get_line(idx: int) -> str:
         return lines[idx] if idx < len(lines) else ""
     
-    name = get_line(0)
-    address = get_line(1)
-    city_state_zip = get_line(2)
-    delivery_address = get_line(3)
-    delivery_city_state_zip = get_line(4)
-    vin = get_line(5)
-    car = get_line(6)
-    color = ai_vision.normalize_phase1_color(get_line(7))
-    insurance_company = get_line(8)
-    insurance_policy_number = get_line(9)
-    extra_info = get_line(10)
+    def field(idx: int) -> str:
+        """One line of the block — blank if the model apologised on it instead of
+        answering. Dropping just that line keeps the rest of a good extraction."""
+        v = get_line(idx)
+        return "" if _value_is_refusal(v) else v
+
+    name = field(0)
+    address = field(1)
+    city_state_zip = field(2)
+    delivery_address = field(3)
+    delivery_city_state_zip = field(4)
+    vin = field(5)
+    car = field(6)
+    color = ai_vision.normalize_phase1_color(field(7))
+    insurance_company = field(8)
+    insurance_policy_number = field(9)
+    extra_info = field(10)
     
     # Vehicle details (for supervisor / group high-level view)
     vehicle_lines = [
@@ -2899,12 +2905,39 @@ def _resolve_dispatch_driver_ids(
     2) Fallback pool (group-linked for single-group, global for broadcast).
     Filters to active, non-suspended, and parseable Telegram IDs.
     """
+    ids, _ = _dispatch_drivers_with_reasons(
+        data, group_id=group_id, is_all_groups=is_all_groups)
+    return ids
+
+
+def _dispatch_drivers_with_reasons(
+    data: dict | None,
+    *,
+    group_id: str | None = None,
+    is_all_groups: bool = False,
+):
+    """(reachable_driver_ids, dropped) where dropped is [(name, why), …].
+
+    The issuer's CHOICE and what that choice resolves to are different things, and
+    conflating them is what sent a one-driver lead to the whole roster: an explicit
+    pick that resolved to nothing looked exactly like no pick at all, and no pick
+    means "use the pool". An explicit pick therefore never widens here — if it comes
+    to nothing the caller reports it instead of broadcasting."""
     payload = data or {}
     all_rows = _get_all_drivers_cached() or []
     id_set = {str(x).strip() for x in (payload.get("selected_driver_ids") or []) if str(x).strip()}
-    selected = [d for d in all_rows if str(d.get("id")) in id_set]
+    dropped: list[tuple[str, str]] = []
 
-    if not selected:
+    if id_set:
+        by_id = {str(d.get("id")): d for d in all_rows if d}
+        selected = []
+        for did in sorted(id_set):
+            row = by_id.get(did)
+            if row is None:
+                dropped.append((f"driver {did}", "no longer on the roster"))
+            else:
+                selected.append(row)
+    else:
         if is_all_groups:
             pool = all_rows
         else:
@@ -2918,15 +2951,31 @@ def _resolve_dispatch_driver_ids(
     suspended = _get_suspended_driver_ids()
     out_ids: list[str] = []
     for d in selected:
+        name = str((d or {}).get("driver_name") or "that driver")
         if not d or not record_is_active(d):
+            dropped.append((name, "switched off in /settings"))
             continue
         did = str(d.get("id") or "").strip()
-        if not did or did in suspended:
+        if not did:
+            dropped.append((name, "no id on the record"))
+            continue
+        if did in suspended:
+            dropped.append((name, "suspended"))
             continue
         if _parse_chat_id(d.get("driver_telegram_id")) is None:
+            dropped.append((name, "no Telegram chat id on file — see /drivers"))
             continue
         out_ids.append(did)
-    return out_ids
+    # Only an explicit pick needs explaining; a pool that thins out is routine.
+    return out_ids, (dropped if id_set else [])
+
+
+def _dropped_drivers_note(dropped: list) -> str:
+    """One line per driver the lead could not reach, so a silent non-delivery
+    becomes a message the issuer can act on."""
+    if not dropped:
+        return ""
+    return "\n".join(f"• {name} — {why}" for name, why in dropped)
 
 
 async def _send_phase1_ai_review(target_message, state_data: dict, context, user_id) -> None:
@@ -6377,13 +6426,28 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
 # ("I'm unable to extract any personal details from this image…") instead of the field
 # block. That sentence was being split across the name lines and shown as the client.
 _AI_REFUSAL_RE = re.compile(
-    r"\b(?:i'?m\s+unable|i\s+am\s+unable|unable\s+to\s+(?:extract|read|determine|identify)|"
-    r"cannot\s+(?:extract|read|determine|identify|assist)|can'?t\s+(?:extract|read|determine)|"
+    r"\b(?:i'?m\s+sorry|i\s+am\s+sorry|i\s+apologi[sz]e|as\s+an\s+ai|"
+    r"i'?m\s+unable|i\s+am\s+unable|unable\s+to\s+(?:extract|read|determine|identify|assist|help)|"
+    r"cannot\s+(?:extract|read|determine|identify|assist|help|provide)|"
+    r"can'?t\s+(?:extract|read|determine|identify|assist|help|provide)|"
     r"no\s+(?:personal\s+)?details?\s+(?:are\s+)?(?:visible|found|present)|"
     r"does\s+not\s+contain\s+(?:any\s+)?(?:personal|required)|"
     r"please\s+provide\s+(?:a\s+)?(?:document|image|clearer))\b",
     re.I,
 )
+
+
+def _value_is_refusal(value) -> bool:
+    """True when ONE extracted field is an apology rather than a value.
+
+    Separate from _looks_like_ai_refusal, which judges the whole reply: a model can
+    refuse a single line and read the rest of the document perfectly, and throwing
+    away a good address, VIN and carrier over one bad line would be worse than the
+    bug. Length-capped so a genuine note that happens to say "sorry" survives."""
+    v = str(value or "").strip()
+    if not v or v == "-":
+        return False
+    return len(v) <= 120 and bool(_AI_REFUSAL_RE.search(v))
 
 
 def _looks_like_ai_refusal(text: str) -> bool:
@@ -7897,6 +7961,16 @@ async def handle_phase1_price_pick(update: Update, context: ContextTypes.DEFAULT
     context.user_data.pop("edit_prompt_msg_id", None)
     db.set_user_state(user_id, "phase1", state_data)
     chat_id = query.message.chat_id if query.message else None
+    # Tapped at the "price missing" gate rather than on the review card: the lead is
+    # mid-dispatch, so carry on with it instead of reopening the edit picker.
+    if context.user_data.pop("phase2_awaiting_price", None):
+        if _phase1_has_phone_and_price(state_data):
+            db.set_user_state(user_id, "special_request_drivers", state_data)
+            if chat_id:
+                await _send_vanishing(context, chat_id, f"✅ Price: {price}")
+            return await _prompt_issuer_special_request(query.message, context, user_id)
+        db.set_user_state(user_id, "phase1", state_data)
+        return await _phase2_ask(query.message, context, state_data)
     await _show_edit_picker(context, state_data, fallback_chat_id=chat_id)
     if chat_id:
         await _send_vanishing(context, chat_id, f"✅ Updated: price → {price}")
@@ -8142,8 +8216,24 @@ def _phase2_prompt(state_data: dict) -> str:
     if needs_phone:
         return "📞 Client phone number missing: please enter the client's phone number"
     if needs_price:
-        return "💲 Price missing: please enter the price (example: $150)"
+        return "💲 Price missing: tap one below, or say/type it (150 or $150)"
     return ""
+
+
+async def _phase2_ask(message, context, state_data) -> int:
+    """Ask for whatever is still missing, with the price buttons when it is the
+    price. The amounts are the same handful here as under Edit -> Price, so the
+    same picker serves both; the flag tells the tap handler to carry on with the
+    dispatch instead of dropping back to the review card."""
+    needs_phone, needs_price = _phase2_missing(state_data or {})
+    markup = None
+    if needs_price and not needs_phone:
+        context.user_data["phase2_awaiting_price"] = True
+        markup = _fresh_price_picker(context, state_data or {})
+    else:
+        context.user_data.pop("phase2_awaiting_price", None)
+    await message.reply_text(_phase2_prompt(state_data or {}), reply_markup=markup)
+    return STATE_PHASE2
 
 
 async def _safe_delete_chat_message(context: ContextTypes.DEFAULT_TYPE, chat_id, message_id) -> None:
@@ -8213,8 +8303,7 @@ async def _ensure_phone_price_before_files(message, context: ContextTypes.DEFAUL
         return await _prompt_issuer_special_request(message, context, user_id)
     context.user_data.pop("phase2_before_files", None)
     db.set_user_state(user_id, "phase1", state_data)
-    await message.reply_text(_phase2_prompt(state_data))
-    return STATE_PHASE2
+    return await _phase2_ask(message, context, state_data)
 
 
 async def handle_add_files_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -9072,7 +9161,9 @@ async def handle_phase2(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
 
     # Get phase 1 data
     state = db.get_user_state(user_id)
-    if not state or not state.get("data"):
+    # `is None`, not falsy: an EMPTY card is a real state and ending the lead over
+    # it is the same silent-drop shape that once ate typed edits.
+    if not state or state.get("data") is None:
         await msg.reply_text("❌ Error: Phase 1 data not found. Please start over with /start")
         return ConversationHandler.END
 
@@ -9098,11 +9189,13 @@ async def handle_phase2(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
     # When the PRICE is the only thing outstanding, a bare number is the price — no
     # "$" needed. Capped at six digits so a mistakenly pasted phone number is not
     # accepted as a price.
-    if needs_price and not needs_phone and not price:
+    if needs_price and not price:
+        # No "$" needed. Capped at six digits so a pasted phone is never taken as a
+        # price — which also makes this safe when BOTH are still missing: a number
+        # that short cannot be the phone we are also waiting for.
         bare = re.sub(r"[^\d.]", "", message_text)
-        if bare and len(re.sub(r"\D", "", bare)) <= 6:
+        if bare and len(re.sub(r"\D", "", bare)) <= 6 and not phone_number:
             price = _clean_inline_value("price", bare) or None
-            phone_number = None
 
     state_data = phase1_data.copy()
     if phone_number and needs_phone:
@@ -9112,8 +9205,7 @@ async def handle_phase2(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
     still_phone, still_price = _phase2_missing(state_data)
     if still_phone or still_price:
         db.set_user_state(user_id, "phase1", state_data)
-        await msg.reply_text(_phase2_prompt(state_data))
-        return STATE_PHASE2
+        return await _phase2_ask(msg, context, state_data)
     context.user_data.pop("phase2_before_files", None)
     # Notes are optional and editable from the AI review screen — never block
     # dispatch on them. Save state then jump straight into finalize/review.
@@ -9132,10 +9224,7 @@ async def handle_special_request_issuers(update: Update, context: ContextTypes.D
     state_data = state["data"].copy()
     if not _phase1_has_phone_and_price(state_data):
         db.set_user_state(user_id, "phase1", state_data)
-        await update.message.reply_text(
-            _phase2_prompt(state_data),
-        )
-        return STATE_PHASE2
+        return await _phase2_ask(update.message, context, state_data)
 
     raw = (update.message.text or "").strip()
     _cr = _cancel_restart_kind(raw)
@@ -9166,10 +9255,7 @@ async def handle_special_request_drivers(update: Update, context: ContextTypes.D
     state_data = state["data"].copy()
     if not _phase1_has_phone_and_price(state_data):
         db.set_user_state(user_id, "phase1", state_data)
-        await update.message.reply_text(
-            _phase2_prompt(state_data),
-        )
-        return STATE_PHASE2
+        return await _phase2_ask(update.message, context, state_data)
 
     raw_d = (update.message.text or "").strip()
     _cr = _cancel_restart_kind(raw_d)
@@ -9201,10 +9287,7 @@ async def _finalize_lead_after_notes(
 
     if not _phase1_has_phone_and_price(state_data):
         db.set_user_state(user_id, "phase1", state_data)
-        await message.reply_text(
-            _phase2_prompt(state_data),
-        )
-        return STATE_PHASE2
+        return await _phase2_ask(message, context, state_data)
 
     phone_number = state_data.pop("pending_phone_number", None)
     price = state_data.pop("pending_price", None)
@@ -9339,33 +9422,26 @@ async def _finalize_lead_after_notes(
 
     reference_id = lead.get("reference_id", "N/A")
 
-    # Honor selected drivers from review defaults/edits (all active by default).
+    # Honour the drivers picked on the review card. A pick that resolves to nobody
+    # is reported, never quietly widened into a broadcast.
     drivers_list: list = []
+    dropped: list = []
     try:
-        raw_driver_ids = state_data.get("selected_driver_ids") or []
-        driver_id_set = {str(x).strip() for x in raw_driver_ids if str(x).strip()}
-        all_drivers_now = _get_all_drivers_cached() or []
-        drivers_list = [d for d in all_drivers_now if str(d.get("id")) in driver_id_set]
+        ids, dropped = _dispatch_drivers_with_reasons(
+            state_data, group_id=group_id, is_all_groups=is_all_groups)
+        keep = {str(x) for x in ids}
+        drivers_list = [d for d in (_get_all_drivers_cached() or []) if str(d.get("id")) in keep]
     except Exception as e:
         logger.warning("finalize_lead_after_notes: resolving selected drivers failed: %s", e)
-        drivers_list = []
-    if not drivers_list:
-        try:
-            suspended = _get_suspended_driver_ids()
-        except Exception:
-            suspended = set()
-        if is_all_groups:
-            fallback_pool = _get_all_drivers_cached() or []
-        else:
-            try:
-                linked = db.get_group_driver_rows_for_group(group_id)
-            except Exception:
-                linked = []
-            fallback_pool = linked or _get_all_drivers_cached() or []
-        drivers_list = [
-            d for d in fallback_pool
-            if d and record_is_active(d) and str(d.get("id")) not in suspended
-        ]
+        drivers_list, dropped = [], []
+    if not drivers_list and dropped:
+        await message.reply_text(
+            "⚠️ That lead could not be sent to the driver you picked:\n\n"
+            + _dropped_drivers_note(dropped)
+            + "\n\nFix it in /settings, or pick another driver and submit again."
+        )
+        db.set_user_state(user_id, "phase1", state_data)
+        return STATE_AI_REVIEW
 
     if is_all_groups:
         await _post_lead_to_all_groups_for_approval(context, lead, active_groups)
@@ -11480,9 +11556,10 @@ async def _issuer_open_driver_selection_after_group_accept(
         id_set = {str(x).strip() for x in raw_ids if str(x).strip()}
         all_drivers = _get_all_drivers_cached()
         selected_drivers = [d for d in all_drivers if str(d.get("id")) in id_set]
-        if not selected_drivers:
-            # Safety fallback: if stored IDs are stale/missing, resolve from
-            # current group-linked/global pool so accepted leads still reach drivers.
+        if not selected_drivers and not raw_ids:
+            # Nothing was ever picked — the pool is the right answer. A pick that
+            # merely resolved to nothing is NOT widened: that turned a one-driver
+            # lead into a broadcast.
             fallback_ids = _resolve_dispatch_driver_ids(
                 {"selected_driver_ids": []},
                 group_id=str((winner_group or {}).get("id") or ""),
