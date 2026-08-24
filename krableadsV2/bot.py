@@ -2,6 +2,7 @@
 import base64
 import difflib
 import io
+import json
 import logging
 import os
 import re
@@ -1429,6 +1430,63 @@ def _prefix_supervisory_html(text: str) -> str:
     return f"<b>{SUPERVISORY_MESSAGE_HEADER}</b>\n\n{t}"
 
 
+# Supervisors added from inside /settings, on top of SUPERVISORY_TELEGRAM_ID. The
+# env ones are FIXED: they cannot be removed here, so the last door is never locked.
+EXTRA_SUPERVISORS_KEY = "extra_supervisor_ids"
+_EXTRA_SUP_TTL_SEC = 30
+_extra_sup_cache: dict = {"at": 0.0, "rows": []}
+
+
+def _extra_supervisors(force: bool = False) -> list:
+    """[{"id": "123", "label": "Name"}, …] — briefly cached, since every gate calls it."""
+    now = time.time()
+    if not force and (now - float(_extra_sup_cache.get("at") or 0)) < _EXTRA_SUP_TTL_SEC:
+        return list(_extra_sup_cache.get("rows") or [])
+    rows: list = []
+    try:
+        raw = db.get_setting(EXTRA_SUPERVISORS_KEY)
+        if raw:
+            parsed = json.loads(raw)
+            if isinstance(parsed, list):
+                for r in parsed:
+                    if isinstance(r, dict) and str(r.get("id") or "").strip():
+                        rows.append({"id": str(r["id"]).strip(),
+                                     "label": str(r.get("label") or "").strip()})
+    except Exception as e:
+        logger.warning("extra supervisors read failed: %s", e)
+        rows = list(_extra_sup_cache.get("rows") or [])
+    _extra_sup_cache["at"] = now
+    _extra_sup_cache["rows"] = rows
+    return list(rows)
+
+
+def _save_extra_supervisors(rows: list) -> bool:
+    ok = False
+    try:
+        ok = bool(db.set_setting(EXTRA_SUPERVISORS_KEY, json.dumps(rows or [])))
+    except Exception as e:
+        logger.warning("extra supervisors write failed: %s", e)
+    _extra_sup_cache["at"] = 0.0            # next read is live, whatever happened
+    return ok
+
+
+def _add_extra_supervisor(chat_id: str, label: str = "") -> bool:
+    rows = _extra_supervisors(force=True)
+    key = _norm_chat_id(chat_id)
+    for r in rows:
+        if _norm_chat_id(r.get("id")) == key:
+            r["label"] = label or r.get("label") or ""
+            return _save_extra_supervisors(rows)
+    rows.append({"id": str(chat_id).strip(), "label": (label or "").strip()})
+    return _save_extra_supervisors(rows)
+
+
+def _remove_extra_supervisor(chat_id: str) -> bool:
+    key = _norm_chat_id(chat_id)
+    rows = [r for r in _extra_supervisors(force=True) if _norm_chat_id(r.get("id")) != key]
+    return _save_extra_supervisors(rows)
+
+
 def _global_supervisory_chat_ids() -> list:
     """Chat IDs from SUPERVISORY_TELEGRAM_ID (comma-separated in env)."""
     out: list = []
@@ -1447,13 +1505,19 @@ def _global_supervisory_chat_ids() -> list:
 
 
 def _user_is_global_supervisor(user_id) -> bool:
-    """True if user_id matches any token in ``Config.SUPERVISORY_TELEGRAM_ID``."""
+    """True for SUPERVISORY_TELEGRAM_ID *or* anyone added under /settings."""
     target = _norm_chat_id(user_id)
     if target is None:
         return False
     for cid in _global_supervisory_chat_ids():
         if _norm_chat_id(cid) == target:
             return True
+    try:
+        for row in _extra_supervisors():
+            if _norm_chat_id(row.get("id")) == target:
+                return True
+    except Exception:
+        pass                                # env supervisors still get in
     return False
 
 
@@ -6176,6 +6240,18 @@ def _in_settings_conversation(update: Update, context: ContextTypes.DEFAULT_TYPE
         return False
 
 
+# A photo of the newest tag issued sets the counter this far past it, so the next
+# lead cannot land on a number already printed in the same block.
+PLATE_IMAGE_JUMP = 10_000
+# Six digits, so a jump off the end wraps rather than printing a 7-digit plate.
+_PLATE_MODULUS = 1_000_000
+
+
+def _plate_after_image(number: int) -> int:
+    """The counter value to set from a tag read off a photo."""
+    return (int(number) + PLATE_IMAGE_JUMP) % _PLATE_MODULUS
+
+
 async def handle_supervisor_plate_image(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Supervisor photo/PDF → read a temp-tag number and stage a plate-counter update —
     works in ANY state. Registered at group -1 (before every conversation), it reads the
@@ -6258,10 +6334,12 @@ async def handle_supervisor_plate_image(update: Update, context: ContextTypes.DE
     if forced_col:
         cur = await asyncio.to_thread(db.get_plate_settings) or {}
         label = _PLATE_SET_LABELS.get(forced_col, forced_col)
+        jumped = _plate_after_image(number)
         await _router_stage_confirm(msg, context, {
-            "kind": "set_plate", "col": forced_col, "value": int(number),
+            "kind": "set_plate", "col": forced_col, "value": jumped,
             "prompt": (
-                f"Read {read_label} from your image.\nSet {label} to {int(number)} "
+                f"Read {read_label} from your image.\nSet {label} to {jumped} "
+                f"— that tag plus {PLATE_IMAGE_JUMP:,} "
                 f"(currently {cur.get(forced_col, '—')})? The H/V letter is kept automatically."
             ),
         })
@@ -6275,10 +6353,12 @@ async def handle_supervisor_plate_image(update: Update, context: ContextTypes.DE
         raise ApplicationHandlerStop
     cur = await asyncio.to_thread(db.get_plate_settings) or {}
     label = _PLATE_SET_LABELS.get(col, col)
+    jumped = _plate_after_image(number)
     await _router_stage_confirm(msg, context, {
-        "kind": "set_plate", "col": col, "value": int(number),
+        "kind": "set_plate", "col": col, "value": jumped,
         "prompt": (
-            f"Read {read_label} from your image.\nSet {label} to {int(number)} "
+            f"Read {read_label} from your image.\nSet {label} to {jumped} "
+            f"— that tag plus {PLATE_IMAGE_JUMP:,} "
             f"(currently {cur.get(col, '—')})? The H/V letter is kept automatically."
         ),
     })
@@ -14960,8 +15040,6 @@ SET_MENU, SET_INPUT = range(2)
 _PLATE_SET_LABELS = {
     "nj_plate_next_number": "Resident plate number",
     "non_nj_plate_next_number": "Non-Resident plate number",
-    "nj_car_next_number": "Resident control number",
-    "non_nj_car_next_number": "Non-Resident control number",
 }
 
 
@@ -14973,6 +15051,7 @@ def _settings_main_kb() -> InlineKeyboardMarkup:
         [InlineKeyboardButton("🚗 Drivers", callback_data="tset_drivers")],
         [InlineKeyboardButton("🚫 Suspensions", callback_data="tset_susp")],
         [InlineKeyboardButton("📊 Client Sources", callback_data="tset_srcs")],
+        [InlineKeyboardButton("👑 Supervisors", callback_data="tset_sups")],
         [InlineKeyboardButton("✖️ Close", callback_data="tset_close")],
     ])
 
@@ -15130,24 +15209,50 @@ async def cmd_settings(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
 
 
 async def _settings_view_plates() -> tuple:
+    """Only the two plate counters. The control number is a per-tag serial nobody
+    tracks between tags, so it is minted at random and has nothing to set."""
     s = await asyncio.to_thread(db.get_plate_settings) or {}
     pre, suf = s.get("nj_plate_prefix", "H"), s.get("non_nj_plate_suffix", "V")
     txt = (
         "🔢 *Plate Numbers*\n\n"
         f"Resident (`{pre}######`) next: *{s.get('nj_plate_next_number', '—')}*\n"
-        f"Non-Resident (`######{suf}`) next: *{s.get('non_nj_plate_next_number', '—')}*\n"
-        f"Resident control next: *{s.get('nj_car_next_number', '—')}*\n"
-        f"Non-Resident control next: *{s.get('non_nj_car_next_number', '—')}*\n\n"
-        "Tap to set the NEXT value issued."
+        f"Non-Resident (`######{suf}`) next: *{s.get('non_nj_plate_next_number', '—')}*\n\n"
+        "Tap to set the next one, or send a *photo of the newest tag issued* — "
+        f"I read it and set the counter {PLATE_IMAGE_JUMP:,} past it.\n\n"
+        "_Control numbers are random on every tag — nothing to set._"
     )
     kb = InlineKeyboardMarkup([
         [InlineKeyboardButton("Set Resident plate #", callback_data="tset_pf:nj_plate_next_number"),
          InlineKeyboardButton("Set Non-Res plate #", callback_data="tset_pf:non_nj_plate_next_number")],
-        [InlineKeyboardButton("Set Resident control #", callback_data="tset_pf:nj_car_next_number"),
-         InlineKeyboardButton("Set Non-Res control #", callback_data="tset_pf:non_nj_car_next_number")],
         [InlineKeyboardButton("⬅️ Back", callback_data="tset_menu")],
     ])
     return (txt, kb)
+
+
+async def _settings_view_supervisors() -> tuple:
+    """Who can open /settings. The env-configured ones are shown but fixed —
+    removing the last way in from inside the room is not a thing to allow."""
+    fixed = await asyncio.to_thread(_global_supervisory_chat_ids)
+    extra = await asyncio.to_thread(_extra_supervisors, True)
+    lines = ["👑 *Supervisors*", "_Anyone here can open /settings._", ""]
+    rows = []
+    for cid in fixed:
+        lines.append(f"🔒 `{cid}` _(set on the server — cannot be removed here)_")
+    if fixed and extra:
+        lines.append("")
+    for r in extra:
+        name = _telegram_md1_escape(r.get("label") or "")
+        lines.append(f"👤 `{r.get('id')}`" + (f" — {name}" if name else ""))
+        rows.append([InlineKeyboardButton(
+            f"Remove {r.get('label') or r.get('id')}"[:40],
+            callback_data=f"tset_supdel:{r.get('id')}")])
+    if not fixed and not extra:
+        lines.append("_Nobody configured._")
+    lines.append("")
+    lines.append("_They can get their own id from /whoami._")
+    rows.append([InlineKeyboardButton("➕ Add Supervisor", callback_data="tset_supadd")])
+    rows.append([InlineKeyboardButton("⬅️ Back", callback_data="tset_menu")])
+    return ("\n".join(lines).rstrip(), InlineKeyboardMarkup(rows))
 
 
 async def _settings_view_groups() -> tuple:
@@ -15178,6 +15283,7 @@ _SETTINGS_VIEWS = {
     "tset_drivers": _settings_view_drivers,
     "tset_susp": _settings_view_suspensions,
     "tset_srcs": _settings_view_sources,
+    "tset_sups": _settings_view_supervisors,
 }
 # Spoken/typed navigation. Ordered: "suspend driver kita" is about suspensions even
 # though it also says "driver", so suspensions is tested before drivers.
@@ -15188,6 +15294,7 @@ _SETTINGS_NAV = [
     (re.compile(r"\b(?:dispatchers?|groups?|teams?|crews?)\b", re.I), "tset_groups"),
     (re.compile(r"\b(?:drivers?|drv)\b", re.I), "tset_drivers"),
     (re.compile(r"\b(?:sources?|client\s*source|lead\s*source|origin)\b", re.I), "tset_srcs"),
+    (re.compile(r"\b(?:supervisors?|admins?|administrators?|owners?)\b", re.I), "tset_sups"),
 ]
 _SETTINGS_BACK_RE = re.compile(r"^\s*(?:back|menu|main|home|up|return)\b", re.I)
 _SETTINGS_CLOSE_RE = re.compile(r"^\s*(?:close|exit|quit|dismiss|finished|done)\b", re.I)
@@ -15198,6 +15305,7 @@ _SETTINGS_HINT = (
     "• *drivers*\n"
     "• *suspensions*\n"
     "• *client sources*\n"
+    "• *supervisors*\n"
     "…or *back* / *close*."
 )
 
@@ -15281,6 +15389,18 @@ async def handle_settings_cb(update: Update, context: ContextTypes.DEFAULT_TYPE)
     if data.startswith("tset_gtog:"):
         await asyncio.to_thread(db.toggle_group_status, data.split(":", 1)[1])
         await _show_settings_view("tset_groups", query=query); return SET_MENU
+    if data == "tset_sups":
+        await _show_settings_view("tset_sups", query=query); return SET_MENU
+    if data == "tset_supadd":
+        context.user_data["tset_await"] = {"kind": "add_supervisor"}
+        await query.message.reply_text(
+            "Send the new supervisor as: *telegram_id* or *Name | telegram_id*\n"
+            "They can get their id by sending /whoami to this bot.",
+            parse_mode="Markdown")
+        return SET_INPUT
+    if data.startswith("tset_supdel:"):
+        await asyncio.to_thread(_remove_extra_supervisor, data.split(":", 1)[1])
+        await _show_settings_view("tset_sups", query=query); return SET_MENU
     if data == "tset_gadd":
         context.user_data["tset_await"] = {"kind": "add_group"}
         await query.message.reply_text(
@@ -15382,6 +15502,24 @@ async def apply_settings_input(update: Update, context: ContextTypes.DEFAULT_TYP
         _bust_driver_caches()
         await update.message.reply_text(
             (f"✅ Added driver “{parts[0]}”." if ok else "❌ Could not add the driver."),
+            reply_markup=_settings_main_kb())
+        return SET_MENU
+    if st.get("kind") == "add_supervisor":
+        parts = [p.strip() for p in text.split("|")]
+        cid = parts[-1] if parts else ""
+        label = parts[0] if len(parts) > 1 else ""
+        if not re.fullmatch(r"-?\d{5,}", cid or ""):
+            return await _retry(
+                "❌ Send the numeric telegram id (or *Name | id*). "
+                "They can get theirs from /whoami.")
+        if _user_is_global_supervisor(cid):
+            await update.message.reply_text(
+                "That person is already a supervisor.", reply_markup=_settings_main_kb())
+            return SET_MENU
+        ok = await asyncio.to_thread(_add_extra_supervisor, cid, label)
+        await update.message.reply_text(
+            (f"✅ {label or cid} can now open /settings." if ok
+             else "❌ Could not add the supervisor."),
             reply_markup=_settings_main_kb())
         return SET_MENU
     if st.get("kind") == "add_source":

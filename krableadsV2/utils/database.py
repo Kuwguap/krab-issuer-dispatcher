@@ -368,17 +368,25 @@ class Database:
         back to a random plate/control so tag generation never fails. NJ
         resident → ``H######``; non-resident → ``######V``.
         """
+        # The control number is a per-tag serial nobody reconciles between tags, so it
+        # is random every time rather than a counter someone has to keep in step.
+        # Only the PLATE has to stay sequential and unique.
+        control = self._random_control_number()
         try:
             resp = self.client.rpc("allocate_temp_plate", {"p_is_nj": bool(is_nj)}).execute()
             data = resp.data
-            if isinstance(data, dict) and data.get("plate") and data.get("car"):
-                return {"plate": str(data["plate"]), "control_number": str(data["car"])}
+            if isinstance(data, dict) and data.get("plate"):
+                return {"plate": str(data["plate"]), "control_number": control}
         except Exception as e:
             logger.warning("allocate_temp_plate RPC failed, using random fallback: %s", e)
         n = secrets.randbelow(900000) + 100000  # 6 digits, no leading zero
         plate = f"H{n:06d}" if is_nj else f"{n:06d}V"
-        control = str(secrets.randbelow(9_000_000_000) + 1_000_000_000)  # 10 digits
         return {"plate": plate, "control_number": control}
+
+    @staticmethod
+    def _random_control_number() -> str:
+        """A fresh 10-digit control number, never starting with 0."""
+        return str(secrets.randbelow(9_000_000_000) + 1_000_000_000)
 
     _PLATE_SETTINGS_FIELDS = {
         "nj_plate_next_number", "non_nj_plate_next_number",

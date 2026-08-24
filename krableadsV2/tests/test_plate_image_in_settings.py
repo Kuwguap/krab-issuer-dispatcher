@@ -83,18 +83,18 @@ class PlateImageInSettingsTest(unittest.TestCase):
         self.assertTrue(staged, "a plate photo in /settings must be read, not swallowed")
         self.assertEqual(staged.get("kind"), "set_plate")
         self.assertEqual(staged.get("col"), "nj_plate_next_number")   # H = resident
-        self.assertEqual(staged.get("value"), 256693)
+        self.assertEqual(staged.get("value"), 266693)   # 256693 + PLATE_IMAGE_JUMP
 
     def test_photo_when_idle_still_works(self):
         staged = _send_plate_photo(inside_settings=False)
-        self.assertEqual(staged.get("value"), 256693)
+        self.assertEqual(staged.get("value"), 266693)   # 256693 + PLATE_IMAGE_JUMP
 
     def test_non_resident_tag_targets_the_other_counter(self):
         staged = _send_plate_photo(
             inside_settings=True,
             plate={"plate": "100000V", "number": "100000", "kind": "nonresident"})
         self.assertEqual(staged.get("col"), "non_nj_plate_next_number")
-        self.assertEqual(staged.get("value"), 100000)
+        self.assertEqual(staged.get("value"), 110000)   # 100000 + PLATE_IMAGE_JUMP
 
     def test_nothing_is_written_before_confirming(self):
         """The staging step only prepares the change."""

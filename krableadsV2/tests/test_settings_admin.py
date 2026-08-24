@@ -251,7 +251,8 @@ class VoiceAndTextNavigationTest(unittest.TestCase):
                     continue
                 self.assertIn(b.callback_data, bot._SETTINGS_VIEWS, b.text)
         spoken = {bot._settings_nav_target(w) for w in
-                  ("plate numbers", "dispatchers", "drivers", "suspensions", "client sources")}
+                  ("plate numbers", "dispatchers", "drivers", "suspensions",
+                   "client sources", "supervisors")}
         self.assertEqual(spoken, set(bot._SETTINGS_VIEWS))
 
     def test_spoken_navigation_opens_the_screen(self):
