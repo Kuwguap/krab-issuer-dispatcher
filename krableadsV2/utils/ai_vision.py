@@ -1690,9 +1690,14 @@ _TRUSTED_COLOR_WORDS = frozenset({
     "bronze", "maroon", "burgundy", "charcoal", "champagne",
     "navy", "ivory", "pearl", "cream", "purple", "teal", "copper",
     "crimson", "brick",
-    # DMV registration codes
-    "blk", "wht", "sil", "gry", "red", "blu", "grn", "ylw",
-    "org", "brn", "gld", "tan", "pur", "ppl",
+    "amethyst", "pink", "lime", "olive", "mint", "rose", "sand", "graphite",
+    "platinum", "onyx", "sapphire", "emerald", "ruby",
+    # DMV registration codes. Every value in tag_pdf._COLOR_MAP belongs here: a
+    # code the bot prints on the tag must never be second-guessed as "not a
+    # colour" — WHI was, and white leads were asked for their colour again.
+    "blk", "wht", "whi", "sil", "slv", "gry", "red", "blu", "grn", "ylw",
+    "org", "brn", "gld", "tan", "pur", "ppl", "bge", "beg", "brg", "brz",
+    "chr", "cpr", "crm", "mrn", "nvy", "pnk", "tel", "gld", "gry",
 })
 
 # Field labels for user-friendly missing-field prompts

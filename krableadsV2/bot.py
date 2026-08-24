@@ -2992,7 +2992,8 @@ async def _continue_phase1_after_ai_review(message, context: ContextTypes.DEFAUL
     missing = ai_vision.detect_missing_fields(state_data, blob)
     # Price / tag info / date-time are optional: no question when unfilled —
     # they simply show as "-" on the final review.
-    missing = [f for f in missing if f not in PHASE1_OPTIONAL_FIELDS]
+    missing = [f for f in missing if f not in PHASE1_OPTIONAL_FIELDS
+               and not _field_already_filled(state_data, f)]
     if missing:
         prompts = ai_vision.MISSING_FIELD_PROMPTS
         msg = prompts.get(missing[0], (f"You missed out {missing[0]}. Can you add it?", missing[0]))[0]
@@ -7742,7 +7743,8 @@ async def handle_phase1(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
         await _send_phase1_ai_review(update.message, state_data, context, user_id)
         # VIN decode is opt-in via the review screen's "🔍 VIN" button.
         missing = ai_vision.detect_missing_fields(state_data, message_text)
-        missing = [f for f in missing if f not in PHASE1_OPTIONAL_FIELDS]
+        missing = [f for f in missing if f not in PHASE1_OPTIONAL_FIELDS
+                   and not _field_already_filled(state_data, f)]
         if missing:
             prompts = ai_vision.MISSING_FIELD_PROMPTS
             msg = prompts.get(missing[0], (f"You missed out {missing[0]}. Can you add it?", missing[0]))[0]
@@ -8730,6 +8732,23 @@ async def handle_phase1_edit_followup_callback(update: Update, context: ContextT
 MISSING_FIELD_TO_STATE_KEY = {"delivery_date": "extra_info"}
 
 
+# state-key -> inline edit-key, so a missing-field answer goes through the same
+# parser as every other prompt.
+_STATE_KEY_TO_INLINE_EK = {v: k for k, v in _INLINE_EK_STATE_KEY.items()}
+
+
+def _field_already_filled(state_data: dict, field: str) -> bool:
+    """True when the card already answers this question. Asked before re-prompting,
+    because the card stays editable while the question is on screen."""
+    key = MISSING_FIELD_TO_STATE_KEY.get(field, field)
+    val = str((state_data or {}).get(key) or "").strip()
+    if not val or val == "-":
+        return False
+    if field == "color":
+        return ai_vision._has_valid_color(val)
+    return True
+
+
 async def handle_missing_field(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """Handle user reply when we asked for a missing field (e.g. color)."""
     user_id = update.effective_user.id
@@ -8743,11 +8762,27 @@ async def handle_missing_field(update: Update, context: ContextTypes.DEFAULT_TYP
         return await _do_cancel_or_restart(update, context, _cr)
     await _autoclean_user_msg(update, context)
     missing_fields = context.user_data.get("missing_fields") or []
-    state_data = context.user_data.get("missing_field_state_data") or {}
+    # The LIVE card, not the snapshot taken when the question was asked — the card
+    # stays editable while this question is open, and answering used to save the
+    # snapshot back over anything changed in between.
+    live = db.get_user_state(user_id)
+    state_data = (live or {}).get("data")
+    if state_data is None:
+        state_data = context.user_data.get("missing_field_state_data") or {}
     field = missing_fields[0] if missing_fields else "color"
     state_key = MISSING_FIELD_TO_STATE_KEY.get(field, field)
-    state_data[state_key] = text
+    # Parse the answer the way every other prompt does, so "color white" stores
+    # White (and "price 150" said here still reaches the price).
+    ek = _STATE_KEY_TO_INLINE_EK.get(state_key)
+    placed = False
+    if ek:
+        placed, _ = await _place_text_at_field_prompt(state_data, ek, text)
+    if not placed:
+        state_data[state_key] = text
     missing_fields = missing_fields[1:]
+    # Whatever else the card gained in the meantime is no longer missing.
+    missing_fields = [f for f in missing_fields
+                      if not _field_already_filled(state_data, f)]
     context.user_data["missing_fields"] = missing_fields
     context.user_data["missing_field_state_data"] = state_data
     # The question (and the answer) disappear — the value lands on the review.
@@ -8783,7 +8818,8 @@ async def handle_missing_field(update: Update, context: ContextTypes.DEFAULT_TYP
         )
     )
     still_missing = ai_vision.detect_missing_fields(state_data, blob)
-    still_missing = [f for f in still_missing if f not in PHASE1_OPTIONAL_FIELDS]
+    still_missing = [f for f in still_missing if f not in PHASE1_OPTIONAL_FIELDS
+                     and not _field_already_filled(state_data, f)]
     if still_missing:
         context.user_data["missing_fields"] = still_missing
         context.user_data["missing_field_state_data"] = state_data.copy()
