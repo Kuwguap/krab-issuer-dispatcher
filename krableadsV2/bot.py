@@ -4162,7 +4162,7 @@ def _apply_ek_value(state_data: dict, ek: str, value: str) -> list:
     return changed
 
 
-async def _smart_place_single_value(state_data: dict, value: str) -> list:
+async def _smart_place_single_value(state_data: dict, value: str, guess_name: bool = True) -> list:
     """Place one free-text/voice value ('first name John', 'white', '$200', '555-…') into
     the best field and return the changed labels (or [] if it couldn't be placed).
     Order: deterministic strong signals → AI {field,value} classifier → name/color/car
@@ -4186,6 +4186,11 @@ async def _smart_place_single_value(state_data: dict, value: str) -> list:
                 return []          # AI is confident it's a command/gibberish → hint
     # (c) FALLBACK: AI unconfigured/errored → deterministic alpha heuristic, orig value.
     ek3 = _alpha_value_ek_heuristic(value)
+    # Its LAST rule is "one to four plain words must be a name". Useful for idle
+    # text, wrong at a field prompt, where it would file a fumbled price as the
+    # client. The colour / car / city rules above it still apply.
+    if ek3 == "name" and not guess_name:
+        return []
     if ek3:
         return _apply_ek_value(state_data, ek3, value)
     return []
@@ -4209,9 +4214,10 @@ _COMMAND_LIKE_RE = re.compile(
 
 
 # ── Natural-language commands during review (voice or typed) ─────────────────
-_CMD_VERB = r"(?:choose|select|pick|set|use|assign|go\s+with|send\s+to|dispatch\s+to)?"
+_CMD_VERB = (r"(?:choose|select|pick|set|use|assign|change|update|switch|make|put|"
+             r"go\s+with|send\s+to|dispatch\s+to)?")
 _ART = r"(?:the\s+|a\s+|an\s+|my\s+|this\s+)?"  # optional article between verb and noun
-_SELECT_SOURCE_RE = re.compile(rf"^\s*{_CMD_VERB}\s*{_ART}(?:contact\s+source|lead\s+source|contact\s+info|source|origin)\s+(.+)$", re.I)
+_SELECT_SOURCE_RE = re.compile(rf"^\s*{_CMD_VERB}\s*{_ART}(?:client'?s?\s+source|contact\s+source|lead\s+source|client\s+info|contact\s+info|came\s+from|found\s+us|source|origin|src)\s+(.+)$", re.I)
 # The GROUPS/teams are the "dispatchers" in the UI, so 'choose dispatcher X' selects a
 # group. The DELIVERY people stay "drivers": 'choose driver X' selects a driver.
 _SELECT_GROUP_RE = re.compile(rf"^\s*{_CMD_VERB}\s*{_ART}(?:group|team|crew|dispatchers?|dispatch|disp)\s+(.+)$", re.I)
@@ -4353,12 +4359,43 @@ async def _apply_selection(kind: str, payload: str, state_data: dict, user_id: i
         _select_driver(state_data, user_id, d)
         return True, f"Driver → {d.get('driver_name', '?')}"
     if kind == "SELECT_SOURCE":
-        s = _match_name(payload, db.get_contact_info_sources(), "label")
+        s = _source_by_exact_label(payload) or _match_name(
+            payload, db.get_contact_info_sources(), "label")
         if not s:
             return False, f"No source matched “{payload}”"
         _select_source(state_data, user_id, s)
         return True, f"Source → {s.get('label', '?')}"
     return False, ""
+
+
+# A selection's value picks up the little joining words on the way in:
+# "set source to Instagram", "driver is Kita".
+_SELECT_VALUE_FILLER_RE = re.compile(r"^(?:to|is|as|=|:|be|the|a|an)\s+", re.IGNORECASE)
+
+
+def _selection_payload(raw: str) -> str:
+    prev = None
+    out = (raw or "").strip().lstrip(":=").strip()
+    while out and out != prev:                 # "set source to the Instagram"
+        prev = out
+        out = _SELECT_VALUE_FILLER_RE.sub("", out).strip()
+    return out
+
+
+def _source_by_exact_label(text: str):
+    """The source a bare word names, or None.
+
+    Deliberately strict — exact once punctuation and spacing are ignored, so
+    dictation's "face book" still finds Facebook while an ordinary word never
+    hijacks the picker the way _match_name's fuzzy pass would."""
+    squash = lambda v: re.sub(r"[^a-z0-9]+", "", str(v or "").casefold())
+    q = squash(text)
+    if not q or len(q) < 3:
+        return None
+    for src in (db.get_contact_info_sources() or []):
+        if squash(src.get("label")) == q:
+            return src
+    return None
 
 
 def _classify_review_command(text: str):
@@ -4392,15 +4429,18 @@ def _classify_review_command(text: str):
     if multi:
         return ("SELECTIONS", multi)
     # B) selections: source → group → driver (distinct nouns, order avoids overlap)
+    # Just the source, no label — "Facebook". Strict match only (see the helper).
+    if _source_by_exact_label(t):
+        return ("SELECT_SOURCE", t.strip())
     m = _SELECT_SOURCE_RE.match(t)
     if m:
-        return ("SELECT_SOURCE", m.group(1).strip())
+        return ("SELECT_SOURCE", _selection_payload(m.group(1)))
     m = _SELECT_GROUP_RE.match(t)
     if m:
-        return ("SELECT_GROUP", m.group(1).strip())
+        return ("SELECT_GROUP", _selection_payload(m.group(1)))
     m = _SELECT_DRIVER_RE.match(t)
     if m:
-        name = m.group(1).strip()
+        name = _selection_payload(m.group(1))
         first = name.split()[0].lower() if name.split() else ""
         if first not in ("note", "notes", "license", "licence"):  # 'driver note/license' are field edits
             return ("SELECT_DRIVER", name)
@@ -5169,6 +5209,17 @@ async def handle_select_state_text(update: Update, context: ContextTypes.DEFAULT
             return None
         picked = "select_group_all" if g == "all" else f"select_group_{g.get('id')}"
         return await handle_group_selection(_TypedAsTap(update, picked), context)
+
+    if state_name == "select_contact_source":
+        sources = db.get_contact_info_sources() or []
+        src = _source_by_exact_label(text) or _match_name(text, sources, "label")
+        if not src:
+            if msg:
+                await msg.reply_text(
+                    f"🤔 No client source matched “{text}”. Tap one above, or say it again.")
+            return None
+        return await handle_contact_source_selection(
+            _TypedAsTap(update, f"contact_source_{src.get('id')}"), context)
 
     if msg:
         await _send_vanishing(context, msg.chat_id, "☝️ Tap a button above to continue.")
@@ -7876,6 +7927,50 @@ async def handle_edit_field_photo(update: Update, context: ContextTypes.DEFAULT_
     return STATE_AI_REVIEW
 
 
+# Fields whose whole purpose is prose. A note reading "color the car black" is a
+# note, so these keep what you type instead of being re-read as labels.
+_PROSE_EKS = frozenset({"issuer", "driver", "xtra"})
+
+
+async def _place_text_at_field_prompt(state_data: dict, ek: str, text: str):
+    """Words typed or spoken while a field prompt is open.
+
+    A prompt is where you are, not a cage: say "color black" at the Price prompt
+    and the colour is what changes. Order — an explicit label for another field
+    wins, then the open field takes the value if it fits, then the AI decides.
+
+    Returns (handled, changed_labels). handled=False means nothing could be made
+    of it, which is the only case worth warning about."""
+    text = (text or "").strip()
+    if not text:
+        return False, []
+    if ek not in _PROSE_EKS:
+        labelled = _parse_multi_field_line(text)
+        # A label naming the field we are already in is just the value.
+        if labelled and not (len(labelled) == 1 and labelled[0][0] == ek):
+            changed = []
+            for p_ek, p_val in labelled:
+                for lbl in _apply_ek_value(state_data, p_ek, p_val):
+                    if lbl not in changed:
+                        changed.append(lbl)
+            if changed:
+                return True, changed
+    value = (_clean_spoken_color(text) or text) if ek == "col" else text
+    cleaned = _clean_inline_value(ek, value)
+    if cleaned:
+        changed = _apply_ek_value(state_data, ek, cleaned)
+        if changed:
+            return True, changed
+        # Accepted by the field but nothing actually moved — "2019 Honda Accord"
+        # survives the loose VIN check and is then scrubbed. Let the AI have it
+        # before calling this handled.
+    # Not a value for this field and not labelled — let the AI find its home.
+    changed = await _smart_place_single_value(state_data, text, guess_name=False)
+    if changed:
+        return True, changed
+    return bool(cleaned), []
+
+
 async def handle_edit_field_text(update, context):
     user_id = update.effective_user.id
     _cr = _cancel_restart_kind_from_update(update)
@@ -7892,21 +7987,17 @@ async def handle_edit_field_text(update, context):
     state_data = state["data"]
 
     text = (update.message.text or "").strip()
-    if text and text != "-":
-        if ek == "col":
-            text = _clean_spoken_color(text) or text
-        elif ek in ("price", "phone", "email"):
-            # Same normalization the inline path uses — a price typed here as "150"
-            # was stored without the "$" the sanitizer requires and then wiped.
-            cleaned = _clean_inline_value(ek, text)
-            if not cleaned:
-                await _send_vanishing(
-                    context, update.effective_chat.id,
-                    f"⚠️ That doesn't look like a valid {PH1_EDIT_PROMPT_LABEL.get(ek, ek)} — try again.",
-                )
-                return STATE_EDIT_FIELD_PROMPT
-            text = cleaned
-    _apply_single_phase1_edit(state_data, ek, text)
+    if text == "-":
+        _apply_single_phase1_edit(state_data, ek, "")
+    else:
+        handled, _ = await _place_text_at_field_prompt(state_data, ek, text)
+        if not handled:
+            await _send_vanishing(
+                context, update.effective_chat.id,
+                f"⚠️ I couldn't read that as a {PH1_EDIT_PROMPT_LABEL.get(ek, ek)}. "
+                "Try again, or name the field — 'color black', 'price 150'.",
+            )
+            return STATE_EDIT_FIELD_PROMPT
     _apply_single_address_as_both(state_data)
     _clean_vin_and_car(state_data)
     _sanitize_phase1_pending_phone_price(state_data)
@@ -8571,15 +8662,24 @@ async def handle_phase1_edit_input(update: Update, context: ContextTypes.DEFAULT
         await update.message.reply_text("❌ Lead data not found. Please start over with /start")
         return ConversationHandler.END
     state_data = state["data"].copy()
+    placed = []
     if text == "-":
         _apply_single_phase1_edit(state_data, ek, "")
     else:
-        _apply_single_phase1_edit(state_data, ek, text)
+        handled, placed = await _place_text_at_field_prompt(state_data, ek, text)
+        if not handled:
+            await update.message.reply_text(
+                f"⚠️ I couldn't read that as a {PH1_EDIT_PROMPT_LABEL.get(ek, ek)}. "
+                "Try again, or name the field — 'color black', 'price 150'.",
+            )
+            return STATE_AI_EDIT_INPUT
     _apply_single_address_as_both(state_data)
     _clean_vin_and_car(state_data)
+    _sanitize_phase1_pending_phone_price(state_data)
     db.set_user_state(user_id, "phase1", state_data)
     context.user_data.pop("phase1_pending_edit_key", None)
-    label = PH1_EDIT_PROMPT_LABEL.get(ek, ek)
+    # Report where it actually landed — it may not be the field that was open.
+    label = ", ".join(placed) if placed else PH1_EDIT_PROMPT_LABEL.get(ek, ek)
     preview = _preview_value_after_phase1_edit(state_data, ek)
     context.user_data.setdefault("phase1_recent_edits", [])
     re_list = context.user_data["phase1_recent_edits"]
@@ -8587,7 +8687,7 @@ async def handle_phase1_edit_input(update: Update, context: ContextTypes.DEFAULT
     if len(re_list) > 15:
         context.user_data["phase1_recent_edits"] = re_list[-15:]
     await update.message.reply_text(
-        "✅ Updated.\n\n"
+        f"✅ Updated: {label}.\n\n"
         "Need another Edit, or Done with edits?",
         reply_markup=_phase1_after_edit_keyboard(),
     )
