@@ -121,11 +121,12 @@ class RenderTest(unittest.TestCase):
         text, _ = self._render(bot._settings_view_groups)
         self.assertIn("✅ NullState", text)
 
-    def test_drivers_list_offers_add_and_toggle(self):
+    def test_drivers_list_offers_add_and_a_row_per_driver(self):
+        """Enable/disable moved onto the driver's own screen, one tap in."""
         _, kb = self._render(bot._settings_view_drivers)
         datas = self._datas(kb)
         self.assertIn("tset_dadd", datas)
-        self.assertTrue(any(d.startswith("tset_dtog:") for d in datas))
+        self.assertTrue(any(d.startswith("tset_drv:") for d in datas), datas)
 
     def test_suspensions_show_reason_and_offer_lift(self):
         text, kb = self._render(bot._settings_view_suspensions)
@@ -313,11 +314,10 @@ class DriverContactDetailsTest(unittest.TestCase):
          "phone_number": "", "email": ""},
     ]
 
-    def _screen(self):
-        db = _fake_db()
-        with mock.patch.object(bot, "db", db),                 mock.patch.object(bot, "_get_all_drivers_cached",
-                                  mock.MagicMock(return_value=self.CONTACTS)):
-            return asyncio.run(bot._settings_view_drivers())
+    def _screen(self, which=0):
+        """One driver's own screen — the roster itself is now a list of buttons and
+        the details live one tap in. See test_driver_buttons.py for the list."""
+        return bot._driver_detail(self.CONTACTS[which], set())
 
     def test_phone_and_email_are_shown(self):
         text, _ = self._screen()
@@ -335,8 +335,8 @@ class DriverContactDetailsTest(unittest.TestCase):
 
     def test_a_driver_with_nothing_on_file_shows_the_blanks(self):
         """Every detail is listed either way — an omitted line read as "none
-        needed" rather than "go and add it". See test_driver_roster.py."""
-        text, _ = self._screen()
+        needed" rather than "go and add it"."""
+        text, _ = self._screen(1)               # Sam Okafor, nothing on file
         self.assertIn("means nothing on file yet", text)
         self.assertGreaterEqual(text.count("—"), 3)
 
@@ -406,10 +406,8 @@ class DriverContactStaysInSettingsTest(unittest.TestCase):
         self.assertNotIn("kita@example.com", text)
 
     def test_settings_is_still_where_they_are_readable(self):
-        db = _fake_db()
-        with mock.patch.object(bot, "db", db),                 mock.patch.object(bot, "_get_all_drivers_cached",
-                                  mock.MagicMock(return_value=self.D)):
-            text, _ = asyncio.run(bot._settings_view_drivers())
+        """On the driver's own screen inside /settings — never on a lead."""
+        text, _ = bot._driver_detail(self.D[0], set())
         self.assertIn("551-374-0027", text)
         self.assertIn("kita@example.com", text)
 

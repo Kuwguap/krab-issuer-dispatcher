@@ -798,6 +798,25 @@ class Database:
             logger.error(f"Error creating lead assignment: {e}")
             return False
 
+    def get_driver_pending_assignment(self, driver_id: str) -> Optional[Dict[str, Any]]:
+        """The driver's newest still-open offer, so "accept" knows what it means."""
+        if not self._check_tables_exist():
+            return None
+        try:
+            r = (
+                self.client.table("lead_assignments")
+                .select("id, lead_id, driver_id, status, created_at")
+                .eq("driver_id", str(driver_id))
+                .eq("status", "pending")
+                .order("created_at", desc=True)
+                .limit(1)
+                .execute()
+            )
+            return (r.data or [None])[0]
+        except Exception as e:
+            logger.error(f"Error reading pending assignment for {driver_id}: {e}")
+            return None
+
     def lead_has_assignments(self, lead_id: str) -> bool:
         """True if any driver assignment exists for this lead (sender already picked drivers)."""
         if not self._check_tables_exist():

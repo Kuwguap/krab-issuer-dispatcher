@@ -311,10 +311,19 @@ async def cmd_drivers(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     drivers = await asyncio.to_thread(_get_all_drivers_cached)
     suspended = await asyncio.to_thread(_get_suspended_driver_ids)
     total = len(drivers or [])
-    header = (f"🚗 *Drivers — {total} on file*\n"
-              "_Tap a value to copy. — means nothing on file yet._\n")
-    for chunk in _pack_blocks(_driver_roster_blocks(drivers, suspended), header):
-        await msg.reply_text(chunk, parse_mode="Markdown")
+    if not total:
+        await msg.reply_text("🚗 *Drivers*\n\n_No drivers yet._", parse_mode="Markdown")
+        return
+    # The same tappable list as /settings, split across messages so a long roster
+    # is never cut. Tapping a driver opens their details and actions.
+    keyboards = _driver_list_keyboard(drivers, suspended)
+    for n, kb in enumerate(keyboards, start=1):
+        head = (f"🚗 *Drivers — {total} on file*\n"
+                "Tap one for phone, email, chat id — and to suspend, lift, "
+                "disable or enable.")
+        if len(keyboards) > 1:
+            head += f"\n_(part {n} of {len(keyboards)})_"
+        await msg.reply_text(head, parse_mode="Markdown", reply_markup=kb)
 
 
 async def cmd_driverblock(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1776,7 +1785,8 @@ def _driver_offer_message_text(lead: dict) -> str:
         f"📍 Delivery (City, State, Zip): {lead.get('delivery_details', '')}\n"
         f"📋 Reference ID: `{reference_id}`\n"
         f" Delivery Time 🏷️: {extra_safe}\n"
-        f"Please have Car, Driver License, and Laser Printer Ready✅"
+        f"Please have Car, Driver License, and Laser Printer Ready✅\n\n"
+        f"_Tap Accept below, or just reply *accept*._"
     )
     if spec:
         msg += f"\n\n📝 Special request (driver): {_sanitize_phones_for_send(spec)}"
@@ -3127,14 +3137,9 @@ async def _continue_phase1_after_ai_review(message, context: ContextTypes.DEFAUL
     # they simply show as "-" on the final review.
     missing = [f for f in missing if f not in PHASE1_OPTIONAL_FIELDS
                and not _field_already_filled(state_data, f)]
-    if missing:
-        prompts = ai_vision.MISSING_FIELD_PROMPTS
-        msg = prompts.get(missing[0], (f"You missed out {missing[0]}. Can you add it?", missing[0]))[0]
-        context.user_data["missing_fields"] = missing
-        context.user_data["missing_field_state_data"] = state_data.copy()
-        sent = await message.reply_text(msg)
-        _track_missing_prompt(context, sent)
-        return STATE_MISSING_FIELD
+    asked = await _ask_next_missing(message, context, user_id, missing, state_data)
+    if asked is not None:
+        return asked
     return await _ensure_phone_price_before_files(message, context, user_id)
 
 
@@ -6247,6 +6252,19 @@ PLATE_IMAGE_JUMP = 10_000
 _PLATE_MODULUS = 1_000_000
 
 
+def _plate_col_from_text(plate: str):
+    """Which counter a tag belongs to, read off the tag: H###### is resident,
+    ######V is not. The AI usually says so itself; this is for when it does not."""
+    p = re.sub(r"[^A-Za-z0-9]", "", str(plate or "")).upper()
+    if not p:
+        return None
+    if p.startswith("H") and p[1:].isdigit():
+        return "nj_plate_next_number"
+    if p.endswith("V") and p[:-1].isdigit():
+        return "non_nj_plate_next_number"
+    return None
+
+
 def _plate_after_image(number: int) -> int:
     """The counter value to set from a tag read off a photo."""
     return (int(number) + PLATE_IMAGE_JUMP) % _PLATE_MODULUS
@@ -6344,7 +6362,7 @@ async def handle_supervisor_plate_image(update: Update, context: ContextTypes.DE
             ),
         })
         raise ApplicationHandlerStop
-    col = _PLATE_IMAGE_KIND_COL.get(result.get("kind"))
+    col = _PLATE_IMAGE_KIND_COL.get(result.get("kind")) or _plate_col_from_text(read_label)
     if not col:
         await msg.reply_text(
             f"🔢 I read {read_label} but couldn't tell resident (H) vs non-resident (V). "
@@ -7909,13 +7927,10 @@ async def handle_phase1(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
         missing = ai_vision.detect_missing_fields(state_data, message_text)
         missing = [f for f in missing if f not in PHASE1_OPTIONAL_FIELDS
                    and not _field_already_filled(state_data, f)]
-        if missing:
-            prompts = ai_vision.MISSING_FIELD_PROMPTS
-            msg = prompts.get(missing[0], (f"You missed out {missing[0]}. Can you add it?", missing[0]))[0]
-            context.user_data["missing_fields"] = missing
-            context.user_data["missing_field_state_data"] = state_data.copy()
-            await update.message.reply_text(msg)
-            return STATE_MISSING_FIELD
+        asked = await _ask_next_missing(
+            update.message, context, update.effective_user.id, missing, state_data)
+        if asked is not None:
+            return asked
         return await _ensure_phone_price_before_files(update.message, context, update.effective_user.id)
 
 
@@ -8938,6 +8953,31 @@ def _field_already_filled(state_data: dict, field: str) -> bool:
     return True
 
 
+async def _ask_next_missing(message, context, user_id: int, fields: list, state_data: dict):
+    """Ask for the first thing still genuinely absent, or return None if nothing is.
+
+    The queue is re-checked against the LIVE card here rather than against whatever
+    dict the caller is holding: a value can arrive while the queue waits — typed on
+    the card, tapped from a picker — and being asked for a colour that is printed
+    right there is the complaint this exists to prevent."""
+    try:
+        live = (db.get_user_state(user_id) or {}).get("data")
+    except Exception:
+        live = None
+    card = live if isinstance(live, dict) else (state_data or {})
+    still = [f for f in (fields or [])
+             if f not in PHASE1_OPTIONAL_FIELDS and not _field_already_filled(card, f)]
+    context.user_data["missing_fields"] = still
+    context.user_data["missing_field_state_data"] = dict(card)
+    if not still:
+        return None
+    prompts = ai_vision.MISSING_FIELD_PROMPTS
+    text = prompts.get(still[0], (f"You missed out {still[0]}. Can you add it?", still[0]))[0]
+    sent = await message.reply_text(text)
+    _track_missing_prompt(context, sent)
+    return STATE_MISSING_FIELD
+
+
 async def handle_missing_field(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """Handle user reply when we asked for a missing field (e.g. color)."""
     user_id = update.effective_user.id
@@ -8980,13 +9020,10 @@ async def handle_missing_field(update: Update, context: ContextTypes.DEFAULT_TYP
         await update.message.delete()
     except Exception:
         pass
-    if missing_fields:
-        next_field = missing_fields[0]
-        prompts = ai_vision.MISSING_FIELD_PROMPTS
-        msg = prompts.get(next_field, (f"You missed out {next_field}. Can you add it?", next_field))[0]
-        sent = await update.message.reply_text(msg)
-        _track_missing_prompt(context, sent)
-        return STATE_MISSING_FIELD
+    asked = await _ask_next_missing(
+        update.message, context, user_id, missing_fields, state_data)
+    if asked is not None:
+        return asked
 
     # Safety net: re-scan in case initial detection short-circuited on one field
     # (e.g. early return on color) and missed insurance/VIN/etc.
@@ -9009,15 +9046,10 @@ async def handle_missing_field(update: Update, context: ContextTypes.DEFAULT_TYP
     still_missing = ai_vision.detect_missing_fields(state_data, blob)
     still_missing = [f for f in still_missing if f not in PHASE1_OPTIONAL_FIELDS
                      and not _field_already_filled(state_data, f)]
-    if still_missing:
-        context.user_data["missing_fields"] = still_missing
-        context.user_data["missing_field_state_data"] = state_data.copy()
-        prompts = ai_vision.MISSING_FIELD_PROMPTS
-        first = still_missing[0]
-        msg = prompts.get(first, (f"You missed out {first}. Can you add it?", first))[0]
-        sent = await update.message.reply_text(msg)
-        _track_missing_prompt(context, sent)
-        return STATE_MISSING_FIELD
+    asked = await _ask_next_missing(
+        update.message, context, user_id, still_missing, state_data)
+    if asked is not None:
+        return asked
 
     _sanitize_phase1_pending_phone_price(state_data)
     db.set_user_state(user_id, "phase1", state_data)
@@ -9531,12 +9563,34 @@ async def _finalize_lead_after_notes(
     # The temp-tag PDF is sent later, when a group ACCEPTS the lead
     # (see _send_full_group_lead_to_chat), not at creation.
 
-    _store_issuer_await_group_accept(
-        user_id,
-        lead_id=str(lead["id"]),
-        await_mode="dispatch_pending",
-        selected_driver_ids=[str(d.get("id")) for d in drivers_list if d.get("id")],
-    )
+    # Drivers are told NOW, alongside the group — neither waits on the other. They
+    # used to get nothing until a group tapped Accept, so a lead the group had not
+    # picked up yet was invisible to every driver, while the issuer's confirmation
+    # below already claimed it had been sent to them.
+    if drivers_list:
+        vehicle_safe, extra_safe = _dispatch_display_parts(phase1_data, issuers_note)
+        _fire_driver_dispatch(
+            context,
+            issuer_notify_chat_id=getattr(message, "chat_id", user_id),
+            user_id=user_id,
+            username=username,
+            lead=lead,
+            lead_data=dict(state_data),
+            phase1_data=phase1_data,
+            selected_drivers=drivers_list,
+            selected_group=selected_group,
+            skip_duplicate_full_group_post=True,   # the approval post just went out
+            phone_number=phone_number,
+            price=price,
+            encrypted_data=encrypted_data,
+            reference_id=reference_id,
+            issuer_note_disp=issuers_note,
+            driver_note_disp=drivers_note,
+            group_id=group_id,
+            vehicle_safe=vehicle_safe,
+            extra_safe=extra_safe,
+            driver_names=", ".join(d.get("driver_name", "?") for d in drivers_list),
+        )
     context.user_data.pop("phase1_pending_media", None)
     context.user_data.pop("phase1_attached_files", None)
     ref_h = html.escape(str(reference_id), quote=False)
@@ -10347,6 +10401,43 @@ async def handle_driver_selection(update: Update, context: ContextTypes.DEFAULT_
     return ConversationHandler.END
 
 
+def _dispatch_display_parts(phase1_data: dict, issuer_note: str) -> tuple:
+    """(vehicle_safe, extra_safe) — the vehicle block drivers and groups both see."""
+    def _safe(v) -> str:
+        return _sanitize_phones_for_send(v or "") or "-"
+
+    lines = [
+        _safe(phase1_data.get("address")),
+        _safe(phase1_data.get("city_state_zip")),
+        (phase1_data.get("vin") or "").strip() or "-",
+        (phase1_data.get("car") or "").strip() or "-",
+        _safe(phase1_data.get("color")),
+        _safe(phase1_data.get("insurance_company")),
+        (phase1_data.get("insurance_policy_number") or "").strip() or "-",
+        _safe(phase1_data.get("extra_info")),
+        _safe("📝 " + issuer_note) if (issuer_note or "").strip() else "📝 No",
+    ]
+    vehicle_safe = (f"🚗 Vehicle: {_safe(phase1_data.get('name'))}\n"
+                    + "\n".join(lines))
+    extra_safe = _sanitize_phones_for_send(phase1_data.get("extra_info", "") or "")
+    return vehicle_safe, extra_safe
+
+
+def _fire_driver_dispatch(context, **kw) -> None:
+    """Start the driver DMs now, in the background, without waiting on anyone."""
+    def _done(t) -> None:
+        try:
+            exc = t.exception()
+        except asyncio.CancelledError:
+            return
+        if exc:
+            logger.error("Driver dispatch failed: %s", exc, exc_info=exc)
+
+    asyncio.create_task(
+        _background_dispatch_lead_after_driver_pick(context, **kw)
+    ).add_done_callback(_done)
+
+
 async def _background_dispatch_lead_after_driver_pick(
     context: ContextTypes.DEFAULT_TYPE,
     *,
@@ -10897,6 +10988,11 @@ async def _maybe_offer_insurance_card(
     # ride-along (card issued together with the tag) — don't also show the manual button.
     if lead.get("wants_insurance"):
         return False
+    # The client already told us their carrier — offering to issue them a policy is
+    # noise on a lead that plainly does not need one.
+    if _lead_already_insured(lead):
+        logger.info("Insurance card: lead %s already carries insurance; no offer", lead_id)
+        return False
     if not Config.is_resend_configured():
         logger.warning(
             "Insurance card: lead %s has email %s but RESEND_API_KEY/RESEND_FROM "
@@ -10954,6 +11050,19 @@ async def _maybe_offer_insurance_card(
     except Exception as e:
         logger.warning("Could not post insurance-card offer: %s", e)
         return False
+
+
+def _lead_already_insured(lead: dict) -> bool:
+    """True when the lead came in with a carrier (or a policy number) of its own."""
+    try:
+        phase1 = _phase1_from_stored_lead(lead or {}) or {}
+    except Exception:
+        phase1 = {}
+    for key in ("insurance_company", "insurance_policy_number"):
+        val = str(phase1.get(key) or (lead or {}).get(key) or "").strip()
+        if val and val not in ("-", "—", "N/A", "n/a", "None"):
+            return True
+    return False
 
 
 PORTAL_DEFAULT_PASSWORD = "Temp#A9"
@@ -11631,6 +11740,9 @@ async def _issuer_open_driver_selection_after_group_accept(
     winner_group = db.get_group_by_id(str(win_gid)) if win_gid else None
 
     if mode == "dispatch_pending":
+        # Kept for leads created before drivers were told up-front, and for the
+        # broadcast path that still defers. A lead already dispatched leaves no
+        # dispatch_pending state behind, so this cannot double-send.
         db.clear_user_state(issuer_uid)
         raw_ids = inner.get("selected_driver_ids") or []
         id_set = {str(x).strip() for x in raw_ids if str(x).strip()}
@@ -11799,6 +11911,57 @@ async def _issuer_open_driver_selection_after_group_accept(
         )
     except Exception as e:
         logger.warning("Could not DM issuer driver picker after group accept: %s", e)
+
+
+# A driver answering the offer in words. Deliberately narrow: these are answers to
+# a question that is on their screen, not general chat.
+_DRIVER_ACCEPT_RE = re.compile(
+    r"^\s*(?:accept(?:ed|ing)?|yes|yep|yeah|yup|ok|okay|sure|i'?ll\s+take\s+it|"
+    r"take\s+it|mine|got\s+it|on\s+it|i\s+got\s+it|claim(?:ed)?)\b[\s.!,]*$",
+    re.IGNORECASE,
+)
+_DRIVER_DECLINE_RE = re.compile(
+    r"^\s*(?:decline[d]?|no|nope|nah|pass|skip|can'?t|cannot|not\s+me|"
+    r"different\s+driver|someone\s+else)\b[\s.!,]*$",
+    re.IGNORECASE,
+)
+
+
+async def handle_driver_word_answer(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """"accept" / "yes" (or "no") from a driver with an open offer.
+
+    Runs the button's own handler through _TypedAsTap rather than repeating the
+    acceptance rules, so typing and tapping can never behave differently. Anything
+    else — or no open offer — passes straight through untouched."""
+    msg = update.effective_message
+    user = update.effective_user
+    if not msg or not user or not (msg.text or "").strip():
+        return
+    if getattr(msg, "chat", None) is not None and msg.chat.type != "private":
+        return
+    text = msg.text.strip()
+    accept = bool(_DRIVER_ACCEPT_RE.match(text))
+    if not accept and not _DRIVER_DECLINE_RE.match(text):
+        return
+    try:
+        driver = await asyncio.to_thread(_driver_row_for_telegram_user, user.id)
+    except Exception:
+        driver = None
+    if not driver:
+        return                                  # not a driver — leave the text alone
+    try:
+        pending = await asyncio.to_thread(
+            db.get_driver_pending_assignment, str(driver.get("id")))
+    except Exception as e:
+        logger.warning("driver word answer: pending lookup failed: %s", e)
+        return
+    lead_id = str((pending or {}).get("lead_id") or "").strip()
+    if not lead_id:
+        return                                  # nothing open — could be anything
+    prefix = "accept_lead_" if accept else "decline_lead_"
+    handler = handle_accept_lead if accept else handle_decline_lead
+    await handler(_TypedAsTap(update, f"{prefix}{lead_id}"), context)
+    raise ApplicationHandlerStop
 
 
 async def handle_accept_lead(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -15077,77 +15240,82 @@ def _driver_contact_lines(driver: dict) -> list:
     ]
 
 
-def _driver_roster_blocks(drivers, suspended=None) -> list:
-    """One block of lines per driver, so a long roster can be split BETWEEN drivers
-    and never inside one. Shared by the /settings screen and /drivers."""
-    susp = {str(x) for x in (suspended or ())}
-    blocks = []
-    for i, d in enumerate(drivers or [], start=1):
-        did = str(d.get("id"))
-        if did in susp:
-            mark, note = "🚫", " _(suspended)_"
-        elif record_is_active(d):
-            mark, note = "✅", ""
-        else:
-            mark, note = "⛔", " _(disabled)_"
-        name = _telegram_md1_escape(d.get("driver_name") or "(unnamed)")
-        # The trailing blank keeps one driver from running into the next —
-        # four tight lines each read as a single wall of text without it.
-        blocks.append([f"{mark} *{i}. {name}*{note}"]
-                      + _driver_contact_lines(d) + [""])
-    return blocks
+# One row per driver, at most this many on a single message's keyboard. Telegram
+# accepts more, but a wall of buttons stops being a list you can read.
+_DRIVER_ROWS_PER_MSG = 40
 
 
-def _pack_blocks(blocks, header="", limit=_TG_TEXT_LIMIT) -> list:
-    """Group whole blocks into as few messages as fit, keeping each block intact."""
-    msgs, cur = [], ([header] if header else [])
-    for block in blocks:
-        candidate = cur + block
-        if cur and len("\n".join(candidate)) > limit:
-            msgs.append("\n".join(cur))
-            cur = list(block)
-        else:
-            cur = candidate
-    if cur:
-        msgs.append("\n".join(cur))
-    # The blank that separates drivers must not dangle at a message end.
-    return [m.rstrip() for m in msgs] or [header or "_No drivers yet._"]
+def _driver_status(driver: dict, suspended: set) -> tuple:
+    """(mark, note) — suspended beats disabled beats active, the way dispatch sees it."""
+    if str((driver or {}).get("id")) in (suspended or set()):
+        return "🚫", "suspended"
+    if record_is_active(driver):
+        return "✅", ""
+    return "⛔", "off"
+
+
+def _driver_list_keyboard(drivers, suspended, *, back="tset_menu", add=True) -> list:
+    """The roster as tappable rows, split into keyboards that stay readable.
+
+    The label carries the name and the status because that is all one line holds;
+    the phone, email and chat id live on the driver's own screen, one tap away."""
+    rows_all = []
+    for d in (drivers or []):
+        mark, note = _driver_status(d, suspended)
+        name = str(d.get("driver_name") or "(unnamed)")
+        label = f"{mark} {name}" + (f" — {note}" if note else "")
+        rows_all.append([InlineKeyboardButton(label[:60], callback_data=f"tset_drv:{d.get('id')}")])
+    keyboards = []
+    for i in range(0, len(rows_all) or 1, _DRIVER_ROWS_PER_MSG):
+        chunk = rows_all[i:i + _DRIVER_ROWS_PER_MSG]
+        last = i + _DRIVER_ROWS_PER_MSG >= len(rows_all)
+        if last:
+            if add:
+                chunk = chunk + [[InlineKeyboardButton("➕ Add Driver", callback_data="tset_dadd")]]
+            if back:
+                chunk = chunk + [[InlineKeyboardButton("⬅️ Back", callback_data=back)]]
+        keyboards.append(InlineKeyboardMarkup(chunk))
+    return keyboards
+
+
+def _driver_detail(driver: dict, suspended: set) -> tuple:
+    """Everything on file for one driver, with every action it supports."""
+    did = str((driver or {}).get("id") or "")
+    mark, note = _driver_status(driver, suspended)
+    name = _telegram_md1_escape(driver.get("driver_name") or "(unnamed)")
+    lines = [f"{mark} *{name}*" + (f" _({note})_" if note else ""), ""]
+    lines += _driver_contact_lines(driver)
+    lines += ["", "_Tap a value to copy. — means nothing on file yet._"]
+    is_susp = did in (suspended or set())
+    rows = [
+        [InlineKeyboardButton(
+            "✅ Lift suspension" if is_susp else "🚫 Suspend",
+            callback_data=f"tset_dlift:{did}" if is_susp else f"tset_dsusp:{did}")],
+        [InlineKeyboardButton(
+            "🔌 Enable" if not record_is_active(driver) else "⛔ Disable",
+            callback_data=f"tset_dtog:{did}")],
+        [InlineKeyboardButton("⬅️ All drivers", callback_data="tset_drivers")],
+    ]
+    return ("\n".join(lines).rstrip(), InlineKeyboardMarkup(rows))
 
 
 async def _settings_view_drivers() -> tuple:
-    """Add a driver, or switch one off/on, and read their contact details. Disabling
-    removes them from the pickers entirely; suspending (separate screen) keeps them
-    visible but unassignable."""
+    """Every driver as a tappable row. Their details and actions are one tap away —
+    a button label holds a name, not a name and three contact fields."""
     drivers = await asyncio.to_thread(_get_all_drivers_cached)
     suspended = await asyncio.to_thread(_get_suspended_driver_ids)
     total = len(drivers or [])
-    lines = [f"🚗 *Drivers — {total} on file*",
-             "_Tap a value to copy. — means nothing on file yet._\n"]
-    blocks = _driver_roster_blocks(drivers, suspended)
-    # One screen is one message, so a roster too long to fit says so and points at
-    # /drivers, which splits it instead of dropping anyone.
-    shown = 0
-    for block in blocks:
-        if len("\n".join(lines + block)) > _TG_TEXT_LIMIT - 120:
-            break
-        lines.extend(block)
-        shown += 1
-    if shown < total:
-        lines.append(f"_…and {total - shown} more — see /drivers for the full list._")
-    rows = []
-    for d in (drivers or [])[:30]:      # Telegram caps the keyboard, not the text
-        active = record_is_active(d)
-        rows.append([InlineKeyboardButton(
-            f"{'Disable' if active else 'Enable'} {d.get('driver_name') or 'driver'}"[:40],
-            callback_data=f"tset_dtog:{d.get('id')}")])
-    if not drivers:
-        lines.append("_No drivers yet._")
-    elif total > 30:
-        lines.append(f"_Buttons shown for the first 30 of {total}._")
-    rows.append([InlineKeyboardButton("➕ Add Driver", callback_data="tset_dadd")])
-    rows.append([InlineKeyboardButton("⬅️ Back", callback_data="tset_menu")])
-    # rstrip: the last driver's separating blank would otherwise dangle.
-    return ("\n".join(lines).rstrip(), InlineKeyboardMarkup(rows))
+    txt = (f"🚗 *Drivers — {total} on file*\n\n"
+           "Tap a driver for their phone, email and chat id — and to suspend, "
+           "lift, disable or enable them.")
+    if not total:
+        txt += "\n\n" + "_No drivers yet._"
+    keyboards = _driver_list_keyboard(drivers, suspended)
+    # One editable message: show the first keyboard and say what did not fit.
+    if len(keyboards) > 1:
+        shown = _DRIVER_ROWS_PER_MSG
+        txt += "\n\n" + f"_Showing {shown} of {total} — /drivers lists them all._"
+    return (txt, keyboards[0])
 
 
 async def _settings_view_suspensions() -> tuple:
@@ -15208,17 +15376,31 @@ async def cmd_settings(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
     return SET_MENU
 
 
+def _plate_with_letter(number, *, resident: bool, prefix: str = "H", suffix: str = "V") -> str:
+    """"209861" -> "H209861" / "477040V" — the number as it is actually printed."""
+    digits = re.sub(r"\D", "", str(number or ""))
+    if not digits:
+        return "—"
+    digits = digits.zfill(6)
+    return f"{prefix}{digits}" if resident else f"{digits}{suffix}"
+
+
 async def _settings_view_plates() -> tuple:
-    """Only the two plate counters. The control number is a per-tag serial nobody
-    tracks between tags, so it is minted at random and has nothing to set."""
+    """Only the two plate counters, shown with the letter they are printed with.
+    The control number is a per-tag serial nobody tracks, so it is minted at random
+    and has nothing to set."""
     s = await asyncio.to_thread(db.get_plate_settings) or {}
     pre, suf = s.get("nj_plate_prefix", "H"), s.get("non_nj_plate_suffix", "V")
+    res = _plate_with_letter(s.get("nj_plate_next_number"), resident=True, prefix=pre)
+    non = _plate_with_letter(s.get("non_nj_plate_next_number"), resident=False, suffix=suf)
     txt = (
         "🔢 *Plate Numbers*\n\n"
-        f"Resident (`{pre}######`) next: *{s.get('nj_plate_next_number', '—')}*\n"
-        f"Non-Resident (`######{suf}`) next: *{s.get('non_nj_plate_next_number', '—')}*\n\n"
-        "Tap to set the next one, or send a *photo of the newest tag issued* — "
-        f"I read it and set the counter {PLATE_IMAGE_JUMP:,} past it.\n\n"
+        f"Resident (`{pre}######`) next: *{res}*\n"
+        f"Non-Resident (`######{suf}`) next: *{non}*\n\n"
+        "*Send Update:*\n"
+        "Tap below, type a number, or send a *photo of the newest tag* — the "
+        f"{pre}/{suf} on it says which counter it is, and I set that one "
+        f"{PLATE_IMAGE_JUMP:,} past it.\n\n"
         "_Control numbers are random on every tag — nothing to set._"
     )
     kb = InlineKeyboardMarkup([
@@ -15409,10 +15591,47 @@ async def handle_settings_cb(update: Update, context: ContextTypes.DEFAULT_TYPE)
     # --- drivers -------------------------------------------------------
     if data == "tset_drivers":
         await _show_settings_view("tset_drivers", query=query); return SET_MENU
+    if data.startswith("tset_drv:"):
+        await _show_driver_detail(query, data.split(":", 1)[1])
+        return SET_MENU
     if data.startswith("tset_dtog:"):
-        await asyncio.to_thread(db.toggle_driver_status, data.split(":", 1)[1])
+        did = data.split(":", 1)[1]
+        await asyncio.to_thread(db.toggle_driver_status, did)
         _bust_driver_caches()
-        await _show_settings_view("tset_drivers", query=query); return SET_MENU
+        # Back to that driver, not to the list — you are mid-decision about them.
+        await _show_driver_detail(query, did)
+        return SET_MENU
+    if data.startswith("tset_dsusp:"):
+        did = data.split(":", 1)[1]
+        ok = await asyncio.to_thread(db.set_driver_suspended, did, True)
+        _bust_driver_caches()
+        if not ok:
+            await query.message.reply_text(
+                "⚠️ Manual suspension needs one database change first — run "
+                "`database/migration_driver_manual_suspend.sql` in the Supabase SQL "
+                "editor. Receipt-debt suspensions work without it.",
+                parse_mode="Markdown")
+        await _show_driver_detail(query, did)
+        return SET_MENU
+    if data.startswith("tset_dlift:"):
+        did = data.split(":", 1)[1]
+        await asyncio.to_thread(db.set_driver_suspended, did, False)
+        # A receipt-debt suspension only lifts once the debt stops counting, so
+        # excuse the outstanding receipts exactly as an accepted appeal does.
+        waived = await asyncio.to_thread(db.waive_driver_pending_receipts, did)
+        _bust_driver_caches()
+        driver = await asyncio.to_thread(_driver_row_by_id, did)
+        if driver:
+            try:
+                pending_after = await asyncio.to_thread(db.get_driver_pending_receipts, did)
+                await _notify_suspension_lifted(
+                    context, driver=driver, pending_after=pending_after)
+            except Exception as e:
+                logger.warning("suspension-lift notice failed: %s", e)
+        if waived:
+            logger.info("Lifted suspension for %s and waived %s receipt(s)", did, waived)
+        await _show_driver_detail(query, did)
+        return SET_MENU
     if data == "tset_dadd":
         context.user_data["tset_await"] = {"kind": "add_driver"}
         await query.message.reply_text(
@@ -15466,6 +15685,21 @@ async def handle_settings_cb(update: Update, context: ContextTypes.DEFAULT_TYPE)
                                        parse_mode="Markdown")
         return SET_INPUT
     return SET_MENU
+
+
+async def _show_driver_detail(query, driver_id: str) -> None:
+    """Draw one driver's screen in place of whatever is on the message."""
+    driver = await asyncio.to_thread(_driver_row_by_id, driver_id)
+    if not driver:
+        await _show_settings_view("tset_drivers", query=query)
+        return
+    suspended = await asyncio.to_thread(_get_suspended_driver_ids)
+    text, kb = _driver_detail(driver, suspended)
+    try:
+        await query.edit_message_text(text, parse_mode="Markdown", reply_markup=kb)
+    except BadRequest as e:
+        if "not modified" not in str(e).lower():
+            await query.message.reply_text(text, parse_mode="Markdown", reply_markup=kb)
 
 
 async def apply_settings_input(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -15947,7 +16181,14 @@ def main():
     # /settings (supervisors): plate counters + group management. Registered
     # before the main conversation so its input step captures the typed value.
     settings_conv = ConversationHandler(
-        entry_points=[CommandHandler(["settings", "setting"], cmd_settings)],
+        entry_points=[
+            CommandHandler(["settings", "setting"], cmd_settings),
+            # The /drivers roster posts settings buttons OUTSIDE /settings, and a
+            # restart drops the conversation anyway — so every settings button is an
+            # entry point too, or the tap reaches nothing at all. handle_settings_cb
+            # gates on supervisor either way.
+            CallbackQueryHandler(handle_settings_cb, pattern=r"^tset_"),
+        ],
         states={
             SET_MENU: [
                 CallbackQueryHandler(handle_settings_cb, pattern=r"^tset_"),
@@ -15995,13 +16236,13 @@ def main():
         group=-1,
     )
 
-    # Voice notes work EVERYWHERE: group -3 runs before everything else,
+    # Voice notes work EVERYWHERE: group -5 runs before everything else,
     # transcribes any private-chat voice/audio note, injects the transcript as the
     # message text, then lets the update flow on — first through the group -2
     # review-edit safety net below, then to whatever text handler is active.
     application.add_handler(
         MessageHandler(filters.VOICE | filters.AUDIO, _global_voice_to_text),
-        group=-4,
+        group=-5,
     )
 
     # Commands without the slash (group -3: after transcription, before everything
@@ -16013,6 +16254,19 @@ def main():
             _bare_command_to_slash,
         ),
         group=-3,
+    )
+
+    # A driver answering their offer in words (its OWN group -4, after voice
+    # transcription so a SPOKEN "accept" works too — only one handler per group
+    # ever runs, so sharing a group with the review-edit net would mute one of them):
+    # "accept" / "yes" runs the same acceptance the Accept button does. Only fires
+    # for a driver who actually has an open offer; everything else flows on.
+    application.add_handler(
+        MessageHandler(
+            filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE,
+            handle_driver_word_answer,
+        ),
+        group=-4,
     )
 
     # Review-edit safety net (group -2: after voice transcription, before every

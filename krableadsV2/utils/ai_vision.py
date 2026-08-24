@@ -1829,13 +1829,15 @@ def detect_missing_fields(state_data: dict, raw_input: str) -> list[str]:
         v = (state_data.get(key) or "").strip()
         return bool(v and v != "-")
 
-    # Color – trust well-known color words, otherwise validate against placeholders + AI.
-    color_val = (state_data.get("color") or "").strip()
-    color_is_good = _has_valid_color(color_val)
-    if color_is_good and not _color_is_trusted(color_val) and raw_input:
-        if _ai_check_color_in_raw(color_val, raw_input):
-            color_is_good = False
-    if not color_is_good:
+    # Colour. A value that is not blank and not a known placeholder IS the colour.
+    #
+    # There used to be an AI second-guess here for anything outside a hand-written
+    # word list ("was a colour really given?"). That answer is not stable — the same
+    # value came back missing on one run and fine on the next — and the only thing it
+    # caught, a city or insurer name landing in the colour field, is what
+    # COLOR_PLACEHOLDERS and the extraction prompt already handle. Asking someone for
+    # a colour that is printed on the card in front of them is the worse failure.
+    if not _has_valid_color((state_data.get("color") or "").strip()):
         missing.append("color")
 
     # Deterministic local checks for other fields so they still get asked when OPENAI isn't set.
