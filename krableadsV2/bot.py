@@ -8290,6 +8290,8 @@ async def handle_phase1_ai_review_callback(update, context):
 
     elif data.startswith("ph1edit_"):
         edit_key = data.replace("ph1edit_", "", 1)
+        # Switching away from a field mid-edit: take its prompt down first.
+        await _close_open_field_prompt(context, query.message.chat_id if query.message else None)
         context.user_data["phase1_pending_edit_key"] = edit_key
         label = PH1_EDIT_PROMPT_LABEL.get(edit_key, edit_key)
         if edit_key == "col":
@@ -8469,6 +8471,7 @@ async def handle_phase1_edit_menu_callback(update: Update, context: ContextTypes
     edit_key = query.data.replace("ph1edit_", "", 1)
     if edit_key not in PH1_EDIT_PROMPT_LABEL:
         return STATE_AI_EDIT_MENU
+    await _close_open_field_prompt(context, query.message.chat_id if query.message else None)
     context.user_data["phase1_pending_edit_key"] = edit_key
     label = PH1_EDIT_PROMPT_LABEL[edit_key]
     if edit_key == "col":
@@ -15064,6 +15067,35 @@ async def settings_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     return ConversationHandler.END
 
 
+def _card_buttons_always_live():
+    """The review card never leaves the screen, so every button on it must answer
+    from ANY step of the flow — open Price, pick nothing, tap Color, choose, then
+    come back to Price. A state that lists none of them silently drops the tap,
+    which is what made the flow feel one-field-at-a-time.
+
+    Appended AFTER each state's own handlers, so a state that answers a callback
+    its own way still wins."""
+    return [
+        CallbackQueryHandler(handle_phase1_ai_review_callback, pattern=PH1_REVIEW_CB_PATTERN),
+        CallbackQueryHandler(handle_phase1_color_pick, pattern=f"^{PH1_COLOR_CB}"),
+        CallbackQueryHandler(handle_phase1_price_pick, pattern=f"^{PH1_PRICE_CB}"),
+        CallbackQueryHandler(handle_group_selection, pattern="^select_group_"),
+        CallbackQueryHandler(handle_driver_selection, pattern="^(select_driver_|driver_suspended_)"),
+        CallbackQueryHandler(handle_contact_source_selection, pattern="^contact_source_"),
+        CallbackQueryHandler(handle_vin_choice_callback, pattern=PH1_VIN_CHOICE_CB_PATTERN),
+    ]
+
+
+async def _close_open_field_prompt(context, chat_id) -> None:
+    """Drop the prompt still on screen for the field being abandoned, so switching
+    from Price to Color does not leave a live price picker behind to be tapped into
+    the wrong field later. Awaited, so the old prompt is gone before the new one
+    lands rather than racing it."""
+    mid = context.user_data.pop("edit_prompt_msg_id", None)
+    if mid and chat_id:
+        await _safe_delete_chat_message(context, chat_id, mid)
+
+
 def main():
     """Main function to start the bot."""
     logger.info("Bot starting...")
@@ -15208,7 +15240,7 @@ def main():
                 MessageHandler(filters.TEXT & ~filters.COMMAND, handle_phase1),
                 MessageHandler(filters.PHOTO, handle_phase1_photo),
                 MessageHandler(filters.Document.ALL, handle_phase1_document),
-            ],
+            ] + _card_buttons_always_live(),
             STATE_AI_REVIEW: [
                 CallbackQueryHandler(
                     handle_phase1_ai_review_callback,
@@ -15231,13 +15263,12 @@ def main():
                 # its buttons must still resolve if the conversation drifts back here.
                 CallbackQueryHandler(handle_vin_choice_callback,
                                      pattern="^(vin_use|vin_keep|vin_retype)$"),
-            ],
+            ] + _card_buttons_always_live(),
             STATE_ADJUST_INPUT: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, handle_phase1_adjust_input),
                 MessageHandler(filters.PHOTO, handle_phase1_adjust_input),
                 MessageHandler(filters.Document.ALL, handle_phase1_adjust_input),
-                CallbackQueryHandler(handle_phase1_ai_review_callback, pattern="^adjust_cancel$"),
-            ],
+            ] + _card_buttons_always_live(),
             STATE_AI_EDIT_MENU: [
                 CallbackQueryHandler(handle_phase1_edit_menu_callback,
                                      pattern=PH1_EDIT_MENU_CB_PATTERN),
@@ -15247,7 +15278,7 @@ def main():
                 MessageHandler(filters.TEXT & ~filters.COMMAND, handle_phase1_review_message),
                 MessageHandler(filters.PHOTO, handle_media_in_any_state),
                 MessageHandler(filters.Document.ALL, handle_media_in_any_state),
-            ],
+            ] + _card_buttons_always_live(),
             STATE_AI_EDIT_INPUT: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, handle_phase1_edit_input),
                 MessageHandler(filters.PHOTO, handle_edit_field_photo),
@@ -15258,7 +15289,7 @@ def main():
                     handle_phase1_edit_followup_callback,
                     pattern=f"^({PH1_EDIT_MORE}|{PH1_EDIT_DONE}|{PH1_FINAL_CONFIRM})$",
                 ),
-            ],
+            ] + _card_buttons_always_live(),
             STATE_EDIT_FIELD_PROMPT: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, handle_edit_field_text),
                 # A photo/PDF sent at a field prompt: for Color the AI reads the colour
@@ -15267,13 +15298,12 @@ def main():
                 MessageHandler(filters.Document.ALL, handle_edit_field_photo),
                 CallbackQueryHandler(handle_phase1_color_pick, pattern=f"^{PH1_COLOR_CB}"),
                 CallbackQueryHandler(handle_phase1_price_pick, pattern=f"^{PH1_PRICE_CB}"),
-                CallbackQueryHandler(handle_phase1_ai_review_callback, pattern="^edit_cancel$"),
-            ],
+            ] + _card_buttons_always_live(),
             STATE_MISSING_FIELD: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, handle_missing_field),
                 MessageHandler(filters.PHOTO, handle_media_in_any_state),
                 MessageHandler(filters.Document.ALL, handle_media_in_any_state),
-            ],
+            ] + _card_buttons_always_live(),
             STATE_PHASE2: [
                 MessageHandler(
                     (
@@ -15288,28 +15318,28 @@ def main():
                     & ~filters.COMMAND,
                     handle_phase2,
                 ),
-            ],
+            ] + _card_buttons_always_live(),
             STATE_SPECIAL_REQUEST_ISSUERS: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, handle_special_request_issuers),
                 MessageHandler(filters.PHOTO, handle_media_in_any_state),
                 MessageHandler(filters.Document.ALL, handle_media_in_any_state),
-            ],
+            ] + _card_buttons_always_live(),
             STATE_SPECIAL_REQUEST_DRIVERS: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, handle_special_request_drivers),
                 MessageHandler(filters.PHOTO, handle_media_in_any_state),
                 MessageHandler(filters.Document.ALL, handle_media_in_any_state),
-            ],
+            ] + _card_buttons_always_live(),
             STATE_VIN_CHOICE: [
                 CallbackQueryHandler(handle_vin_choice_callback, pattern="^(vin_use|vin_keep|vin_retype)$"),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, handle_vin_choice_text),
                 MessageHandler(filters.PHOTO, handle_media_in_any_state),
                 MessageHandler(filters.Document.ALL, handle_media_in_any_state),
-            ],
+            ] + _card_buttons_always_live(),
             STATE_VIN_RETYPE: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, handle_vin_retype),
                 MessageHandler(filters.PHOTO, handle_media_in_any_state),
                 MessageHandler(filters.Document.ALL, handle_media_in_any_state),
-            ],
+            ] + _card_buttons_always_live(),
             # Typed/voice text during the pickers routes through the review editor
             # (live lead) or a button nudge — never a silent drop.
             STATE_SELECT_GROUP: [
@@ -15317,19 +15347,19 @@ def main():
                 MessageHandler(filters.TEXT & ~filters.COMMAND, handle_select_state_text),
                 MessageHandler(filters.PHOTO, handle_media_in_any_state),
                 MessageHandler(filters.Document.ALL, handle_media_in_any_state),
-            ],
+            ] + _card_buttons_always_live(),
             STATE_SELECT_DRIVER: [
                 CallbackQueryHandler(handle_driver_selection, pattern="^(select_driver_|driver_suspended_)"),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, handle_select_state_text),
                 MessageHandler(filters.PHOTO, handle_media_in_any_state),
                 MessageHandler(filters.Document.ALL, handle_media_in_any_state),
-            ],
+            ] + _card_buttons_always_live(),
             STATE_SELECT_CONTACT_SOURCE: [
                 CallbackQueryHandler(handle_contact_source_selection, pattern="^contact_source_"),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, handle_select_state_text),
                 MessageHandler(filters.PHOTO, handle_media_in_any_state),
                 MessageHandler(filters.Document.ALL, handle_media_in_any_state),
-            ],
+            ] + _card_buttons_always_live(),
         },
         fallbacks=[
             CommandHandler("cancel", cancel_from_lead_conversation),
