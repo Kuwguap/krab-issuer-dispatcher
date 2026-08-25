@@ -8215,8 +8215,12 @@ async def _place_text_at_field_prompt(state_data: dict, ek: str, text: str):
         return False, []
     if ek not in _PROSE_EKS:
         labelled = _parse_multi_field_line(text)
-        # A label naming the field we are already in is just the value.
-        if labelled and not (len(labelled) == 1 and labelled[0][0] == ek):
+        if labelled and len(labelled) == 1 and labelled[0][0] == ek:
+            # "price 150" AT the price prompt: same field, so use the value the
+            # parser already stripped the label off. Falling through to the raw text
+            # wrote "price 150" into the field.
+            return True, _apply_ek_value(state_data, ek, labelled[0][1])
+        if labelled:
             changed = []
             for p_ek, p_val in labelled:
                 for lbl in _apply_ek_value(state_data, p_ek, p_val):
@@ -11165,8 +11169,21 @@ def _generate_portal_password() -> str:
     return PORTAL_DEFAULT_PASSWORD
 
 
+def _price_amount_str(price) -> str:
+    """Just the number out of a price string: "$150 + toll" -> "150".
+
+    Prices are written for people ("$150", "$150 + toll", "1,500"), and every
+    numeric consumer — the premium maths, Monday's number column — needs the digits
+    on their own."""
+    m = re.search(r"\d[\d,]*(?:\.\d+)?", str(price or ""))
+    return m.group(0).replace(",", "") if m else ""
+
+
 def _parse_annual_premium(lead: dict) -> float:
-    raw = (lead.get("price") or "").strip().replace(",", "").replace("$", "")
+    # The price is a human string — "$150", "$150 + toll". Take the NUMBER out of it
+    # rather than stripping two characters and hoping: "+ toll" made float() raise
+    # and the premium silently became 0.
+    raw = _price_amount_str(lead.get("price"))
     try:
         return float(raw)
     except (TypeError, ValueError):
@@ -12166,11 +12183,22 @@ async def handle_accept_lead(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
             asyncio.create_task(_monday_driver_update())
 
-    await query.message.edit_text(
-        "✅ **You accepted this lead!**",
-        parse_mode="Markdown",
-        reply_markup=_EMPTY_INLINE_KB,
-    )
+    # The word "accept" reaches this via _TypedAsTap, where query.message is the
+    # DRIVER's own message — editing someone else's message is a BadRequest, and it
+    # landed here AFTER the acceptance was committed, aborting everything below it
+    # (tracking gate, details, notices). Edit when we can, say it plainly when not.
+    try:
+        await query.message.edit_text(
+            "✅ **You accepted this lead!**",
+            parse_mode="Markdown",
+            reply_markup=_EMPTY_INLINE_KB,
+        )
+    except Exception:
+        try:
+            await query.message.reply_text(
+                "✅ **You accepted this lead!**", parse_mode="Markdown")
+        except Exception as e:
+            logger.warning("could not confirm the acceptance to the driver: %s", e)
     # Location gate: with tracking configured, the driver gets the tracking
     # link now and the full details only after their location ping arrives.
     await _start_tracking_gate_or_send_details(
@@ -14960,6 +14988,11 @@ def _followup_team_keyboard(short: str) -> InlineKeyboardMarkup:
     ])
 
 
+# How long an "Edit email/phone" prompt stays armed. Short on purpose: while it is
+# armed it consumes the next thing typed, so a forgotten one must not lie in wait.
+_CF_EDIT_TTL_SEC = 300
+
+
 async def handle_cf_edit_reply(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """The new email/phone for a client, typed after tapping Edit on a reminder.
 
@@ -14968,6 +15001,11 @@ async def handle_cf_edit_reply(update: Update, context: ContextTypes.DEFAULT_TYP
     pending = (context.user_data or {}).get("cf_edit") or {}
     fid, field = pending.get("fid"), pending.get("field")
     if not fid or not field:
+        return
+    # It expires. A never-ending slot steals the NEXT thing the user types
+    # anywhere — a settings value, a lead edit — and writes it onto a client record.
+    if (time.time() - float(pending.get("ts") or 0)) > _CF_EDIT_TTL_SEC:
+        context.user_data.pop("cf_edit", None)
         return
     msg = update.effective_message
     text = ((msg.text if msg else "") or "").strip()
@@ -15020,7 +15058,7 @@ async def _handle_cf_action(update: Update, context: ContextTypes.DEFAULT_TYPE, 
     if prefix in ("cf_email_", "cf_phone_"):
         # Change where THIS client's outreach goes, from the reminder itself.
         what = "email" if prefix == "cf_email_" else "phone"
-        context.user_data["cf_edit"] = {"fid": fid, "field": what}
+        context.user_data["cf_edit"] = {"fid": fid, "field": what, "ts": time.time()}
         try:
             await query.edit_message_reply_markup(reply_markup=None)
         except Exception:
@@ -16600,10 +16638,13 @@ def main():
 
     # The new email/phone typed after tapping Edit on a follow-up reminder. Its own
     # group: a reminder is answered wherever it was read, inside no conversation.
+    # AFTER the group -5 transcriber, or a spoken answer never reaches it (its
+    # filter is TEXT, and voice only becomes text at -5).
     application.add_handler(
         MessageHandler(
-            filters.TEXT & ~filters.COMMAND, handle_cf_edit_reply),
-        group=-6,
+            filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE,
+            handle_cf_edit_reply),
+        group=-45,
     )
 
     # A driver answering their offer in words (its OWN group -4, after voice

@@ -1,6 +1,8 @@
 """Simple Flask admin dashboard for managing groups, drivers, and supervisory IDs."""
 from flask import Flask, render_template_string, request, jsonify, redirect, url_for
 from flask_cors import CORS
+import base64
+import hmac
 import os
 import re
 import logging
@@ -96,6 +98,76 @@ class AdminDatabase:
         self._tables_checked = False
         self._tables_exist = False
     
+    # ── Receipts, stored in the database ─────────────────────────────────
+    # These mirror utils/database.py: the dashboard has its own client, so a method
+    # added there is NOT available here. The portal calls all three.
+
+    def save_receipt_file(
+        self,
+        lead_id: str,
+        *,
+        data: bytes,
+        content_type: str = "image/jpeg",
+        reference_id: str = "",
+        driver_id: str = "",
+        source: str = "portal",
+    ):
+        """Store one receipt image. Returns its row id, or None."""
+        if not data:
+            return None
+        try:
+            row = {
+                "lead_id": str(lead_id),
+                "reference_id": str(reference_id or "")[:64],
+                "content_type": (content_type or "image/jpeg")[:64],
+                "size_bytes": len(data),
+                "data_base64": base64.b64encode(data).decode("ascii"),
+                "source": (source or "portal")[:16],
+            }
+            if driver_id:
+                row["driver_id"] = str(driver_id)
+            r = self.client.table("receipt_files").insert(row).execute()
+            return str((r.data or [{}])[0].get("id") or "") or None
+        except Exception as e:
+            logger.error("save_receipt_file failed for lead %s: %s", lead_id, e)
+            return None
+
+    def get_receipt_file(self, lead_id: str):
+        """The newest stored receipt as {"data": bytes, "content_type": str}."""
+        try:
+            r = (
+                self.client.table("receipt_files")
+                .select("content_type, data_base64, uploaded_at")
+                .eq("lead_id", str(lead_id))
+                .order("uploaded_at", desc=True)
+                .limit(1)
+                .execute()
+            )
+            row = (r.data or [None])[0]
+            if not row or not row.get("data_base64"):
+                return None
+            return {
+                "data": base64.b64decode(row["data_base64"]),
+                "content_type": row.get("content_type") or "image/jpeg",
+                "uploaded_at": row.get("uploaded_at"),
+            }
+        except Exception as e:
+            logger.warning("get_receipt_file failed for lead %s: %s", lead_id, e)
+            return None
+
+    def has_receipt_file(self, lead_id: str) -> bool:
+        try:
+            r = (
+                self.client.table("receipt_files")
+                .select("id")
+                .eq("lead_id", str(lead_id))
+                .limit(1)
+                .execute()
+            )
+            return bool(r.data)
+        except Exception:
+            return False
+
     def _check_tables_exist(self) -> bool:
         """Check if required tables exist."""
         if self._tables_checked:
@@ -1778,6 +1850,22 @@ def receipt_portal_url(lead_id: str) -> str:
     return f"{RECEIPT_PORTAL_BASE}/r/{receipt_token(lead_id)}"
 
 
+# What a receipt may be. The stored type is OURS, never the uploader's string —
+# this file is served back from the admin origin, so image/svg+xml (a script
+# container) and anything unrecognised are refused rather than echoed.
+_RECEIPT_TYPES = {
+    "image/jpeg": "image/jpeg",
+    "image/jpg": "image/jpeg",
+    "image/pjpeg": "image/jpeg",
+    "image/png": "image/png",
+    "image/webp": "image/webp",
+    "image/heic": "image/heic",
+    "image/heif": "image/heif",
+    "image/gif": "image/gif",
+    "application/pdf": "application/pdf",
+}
+
+
 _PORTAL_PAGE = """<!doctype html>
 <html><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
@@ -1870,11 +1958,15 @@ def receipt_portal(token):
             _PORTAL_PAGE, heading="Upload your receipt", reference_id=reference_id,
             done=False, img_url="",
             error="That file is too large. Send a photo rather than a video."), 413
-    content_type = (getattr(up, "mimetype", "") or "image/jpeg").split(";")[0]
-    if not content_type.startswith("image/") and content_type != "application/pdf":
+    # An allowlist, not "anything image/*": image/svg+xml is a script container, and
+    # this file is served straight back from the admin's own origin.
+    claimed = (getattr(up, "mimetype", "") or "").split(";")[0].strip().lower()
+    content_type = _RECEIPT_TYPES.get(claimed)
+    if not content_type:
         return render_template_string(
             _PORTAL_PAGE, heading="Upload your receipt", reference_id=reference_id,
-            done=False, img_url="", error="Send a photo or a PDF."), 415
+            done=False, img_url="",
+            error="Send a JPEG, PNG, HEIC, WEBP or PDF."), 415
 
     saved = db.save_receipt_file(
         lead_id, data=data, content_type=content_type,
@@ -1908,16 +2000,30 @@ def receipt_image_from_db(lead_id):
         got = None
     if not got:
         return jsonify({"error": "no receipt stored for this lead"}), 404
+    # Re-check on the way OUT too: a row written before the allowlist existed could
+    # still name anything.
+    safe = _RECEIPT_TYPES.get((got.get("content_type") or "").lower(), "image/jpeg")
     return _Resp(
         got["data"],
-        mimetype=got.get("content_type") or "image/jpeg",
-        headers={"Cache-Control": "private, max-age=86400"},
+        mimetype=safe,
+        headers={"Cache-Control": "private, max-age=86400",
+                 "X-Content-Type-Options": "nosniff",
+                 "Content-Security-Policy": "default-src 'none'"},
     )
 
 
 @app.route("/api/receipts/link/<lead_id>", methods=["GET"])
 def api_receipt_link(lead_id):
-    """The upload link for a lead, for the bot and the admin UI to hand out."""
+    """The upload link for a lead. Requires the admin key: the token IS the
+    authorisation to upload, so an endpoint that mints one for any lead id on
+    request would undo the whole point of it being unguessable."""
+    supplied = (request.headers.get("Authorization") or "").strip()
+    if supplied.lower().startswith("bearer "):
+        supplied = supplied[7:].strip()
+    supplied = supplied or (request.args.get("key") or "").strip()
+    expected = (os.getenv("INTEGRATIONS_API_KEY") or os.getenv("ADMIN_API_KEY") or "").strip()
+    if not expected or not supplied or not hmac.compare_digest(supplied, expected):
+        return jsonify({"error": "unauthorized"}), 401
     return jsonify({"lead_id": lead_id, "url": receipt_portal_url(lead_id)})
 
 
@@ -1956,10 +2062,13 @@ def api_receipt_image(lead_id):
     except Exception:
         stored = None
     if stored:
+        safe = _RECEIPT_TYPES.get((stored.get("content_type") or "").lower(), "image/jpeg")
         return Response(
             stored["data"],
-            mimetype=stored.get("content_type") or "image/jpeg",
-            headers={"Cache-Control": "private, max-age=86400"},
+            mimetype=safe,
+            headers={"Cache-Control": "private, max-age=86400",
+                     "X-Content-Type-Options": "nosniff",
+                     "Content-Security-Policy": "default-src 'none'"},
         )
     try:
         row = db.client.table("leads").select("receipt_image_url").eq("id", lead_id).limit(1).execute()

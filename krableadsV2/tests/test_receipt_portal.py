@@ -227,8 +227,90 @@ class TheImageComesFromTheDatabase(unittest.TestCase):
         self.assertEqual(PNG, r.get_data())
         d.client.table.assert_not_called()
 
-    def test_the_link_endpoint_hands_out_the_portal_url(self):
-        r = self.client.get(f"/api/receipts/link/{LEAD}")
+
+
+class TheDashboardActuallyHasTheMethodsTest(unittest.TestCase):
+    """The dashboard has its OWN database class. Methods added to the bot's are NOT
+    available here — and mocking `db` hides that completely, which is exactly how a
+    dead portal shipped: a MagicMock answers any method you ask it for."""
+
+    PORTAL_NEEDS = ("save_receipt_file", "get_receipt_file", "has_receipt_file")
+
+    def test_the_real_class_has_every_method_the_portal_calls(self):
+        missing = [m for m in self.PORTAL_NEEDS
+                   if not callable(getattr(ad.AdminDatabase, m, None))]
+        self.assertEqual([], missing, f"the portal would die with AttributeError: {missing}")
+
+    def test_the_live_instance_has_them_too(self):
+        for m in self.PORTAL_NEEDS:
+            with self.subTest(method=m):
+                self.assertTrue(callable(getattr(ad.db, m, None)), m)
+
+    def test_they_take_the_arguments_the_portal_passes(self):
+        import inspect
+        sig = inspect.signature(ad.AdminDatabase.save_receipt_file)
+        for kw in ("data", "content_type", "reference_id", "source"):
+            self.assertIn(kw, sig.parameters, kw)
+
+
+class OnlySafeFileTypesTest(unittest.TestCase):
+    """The receipt is served back from the admin's own origin."""
+
+    def setUp(self):
+        ad.app.config["TESTING"] = True
+        self.client = ad.app.test_client()
+
+    def _post(self, mimetype, name="r.svg"):
+        db = mock.MagicMock()
+        (db.client.table.return_value.select.return_value.eq.return_value
+         .limit.return_value.execute.return_value) = mock.MagicMock(
+            data=[{"id": LEAD, "reference_id": "REF1", "receipt_image_url": ""}])
+        db.save_receipt_file.return_value = "r1"
+        with mock.patch.object(ad, "db", db):
+            import io as _io
+            return self.client.post(
+                f"/r/{ad.receipt_token(LEAD)}",
+                data={"receipt": (_io.BytesIO(b"<svg onload=alert(1)>"), name, mimetype)},
+                content_type="multipart/form-data")
+
+    def test_svg_is_refused(self):
+        self.assertEqual(415, self._post("image/svg+xml").status_code)
+
+    def test_html_is_refused(self):
+        self.assertEqual(415, self._post("text/html", "r.html").status_code)
+
+    def test_a_photo_is_accepted(self):
+        self.assertEqual(200, self._post("image/jpeg", "r.jpg").status_code)
+
+    def test_the_served_type_is_ours_not_the_uploaders(self):
+        db = mock.MagicMock()
+        db.get_receipt_file.return_value = {"data": b"x", "content_type": "image/svg+xml"}
+        with mock.patch.object(ad, "db", db):
+            r = self.client.get(f"/receipt/{LEAD}")
+        self.assertNotIn("svg", r.mimetype)
+        self.assertEqual("nosniff", r.headers.get("X-Content-Type-Options"))
+
+
+class TheLinkEndpointIsNotOpenTest(unittest.TestCase):
+    """The token IS the permission to upload, so minting one must not be free."""
+
+    def setUp(self):
+        ad.app.config["TESTING"] = True
+        self.client = ad.app.test_client()
+
+    def test_no_key_no_link(self):
+        self.assertEqual(401, self.client.get(f"/api/receipts/link/{LEAD}").status_code)
+
+    def test_a_wrong_key_is_refused(self):
+        with mock.patch.dict(os.environ, {"ADMIN_API_KEY": "right"}):
+            r = self.client.get(f"/api/receipts/link/{LEAD}",
+                                headers={"Authorization": "Bearer wrong"})
+        self.assertEqual(401, r.status_code)
+
+    def test_the_right_key_gets_it(self):
+        with mock.patch.dict(os.environ, {"ADMIN_API_KEY": "right"}):
+            r = self.client.get(f"/api/receipts/link/{LEAD}",
+                                headers={"Authorization": "Bearer right"})
         self.assertEqual(200, r.status_code)
         self.assertEqual(ad.receipt_portal_url(LEAD), r.get_json()["url"])
 

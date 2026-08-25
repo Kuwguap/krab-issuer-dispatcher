@@ -78,7 +78,11 @@ class MondayClient:
         group_message = lead_data.get('group_message', '')
         supervisor_name = lead_data.get('supervisor_name', '')
         phone_number = lead_data.get('phone_number', '')
-        price = lead_data.get('price', '').replace('$', '')  # Remove $ sign for Monday.com
+        # A NUMBER, not a stripped string: the price reads "$150 + toll" now, and
+        # .replace('$','') left "150 + toll" for a numeric column — and crashed
+        # outright when price was None.
+        _p = re.search(r"\d[\d,]*(?:\.\d+)?", str(lead_data.get('price') or ''))
+        price = _p.group(0).replace(',', '') if _p else ''
         delivery_address = lead_data.get('delivery_address', '')
         delivery_city_state_zip = lead_data.get('delivery_city_state_zip', '')
         full_delivery = ", ".join([part for part in [delivery_address, delivery_city_state_zip] if part]).strip()
