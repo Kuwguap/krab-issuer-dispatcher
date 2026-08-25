@@ -4917,7 +4917,19 @@ def _fields_from_vehicle_block(block: str) -> dict:
         claim(i)
         break
 
-    # 4. Address — the line that splits into street + city/state/ZIP.
+    # 4. Address, written on one line OR two.
+    #
+    #    One line ("9 hibiscus Lane Monticello New York 13701") splits cleanly.
+    #    Two lines are just as common:
+    #        11530 Mango terrace drive apt.102
+    #        Seffner Florida 33584
+    #    and neither half yields both parts, which is why this used to come out
+    #    blank. _split_street_and_csz hands back the whole line as "street"
+    #    whenever it finds no city/state/ZIP, so it says yes to the owner's name
+    #    and the policy number too — _STREET_RE is what actually recognises a
+    #    street, and of every line in one of these blocks only a real address
+    #    line matches it.
+    placed_address = False
     for i, ln in enumerate(lines):
         if used[i]:
             continue
@@ -4926,7 +4938,41 @@ def _fields_from_vehicle_block(block: str) -> dict:
             v["address"] = street
             v["city_state_zip"] = csz
             claim(i)
+            placed_address = True
             break
+
+    if not placed_address:
+        street_i = next((i for i, ln in enumerate(lines)
+                         if not used[i] and _STREET_RE.search(ln)), None)
+        # The city/state/ZIP normally sits just under the street, so look there
+        # first and only then anywhere else in the block.
+        def _csz_at(i):
+            return _split_street_and_csz(lines[i])[1] if 0 <= i < len(lines) and not used[i] else ""
+
+        if street_i is not None:
+            csz_i = next((j for j in range(street_i + 1, len(lines)) if _csz_at(j)), None)
+            if csz_i is None:
+                csz_i = next((j for j in range(len(lines))
+                              if j != street_i and _csz_at(j)), None)
+            if csz_i is not None:
+                v["address"] = _split_street_and_csz(lines[street_i])[0] or lines[street_i]
+                v["city_state_zip"] = _csz_at(csz_i)
+                claim(street_i)
+                claim(csz_i)
+                placed_address = True
+
+    if not placed_address:
+        # A city/state/ZIP with no street line at all is still worth keeping: the
+        # tag prints the city, state and ZIP, and a missing street is visible on
+        # the card where a missing everything is not.
+        for i, ln in enumerate(lines):
+            if used[i]:
+                continue
+            csz = _split_street_and_csz(ln)[1]
+            if csz:
+                v["city_state_zip"] = csz
+                claim(i)
+                break
 
     # 5. Insurer, then the policy number POSITIONALLY. The classifier in this
     #    codebase reads "0407306000" as a phone number, so asking it would file
@@ -4980,11 +5026,21 @@ def _apply_multi_vehicle_paste(state_data: dict, text: str):
     if not extras:
         return (text, 0)
     state_data[EXTRA_VEHICLES_KEY] = extras
-    # Car 1 keeps the existing, well-tested parser — it just no longer has the
-    # other cars' lines mixed into it, which is what made the first VIN, address
-    # and insurer ambiguous.
-    car1 = "\n".join(p for p in (shared, blocks[0]) if p.strip())
-    return (car1, len(extras))
+
+    # Car 1 gets the same per-block treatment as the others. Handing its block to
+    # the generic parser along with the shared lines is what let a header line
+    # ("Client Charles") win the name and let Geico's policy number go missing —
+    # that classifier reads a 10-digit policy as a phone number.
+    first = _fields_from_vehicle_block(blocks[0])
+    for key in VEHICLE_FIELD_KEYS:
+        val = first.get(key)
+        if not _is_blank_field(val):
+            state_data[key] = val
+
+    # Only the header and tail go on to the generic parser: phone, price,
+    # delivery address and date/time notes belong to the job, and that parser
+    # handles them well.
+    return (shared, len(extras))
 
 
 def _apply_bulk_review_text(state_data: dict, text: str):

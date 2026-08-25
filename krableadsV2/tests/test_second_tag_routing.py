@@ -316,5 +316,79 @@ Geico
         self.assertEqual(bot._extra_vehicles(card), [])
 
 
+REAL_PASTE = """Client Charles
+Phone 845-423-9476
+
+CHARLES JONES
+9 hibiscus Lane Monticello New York 13701
+Vin numbers:
+CHARLES JONES
+2017 Nissan Altima
+VIN: 1N4AL3AP0HC166043
+Geico
+0407306000
+Color grey
+
+CHARLES G JONES
+11530 Mango terrace drive apt.102
+ Seffner Florida 33584
+2010 Toyota Camry
+VIN: 4T1BF3EK6AU051219
+Progressive
+982658176
+Color grey
+
+
+Delivery time now 1 hour to 9 hibiscus Lane Monticello New York 13701
+Phone 845-423-9476"""
+
+
+class TheRealMessageFromABlankCardTest(unittest.TestCase):
+    r"""Reported: "Doesn't read the 2nd car address empty".
+
+    Starts from an EMPTY card, the way a real lead starts — not the pre-filled
+    _REVIEW_DATA the other tests use — so nothing can be inherited and every
+    field has to come out of the message itself.
+    """
+
+    def setUp(self):
+        self.steps, self.card = _sequence("txt:" + REAL_PASTE, start_card={})
+
+    def test_the_second_cars_address_is_on_the_card(self):
+        v = bot._extra_vehicles(self.card)[0]
+        self.assertEqual(v["address"], "11530 Mango terrace drive apt.102")
+        self.assertEqual(v["city_state_zip"], "Seffner Florida 33584")
+
+    def test_car_one_is_the_registrant_not_the_header_line(self):
+        self.assertEqual(self.card.get("name"), "CHARLES JONES")
+
+    def test_car_one_keeps_its_own_vin_and_policy(self):
+        self.assertEqual(self.card.get("vin"), "1N4AL3AP0HC166043")
+        self.assertEqual(self.card.get("insurance_policy_number"), "0407306000")
+
+    def test_the_transaction_fields_are_still_single_and_correct(self):
+        self.assertEqual(self.card.get("pending_phone_number"), "845-423-9476")
+        self.assertIn("hibiscus", (self.card.get("delivery_address") or "")
+                      + (self.card.get("extra_info") or ""))
+
+    def test_the_card_shows_both_cars_in_full(self):
+        shown = bot._format_phase1_field_lines(self.card)
+        # The card splits the name into First/Last, as it always has for car 1.
+        for want in ("2nd Tag", "First name: CHARLES", "Last name: JONES",
+                     "Last name: G JONES",
+                     "1N4AL3AP0HC166043", "4T1BF3EK6AU051219",
+                     "9 hibiscus Lane", "11530 Mango terrace drive apt.102",
+                     "Monticello New York 13701", "Seffner Florida 33584",
+                     "GEICO", "Progressive", "0407306000", "982658176"):
+            with self.subTest(expected=want):
+                self.assertIn(want, shown)
+
+    def test_the_operator_is_told_what_happened(self):
+        self.assertIn("2nd Tag", _texts(self.steps[0]))
+
+    def test_it_submits_without_being_blocked(self):
+        self.assertEqual(bot._extra_vehicles_submit_block(self.card), "")
+
+
 if __name__ == "__main__":
     unittest.main()

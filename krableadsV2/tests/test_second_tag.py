@@ -641,6 +641,180 @@ class OrdinalsReadCorrectlyTest(unittest.TestCase):
             self.assertEqual(bot._ordinal_tag_label(n), want)
 
 
+# The operator's message as they really sent it, character for character. It
+# differs from the tidy version above in three ways that all broke something:
+#   * car 2's address is on TWO lines, which left it blank ("Doesn't read the
+#     2nd car address empty");
+#   * there is a "Vin numbers:" header and the client's name appears twice;
+#   * there is a leading "Client Charles" line, which the generic parser took as
+#     the registrant's name.
+REAL_PASTE = """Client Charles
+Phone 845-423-9476
+
+CHARLES JONES
+9 hibiscus Lane Monticello New York 13701
+Vin numbers:
+CHARLES JONES
+2017 Nissan Altima
+VIN: 1N4AL3AP0HC166043
+Geico
+0407306000
+Color grey
+
+CHARLES G JONES
+11530 Mango terrace drive apt.102
+ Seffner Florida 33584
+2010 Toyota Camry
+VIN: 4T1BF3EK6AU051219
+Progressive
+982658176
+Color grey
+
+
+Delivery time now 1 hour to 9 hibiscus Lane Monticello New York 13701
+Phone 845-423-9476"""
+
+CAR1 = {
+    "name": "CHARLES JONES",
+    "address": "9 hibiscus Lane",
+    "city_state_zip": "Monticello New York 13701",
+    "vin": "1N4AL3AP0HC166043",
+    "car": "2017 Nissan Altima",
+    "color": "Grey",
+    "insurance_company": "GEICO",
+    "insurance_policy_number": "0407306000",
+}
+
+
+class TheOperatorsRealMessageTest(unittest.TestCase):
+    r"""Reported: "Doesn't read the 2nd car address empty".
+
+    The address rule wanted street AND city/state/ZIP out of ONE line, which is
+    how car 1 happens to be written. Car 2's is on two, so neither half yielded
+    both and it came out blank.
+
+    Fixing it also had to fix car 1, because the generic parser reading the whole
+    message at once picked the first thing that looked like each field wherever it
+    sat: car 1 was getting car TWO's VIN, car TWO's policy number as its Price,
+    and the "Client Charles" header as its name.
+    """
+
+    def setUp(self):
+        self.card = {}
+        self.rest, self.added = bot._apply_multi_vehicle_paste(self.card, REAL_PASTE)
+
+    def test_the_second_cars_address_is_read(self):
+        v = bot._extra_vehicles(self.card)[0]
+        self.assertEqual(v["address"], "11530 Mango terrace drive apt.102")
+        self.assertEqual(v["city_state_zip"], "Seffner Florida 33584")
+
+    def test_every_other_field_of_the_second_car(self):
+        v = bot._extra_vehicles(self.card)[0]
+        self.assertEqual(v["name"], "CHARLES G JONES")
+        self.assertEqual(v["vin"], "4T1BF3EK6AU051219")
+        self.assertEqual(v["car"], "2010 Toyota Camry")
+        self.assertEqual(v["color"], "Grey")
+        self.assertEqual(v["insurance_company"], "Progressive")
+        self.assertEqual(v["insurance_policy_number"], "982658176")
+
+    def test_car_one_keeps_its_own_vin(self):
+        """It was picking up car 2's."""
+        self.assertEqual(self.card["vin"], "1N4AL3AP0HC166043")
+
+    def test_car_ones_policy_number_is_not_lost(self):
+        """This codebase's value classifier reads "0407306000" as a phone number,
+        so asking it would file Geico's policy as the client's phone."""
+        self.assertEqual(self.card["insurance_policy_number"], "0407306000")
+
+    def test_the_registrant_wins_over_the_header_line(self):
+        """"Client Charles" is a note the operator writes to themselves."""
+        self.assertEqual(self.card["name"], "CHARLES JONES")
+
+    def test_every_car_one_field(self):
+        for key, want in CAR1.items():
+            with self.subTest(field=key):
+                self.assertEqual(self.card.get(key), want)
+
+    def test_the_phone_and_delivery_still_go_to_the_generic_parser(self):
+        """Those belong to the job, and that parser handles them well."""
+        self.assertIn("845-423-9476", self.rest)
+        self.assertIn("Delivery time", self.rest)
+
+    def test_neither_car_ends_up_with_the_others_details(self):
+        v = bot._extra_vehicles(self.card)[0]
+        self.assertNotEqual(self.card["vin"], v["vin"])
+        self.assertNotEqual(self.card["insurance_policy_number"],
+                            v["insurance_policy_number"])
+        self.assertNotEqual(self.card["city_state_zip"], v["city_state_zip"])
+
+    def test_the_two_tags_come_out_right(self):
+        lead = {"id": "L", "reference_id": "R", "extra_vehicles":
+                bot._extra_vehicles(self.card),
+                "vehicle_details": "\n".join([
+                    CAR1["name"], CAR1["address"], CAR1["city_state_zip"], "-", "-",
+                    CAR1["vin"], CAR1["car"], CAR1["color"],
+                    CAR1["insurance_company"], CAR1["insurance_policy_number"], "-"])}
+        with mock.patch.object(bot.db, "allocate_temp_plate", fake_plates()), \
+             mock.patch.object(bot.db, "update_lead", return_value=True):
+            one = asyncio.run(bot._tag_fields_from_lead(lead, vehicle=1))
+            two = asyncio.run(bot._tag_fields_from_lead(lead, vehicle=2))
+        self.assertEqual((one["state"], one["city"], one["zip"]),
+                         ("NY", "Monticello", "13701"))
+        self.assertEqual((two["state"], two["city"], two["zip"]),
+                         ("FL", "Seffner", "33584"))
+        self.assertEqual(one["policy"], "0407306000")
+        self.assertEqual(two["policy"], "982658176")
+        self.assertNotEqual(one["plate"], two["plate"])
+
+
+class AddressesComeInSeveralShapesTest(unittest.TestCase):
+    """_split_street_and_csz returns the WHOLE line as "street" whenever it finds
+    no city/state/ZIP, so it says yes to a person's name, a car and a policy
+    number alike. _STREET_RE is what actually recognises a street."""
+
+    def _addr(self, block):
+        v = bot._fields_from_vehicle_block(block)
+        return (v["address"], v["city_state_zip"])
+
+    def test_one_line(self):
+        self.assertEqual(
+            self._addr("JOHN DOE\n9 hibiscus Lane Monticello New York 13701\n"
+                       "VIN: 1N4AL3AP0HC166043"),
+            ("9 hibiscus Lane", "Monticello New York 13701"))
+
+    def test_two_lines(self):
+        self.assertEqual(
+            self._addr("JOHN DOE\n11530 Mango terrace drive apt.102\n"
+                       "Seffner Florida 33584\nVIN: 4T1BF3EK6AU051219"),
+            ("11530 Mango terrace drive apt.102", "Seffner Florida 33584"))
+
+    def test_two_lines_with_the_stray_leading_space_the_operator_sent(self):
+        self.assertEqual(
+            self._addr("JOHN DOE\n11530 Mango terrace drive apt.102\n"
+                       " Seffner Florida 33584\nVIN: 4T1BF3EK6AU051219"),
+            ("11530 Mango terrace drive apt.102", "Seffner Florida 33584"))
+
+    def test_a_city_state_zip_with_no_street_is_still_kept(self):
+        """The tag prints city, state and ZIP; a missing street shows on the card
+        where a missing everything does not."""
+        addr, csz = self._addr("JOHN DOE\nSeffner Florida 33584\n"
+                               "VIN: 4T1BF3EK6AU051219")
+        self.assertEqual(csz, "Seffner Florida 33584")
+
+    def test_a_name_is_never_mistaken_for_a_street(self):
+        addr, csz = self._addr("CHARLES G JONES\nVIN: 4T1BF3EK6AU051219\n"
+                               "2010 Toyota Camry")
+        self.assertEqual(addr, "")
+        self.assertEqual(csz, "")
+
+    def test_a_policy_number_is_never_mistaken_for_a_street(self):
+        v = bot._fields_from_vehicle_block(
+            "CHARLES G JONES\nVIN: 4T1BF3EK6AU051219\n2010 Toyota Camry\n"
+            "Progressive\n982658176")
+        self.assertEqual(v["address"], "")
+        self.assertEqual(v["insurance_policy_number"], "982658176")
+
+
 class EveryCreateSiteCarriesTheExtraCarsTest(unittest.TestCase):
     """There are FIVE db.create_lead calls. Only one is the review card's Submit —
     the others are reached whenever the phone or price still has to be asked for,
