@@ -6,6 +6,8 @@ import json
 import logging
 import os
 import re
+import hashlib
+import hmac
 import html
 import sys
 import secrets
@@ -1689,6 +1691,43 @@ def _issuer_display_html_from_lead(lead: dict) -> str:
 
 
 _TELEGRAM_FILE_API_MARKER = "https://api.telegram.org/file/bot"
+
+
+# Where a driver can upload a receipt from a phone. The bytes go straight into the
+# database; nothing about the link expires, unlike a Telegram file URL.
+RECEIPT_PORTAL_BASE = (
+    os.getenv("RECEIPT_PORTAL_BASE") or "https://tristatetags.com/backend"
+).strip().rstrip("/")
+_RECEIPT_LINK_SECRET = (
+    os.getenv("RECEIPT_LINK_SECRET") or (Config.SUPABASE_KEY or "") or "krab-receipt-portal"
+).strip()
+
+
+def receipt_portal_url(lead_id) -> str:
+    """The upload page for one lead. Must match admin_dashboard.receipt_token —
+    same secret, same message, or the page will not recognise the link."""
+    mac = hmac.new(
+        _RECEIPT_LINK_SECRET.encode("utf-8"),
+        f"receipt:{lead_id}".encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()[:24]
+    return f"{RECEIPT_PORTAL_BASE}/r/{lead_id}.{mac}"
+
+
+async def _store_receipt_bytes(lead_id, data: bytes, *, content_type="image/jpeg",
+                               reference_id="", driver_id="") -> bool:
+    """Mirror a Telegram-sent receipt into the database, so it outlives the file."""
+    if not data:
+        return False
+    try:
+        got = await asyncio.to_thread(
+            db.save_receipt_file, str(lead_id), data=data, content_type=content_type,
+            reference_id=str(reference_id or ""), driver_id=str(driver_id or ""),
+            source="telegram")
+        return bool(got)
+    except Exception as e:
+        logger.warning("could not store receipt bytes for %s: %s", lead_id, e)
+        return False
 
 
 def _normalize_receipt_image_url(url: str) -> str:
@@ -6300,8 +6339,14 @@ async def handle_supervisor_plate_image(update: Update, context: ContextTypes.DE
     # /settings is deliberately NOT deferred to: it has no image handler, so a plate
     # photo sent there used to be swallowed and nothing happened. Reading the tag is
     # exactly what the supervisor wants in that screen.
-    if not forced_col and _user_in_active_conversation(
-            update, context, ignore=_SETTINGS_CONV_HANDLER):
+    # Standing on the Plate Numbers screen settles it: the photo is a tag, whatever
+    # else is half-open. Ignoring the settings conversation was not enough — an
+    # unfinished LEAD conversation still counted here, so the photo deferred to the
+    # lead flow and started a new lead instead of updating the counter.
+    if (not forced_col
+            and not _in_settings_conversation(update, context)
+            and _user_in_active_conversation(
+                update, context, ignore=_SETTINGS_CONV_HANDLER)):
         return
     # Reading it as a tag now → consume the arming.
     context.user_data.pop("router_plate_followup", None)
@@ -13241,11 +13286,18 @@ async def handle_receipt_confirm_callback(update: Update, context: ContextTypes.
 
     db.set_user_state(user_id, "waiting_receipt_image", context.user_data)
 
-    await query.message.reply_text(
-        "📸 **Upload Receipt**\n\n"
-        "Please upload the receipt image now🧾.\n\n",
-        parse_mode="Markdown",
-    )
+    lead_id = context.user_data.get("receipt_lead_id")
+    # The web page is offered alongside the photo. A picture sent here is mirrored
+    # into the database anyway, but the page is what keeps working when Telegram
+    # is awkward — and what the office opens later, since it never expires.
+    portal = receipt_portal_url(lead_id) if lead_id else ""
+    ask = "📸 **Upload Receipt**\n\nPlease upload the receipt image now🧾."
+    kb = None
+    if portal:
+        ask += "\n\nOr upload it on the web — that link never expires:"
+        kb = InlineKeyboardMarkup(
+            [[InlineKeyboardButton("🌐 Upload on the web", url=portal)]])
+    await query.message.reply_text(ask, parse_mode="Markdown", reply_markup=kb)
 
     return STATE_WAITING_RECEIPT_IMAGE
 
@@ -13453,10 +13505,21 @@ async def handle_receipt_image(update: Update, context: ContextTypes.DEFAULT_TYP
     pending_before = db.get_driver_pending_receipts(dr_check["id"]) if dr_check else []
     was_suspended = len(pending_before) >= SUSPENSION_THRESHOLD
 
+    # Into the DATABASE first — a row cannot expire the way a Telegram file does,
+    # and it is what the dashboard reads. Storage stays as a second copy.
+    in_db = await _store_receipt_bytes(
+        lead_id, image_bytes,
+        content_type=("image/png" if str(file_name or "").lower().endswith(".png")
+                      else "image/jpeg"),
+        reference_id=reference_id,
+        driver_id=str((dr_check or {}).get("id") or ""))
     storage_url = db.upload_receipt_to_storage(lead_id, reference_id, image_bytes, file_name)
-    stored_url = _normalize_receipt_image_url(
-        ((storage_url or "").strip() or telegram_file_url).strip()
-    )
+    if in_db:
+        stored_url = f"{RECEIPT_PORTAL_BASE}/receipt/{lead_id}"
+    else:
+        stored_url = _normalize_receipt_image_url(
+            ((storage_url or "").strip() or telegram_file_url).strip()
+        )
     # Telegram file URLs expire after ~1h. When we fall back to one, append the
     # permanent file_id as a URL fragment (#tgfid=...) — fragments are invisible
     # to HTTP fetches, but the dispatch-api receipt viewer parses it to re-sign

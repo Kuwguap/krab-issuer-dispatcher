@@ -84,6 +84,14 @@ class SettingsGuardTest(unittest.TestCase):
         with mock.patch.object(bot, "_SETTINGS_CONV_HANDLER", None):
             self.assertFalse(bot._in_settings_conversation(mock.MagicMock(), mock.MagicMock()))
 
+    def test_settings_beats_a_half_finished_lead(self):
+        """Reported twice. Ignoring the settings conversation was not enough: an
+        unfinished LEAD conversation still counted, so the photo deferred to the
+        lead flow and started a new lead instead of updating the counter."""
+        src = (ROOT / "bot.py").read_text(encoding="utf-8")
+        self.assertIn("not _in_settings_conversation(update, context)", src)
+        self.assertIn("and _user_in_active_conversation(", src)
+
     def test_a_failed_read_in_settings_does_not_fall_through(self):
         """The fall-through exists for forwarded lead images — not for /settings."""
         src = (ROOT / "bot.py").read_text(encoding="utf-8")

@@ -4,6 +4,7 @@ from flask_cors import CORS
 import os
 import re
 import logging
+from concurrent.futures import ThreadPoolExecutor as _ThreadPool
 from pathlib import Path
 from dotenv import load_dotenv
 
@@ -342,28 +343,27 @@ class AdminDatabase:
         out = {"total_leads": 0, "drivers": []}
         if not self._check_tables_exist():
             return out
+        # ONE pass over `leads` — this used to pull the whole table twice, which on
+        # a busy month is most of what made the page slow.
+        lead_rows = []
         try:
-            r = self.client.table("leads").select("id, exclude_from_count").execute()
-            out["total_leads"] = len([
-                x for x in (r.data or []) if not x.get("exclude_from_count")
-            ])
+            lead_rows = (
+                self.client.table("leads")
+                .select("id, receipt_image_url, exclude_from_count")
+                .execute()
+                .data
+            ) or []
         except Exception:
-            pass
+            lead_rows = []
+        excluded_lead_ids = {l["id"] for l in lead_rows if l.get("exclude_from_count")}
+        out["total_leads"] = len(lead_rows) - len(excluded_lead_ids)
         try:
             drivers = self.client.table("drivers").select("id, driver_name").execute()
             assignments = self.client.table("lead_assignments").select("driver_id, lead_id").eq("status", "accepted").execute()
-            lead_ids_with_receipt = set()
-            try:
-                leads = self.client.table("leads").select("id, receipt_image_url, exclude_from_count").execute()
-                lead_ids_with_receipt = {
-                    l["id"] for l in (leads.data or [])
-                    if l.get("receipt_image_url") and not l.get("exclude_from_count")
-                }
-                excluded_lead_ids = {
-                    l["id"] for l in (leads.data or []) if l.get("exclude_from_count")
-                }
-            except Exception:
-                pass
+            lead_ids_with_receipt = {
+                l["id"] for l in lead_rows
+                if l.get("receipt_image_url") and not l.get("exclude_from_count")
+            }
             by_driver = {}
             for a in (assignments.data or []):
                 did = a.get("driver_id")
@@ -1060,19 +1060,32 @@ DASHBOARD_HTML = """
 def dashboard():
     """Main dashboard page."""
     try:
-        groups = db.get_all_groups()
-        drivers = db.get_all_drivers()
-        groups_assistants = {}
-        for g in (groups or []):
-            groups_assistants[g['id']] = db.get_group_assistants(g['id'])
-        assistants_choose_group = (db.get_setting("assistants_choose_group") or "").lower() in ("true", "1", "yes")
-        st_telegram_id = (db.get_setting("st_telegram_id") or "").strip()
-        receipt_detection_mode = (db.get_setting("receipt_detection_mode") or "lax").strip().lower()
+        # Every one of these is an independent HTTP round trip to Supabase, and they
+        # used to run one after another — a dozen latencies stacked end to end, plus
+        # one more per group for its assistants. Fired together instead.
+        with _ThreadPool(max_workers=8) as pool:
+            f_groups = pool.submit(db.get_all_groups)
+            f_drivers = pool.submit(db.get_all_drivers)
+            f_sources = pool.submit(db.get_contact_info_sources)
+            f_usage = pool.submit(db.get_bot_usage)
+            f_stats = pool.submit(db.get_lead_stats)
+            f_choose = pool.submit(db.get_setting, "assistants_choose_group")
+            f_st = pool.submit(db.get_setting, "st_telegram_id")
+            f_mode = pool.submit(db.get_setting, "receipt_detection_mode")
+            groups = f_groups.result() or []
+            # The per-group assistants are a second wave: they need the group ids.
+            f_assist = {g["id"]: pool.submit(db.get_group_assistants, g["id"])
+                        for g in groups}
+            drivers = f_drivers.result()
+            contact_sources = f_sources.result()
+            bot_usage = f_usage.result()
+            lead_stats = f_stats.result()
+            assistants_choose_group = (f_choose.result() or "").lower() in ("true", "1", "yes")
+            st_telegram_id = (f_st.result() or "").strip()
+            receipt_detection_mode = (f_mode.result() or "lax").strip().lower()
+            groups_assistants = {gid: f.result() for gid, f in f_assist.items()}
         if receipt_detection_mode not in ("strict", "lax"):
             receipt_detection_mode = "lax"
-        contact_sources = db.get_contact_info_sources()
-        bot_usage = db.get_bot_usage()
-        lead_stats = db.get_lead_stats()
         return render_template_string(
             DASHBOARD_HTML,
             groups=groups or [],
@@ -1718,6 +1731,196 @@ def api_tracking_route():
         return jsonify({"error": str(e)}), 500
 
 
+
+# ── Receipt upload portal ───────────────────────────────────────────────────
+# Telegram file URLs expire after about an hour, so a receipt uploaded through the
+# bot became a dead link the same day. A driver opens a link instead, uploads there,
+# and the bytes land in the database — which is also where the dashboard reads them.
+# The link carries an HMAC of the lead id, so it needs no login and cannot be
+# guessed, and it is useless for any other lead.
+
+RECEIPT_LINK_SECRET = (
+    os.getenv("RECEIPT_LINK_SECRET")
+    or os.getenv("SUPABASE_KEY")            # already secret, already deployed
+    or "krab-receipt-portal"
+).strip()
+# Where the portal is reachable from a phone. tristatetags.com/backend proxies here.
+RECEIPT_PORTAL_BASE = (
+    os.getenv("RECEIPT_PORTAL_BASE") or "https://tristatetags.com/backend"
+).strip().rstrip("/")
+
+_MAX_RECEIPT_BYTES = 12 * 1024 * 1024      # a phone photo, with room to spare
+
+
+def receipt_token(lead_id: str) -> str:
+    """Unguessable, stable per lead, and verifiable without storing anything."""
+    import hashlib
+    import hmac as _hmac
+    mac = _hmac.new(
+        RECEIPT_LINK_SECRET.encode("utf-8"),
+        f"receipt:{lead_id}".encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()[:24]
+    return f"{lead_id}.{mac}"
+
+
+def receipt_lead_from_token(token: str):
+    """The lead id a token vouches for, or None."""
+    import hmac as _hmac
+    lead_id, _, mac = (token or "").partition(".")
+    if not lead_id or not mac:
+        return None
+    expected = receipt_token(lead_id).split(".", 1)[1]
+    return lead_id if _hmac.compare_digest(mac, expected) else None
+
+
+def receipt_portal_url(lead_id: str) -> str:
+    return f"{RECEIPT_PORTAL_BASE}/r/{receipt_token(lead_id)}"
+
+
+_PORTAL_PAGE = """<!doctype html>
+<html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Upload receipt</title>
+<style>
+ :root { color-scheme: light dark; }
+ body { font-family: -apple-system, system-ui, sans-serif; margin: 0;
+        padding: 24px; max-width: 34rem; background: #f6f7f9; color: #111; }
+ @media (prefers-color-scheme: dark) { body { background:#111; color:#eee; } }
+ .card { background: #fff; border-radius: 14px; padding: 22px;
+         box-shadow: 0 1px 3px rgba(0,0,0,.14); }
+ @media (prefers-color-scheme: dark) { .card { background:#1c1c1e; } }
+ h1 { font-size: 1.25rem; margin: 0 0 .35rem; }
+ .ref { font-family: ui-monospace, monospace; font-size: 1rem; opacity:.75; }
+ label { display:block; margin: 18px 0 8px; font-weight: 600; }
+ input[type=file] { width: 100%; padding: 14px; border: 2px dashed #bbb;
+                    border-radius: 10px; background: transparent; color: inherit; }
+ button { width: 100%; margin-top: 18px; padding: 15px; font-size: 1.05rem;
+          font-weight: 600; border: 0; border-radius: 10px; background: #0b7;
+          color: #fff; }
+ button:disabled { opacity: .5; }
+ .ok { color: #0a7; font-weight: 600; }
+ .err { color: #c33; font-weight: 600; }
+ .hint { opacity: .7; font-size: .9rem; margin-top: 14px; }
+ img.preview { max-width: 100%; border-radius: 10px; margin-top: 16px; }
+</style></head><body>
+<div class="card">
+  <h1>{{ heading }}</h1>
+  {% if reference_id %}<div class="ref">Ref {{ reference_id }}</div>{% endif %}
+  {% if done %}
+    <p class="ok">✅ Receipt received. Nothing else to do.</p>
+    {% if img_url %}<img class="preview" src="{{ img_url }}" alt="the receipt you sent">{% endif %}
+  {% elif error %}
+    <p class="err">{{ error }}</p>
+  {% else %}
+    <form method="post" enctype="multipart/form-data">
+      <label for="f">Photo of the receipt</label>
+      <input id="f" type="file" name="receipt" accept="image/*" capture="environment" required>
+      <button type="submit">Upload</button>
+    </form>
+    <p class="hint">Take the photo now, or pick one from your camera roll.
+       It is saved straight to the office — no Telegram, and the link does not expire.</p>
+  {% endif %}
+</div></body></html>"""
+
+
+@app.route("/r/<token>", methods=["GET", "POST"])
+def receipt_portal(token):
+    """The page a driver opens to hand in a receipt."""
+    from flask import Response as _Resp
+    lead_id = receipt_lead_from_token(token)
+    if not lead_id:
+        return _Resp(render_template_string(
+            _PORTAL_PAGE, heading="Link not recognised", reference_id="",
+            done=False, img_url="",
+            error="This link is not valid. Ask the office for a new one."), status=404)
+    try:
+        row = (db.client.table("leads").select("id, reference_id, receipt_image_url")
+               .eq("id", lead_id).limit(1).execute())
+        lead = (row.data or [None])[0]
+    except Exception as e:
+        logger.error("receipt portal: lead lookup failed: %s", e)
+        lead = None
+    if not lead:
+        return _Resp(render_template_string(
+            _PORTAL_PAGE, heading="Lead not found", reference_id="",
+            done=False, img_url="", error="That lead no longer exists."), status=404)
+    reference_id = (lead.get("reference_id") or "").strip()
+
+    if request.method == "GET":
+        already = False
+        try:
+            already = db.has_receipt_file(lead_id)
+        except Exception:
+            already = False
+        return render_template_string(
+            _PORTAL_PAGE,
+            heading="Receipt received" if already else "Upload your receipt",
+            reference_id=reference_id, done=already, error="",
+            img_url=f"/receipt/{lead_id}" if already else "")
+
+    up = request.files.get("receipt")
+    data = up.read() if up else b""
+    if not data:
+        return render_template_string(
+            _PORTAL_PAGE, heading="Upload your receipt", reference_id=reference_id,
+            done=False, img_url="", error="No file arrived — try again."), 400
+    if len(data) > _MAX_RECEIPT_BYTES:
+        return render_template_string(
+            _PORTAL_PAGE, heading="Upload your receipt", reference_id=reference_id,
+            done=False, img_url="",
+            error="That file is too large. Send a photo rather than a video."), 413
+    content_type = (getattr(up, "mimetype", "") or "image/jpeg").split(";")[0]
+    if not content_type.startswith("image/") and content_type != "application/pdf":
+        return render_template_string(
+            _PORTAL_PAGE, heading="Upload your receipt", reference_id=reference_id,
+            done=False, img_url="", error="Send a photo or a PDF."), 415
+
+    saved = db.save_receipt_file(
+        lead_id, data=data, content_type=content_type,
+        reference_id=reference_id, source="portal")
+    if not saved:
+        return render_template_string(
+            _PORTAL_PAGE, heading="Upload your receipt", reference_id=reference_id,
+            done=False, img_url="",
+            error="Could not save it. Try once more, or send it in Telegram."), 500
+    # The lead points at OUR url now, not at a Telegram file that will expire.
+    try:
+        db.client.table("leads").update(
+            {"receipt_image_url": f"{RECEIPT_PORTAL_BASE}/receipt/{lead_id}"}
+        ).eq("id", lead_id).execute()
+    except Exception as e:
+        logger.error("receipt portal: could not point the lead at the upload: %s", e)
+    logger.info("Receipt stored from portal for lead %s (%s bytes)", lead_id, len(data))
+    return render_template_string(
+        _PORTAL_PAGE, heading="Receipt received", reference_id=reference_id,
+        done=True, error="", img_url=f"/receipt/{lead_id}")
+
+
+@app.route("/receipt/<lead_id>", methods=["GET"])
+def receipt_image_from_db(lead_id):
+    """The receipt itself, straight out of the database. Never expires."""
+    from flask import Response as _Resp
+    try:
+        got = db.get_receipt_file(lead_id)
+    except Exception as e:
+        logger.error("receipt read failed for %s: %s", lead_id, e)
+        got = None
+    if not got:
+        return jsonify({"error": "no receipt stored for this lead"}), 404
+    return _Resp(
+        got["data"],
+        mimetype=got.get("content_type") or "image/jpeg",
+        headers={"Cache-Control": "private, max-age=86400"},
+    )
+
+
+@app.route("/api/receipts/link/<lead_id>", methods=["GET"])
+def api_receipt_link(lead_id):
+    """The upload link for a lead, for the bot and the admin UI to hand out."""
+    return jsonify({"lead_id": lead_id, "url": receipt_portal_url(lead_id)})
+
+
 @app.route('/api/receipts/image/<lead_id>', methods=['GET'])
 def api_receipt_image(lead_id):
     """Receipt image resolver — STREAMS the image bytes (no redirects).
@@ -1746,6 +1949,18 @@ def api_receipt_image(lead_id):
             logger.warning("receipt image fetch failed for %s: %s", lead_id, fe)
         return None
 
+    # The database first: anything uploaded through the portal (or mirrored there
+    # from Telegram) is served straight from the row and cannot expire.
+    try:
+        stored = db.get_receipt_file(lead_id)
+    except Exception:
+        stored = None
+    if stored:
+        return Response(
+            stored["data"],
+            mimetype=stored.get("content_type") or "image/jpeg",
+            headers={"Cache-Control": "private, max-age=86400"},
+        )
     try:
         row = db.client.table("leads").select("receipt_image_url").eq("id", lead_id).limit(1).execute()
         url = ((row.data or [{}])[0].get("receipt_image_url") or "").strip()

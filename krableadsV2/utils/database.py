@@ -1,4 +1,5 @@
 """Database utilities for Supabase integration."""
+import base64
 import logging
 import re
 import secrets
@@ -413,6 +414,77 @@ class Database:
             return bool(r.data)
         except Exception as e:
             logger.warning("update_plate_settings failed: %s", e)
+            return False
+
+    # ── Receipts, stored in the database ─────────────────────────────────
+    # Telegram file URLs expire in about an hour and file_ids are bot-scoped, so
+    # every receipt eventually became a dead link. The bytes live in a table now:
+    # a row does not expire, and serving one is a single read.
+
+    def save_receipt_file(
+        self,
+        lead_id: str,
+        *,
+        data: bytes,
+        content_type: str = "image/jpeg",
+        reference_id: str = "",
+        driver_id: str = "",
+        source: str = "portal",
+    ) -> Optional[str]:
+        """Store one receipt image. Returns its row id, or None if it could not."""
+        if not data:
+            return None
+        try:
+            row = {
+                "lead_id": str(lead_id),
+                "reference_id": str(reference_id or "")[:64],
+                "content_type": (content_type or "image/jpeg")[:64],
+                "size_bytes": len(data),
+                "data_base64": base64.b64encode(data).decode("ascii"),
+                "source": (source or "portal")[:16],
+            }
+            if driver_id:
+                row["driver_id"] = str(driver_id)
+            r = self.client.table("receipt_files").insert(row).execute()
+            return str((r.data or [{}])[0].get("id") or "") or None
+        except Exception as e:
+            logger.error("save_receipt_file failed for lead %s: %s", lead_id, e)
+            return None
+
+    def get_receipt_file(self, lead_id: str) -> Optional[Dict[str, Any]]:
+        """The newest stored receipt for a lead as {"data": bytes, "content_type": str}."""
+        try:
+            r = (
+                self.client.table("receipt_files")
+                .select("content_type, data_base64, uploaded_at")
+                .eq("lead_id", str(lead_id))
+                .order("uploaded_at", desc=True)
+                .limit(1)
+                .execute()
+            )
+            row = (r.data or [None])[0]
+            if not row or not row.get("data_base64"):
+                return None
+            return {
+                "data": base64.b64decode(row["data_base64"]),
+                "content_type": row.get("content_type") or "image/jpeg",
+                "uploaded_at": row.get("uploaded_at"),
+            }
+        except Exception as e:
+            logger.warning("get_receipt_file failed for lead %s: %s", lead_id, e)
+            return None
+
+    def has_receipt_file(self, lead_id: str) -> bool:
+        try:
+            r = (
+                self.client.table("receipt_files")
+                .select("id")
+                .eq("lead_id", str(lead_id))
+                .limit(1)
+                .execute()
+            )
+            return bool(r.data)
+        except Exception:
             return False
 
     def upload_receipt_to_storage(
