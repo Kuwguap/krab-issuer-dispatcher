@@ -22,6 +22,9 @@ class Config:
         (os.getenv("TRISTATECOVERAGE_API_BASE") or "https://tristatecoverage.com").strip().rstrip("/")
     )
     INTEGRATIONS_API_KEY = (os.getenv("INTEGRATIONS_API_KEY") or "").strip().lstrip("=") or None
+    # Who may see EVERY entry, not just their own. Same variable name the dispatch
+    # bot uses, so one list of people governs both.
+    SUPERVISORY_TELEGRAM_ID = (os.getenv("SUPERVISORY_TELEGRAM_ID") or "").strip()
 
     # NY FS-20 issuer block — fixed (matches NJ TEI layout, carrier code 707).
     # Intentionally NOT read from env: stale Render dashboard values were still

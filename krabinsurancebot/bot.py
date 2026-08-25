@@ -820,6 +820,56 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     return ConversationHandler.END
 
 
+def _is_supervisor(user_id) -> bool:
+    """Anyone in SUPERVISORY_TELEGRAM_ID (comma or space separated)."""
+    raw = (getattr(Config, "SUPERVISORY_TELEGRAM_ID", "") or "").strip()
+    if not raw:
+        return False
+    wanted = str(user_id).strip()
+    return any(tok.strip().lstrip("=") == wanted
+               for tok in raw.replace(",", " ").split())
+
+
+async def cmd_entries(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Every card issued, by anyone — supervisors only.
+
+    /transactions is the caller's own history; this is the whole book, which is what
+    you need when you are checking the day rather than your own work."""
+    user = update.effective_user
+    if user is None:
+        return ConversationHandler.END
+    if not _is_supervisor(user.id):
+        await _send_clean(
+            context, update.effective_chat.id,
+            "🔒 That one is for supervisors. Use /transactions for your own.")
+        return ConversationHandler.END
+
+    entries = tx.list_all(limit=50)
+    if not entries:
+        await _send_clean(context, update.effective_chat.id, "📭 No entries yet.")
+        return ConversationHandler.END
+
+    ok = sum(1 for e in entries if e.get("success"))
+    lines = [f"📚 <b>All entries — last {len(entries)}</b>",
+             f"<i>{ok} issued, {len(entries) - ok} failed</i>", ""]
+    for e in entries:
+        ts_raw = (e.get("ts") or "").rstrip("Z")
+        try:
+            when = datetime.fromisoformat(ts_raw).strftime("%m/%d %H:%M")
+        except ValueError:
+            when = ts_raw[:16] or "—"
+        mark = "✅" if e.get("success") else "❌"
+        who = e.get("issued_by") or e.get("username") or str(e.get("user_id") or "—")
+        lines.append(
+            f"{mark} <code>{html.escape(str(e.get('policy_number') or '—'))}</code> "
+            f"· {html.escape(str(e.get('name') or '—'))} "
+            f"· {html.escape(str(e.get('vehicle') or '—'))}"
+            f"\n    {when} · by {html.escape(str(who))}"
+        )
+    await _send_clean(context, update.effective_chat.id, "\n".join(lines))
+    return ConversationHandler.END
+
+
 async def cmd_transactions(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     user = update.effective_user
     if user is None:
@@ -1402,6 +1452,7 @@ def main() -> None:
             CommandHandler("cancel", cancel_cmd),
             CommandHandler("help", cmd_help),
             CommandHandler("transactions", cmd_transactions),
+            CommandHandler(["entries", "all", "allentries"], cmd_entries),
         ],
         allow_reentry=True,
     )
@@ -1409,6 +1460,7 @@ def main() -> None:
     app.add_handler(conv)
     app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(CommandHandler("transactions", cmd_transactions))
+    app.add_handler(CommandHandler(["entries", "all", "allentries"], cmd_entries))
     app.add_handler(CommandHandler("cancel", cancel_cmd))
 
     logger.info("Krab Insurance Bot polling...")

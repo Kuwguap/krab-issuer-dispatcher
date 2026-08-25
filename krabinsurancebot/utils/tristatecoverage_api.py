@@ -127,6 +127,24 @@ def create_portal_client(
     except Exception:
         data = {}
 
+    # An account that already exists IS what the caller needed. The portal answers
+    # 409 (older builds) or 400-with-a-duplicate-message for this, and returning it
+    # as an error meant every repeat customer — and every second car on one
+    # household email — was told "create failed" and got no card.
+    _dup_text = ""
+    if isinstance(data, dict):
+        _dup_text = " ".join(
+            str(data.get(k) or "") for k in ("error", "message", "code", "detail"))
+    if resp.status_code == 409 or _looks_like_duplicate_email(_dup_text):
+        logger.info("Portal account already exists — continuing with the card.")
+        return CreatePortalClientResult(
+            True,
+            resp.status_code,
+            None,
+            data if isinstance(data, dict) else None,
+            added="existing",
+        )
+
     if resp.status_code >= 200 and resp.status_code < 300:
         if isinstance(data, dict) and data.get("ok") is False:
             return CreatePortalClientResult(
