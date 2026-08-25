@@ -544,6 +544,156 @@ def _draw_left(tw: fitz.TextWriter, text: str, area: dict, font: fitz.Font) -> N
     tw.append((area["left"], y_top), text, font=font, fontsize=size)
 
 
+# Below this a value stops being readable on a printed tag, so the text is trimmed
+# rather than shrunk further.
+_MIN_FIELD_PT = 4.0
+# A carrier name is allowed to shrink this far before it is worth abbreviating
+# further instead. Above it a longer, plainer name still reads on a printed tag.
+_MIN_READABLE_PT = 5.5
+
+# How the operator already abbreviates carriers on the insurance card
+# (utils/insurance_card.py prints e.g. "484 NEW SOUTH INS.CO."), so the tag matches
+# the paperwork rather than inventing a second convention.
+_CARRIER_WORD_ABBR = {
+    "INSURANCE": "INS",
+    "ASSURANCE": "ASSUR",
+    "COMPANY": "CO",
+    "COMPANIES": "COS",
+    "CORPORATION": "CORP",
+    "INCORPORATED": "INC",
+    "RECIPROCAL": "RECIP",
+    "EXCHANGE": "EXCH",
+    "UNDERWRITERS": "UNDWTRS",
+    "UNDERWRITER": "UNDWTR",
+    "ASSOCIATION": "ASSN",
+    "MANUFACTURERS": "MFRS",
+    "INDEMNITY": "INDEM",
+    "MUTUAL": "MUT",
+    "CASUALTY": "CAS",
+    "GENERAL": "GEN",
+    "NATIONAL": "NATL",
+    "AMERICAN": "AMER",
+    "PROPERTY": "PROP",
+    "SERVICES": "SVCS",
+    "SERVICE": "SVC",
+    "GROUP": "GRP",
+    "HOLDINGS": "HLDGS",
+    "AUTOMOBILE": "AUTO",
+    "GUARANTY": "GTY",
+    "SECURITY": "SEC",
+    "FINANCIAL": "FIN",
+    "INTERINSURANCE": "INTERINS",
+    "RESPONSIBILITY": "RESP",
+}
+# Words worth dropping entirely before initialising anything — they carry no
+# identifying information once the rest of the name is there.
+_CARRIER_DROPPABLE = ("THE", "OF", "AND", "&")
+
+
+def _fit_by_trimming(text: str, avail: float, size: float, font) -> str:
+    """The longest prefix of `text` that fits, with an ellipsis when it had to cut.
+
+    The last line of defence: whatever else happens, a value never leaves its box.
+    Binary search rather than a loop per character — some values are long."""
+    if font.text_length(text, size) <= avail:
+        return text
+    ell = "…"
+    if font.text_length(ell, size) > avail:
+        return ""
+    lo, hi = 0, len(text)
+    while lo < hi:
+        mid = (lo + hi + 1) // 2
+        if font.text_length(text[:mid] + ell, size) <= avail:
+            lo = mid
+        else:
+            hi = mid - 1
+    return (text[:lo] + ell) if lo else ell
+
+
+def shorten_carrier(name: str, avail: float, size: float, font) -> str:
+    """A carrier name that fits its box and still reads as that carrier.
+
+    "PRIVILEGE UNDERWRITERS RECIPROCAL EXCHANGE" has no hope at 84pt and 7pt type,
+    so it is shortened in stages, each measured against the real font, stopping at
+    the first that fits:
+
+        PRIVILEGE UNDERWRITERS RECIPROCAL EXCHANGE   as given
+        PRIVILEGE UNDWTRS RECIP EXCH                 known abbreviations
+        PRIVILEGE UNDERWRITERS RE                    tail initialised
+        PRIVILEGE URE                                all but the first initialised
+        PRIVILE…                                     trimmed
+
+    Deterministic and offline on purpose: the tag has to print whether or not the
+    AI is reachable. When a suggestion IS available it is simply offered as the
+    first candidate (see `suggested`)."""
+    text = " ".join(str(name or "").upper().split())
+    if not text:
+        return ""
+
+    # A fuller name one size down beats a cryptic one at full size: "NEW JERSEY MFRS
+    # INS CO" at 6pt reads, "NEW JERSEY MFRS IC" at 7pt does not. So each stage is
+    # allowed to shrink, but only to where it is still legible on paper — below that
+    # the next, shorter stage is better.
+    readable = max(_MIN_READABLE_PT, _MIN_FIELD_PT)
+
+    def fits(v: str) -> bool:
+        """True when v fits the box at a size still worth printing."""
+        if not v:
+            return False
+        w = font.text_length(v, size)
+        if w <= avail:
+            return True
+        return size * avail / w >= readable
+
+    if fits(text):
+        return text
+
+    words = text.split()
+
+    def tail_initialled(ws):
+        """Longest-head-first candidates: "PRIVILEGE UNDERWRITERS RE".
+
+        Only tails of two or more words — "RE" for RECIPROCAL EXCHANGE says
+        something, a lone "E" for EXCHANGE does not."""
+        for keep in range(len(ws) - 2, 0, -1):
+            yield " ".join(ws[:keep] + ["".join(w[0] for w in ws[keep:])])
+
+    # Ordered by how much of the name survives, because that is what makes it
+    # recognisable: every word shortened beats some words replaced by a letter,
+    # which in turn beats words thrown away.
+
+    # 1. The house abbreviations (INSURANCE -> INS, COMPANY -> CO, exactly as the
+    #    insurance card already prints them) — every word still there.
+    abbr = [_CARRIER_WORD_ABBR.get(w, w) for w in words]
+    if fits(" ".join(abbr)):
+        return " ".join(abbr)
+
+    # 2. The name as given with the tail initialised — the identifying words whole,
+    #    and a letter each for the rest: "PRIVILEGE UNDERWRITERS RE".
+    for cand in tail_initialled(words):
+        if fits(cand):
+            return cand
+
+    # 3. Abbreviated AND tail-initialised.
+    for cand in tail_initialled(abbr):
+        if fits(cand):
+            return cand
+
+    # 4. Drop the words that carry nothing, then trailing words.
+    lean = [w for w in abbr if w not in _CARRIER_DROPPABLE] or abbr
+    for keep in range(len(lean), 0, -1):
+        if fits(" ".join(lean[:keep])):
+            return " ".join(lean[:keep])
+
+    # 5. First word plus the initials of everything else — "PRIVILEGE URE".
+    first_only = lean[0] + (" " + "".join(w[0] for w in lean[1:]) if len(lean) > 1 else "")
+    if fits(first_only):
+        return first_only
+
+    # 5. Out of tricks: trim, and say so with an ellipsis.
+    return _fit_by_trimming(text, avail, size, font)
+
+
 def _draw_field(tw: fitz.TextWriter, rect: fitz.Rect, text: str, size: float, font: fitz.Font) -> None:
     """Left-aligned value inside a form widget rect (fitz top-origin), baseline
     vertically centered like the flattened AcroForm appearance. The font size
@@ -555,7 +705,17 @@ def _draw_field(tw: fitz.TextWriter, rect: fitz.Rect, text: str, size: float, fo
     if avail > 4:
         text_w = font.text_length(text, size)
         if text_w > avail:
-            size = max(4.0, size * avail / text_w)
+            # Shrink proportionally, but not below legibility.
+            size = max(_MIN_FIELD_PT, size * avail / text_w)
+            # The floor and the fit are reached at the SAME instant, because the
+            # shrink is exactly proportional — so once it clamps, the text no longer
+            # fits and used to be drawn anyway, with no clip rect. A long carrier
+            # name ran 20pt past its box and printed over the policy number beside
+            # it. Trim to the longest prefix that genuinely fits.
+            if font.text_length(text, size) > avail:
+                text = _fit_by_trimming(text, avail, size, font)
+                if not text:
+                    return
     baseline_y = (rect.y0 + rect.y1) / 2 + size * 0.34
     tw.append((rect.x0 + 1.2, baseline_y), text, font=font, fontsize=size)
 
@@ -627,13 +787,13 @@ def build_tag_pdf(fields: Dict[str, Any]) -> bytes:
     # Snapshot each fillable widget (rect + font size) BEFORE removing the form.
     # The empty AcroForm widgets otherwise paint their blank appearance over any
     # page content we draw, hiding the values.
-    small: list[tuple[fitz.Rect, str, float]] = []
+    small: list[tuple[fitz.Rect, str, float, str]] = []
     for w in page.widgets():
         if w.field_name in _HERO_FIELDS:
             continue
         val = value_map.get(w.field_name)
         if val:
-            small.append((fitz.Rect(w.rect), val, w.text_fontsize or 7.0))
+            small.append((fitz.Rect(w.rect), val, w.text_fontsize or 7.0, w.field_name))
 
     # FLATTEN: delete every interactive widget, then copy the page into a fresh
     # document. delete_widget() alone does not persist through tobytes() on the
@@ -657,7 +817,12 @@ def build_tag_pdf(fields: Dict[str, Any]) -> bytes:
         pass
 
     tw = fitz.TextWriter(page.rect)
-    for rect, val, size in small:
+    for rect, val, size, name in small:
+        if name == "ins":
+            # The carrier name is the one field whose real data routinely outgrows
+            # its box, and the box to its right is the POLICY NUMBER — so it is
+            # abbreviated to fit rather than shrunk into its neighbour.
+            val = shorten_carrier(val, rect.width - 2.4, size, regular)
         _draw_field(tw, rect, val, size, regular)
     _draw_centered(tw, plate, _LAYOUT["plate"], bold, max_width=PAGE_W - 56)
     _draw_centered(tw, exp_banner, _LAYOUT["exp"], bold, max_width=PAGE_W - 40)
