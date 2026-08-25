@@ -4709,6 +4709,17 @@ def _clean_inline_value(edit_key: str, value: str) -> str:
     value = re.sub(r"^(?:is|are|to|=|:)\s+", "", value, flags=re.IGNORECASE).strip()
     if not value:
         return ""
+    # "color black please" is the colour black. Only for fields where a trailing
+    # courtesy is never part of the value — see _TAIL_STRIPPABLE_EKS.
+    if edit_key in _TAIL_STRIPPABLE_EKS:
+        prev = None
+        while value and value != prev:
+            prev = value
+            value = _TAIL_SCAFFOLD_RE.sub("", value).strip()
+        if not value:
+            value = prev or ""
+        if not value:
+            return ""
     if edit_key == "price":
         m = re.search(r"\d[\d,]*(?:\.\d+)?", value)
         if not m:
@@ -4718,7 +4729,7 @@ def _clean_inline_value(edit_key: str, value: str) -> str:
         return amount + _PH1_TOLL_SUFFIX if _price_has_toll(value) else amount
     if edit_key in ("name", "fn", "ln"):
         # "name of the insurance company State Farm" left "of the" behind.
-        if all(w.strip(".,'").lower() in _FIELD_LEAD_FILLERS for w in value.split()):
+        if all(w.strip(".,'").lower() in _FILLER_NOT_A_NAME for w in value.split()):
             return ""
     if edit_key == "ins":
         # "gieco" / "state farm insurance co" -> the carrier's real name.
@@ -4744,11 +4755,47 @@ def _clean_inline_value(edit_key: str, value: str) -> str:
 
 # Words that may precede the first field label without making it "prose"
 # ("enter phone …", "set the price 200", "change color to white").
+# Words that may PRECEDE a field label without making the line prose. Safe to
+# grow: a word here only ever gets skipped on the way to finding the label.
 _FIELD_LEAD_FILLERS = frozenset({
     "enter", "set", "change", "make", "update", "put", "add", "please", "the", "a",
     "an", "my", "to", "for", "is", "are", "it", "its", "it's", "this", "that", "new",
     "lead", "client", "can", "you", "i", "we", "and", "with", "of", "also", "now",
+    # Grown for fluency: determiners, modals and the noises people make while
+    # thinking. Deliberately NO nouns (customer, guy, lady, owner) and no words
+    # that are common given names — see _FILLER_NOT_A_NAME below for why.
+    "their", "his", "her", "our", "your", "hers", "theirs", "them", "could",
+    "would", "should", "i'd", "id", "i'm", "im", "i've", "ive", "like", "want",
+    "need", "wanna", "gonna", "let", "lets", "let's", "go", "ahead", "just",
+    "ok", "okay", "um", "uh", "so", "well", "hey", "yo", "actually", "sorry",
+    "alright", "real", "quick", "gimme", "kindly", "wait", "anyway", "still",
 })
+
+# A value made ENTIRELY of these is not a name — "change name to the" stores
+# nothing. Frozen at the 33 words that set held before it was grown for fluency,
+# and deliberately NOT the same object: every word added above would otherwise
+# become a name that cannot be typed. "Will", "Mark", "Just", "Guy", "Quick" and
+# "Still" are all real names, and the failure is silent — a green "Updated"
+# toast over a field that was cleared.
+_FILLER_NOT_A_NAME = frozenset({
+    "enter", "set", "change", "make", "update", "put", "add", "please", "the", "a",
+    "an", "my", "to", "for", "is", "are", "it", "its", "it's", "this", "that", "new",
+    "lead", "client", "can", "you", "i", "we", "and", "with", "of", "also", "now",
+})
+
+# Politeness and filler that arrive AFTER a value: "black please", "Susan thanks".
+# Applied only to the fields in _TAIL_STRIPPABLE_EKS — a note must keep its
+# "thanks", and an address must keep its "OK" (Oklahoma).
+_TAIL_SCAFFOLD_RE = re.compile(
+    r"(?:\s|^)(?:please|pls|plz|thanks|thank\s+you|thx|ty|cheers|"
+    r"for\s+(?:me|us|now)|asap|alright|okay|ok)\s*[.!,]*\s*$",
+    re.IGNORECASE,
+)
+# Which fields may have their tail shaved. The EXCLUSIONS are the design:
+#   issuer/driver/xtra  — a note must keep its "thanks"
+#   addr/csz/daddr/dcsz — "Tulsa OK" would be shaved to "Tulsa"; OK is a state
+#   phone/price/email   — these EXTRACT rather than accept, so nothing to shave
+_TAIL_STRIPPABLE_EKS = frozenset({"col", "fn", "ln", "name", "dl", "ins", "car", "pol", "vin"})
 # Every alias as a standalone word, longest-first (so "delivery address" beats "address").
 _MULTIFIELD_ALIAS_RE = re.compile(
     r"\b(" + "|".join(re.escape(k) for k in sorted(_INLINE_EDIT_ALIASES, key=len, reverse=True))
@@ -5292,6 +5339,11 @@ def _structured_value_ek(v: str):
     # Accord') claiming the address slot: an explicit street token still wins, but a
     # bare leading number / comma does NOT when the value looks like a vehicle.
     looks_vehicle = bool(_CAR_MAKE_RE.search(v) or re.search(r"\b(19|20)\d{2}\b", v))
+    # A trailing money word means this is an amount, whatever else it contains.
+    # "150 plus toll" has a digit and used to be filed as the registration
+    # address — and then mirrored into the delivery address.
+    if re.search(r"(?:dollars?|bucks|tolls?|flat|even|each|total|usd)\s*[.!]*$", v, re.I):
+        return "price"
     if re.search(r"\d", v) and _STREET_RE.search(v):
         return "addr"
     if not looks_vehicle and (("," in v and re.search(r"\d", v))
@@ -5412,6 +5464,150 @@ async def _smart_place_single_value(state_data: dict, value: str, guess_name: bo
 # A phrase that looks like a (mis-typed / mis-heard) COMMAND — never smart-place it as
 # a field value. So a select/submit/VIN command that didn't classify shows the hint
 # instead of turning 'choose the driver kita' or 'submit' into a name.
+# ── Speaking to the bot the way you would speak to a person ─────────────────
+# Everything below rewrites a message ONLY so the existing recognisers can see
+# the command inside it. It never produces a value that gets stored: every value
+# is still sliced out of the raw text the operator typed.
+#
+# Deliberately NOT containing any _CMD_VERB word (choose/select/pick/set/use/
+# assign/change/update/switch/make/put/go with) — those are what make the
+# residue match once the scaffolding in front of them is gone.
+_LEAD_SCAFFOLD = frozenset({
+    "i", "i'd", "id", "i'm", "im", "i've", "ive", "we", "we'd", "wed", "you",
+    "can", "could", "would", "will", "should", "please", "pls", "plz", "kindly",
+    "like", "want", "wanna", "need", "gonna", "going", "let", "lets", "let's",
+    "just", "maybe", "ok", "okay", "alright", "so", "well", "um", "uh", "erm",
+    "hey", "hi", "yo", "yeah", "yep", "yup", "sure", "actually", "sorry",
+    "quick", "quickly", "real", "anyway", "also", "then", "now", "and", "but",
+    "for", "this", "one", "here", "there", "gimme", "lemme", "wait", "hold",
+    "they", "he", "she", "it", "client", "customer", "guy",
+    "to", "do", "does", "did", "we'd", "could", "should",
+})
+# Trailing courtesy on a whole message: "driver Susan please", "... thanks man".
+_TAIL_SCAFFOLD_MSG_RE = re.compile(
+    r"(?:\s|^)(?:please|pls|plz|thanks|thank\s+you|thx|ty|cheers|for\s+(?:me|us|now)|"
+    r"asap|alright|okay|ok|man|bro|buddy|sir|maam|ma'am)\s*[.!,]*\s*$",
+    re.IGNORECASE,
+)
+# A label followed by punctuation instead of a space. Anchored to a KNOWN label,
+# which is the whole safety story: "address, 321 Main St" is repaired, while
+# "Fort Lee, NJ 07024", "$1,500" and "a@b.com" are untouched because Lee, 1 and
+# a are not labels.
+_ALIAS_SEP_RE = None          # built lazily, after both alias tables exist
+# "all drivers" means what "driver all" means. The quantifier has to be followed
+# by a selection noun AND end the message, so "all drivers are late" is prose.
+_QUANT_NOUN = {
+    "drivers": "driver", "driver": "driver", "drv": "driver",
+    "dispatchers": "dispatcher", "dispatcher": "dispatcher",
+    "dispatch": "dispatcher", "disp": "dispatcher",
+    "groups": "group", "group": "group",
+    "teams": "team", "team": "team",
+    "crews": "crew", "crew": "crew",
+}
+_QUANT_RE = re.compile(
+    r"\b(?:all|every|each|the\s+whole|the\s+entire)\s+(?:of\s+)?(?:the\s+)?"
+    r"(" + "|".join(sorted(_QUANT_NOUN, key=len, reverse=True)) + r")\s*[.!]*\s*$",
+    re.IGNORECASE,
+)
+# "everyone" / "everybody" with no noun at all. Drivers are what a lead is
+# broadcast to, so that is what it resolves to.
+_QUANT_BARE_RE = re.compile(r"\b(?:everyone|everybody|every\s*one)\s*[.!]*\s*$", re.I)
+# What may stand in front of a quantifier without making the line prose: the
+# command verbs, the ways of saying "send", and pure filler. Anything else and
+# the rewrite is refused — "tell all drivers I said hi" keeps its meaning.
+_QUANT_LEAD_OK = frozenset({
+    "choose", "select", "pick", "set", "use", "assign", "change", "update",
+    "switch", "make", "put", "go", "with", "send", "dispatch", "notify",
+    "blast", "broadcast", "text", "message", "ping", "alert", "add", "give",
+    "do", "want", "wants", "need", "needs", "get", "let", "lets", "let's",
+    "to", "the", "a", "an", "my", "this", "it", "them", "out", "over", "on",
+    "and", "please", "for", "of", "i", "we", "you", "can", "could", "would",
+    "just", "ok", "okay", "hey", "now",
+})
+
+
+def _quantifier_rewrite(t: str):
+    """"send it to all the drivers" -> "driver all", or None if it is not that.
+
+    Everything before the quantifier has to be a verb or filler; one content
+    word and this refuses, which is what keeps "tell all drivers I said hi" and
+    "all drivers are running late" out.
+    """
+    m = _QUANT_RE.search(t) or _QUANT_BARE_RE.search(t)
+    if not m:
+        return None
+    for tok in re.split(r"[\s,]+", t[: m.start()].strip().lower()):
+        tok = tok.strip(".:;-_'\"")
+        if tok and tok not in _QUANT_LEAD_OK:
+            return None
+    noun = _QUANT_NOUN.get(m.group(1).lower()) if m.re is _QUANT_RE else "driver"
+    return f"{noun} all" if noun else None
+_LEAD_SCAFFOLD_MAX_TOKENS = 5
+_LEAD_SCAFFOLD_MAX_CHARS = 28
+
+
+def _alias_sep_re():
+    """Built once, on first use, so it sees both alias tables however they grow."""
+    global _ALIAS_SEP_RE
+    if _ALIAS_SEP_RE is None:
+        labels = sorted(set(_SELECT_ALIAS_KIND) | set(_INLINE_EDIT_ALIASES),
+                        key=len, reverse=True)
+        _ALIAS_SEP_RE = re.compile(
+            r"\b(" + "|".join(re.escape(k) for k in labels) + r")\s*[:=,.\-\u2013\u2014]+\s*",
+            re.IGNORECASE)
+    return _ALIAS_SEP_RE
+
+
+def _norm_command_text(text: str) -> str:
+    """The same instruction with the conversation stripped off it.
+
+    "I'd like to select all drivers please" -> "driver all", which the existing
+    patterns already understand. Returns the input unchanged when there is
+    nothing to do, and NEVER returns empty.
+
+    Pure: no I/O, no context, no database. Bails on anything long or multi-line
+    (that is a paste, not a command) and on KRAB_FLUENCY=0.
+    """
+    t = (text or "").strip()
+    if not t or len(t) > 400 or "\n" in t or os.getenv("KRAB_FLUENCY", "1") == "0":
+        return t
+    original = t
+
+    # 1. Peel conversational scaffolding off the front, a bounded amount of it.
+    tokens = t.split()
+    dropped_tokens = dropped_chars = 0
+    while (tokens and dropped_tokens < _LEAD_SCAFFOLD_MAX_TOKENS
+           and dropped_chars < _LEAD_SCAFFOLD_MAX_CHARS):
+        head = tokens[0].lower().strip(".,;:!?'\"")
+        if head not in _LEAD_SCAFFOLD:
+            break
+        dropped_chars += len(tokens[0]) + 1
+        dropped_tokens += 1
+        tokens = tokens[1:]
+    if tokens:
+        t = " ".join(tokens)
+
+    # 2. And the courtesy off the end.
+    prev = None
+    while t and t != prev:
+        prev = t
+        t = _TAIL_SCAFFOLD_MSG_RE.sub("", t).strip()
+    if not t:
+        t = prev or original
+
+    # 3. "driver: Susan" / "driver, susan" — how a phone transcribes a pause.
+    t = _alias_sep_re().sub(lambda m: m.group(1) + " ", t).strip()
+
+    # 4. "all drivers" -> "driver all". The quantifier must END the message and
+    #    everything before it must be verbs or filler, so "all drivers are
+    #    running late" and "tell all drivers I said hi" both stay prose.
+    q = _quantifier_rewrite(t)
+    if q:
+        t = q
+
+    return t or original
+
+
 _COMMAND_LIKE_RE = re.compile(
     # A bare yes/no is an ANSWER, never a field value — without this a stray "yes"
     # (e.g. after a redeploy dropped the question) was filed as the client's name.
@@ -5448,7 +5644,16 @@ _VIN_KEEP_RE = re.compile(r"\b(keep|same|leave\s+it|leave\s+alone|as\s+is|as-is|
 _VIN_RETYPE_RE = re.compile(r"\b(retype|re-?enter|redo|fix|correct)\b.*\bvin\b|\btype\b.*\bvin\b.*\bagain\b", re.I)
 _VIN_USE_RE = re.compile(r"\buse\b.*\b(vin|dmv|new|decoded|lookup|api|theirs?|that)\b", re.I)
 _RUN_VIN_RE = re.compile(r"\b(run|check|lookup|look\s+up|decode|verify|pull|scan)\b.*\bvin\b|\bvin\b.*\b(check|lookup|decode|scan)\b", re.I)
-_ALL_SELECT_RE = re.compile(r"^\s*(?:all|every\s*one|everybody|everything)\b", re.I)
+# The quantifier must be the WHOLE answer, optionally naming what it quantifies.
+# Matching anything merely STARTING with "all" meant "all called already" — the
+# tail of "the drivers all called already" — broadcast the lead to every driver.
+_ALL_SELECT_RE = re.compile(
+    r"^\s*(?:all|every\s*one|everybody|everything|every)"
+    r"(?:\s+(?:of\s+)?(?:the\s+)?"
+    r"(?:drivers?|drv|dispatchers?|dispatch|disp|groups?|teams?|crews?|sources?))?"
+    r"\s*[.!]*\s*$",
+    re.I,
+)
 
 
 # "submit" / "send lead" / "dispatch" / "send it" → dispatch the lead now. Whole-
@@ -5489,6 +5694,12 @@ _SELECT_ALIAS_RE = re.compile(
 _SELECT_LEAD_FILLERS = frozenset({
     "choose", "select", "pick", "set", "use", "assign", "send", "dispatch", "to", "the",
     "a", "an", "my", "this", "and", "please", "for", "with", "go", "id",
+    # Grown so a multi-selection survives being asked for politely:
+    # "make driver Susan and dispatcher HighKage", "put driver Susan and team X".
+    # Still refused: "the driver said dispatch was late" — _SELECT_NOT_A_NAME
+    # catches the sentence words in the payload.
+    "make", "do", "change", "update", "switch", "put", "want", "wants",
+    "need", "needs", "it", "them", "out", "over", "on", "all", "every", "both",
 })
 # Separators between one selection and the next ("Kita and dispatcher HighKage").
 _SELECT_TAIL_RE = re.compile(r"(?:\s+and|\s*[,;/]+)\s*$", re.I)
@@ -5510,6 +5721,10 @@ def _looks_like_a_pick_name(name: str) -> bool:
     if not words or len(words) > 4:
         return False
     return not any(w in _SELECT_NOT_A_NAME for w in words)
+
+
+# A driver NOTE is never a driver pick, on either path.
+_SELECT_NOTE_HEADS = ("note", "notes", "license", "licence")
 
 
 def _parse_multi_select_line(text: str):
@@ -5536,6 +5751,11 @@ def _parse_multi_select_line(text: str):
             continue
         if not _looks_like_a_pick_name(name):
             return None                       # prose, not a list of picks
+        # "driver note call the dispatcher first" is a NOTE. The single-selection
+        # path has always known that; this path did not, and widening the head
+        # gate above makes this path reachable far more often.
+        if kind == "SELECT_DRIVER" and name.split()[0].lower() in _SELECT_NOTE_HEADS:
+            return None
         out.append((kind, name))
     # Two nouns but one had no name ("driver dispatch Kita") is not a clean list.
     return out if len(out) >= 2 else None
@@ -5549,7 +5769,7 @@ async def _apply_selection(kind: str, payload: str, state_data: dict, user_id: i
         if _ALL_SELECT_RE.match(payload):
             _select_group(state_data, user_id, "all")
             return True, "Dispatcher → All Dispatchers"
-        g = _match_name(payload, [x for x in db.get_all_groups() if record_is_active(x)],
+        g = _resolve_pick_name(payload, [x for x in db.get_all_groups() if record_is_active(x)],
                         "group_name")
         if not g:
             return False, f"No dispatcher matched “{payload}”"
@@ -5562,9 +5782,9 @@ async def _apply_selection(kind: str, payload: str, state_data: dict, user_id: i
         active = [d for d in _get_all_drivers_cached() if record_is_active(d)]
         suspended = _get_suspended_driver_ids()
         eligible = [d for d in active if str(d.get("id")) not in suspended]
-        d = _match_name(payload, eligible, "driver_name")
+        d = _resolve_pick_name(payload, eligible, "driver_name")
         if not d:
-            susp = _match_name(payload, [x for x in active if str(x.get("id")) in suspended],
+            susp = _resolve_pick_name(payload, [x for x in active if str(x.get("id")) in suspended],
                                "driver_name")
             if susp:
                 return False, f"{susp.get('driver_name', 'Driver')} is suspended (PENALTY)"
@@ -5572,7 +5792,7 @@ async def _apply_selection(kind: str, payload: str, state_data: dict, user_id: i
         _select_driver(state_data, user_id, d)
         return True, f"Driver → {d.get('driver_name', '?')}"
     if kind == "SELECT_SOURCE":
-        s = _source_by_exact_label(payload) or _match_name(
+        s = _source_by_exact_label(payload) or _resolve_pick_name(
             payload, db.get_contact_info_sources(), "label")
         if not s:
             return False, f"No source matched “{payload}”"
@@ -5583,7 +5803,8 @@ async def _apply_selection(kind: str, payload: str, state_data: dict, user_id: i
 
 # A selection's value picks up the little joining words on the way in:
 # "set source to Instagram", "driver is Kita".
-_SELECT_VALUE_FILLER_RE = re.compile(r"^(?:to|is|as|=|:|be|the|a|an)\s+", re.IGNORECASE)
+_SELECT_VALUE_FILLER_RE = re.compile(
+    r"^(?:to|is|as|=|:|be|the|a|an|on|from|via|through|at|by|in)\s+", re.IGNORECASE)
 
 
 def _selection_payload(raw: str) -> str:
@@ -5592,7 +5813,64 @@ def _selection_payload(raw: str) -> str:
     while out and out != prev:                 # "set source to the Instagram"
         prev = out
         out = _SELECT_VALUE_FILLER_RE.sub("", out).strip()
-    return out
+    # _match_name never strips punctuation from the query, so "Susan." used to
+    # reach a driver called Susan only by falling through to the 0.55 fuzzy rung.
+    return out.strip(" .,;:!?")
+
+
+def _clause_head(payload: str) -> str:
+    """The first clause of a payload: "Susan, send it" -> "Susan".
+
+    The selection regexes capture to end of line, so any word after the name is
+    glued to it and then compared against the whole driver name — which is why
+    "driver Susan, send it" found nobody.
+    """
+    return re.split(r"\s*[,;]\s*", str(payload or ""), maxsplit=1)[0].strip(" .,;:!?")
+
+
+def _payload_is_prose(payload: str) -> bool:
+    """True when a selection payload is plainly a sentence, not a name.
+
+    "driver needs to ring the bell twice" classifies as a driver pick because
+    the line opens with the word "driver". It is a note. Callers use this to
+    fall THROUGH to note handling rather than opening a picker over the top of
+    what the operator was actually writing.
+    """
+    p = str(payload or "").strip()
+    if not p:
+        return True
+    if _ALL_SELECT_RE.match(p):
+        return False
+    return not _looks_like_a_pick_name(p)
+
+
+def _resolve_pick_name(payload: str, candidates: list, name_key: str):
+    """Find a driver/dispatcher/source by name, tolerating the words around it.
+
+    Runs the plain match FIRST, so it can never change an answer that already
+    worked; the extra rungs only ever rescue a None.
+
+    The prose guard is the price of admission for widening what counts as a
+    command elsewhere: "driver needs to ring the bell twice" must stay a note,
+    not become a hunt for a driver called "needs to ring the bell twice".
+    """
+    p = str(payload or "").strip()
+    if not p:
+        return None
+    hit = _match_name(p, candidates, name_key)
+    if hit:
+        return hit
+    if not _looks_like_a_pick_name(p) and not _ALL_SELECT_RE.match(p):
+        return None
+    stripped = p.strip(" .,;:!?")
+    if stripped != p:
+        hit = _match_name(stripped, candidates, name_key)
+        if hit:
+            return hit
+    head = _clause_head(p)
+    if head and head != stripped:
+        return _match_name(head, candidates, name_key)
+    return None
 
 
 def _source_by_exact_label(text: str):
@@ -5611,11 +5889,38 @@ def _source_by_exact_label(text: str):
     return None
 
 
-def _classify_review_command(text: str):
-    """Classify a review-screen message into an action. Returns (kind, payload) where
-    kind ∈ FIELD_EDITS | SUBMIT | SELECT_GROUP | SELECT_DRIVER | SELECT_SOURCE | RUN_VIN |
-    VIN_USE | VIN_KEEP | VIN_RETYPE | NONE. Field edits win first (so 'driver note …'
-    and 'phone …' stay field edits); then submit; then selections; then VIN verbs."""
+def _classify_review_command(text: str, *, vin_pending: bool = True):
+    """What the operator just asked for, in their own words.
+
+    Two passes, and the order is the whole safety guarantee:
+
+        strict(text) or fluent(normalised(text))
+
+    The fluent pass may only ever UPGRADE a ("NONE", None). It can never
+    overrule a verdict the strict pass already reached, so nothing that works
+    today can start meaning something else tomorrow. Any future "pass 1 is
+    wrong" case is fixed by narrowing pass 1 — the moment pass 2 can win, the
+    property that makes this safe on a live bot is gone.
+
+    ``vin_pending`` is such a narrowing: with no DMV question on screen the VIN
+    verbs are skipped entirely, because _VIN_KEEP_RE's bare \\b(keep|same)\\b is
+    the loosest recogniser in this file and "keep the gate code handy" is a note.
+    """
+    t = (text or "").strip()
+    if not t:
+        return ("NONE", None)
+    kind, payload = _classify_review_command_once(t, vin_pending=vin_pending)
+    if kind != "NONE":
+        return (kind, payload)
+    normalised = _norm_command_text(t)
+    if normalised and normalised != t:
+        return _classify_review_command_once(normalised, vin_pending=vin_pending)
+    return ("NONE", None)
+
+
+def _classify_review_command_once(text: str, *, vin_pending: bool = True):
+    """One pass of the classifier. Field edits win first (so 'driver note …' and
+    'phone …' stay field edits); then submit; then selections; then VIN verbs."""
     t = (text or "").strip()
     if not t:
         return ("NONE", None)
@@ -5659,6 +5964,13 @@ def _classify_review_command(text: str):
             return ("SELECT_DRIVER", name)
     # C) VIN verbs. Order matters: "keep/same" first ("use the same" = keep); then
     # "use <vin>" ("use vin lookup"/"use the new" = use decoded); retype; else run.
+    #
+    # Skipped entirely unless a DMV question is actually on screen. _VIN_KEEP_RE
+    # searches for a bare "keep" or "same" ANYWHERE in the line, so with no
+    # question pending it claims "keep the gate code handy" and "Same Day
+    # Delivery" — both of which are notes.
+    if not vin_pending:
+        return ("NONE", None)
     if _VIN_KEEP_RE.search(t):
         return ("VIN_KEEP", None)
     if _VIN_RETYPE_RE.search(t):
@@ -5808,7 +6120,10 @@ async def _interpret_review_command(update, context, user_id, state_data, text):
     """Execute a natural-language review command (group/driver/source select, VIN).
     Returns the next conversation state, or None when the text is not a command (the
     caller then falls back to the AI parser)."""
-    kind, payload = _classify_review_command(text)
+    # The DMV question is only "on screen" when a decode conflict is actually
+    # waiting. Without that, the VIN verbs must not fire at all.
+    kind, payload = _classify_review_command(
+        text, vin_pending=bool(context.user_data.get("vin_choice_api_car")))
     if kind in ("NONE", "FIELD_EDITS"):
         return None
     chat_id = update.effective_chat.id if update.effective_chat else None
@@ -5859,8 +6174,10 @@ async def _interpret_review_command(update, context, user_id, state_data, text):
             await _update_review_message_text(context, state_data)
             await _finish("✅ Dispatcher → All Dispatchers")
             return STATE_AI_REVIEW
-        g = _match_name(payload, [x for x in db.get_all_groups() if record_is_active(x)], "group_name")
+        g = _resolve_pick_name(payload, [x for x in db.get_all_groups() if record_is_active(x)], "group_name")
         if not g:
+            if _payload_is_prose(payload):
+                return None               # a note, not a pick
             await _open_group_picker(context)
             await update.message.reply_text(f"🤔 No dispatcher matched “{payload}”. Pick one above.")
             return STATE_AI_REVIEW
@@ -5878,12 +6195,14 @@ async def _interpret_review_command(update, context, user_id, state_data, text):
         active = [d for d in _get_all_drivers_cached() if record_is_active(d)]
         suspended = _get_suspended_driver_ids()
         eligible = [d for d in active if str(d.get("id")) not in suspended]
-        d = _match_name(payload, eligible, "driver_name")
+        d = _resolve_pick_name(payload, eligible, "driver_name")
         if not d:
-            susp = _match_name(payload, [x for x in active if str(x.get("id")) in suspended], "driver_name")
+            susp = _resolve_pick_name(payload, [x for x in active if str(x.get("id")) in suspended], "driver_name")
             if susp:
                 await update.message.reply_text(f"🚫 {susp.get('driver_name', 'Driver')} is suspended (PENALTY).")
                 return STATE_AI_REVIEW
+            if _payload_is_prose(payload):
+                return None               # a note, not a pick — let it be written
             await _open_driver_picker(context)
             await update.message.reply_text(f"🤔 No driver matched “{payload}”. Pick one above.")
             return STATE_AI_REVIEW
@@ -5893,8 +6212,10 @@ async def _interpret_review_command(update, context, user_id, state_data, text):
         return STATE_AI_REVIEW
 
     if kind == "SELECT_SOURCE":
-        s = _match_name(payload, db.get_contact_info_sources(), "label")
+        s = _resolve_pick_name(payload, db.get_contact_info_sources(), "label")
         if not s:
+            if _payload_is_prose(payload):
+                return None               # a note, not a pick
             await _open_source_picker(context)
             await update.message.reply_text(f"🤔 No source matched “{payload}”. Pick one above.")
             return STATE_AI_REVIEW
@@ -9617,8 +9938,15 @@ async def _selection_command_at_a_field_prompt(update, context, user_id: int,
     finds a bare "same" or "keep" anywhere in the line — that a genuine value like
     "Same Day Delivery" typed at the notes prompt would be read as a command.
     """
-    kind, _payload = _classify_review_command(text)
+    # A field prompt is open, so no DMV question is: the VIN verbs are excluded
+    # here by design anyway, and asking for them can only produce a false hit.
+    kind, _payload = _classify_review_command(text, vin_pending=False)
     if kind not in ("SELECT_DRIVER", "SELECT_GROUP", "SELECT_SOURCE"):
+        return None
+    # A line can classify as a pick and still be prose: "the drivers all called
+    # already" opens with the noun. Ask before dismantling the open prompt —
+    # otherwise the prompt is gone and the sentence is still just a value.
+    if _payload_is_prose(_payload):
         return None
     # At a NAME prompt a name is a name. "Dispatch Solutions LLC" and "Team
     # Rubicon" are real registrants, and the group regex matches anything opening
