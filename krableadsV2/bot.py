@@ -6822,16 +6822,28 @@ async def _bare_command_to_slash(update: Update, context: ContextTypes.DEFAULT_T
     text = ((msg.text if msg else "") or "").strip()
     if not msg or not text or text.startswith("/"):
         return
-    # cancel / restart (and "new lead", "temp tag", …) already have a tested word
-    # family — reuse it so those phrases behave identically to their slash command.
-    cmd = _cancel_restart_kind(text) or None
-    if cmd is None:
-        # A prompt that is explicitly waiting for a typed VALUE must keep it: a client
-        # source really could be called "Test", and a field value could be "Me".
-        if context.user_data and (context.user_data.get("tset_await")
-                                  or context.user_data.get("phase1_pending_edit_key")):
-            return
-        cmd = _bare_command_for(text)
+    # Is a prompt explicitly waiting for a typed VALUE? That question has to be
+    # asked FIRST. "Temp Tag" — the product this business sells — matches the
+    # new-lead family, so asking about commands first meant typing it as a client
+    # source or a note silently wiped the whole card.
+    #
+    # But the operator still has to be able to leave. `strict` is the line: the
+    # exact cancel/restart words get through, the family made of ordinary nouns
+    # (temp tag, new lead, the order, a tag) does not.
+    awaiting_value = bool(context.user_data and (
+        context.user_data.get("tset_await")
+        or context.user_data.get("phase1_pending_edit_key")
+        or context.user_data.get("missing_fields")
+        or (context.user_data.get("fu") or {}).get("pending")))
+    if awaiting_value:
+        cmd = _cancel_restart_kind(text, strict=True)
+        if not cmd:
+            return                       # it is a value; leave it alone
+    else:
+        # cancel / restart (and "new lead", "temp tag", …) already have a tested
+        # word family — reuse it so those phrases behave identically to their
+        # slash command.
+        cmd = _cancel_restart_kind(text) or _bare_command_for(text)
     if not cmd:
         return
     slash = f"/{cmd}"
@@ -6915,6 +6927,12 @@ _RESTART_RE = re.compile(
 # mean the same as /lead: drop whatever is in progress and open a fresh review card.
 # A qualifier ("new", "another", "start a", "temp") is REQUIRED so a bare "tag" or
 # "client" inside a value can never wipe a card the issuer is filling in.
+# The object a cancel can carry: "cancel it", "scrap that one", "forget the lead".
+_OBJ_TAIL_RE = re.compile(
+    r"\s+(?:it|this|that|that\s+one|this\s+one|the\s+lead|the\s+tag|the\s+card|"
+    r"the\s+client|the\s+order|everything|all\s+of\s+it)\s*[.!]*$",
+    re.I,
+)
 _NEW_LEAD_RE = re.compile(
     r"^\s*(?:(?:new|another|next|start|create|add|a|the)\s+)+"
     r"(?:temp(?:orary)?\s+)?(?:lead|client|customer|tag|sale|entry|order)s?\s*[.!]*\s*$"
@@ -6923,27 +6941,51 @@ _NEW_LEAD_RE = re.compile(
 )
 
 
-def _cancel_restart_kind(text: str):
-    """'restart' | 'cancel' | None for a whole-message cancel/restart phrase."""
+def _cancel_restart_kind(text: str, *, strict: bool = False):
+    """'restart' | 'cancel' | None for a whole-message cancel/restart phrase.
+
+    ``strict`` is for the handlers that have a prompt open and are waiting for a
+    literal value. Cancel and restart are the same destructive action here, with
+    no confirmation anywhere, so a prompt expecting a value gets the exact word
+    or nothing — a driver note reading "never mind that" must not wipe a card.
+    """
     t = (text or "").strip()
     if not t:
         return None
+    kind = _cancel_restart_kind_once(t, strict=strict)
+    if kind or strict:
+        return kind
+    # "cancel it", "scrap that one", "never mind this" — the same instruction
+    # carrying an object the whole-message patterns cannot see past.
+    n = _OBJ_TAIL_RE.sub("", _norm_command_text(t)).strip()
+    return _cancel_restart_kind_once(n) if n and n != t else None
+
+
+def _cancel_restart_kind_once(t: str, *, strict: bool = False):
     if _RESTART_RE.match(t):
         return "restart"
     # Asking for a new lead IS a restart: wipe the current card, open a fresh one.
     # Handled here so it works in every state that already honours cancel/restart —
-    # the review card, the pickers, a field prompt, phase 1/2 and idle chat — instead
-    # of being filed as a field value (it used to become the client's NAME).
-    if _NEW_LEAD_RE.match(t):
+    # the review card, the pickers, phase 1/2 and idle chat — instead of being
+    # filed as a field value (it used to become the client's NAME).
+    #
+    # NOT under `strict`, because unlike cancel/restart this family is made of
+    # ordinary nouns: "temp tag" is the product, "the order" is a plausible note,
+    # "another client" is a plausible source. With a prompt open and a value
+    # expected, matching those costs the operator the entire card.
+    if not strict and _NEW_LEAD_RE.match(t):
         return "restart"
     if _CANCEL_RE.match(t):
         return "cancel"
     return None
 
 
-def _cancel_restart_kind_from_update(update: Update):
+def _cancel_restart_kind_from_update(update: Update, *, strict: bool = False):
     msg = update.effective_message
-    return _cancel_restart_kind((msg.text if msg else "") or "")
+    # A photo CAPTIONED "cancel" carries the same intent as a message saying it,
+    # and handle_media_in_any_state already reads the image itself.
+    raw = ((msg.text if msg else "") or (msg.caption if msg else "") or "")
+    return _cancel_restart_kind(raw, strict=strict)
 
 
 async def _do_cancel_or_restart(update: Update, context: ContextTypes.DEFAULT_TYPE, kind: str) -> int:
@@ -10017,7 +10059,7 @@ async def _place_text_at_field_prompt(state_data: dict, ek: str, text: str):
 
 async def handle_edit_field_text(update, context):
     user_id = update.effective_user.id
-    _cr = _cancel_restart_kind_from_update(update)
+    _cr = _cancel_restart_kind_from_update(update, strict=True)
     if _cr:
         return await _do_cancel_or_restart(update, context, _cr)
     await _autoclean_user_msg(update, context)
@@ -10851,6 +10893,16 @@ async def _ask_next_missing(message, context, user_id: int, fields: list, state_
              if f not in PHASE1_OPTIONAL_FIELDS and not _field_already_filled(card, f)]
     context.user_data["missing_fields"] = still
     context.user_data["missing_field_state_data"] = dict(card)
+    # Persist the live card before the question goes up. handle_missing_field
+    # answers from the stashed copy and saves it, so without this anything the
+    # operator changed WHILE the question was on screen is silently reverted —
+    # ask for a colour, get "price 150" typed on the card, answer the colour, and
+    # the price is gone.
+    if live is not card or card is not state_data:
+        try:
+            db.set_user_state(user_id, "phase1", card)
+        except Exception as e:
+            logger.warning("could not persist the card before asking: %s", e)
     if not still:
         return None
     prompts = ai_vision.MISSING_FIELD_PROMPTS
@@ -10868,7 +10920,7 @@ async def handle_missing_field(update: Update, context: ContextTypes.DEFAULT_TYP
         sent = await update.message.reply_text("Please send the missing value.")
         _track_missing_prompt(context, sent)
         return STATE_MISSING_FIELD
-    _cr = _cancel_restart_kind(text)
+    _cr = _cancel_restart_kind(text, strict=True)
     if _cr:
         return await _do_cancel_or_restart(update, context, _cr)
     await _autoclean_user_msg(update, context)
@@ -10893,6 +10945,16 @@ async def handle_missing_field(update: Update, context: ContextTypes.DEFAULT_TYP
     if ek:
         placed, _ = await _place_text_at_field_prompt(state_data, ek, text)
     if not placed:
+        # A command-shaped answer is not a value. Without this, "cancel" or
+        # "driver Susan" typed at "You missed out the vehicle color" became the
+        # COLOUR, and it prints on the tag.
+        if _COMMAND_LIKE_RE.search(text):
+            sent = await update.message.reply_text(
+                f"That looked like a command, so I did not store it as the "
+                f"{field.replace('_', ' ')}. Send just the value, or tap ✏️ Edit."
+            )
+            _track_missing_prompt(context, sent)
+            return STATE_MISSING_FIELD
         state_data[state_key] = text
     missing_fields = missing_fields[1:]
     # Whatever else the card gained in the meantime is no longer missing.
@@ -10995,7 +11057,7 @@ async def handle_vin_choice_text(update: Update, context: ContextTypes.DEFAULT_T
     """STATE_VIN_CHOICE: answer the VIN conflict by voice/text ('use the new',
     'keep the same', 'retype vin') instead of tapping a button."""
     text = ((update.message.text if update.message else "") or "").strip()
-    _cr = _cancel_restart_kind(text)
+    _cr = _cancel_restart_kind(text, strict=True)
     if _cr:
         return await _do_cancel_or_restart(update, context, _cr)
     await _autoclean_user_msg(update, context)
@@ -11225,7 +11287,7 @@ async def handle_special_request_issuers(update: Update, context: ContextTypes.D
         return await _phase2_ask(update.message, context, state_data)
 
     raw = (update.message.text or "").strip()
-    _cr = _cancel_restart_kind(raw)
+    _cr = _cancel_restart_kind(raw, strict=True)
     if _cr:
         return await _do_cancel_or_restart(update, context, _cr)
     await _autoclean_user_msg(update, context)
@@ -11256,7 +11318,7 @@ async def handle_special_request_drivers(update: Update, context: ContextTypes.D
         return await _phase2_ask(update.message, context, state_data)
 
     raw_d = (update.message.text or "").strip()
-    _cr = _cancel_restart_kind(raw_d)
+    _cr = _cancel_restart_kind(raw_d, strict=True)
     if _cr:
         return await _do_cancel_or_restart(update, context, _cr)
     await _autoclean_user_msg(update, context)
