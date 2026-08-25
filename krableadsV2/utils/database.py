@@ -623,7 +623,10 @@ class Database:
         try:
             group = self.get_group_by_id(group_id)
             if group:
-                new_status = not group.get('is_active', True)
+                # record_is_active, not a raw get: a SQL NULL means ACTIVE on every
+                # other path, but `not None` is True — so the first tap on such a
+                # row "enabled" something already enabled and appeared to do nothing.
+                new_status = not record_is_active(group)
                 self.client.table("groups").update({"is_active": new_status}).eq("id", group_id).execute()
                 return True
             return False
@@ -794,8 +797,10 @@ class Database:
         try:
             driver = self.client.table("drivers").select("*").eq("id", driver_id).execute()
             if driver.data:
-                current_status = driver.data[0].get('is_active', True)
-                new_status = not current_status
+                # Same as toggle_group_status: a SQL NULL is ACTIVE everywhere else,
+                # but `not None` is True, so the first tap enabled an already-enabled
+                # driver and looked like the button did nothing.
+                new_status = not record_is_active(driver.data[0])
                 self.client.table("drivers").update({"is_active": new_status}).eq("id", driver_id).execute()
                 return True
             return False
@@ -1491,6 +1496,37 @@ class Database:
             logger.error("mark_driver_timeout_notified: %s", e)
             return False
 
+    def _waived_lead_ids(self, lead_ids) -> set:
+        """Which of these leads no longer count towards receipt debt.
+
+        A SEPARATE, tolerant query on purpose: exclude_from_count cannot go in the
+        embedded select above because a DB that has not run
+        migration_lead_appeals.sql answers 42703 and the whole call returns nothing
+        for every driver. Asked for on its own, a failure costs only the exclusion.
+        Chunked, because a long backlog makes one .in_() outgrow the URL limit and
+        the waiver silently stops being honoured."""
+        ids = [str(x) for x in (lead_ids or []) if x]
+        if not ids:
+            return set()
+        out = set()
+        for i in range(0, len(ids), 100):
+            chunk = ids[i:i + 100]
+            try:
+                r = (
+                    self.client.table("leads")
+                    .select("id, exclude_from_count")
+                    .in_("id", chunk)
+                    .execute()
+                )
+                for row in (r.data or []):
+                    if row.get("exclude_from_count"):
+                        out.add(str(row["id"]))
+            except Exception as e:
+                # Un-migrated column, or a query too large. Say so — swallowing it
+                # is what let a lifted suspension keep counting.
+                logger.warning("waiver lookup failed for %d lead(s): %s", len(chunk), e)
+        return out
+
     def _lead_excluded_from_receipt_count(self, lead: dict) -> bool:
         """True when appeals migration marked the lead excluded (column may be absent)."""
         return bool((lead or {}).get("exclude_from_count"))
@@ -1505,19 +1541,21 @@ class Database:
             r = self.client.table("lead_assignments").select(
                 "lead_id, lead:leads(reference_id, receipt_image_url, vehicle_details, delivery_details, extra_info, special_request_note, special_request_issuers, special_request_drivers)"
             ).eq("driver_id", driver_id).eq("status", "accepted").execute()
-            out = []
+            unpaid = []
             for row in r.data or []:
                 lead = row.get("lead") or {}
                 if lead.get("receipt_image_url"):
                     continue
-                if self._lead_excluded_from_receipt_count(lead):
-                    continue
-                out.append({
+                unpaid.append({
                     "lead_id": row.get("lead_id"),
                     "reference_id": lead.get("reference_id") or "N/A",
                     "lead": lead,
                 })
-            return out
+            # The waiver, asked for separately — the embedded select above cannot
+            # carry exclude_from_count without breaking un-migrated DBs, which left
+            # this filter dead and told waived drivers they were still suspended.
+            waived = self._waived_lead_ids([u["lead_id"] for u in unpaid])
+            return [u for u in unpaid if str(u["lead_id"]) not in waived]
         except Exception as e:
             logger.error("get_driver_pending_receipts: %s", e)
             return []
@@ -1685,6 +1723,9 @@ class Database:
                 "id, driver_name",
             )
 
+            # Asked for separately, for the same reason as in
+            # get_driver_pending_receipts: the column cannot ride along above.
+            waived = self._waived_lead_ids(lead_ids)
             out = []
             for row in rows:
                 lid = str(row.get("lead_id") or "").strip()
@@ -1694,7 +1735,7 @@ class Database:
                 lead = leads_by_id.get(lid) or {}
                 if lead.get("receipt_image_url"):
                     continue
-                if self._lead_excluded_from_receipt_count(lead):
+                if lid in waived:
                     continue
                 ref = (lead.get("reference_id") or "").strip()
                 if not ref or ref.upper() == "N/A":
@@ -1707,10 +1748,14 @@ class Database:
                     "driver_name": (driver.get("driver_name") or "Driver").strip() or "Driver",
                     "lead": lead,
                 })
-            if not out and rows:
+            # Fall back only when the JOIN actually failed — an empty leads_by_id
+            # despite lead ids to look up. "Nothing is outstanding" is a normal,
+            # healthy answer, and treating it as a broken join ran a synchronous
+            # query per driver from inside async handlers every single time.
+            if rows and lead_ids and not leads_by_id:
                 logger.warning(
-                    "get_all_pending_receipts: %d accepted assignment(s) but flat join found "
-                    "0 pending — falling back to per-driver scan",
+                    "get_all_pending_receipts: %d accepted assignment(s) but the lead "
+                    "lookup returned nothing — falling back to a per-driver scan",
                     len(rows),
                 )
                 out = self._get_all_pending_receipts_per_driver(limit=0)

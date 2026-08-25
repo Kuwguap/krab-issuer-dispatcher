@@ -13329,6 +13329,18 @@ async def handle_reference_id_input(update: Update, context: ContextTypes.DEFAUL
     return STATE_WAITING_RECEIPT_CONFIRM
 
 
+async def handle_reference_id_stray(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """A picture sent where a reference id was asked for. Keeps the receipt session
+    rather than letting the image escape into the lead flow and wipe it."""
+    msg = update.effective_message
+    if msg:
+        await msg.reply_text(
+            "📋 I need the *reference ID* first (the code on the lead), then the "
+            "receipt photo.",
+            parse_mode="Markdown")
+    return STATE_WAITING_REFERENCE_ID
+
+
 async def handle_receipt_confirm_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """Handle receipt confirmation callback."""
     query = update.callback_query
@@ -16187,6 +16199,11 @@ def _card_buttons_always_live():
         CallbackQueryHandler(handle_driver_selection, pattern="^(select_driver_|driver_suspended_)"),
         CallbackQueryHandler(handle_contact_source_selection, pattern="^contact_source_"),
         CallbackQueryHandler(handle_vin_choice_callback, pattern=PH1_VIN_CHOICE_CB_PATTERN),
+        # "Change another field" / "Done" / "Confirm" were registered in ONE state,
+        # so they died as soon as the flow moved on or the process restarted.
+        CallbackQueryHandler(
+            handle_phase1_edit_followup_callback,
+            pattern=f"^({PH1_EDIT_MORE}|{PH1_EDIT_DONE}|{PH1_FINAL_CONFIRM})$"),
     ]
 
 
@@ -16477,6 +16494,12 @@ def main():
             CallbackQueryHandler(handle_driver_add_lead_callback, pattern="^driver_add_lead$"),
             CallbackQueryHandler(handle_another_tag_callback, pattern="^another_tag_"),
             CallbackQueryHandler(handle_driver_add_receipt_callback, pattern="^driver_add_receipt$"),
+            # Reassign driver belongs here too. It was an entry point only, and
+            # entry points are not consulted while a conversation is active — so
+            # the moment the issuer started their next lead, the button on the
+            # previous card (and the timeout job's "Pick new driver", which arrives
+            # ten minutes later) reached nothing at all.
+            CallbackQueryHandler(handle_resend_driver, pattern="^resend_driver_"),
             CallbackQueryHandler(handle_reassign_group_pick, pattern="^reassign_group_"),
         ],
     )
@@ -16495,9 +16518,22 @@ def main():
             CommandHandler(["receipt", "receipts", "recipts"], handle_driver_receipts_menu_command),
             CallbackQueryHandler(handle_driver_receipt_callback, pattern="^driver_receipt$"),
             CallbackQueryHandler(handle_receipt_for_ref_callback, pattern="^receipt_for_"),
+            # Confirm/Cancel were registered only inside the confirm state, and there
+            # is no persistence — so a redeploy between showing the buttons and the
+            # driver tapping one left them inert. The handler already rebuilds its
+            # context from the DB (_merge_receipt_context_from_db).
+            CallbackQueryHandler(handle_receipt_confirm_callback,
+                                 pattern="^(confirm_receipt|cancel_receipt)$"),
         ],
         states={
-            STATE_WAITING_REFERENCE_ID: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_reference_id_input)],
+            STATE_WAITING_REFERENCE_ID: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_reference_id_input),
+                # A photo here is not a reference id, but leaving it unhandled let it
+                # fall through to the idle-lead catch-all, which started a LEAD and
+                # wiped the receipt session.
+                MessageHandler(filters.PHOTO | filters.Document.ALL,
+                               handle_reference_id_stray),
+            ],
             STATE_WAITING_RECEIPT_CONFIRM: [CallbackQueryHandler(handle_receipt_confirm_callback, pattern="^(confirm_receipt|cancel_receipt)$")],
             STATE_WAITING_RECEIPT_IMAGE: [
                 MessageHandler(_receipt_image_filter, handle_receipt_image),
@@ -16549,7 +16585,10 @@ def main():
             STATE_FU_MENU: [
                 CallbackQueryHandler(
                     handle_fu_menu_callback,
-                    pattern="^(fuf_\\w+|fud_\\d+|fut_\\w+|fufr_\\w+|fue_\\w+)$",
+                    # fud_ takes WORDS, not just digits: the picker's "⚡ Now" button sends
+                    # fud_now, and \d+ rejected it, so the only way to undo a
+                    # chosen start day reached no handler and spun forever.
+                    pattern="^(fuf_\\w+|fud_\\w+|fut_\\w+|fufr_\\w+|fue_\\w+)$",
                 ),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, handle_fu_menu_text),
             ],
