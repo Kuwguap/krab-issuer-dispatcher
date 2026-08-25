@@ -9548,6 +9548,40 @@ async def handle_edit_field_photo(update: Update, context: ContextTypes.DEFAULT_
 _PROSE_EKS = frozenset({"issuer", "driver", "xtra"})
 
 
+async def _selection_command_at_a_field_prompt(update, context, user_id: int,
+                                              state_data: dict, text: str,
+                                              ek: str | None = None):
+    """"change the driver Susan" typed with a field prompt open — the next state,
+    or None when the text really is a value for the open field.
+
+    An open prompt is where you ARE, not what you MEANT. Without this the
+    sentence is written into whichever field is waiting: a car's colour became
+    "Change The Driver Susan", and a VIN prompt took the whole sentence as a VIN.
+    Both print on the tag.
+
+    Restricted to the three selections on purpose. Labelled field edits already
+    route correctly below, and the VIN verbs match loosely enough — _VIN_KEEP_RE
+    finds a bare "same" or "keep" anywhere in the line — that a genuine value like
+    "Same Day Delivery" typed at the notes prompt would be read as a command.
+    """
+    kind, _payload = _classify_review_command(text)
+    if kind not in ("SELECT_DRIVER", "SELECT_GROUP", "SELECT_SOURCE"):
+        return None
+    # At a NAME prompt a name is a name. "Dispatch Solutions LLC" and "Team
+    # Rubicon" are real registrants, and the group regex matches anything opening
+    # with dispatch/team/group/crew. Driver selection survives even here: it needs
+    # the literal word "driver", which no person or company is called.
+    if _edit_key_base(ek) in ("fn", "ln") and kind != "SELECT_DRIVER":
+        return None
+    chat_id = update.effective_chat.id if update.effective_chat else None
+    await _close_open_field_prompt(context, chat_id)
+    await _clear_missing_prompts(context)
+    context.user_data.pop("phase1_pending_edit_key", None)
+    # The interpreter applies the selection, re-renders the card so the button
+    # shows the new name, and reports what it did.
+    return await _interpret_review_command(update, context, user_id, state_data, text)
+
+
 async def _place_text_at_field_prompt(state_data: dict, ek: str, text: str):
     """Words typed or spoken while a field prompt is open.
 
@@ -9621,6 +9655,10 @@ async def handle_edit_field_text(update, context):
     state_data = state["data"]
 
     text = (update.message.text or "").strip()
+    redirected = await _selection_command_at_a_field_prompt(
+        update, context, user_id, state_data, text, ek)
+    if redirected is not None:
+        return redirected
     if text == "-":
         _apply_single_phase1_edit(state_data, ek, "")
     else:
@@ -10327,6 +10365,10 @@ async def handle_phase1_edit_input(update: Update, context: ContextTypes.DEFAULT
         await update.message.reply_text("❌ Lead data not found. Please start over with /start")
         return ConversationHandler.END
     state_data = state["data"].copy()
+    redirected = await _selection_command_at_a_field_prompt(
+        update, context, user_id, state_data, text, ek)
+    if redirected is not None:
+        return redirected
     placed = []
     if text == "-":
         _apply_single_phase1_edit(state_data, ek, "")
@@ -10461,6 +10503,10 @@ async def handle_missing_field(update: Update, context: ContextTypes.DEFAULT_TYP
     state_key = MISSING_FIELD_TO_STATE_KEY.get(field, field)
     # Parse the answer the way every other prompt does, so "color white" stores
     # White (and "price 150" said here still reaches the price).
+    redirected = await _selection_command_at_a_field_prompt(
+        update, context, user_id, state_data, text)
+    if redirected is not None:
+        return redirected
     ek = _STATE_KEY_TO_INLINE_EK.get(state_key)
     placed = False
     if ek:
