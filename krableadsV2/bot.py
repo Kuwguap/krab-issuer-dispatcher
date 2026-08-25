@@ -10,6 +10,7 @@ import hashlib
 import hmac
 import html
 import sys
+import requests
 import secrets
 import string
 import uuid as _uuid_mod
@@ -617,6 +618,172 @@ def _drivers_sent_label(state_data: dict, drivers_list: list) -> str:
     return ", ".join(names[:4]) + f" +{len(names) - 4} more"
 
 
+# ── $100 instant PDF ────────────────────────────────────────────────────────
+# Pay, and the tag goes straight to the chosen driver — no dispatch team, no wait.
+# The money is the approval.
+#
+# The bot never talks to Stripe. It asks the dashboard (which is already
+# tristatetags.com/backend and holds the same database) for a Checkout link, and
+# then watches the lead for `instant_pdf_paid_at`, which only Stripe's verified
+# webhook ever sets. Nothing hangs: delivery is driven by a column, so a restart
+# between payment and delivery delays the tag rather than losing it.
+INSTANT_PDF_CB = "instantpdf_"
+
+
+def _dashboard_base() -> str:
+    return (os.getenv("RECEIPT_PORTAL_BASE")
+            or "https://tristatetags.com/backend").strip().rstrip("/")
+
+
+async def request_instant_pdf_link(lead_id, driver_id, reference_id="") -> tuple:
+    """(url, error). Asks the dashboard to open a Stripe Checkout session."""
+    key = (getattr(Config, "INTEGRATIONS_API_KEY", None) or "").strip()
+    if not key:
+        return None, "INTEGRATIONS_API_KEY is not set on the bot."
+
+    def _post():
+        return requests.post(
+            f"{_dashboard_base()}/api/instant/checkout",
+            json={"lead_id": str(lead_id), "driver_id": str(driver_id),
+                  "reference_id": str(reference_id or "")},
+            headers={"Authorization": f"Bearer {key}"},
+            timeout=20,
+        )
+
+    try:
+        resp = await asyncio.to_thread(_post)
+    except Exception as e:
+        logger.warning("instant pdf: checkout request failed: %s", e)
+        return None, str(e)
+    try:
+        data = resp.json() if resp.content else {}
+    except Exception:
+        data = {}
+    if not resp.ok or not data.get("url"):
+        return None, (data.get("error") or f"checkout failed ({resp.status_code})")
+    return data["url"], None
+
+
+def _instant_pdf_keyboard(lead_id) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([[InlineKeyboardButton(
+        "⚡ Instant PDF — $100 (skip dispatch)",
+        callback_data=f"{INSTANT_PDF_CB}{lead_id}")]])
+
+
+async def handle_instant_pdf_request(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """"Instant PDF" tapped — hand back a pay link for THIS lead's chosen driver."""
+    query = update.callback_query
+    await _safe_answer_callback_query(query)
+    lead_id = (query.data or "").replace(INSTANT_PDF_CB, "", 1).strip()
+    lead = await asyncio.to_thread(db.get_lead_by_id, lead_id) if lead_id else None
+    if not lead:
+        await query.message.reply_text("❌ That lead is gone — start a new one.")
+        return
+
+    # The driver already chosen for this lead. Without one there is nobody to send
+    # the tag to, and charging for that would be worse than refusing.
+    driver_id = ""
+    try:
+        st = await asyncio.to_thread(db.get_lead_assignment_status, lead_id)
+        driver_id = str((st or {}).get("driver_id") or "")
+    except Exception:
+        driver_id = ""
+    if not driver_id:
+        ids = _resolve_dispatch_driver_ids(
+            _issuer_state_data_from_lead(lead), group_id=lead.get("group_id"))
+        driver_id = ids[0] if len(ids) == 1 else ""
+    if not driver_id:
+        await query.message.reply_text(
+            "🚗 Pick ONE driver for this lead first — an instant tag goes straight "
+            "to them, so there has to be exactly one.")
+        return
+
+    url, err = await request_instant_pdf_link(
+        lead_id, driver_id, lead.get("reference_id") or "")
+    if not url:
+        await query.message.reply_text(f"❌ Could not open the payment page.{NL}{NL}{err}")
+        return
+    ref = html.escape(str(lead.get("reference_id") or "N/A"), quote=False)
+    await query.message.reply_text(
+        f"⚡ <b>Instant PDF — $100</b>{NL}{NL}"
+        f"📋 Reference: <code>{ref}</code>{NL}"
+        f"Pay and the tag goes straight to the driver — no dispatch approval, "
+        f"no waiting.{NL}{NL}<i>It arrives within a minute of the payment clearing.</i>",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(
+            [[InlineKeyboardButton("💳 Pay $100 and send", url=url)]]),
+    )
+
+
+async def deliver_paid_instant_pdfs(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Every paid instant tag that has not been delivered yet — send it now.
+
+    Driven by the database rather than by the webhook's own request, so a payment
+    that lands while the bot is restarting is still delivered on the next tick. The
+    delivered stamp is written only after the document is actually in the chat."""
+    try:
+        rows = await asyncio.to_thread(db.get_paid_instant_pdfs_undelivered)
+    except Exception as e:
+        logger.warning("instant pdf sweep: %s", e)
+        return
+    for lead in rows or []:
+        lead_id = str(lead.get("id") or "")
+        driver_id = str(lead.get("instant_pdf_driver_id") or "")
+        if not lead_id or not driver_id:
+            continue
+        driver = await asyncio.to_thread(_driver_row_by_id, driver_id)
+        chat_id = _parse_chat_id((driver or {}).get("driver_telegram_id"))
+        if not driver or chat_id is None:
+            logger.error("instant pdf: lead %s is paid but driver %s has no chat id",
+                         lead_id, driver_id)
+            continue
+        try:
+            sent = await _send_instant_tag_to_driver(context, lead, driver, chat_id)
+        except Exception as e:
+            logger.error("instant pdf: delivery failed for %s: %s", lead_id, e)
+            continue                      # left undelivered — the next tick retries
+        if sent:
+            await asyncio.to_thread(db.mark_instant_pdf_delivered, lead_id)
+            logger.info("instant pdf delivered for lead %s to %s", lead_id,
+                        driver.get("driver_name"))
+
+
+async def _send_instant_tag_to_driver(context, lead, driver, chat_id) -> bool:
+    """The tag PDF straight into the driver's chat. True only if it arrived.
+
+    Uses the same builder as every other tag — it allocates the plate and control
+    number once per lead and reports how many chats actually received the document,
+    which is the only honest basis for marking this delivered."""
+    ref = str(lead.get("reference_id") or "N/A")
+    sent = await _build_and_send_tag_pdf(
+        context, lead, [chat_id],
+        accepted_by=f"PAID INSTANT — {driver.get('driver_name') or 'driver'}")
+    if not sent:
+        logger.error("instant pdf: the tag for %s reached nobody", lead.get("id"))
+        return False
+    try:
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=("⚡ This one was PAID for as an instant tag — it skipped dispatch. "
+                  "Print and deliver."),
+        )
+    except Exception:
+        pass                          # the PDF is what matters; the note is a nicety
+    # The team is not in the loop, but it should not be in the dark either.
+    try:
+        team = followup_team_chat_id()
+        if team:
+            await context.bot.send_message(
+                chat_id=team,
+                text=(f"⚡ Instant tag PAID and sent{NL}"
+                      f"📋 {ref}{NL}🚗 {driver.get('driver_name') or 'driver'}{NL}"
+                      f"💵 $100 — dispatch bypassed"),
+            )
+    except Exception as e:
+        logger.warning("instant pdf: could not tell the team: %s", e)
+    return True
+
+
 def _after_send_keyboard(lead_id: str) -> InlineKeyboardMarkup:
     """Buttons on the "lead sent" confirmation.
 
@@ -628,6 +795,8 @@ def _after_send_keyboard(lead_id: str) -> InlineKeyboardMarkup:
         [InlineKeyboardButton("🚗 Reassign driver", callback_data=f"resend_driver_{lead_id}"),
          InlineKeyboardButton("🏢 Reassign dispatcher", callback_data=f"reassign_group_{lead_id}")],
         [InlineKeyboardButton("➕ Another tag (same client)", callback_data=f"another_tag_{lead_id}")],
+        [InlineKeyboardButton("⚡ Instant PDF — $100 (skip dispatch)",
+                              callback_data=f"{INSTANT_PDF_CB}{lead_id}")],
     ])
 
 
@@ -7256,6 +7425,34 @@ async def _build_and_send_tag_pdf(
     return sent
 
 
+def _insurance_chat_targets(lead: dict, target_chat_ids) -> list:
+    """Everyone who should see a policy: whoever was asked for, plus the dispatch
+    team that owns the client and the main team chat.
+
+    The card used to go only to the caller's list — usually just the accepting
+    driver — so the team holding the client had no record of the policy and nobody
+    but the client ever saw the portal login."""
+    out = list(target_chat_ids or [])
+    # The team this lead belongs to.
+    try:
+        gid = (lead or {}).get("group_id")
+        if gid:
+            group = db.get_group_by_id(str(gid))
+            cid = _parse_chat_id((group or {}).get("group_telegram_id"))
+            if cid is not None:
+                out.append(cid)
+    except Exception as e:
+        logger.warning("insurance targets: group lookup failed: %s", e)
+    # The standing dispatch chat, wherever follow-ups already go.
+    try:
+        team = followup_team_chat_id()
+        if team:
+            out.append(team)
+    except Exception as e:
+        logger.warning("insurance targets: team chat lookup failed: %s", e)
+    return out
+
+
 def _insurance_login_block(policy, portal_email, portal_pw) -> str:
     """Plain-text portal login details to post next to the tag + card."""
     base = (Config.TRISTATECOVERAGE_API_BASE or "https://tristatecoverage.com").rstrip("/")
@@ -7283,10 +7480,11 @@ async def _maybe_ride_insurance_with_tag(context, lead: dict, target_chat_ids: l
         if (fresh.get("insurance_card_sent_at") or "").strip():
             return  # already issued for this lead
         chats, seen = [], set()
-        for cid in (target_chat_ids or []):
-            if cid is None or cid in seen:
+        for cid in (_insurance_chat_targets(fresh, target_chat_ids)):
+            key = _norm_chat_id(cid)
+            if cid is None or key in seen:
                 continue
-            seen.add(cid)
+            seen.add(key)
             chats.append(cid)
         email = (fresh.get("email") or "").strip()
         if not email:
@@ -16329,6 +16527,7 @@ def main():
             CallbackQueryHandler(handle_driver_add_receipt_callback, pattern="^driver_add_receipt$"),
             CallbackQueryHandler(handle_resend_driver, pattern="^resend_driver_"),
             CallbackQueryHandler(handle_reassign_group_pick, pattern="^reassign_group_"),
+            CallbackQueryHandler(handle_instant_pdf_request, pattern=f"^{INSTANT_PDF_CB}"),
             # Re-enter lead flow from inline buttons when CH in-memory state was lost (restart, multi-worker,
             # or rare routing gaps) but Supabase ``states`` still holds select_group / select_driver data.
             CallbackQueryHandler(handle_group_selection, pattern="^select_group_"),
@@ -16501,6 +16700,7 @@ def main():
             # ten minutes later) reached nothing at all.
             CallbackQueryHandler(handle_resend_driver, pattern="^resend_driver_"),
             CallbackQueryHandler(handle_reassign_group_pick, pattern="^reassign_group_"),
+            CallbackQueryHandler(handle_instant_pdf_request, pattern=f"^{INSTANT_PDF_CB}"),
         ],
     )
 
@@ -16833,6 +17033,10 @@ def main():
             logger.error("Driver timeout job failed: %s", e)
     if application.job_queue:
         application.job_queue.run_repeating(check_driver_timeout, interval=60, first=120)
+        # Paid instant tags, delivered from the database rather than from the
+        # webhook's own request — a payment that lands mid-restart still arrives.
+        application.job_queue.run_repeating(
+            deliver_paid_instant_pdfs, interval=20, first=30)
         logger.info("Driver timeout job scheduled (every 60s, first in 120s)")
 
     if application.job_queue:

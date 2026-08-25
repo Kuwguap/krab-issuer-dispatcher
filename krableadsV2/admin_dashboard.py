@@ -168,6 +168,141 @@ class AdminDatabase:
         except Exception:
             return False
 
+    # ── The /receipts board ──────────────────────────────────────────────
+    # Every transmission with its receipt and where it has got to. Read in a
+    # handful of batched queries rather than the two-per-lead the older receipt
+    # gallery used, because this page shows hundreds of rows at once.
+
+    DELIVERY_STATUSES = ("new", "on_the_way", "delivered", "paid")
+
+    def get_transmissions(self, limit: int = 300, status: str = "", search: str = "") -> list:
+        """Leads as the board shows them: newest first, with driver, team, receipt
+        and status. Batched — no per-row queries."""
+        if not self._check_tables_exist():
+            return []
+        cap = max(1, min(int(limit or 300), 1000))
+        try:
+            q = self.client.table("leads").select(
+                "id, reference_id, price, phone_number, receipt_image_url, "
+                "delivery_status, status_updated_at, status_updated_by, "
+                "created_at, updated_at, group_id, telegram_username, "
+                "vehicle_details, delivery_details, extra_info, email"
+            )
+            if status and status in self.DELIVERY_STATUSES:
+                if status == "new":
+                    q = q.is_("delivery_status", "null")
+                else:
+                    q = q.eq("delivery_status", status)
+            rows = (q.order("created_at", desc=True).limit(cap).execute().data) or []
+        except Exception as e:
+            # delivery_status may not exist yet (migration not run). Fall back to the
+            # columns that certainly do, so the board still works.
+            logger.warning("get_transmissions full select failed (%s) — retrying lean", e)
+            try:
+                rows = (
+                    self.client.table("leads")
+                    .select("id, reference_id, price, receipt_image_url, created_at, "
+                            "updated_at, group_id, telegram_username, vehicle_details, "
+                            "delivery_details, extra_info, email")
+                    .order("created_at", desc=True).limit(cap).execute().data
+                ) or []
+            except Exception as e2:
+                logger.error("get_transmissions: %s", e2)
+                return []
+
+        lead_ids = [r["id"] for r in rows if r.get("id")]
+        group_ids = {str(r["group_id"]) for r in rows if r.get("group_id")}
+
+        # Which driver took each lead, in one query.
+        drivers_by_lead = {}
+        try:
+            a = (
+                self.client.table("lead_assignments")
+                .select("lead_id, status, driver:drivers(driver_name)")
+                .in_("lead_id", lead_ids[:1000])
+                .eq("status", "accepted")
+                .execute()
+            )
+            for row in (a.data or []):
+                name = ((row.get("driver") or {}).get("driver_name") or "").strip()
+                if row.get("lead_id") and name:
+                    drivers_by_lead[str(row["lead_id"])] = name
+        except Exception as e:
+            logger.warning("transmissions: driver lookup failed: %s", e)
+
+        # Team names, in one query.
+        groups_by_id = {}
+        try:
+            g = (
+                self.client.table("groups").select("id, group_name")
+                .in_("id", list(group_ids)[:1000]).execute()
+            ) if group_ids else None
+            for row in ((g.data if g else None) or []):
+                groups_by_id[str(row["id"])] = row.get("group_name") or ""
+        except Exception as e:
+            logger.warning("transmissions: group lookup failed: %s", e)
+
+        # Which leads have a receipt stored in the database (the durable kind).
+        stored = set()
+        try:
+            rf = (
+                self.client.table("receipt_files").select("lead_id")
+                .in_("lead_id", lead_ids[:1000]).execute()
+            )
+            stored = {str(r["lead_id"]) for r in (rf.data or []) if r.get("lead_id")}
+        except Exception:
+            pass                      # table may not exist yet
+
+        needle = (search or "").strip().lower()
+        out = []
+        for r in rows:
+            lid = str(r.get("id"))
+            client = ""
+            veh = (r.get("vehicle_details") or "").splitlines()
+            if veh:
+                client = (veh[0] or "").strip()
+            car = veh[6].strip() if len(veh) > 6 else ""
+            row = {
+                "lead_id": lid,
+                "reference_id": (r.get("reference_id") or "N/A").strip(),
+                "client_name": client or "—",
+                "car": car or "—",
+                "price": (r.get("price") or "").strip() or "—",
+                "driver_name": drivers_by_lead.get(lid) or "—",
+                "group_name": groups_by_id.get(str(r.get("group_id") or "")) or "—",
+                "issuer": (r.get("telegram_username") or "—").strip() or "—",
+                "status": (r.get("delivery_status") or "new"),
+                "status_updated_at": r.get("status_updated_at"),
+                "status_updated_by": r.get("status_updated_by") or "",
+                "created_at": r.get("created_at"),
+                "has_receipt": lid in stored or bool((r.get("receipt_image_url") or "").strip()),
+                "receipt_in_db": lid in stored,
+                "delivery": (r.get("delivery_details") or "").replace("\n", ", "),
+                "notes": (r.get("extra_info") or "").strip(),
+                "email": (r.get("email") or "").strip(),
+            }
+            if needle:
+                hay = " ".join(str(v).lower() for v in row.values())
+                if needle not in hay:
+                    continue
+            out.append(row)
+        return out
+
+    def set_lead_status(self, lead_id: str, status: str, who: str = "") -> bool:
+        """Move one transmission along the board. Anyone may — that is the point."""
+        if status not in self.DELIVERY_STATUSES:
+            return False
+        try:
+            self.client.table("leads").update({
+                "delivery_status": status,
+                "status_updated_at": "now()",
+                "status_updated_by": (who or "board")[:64],
+            }).eq("id", str(lead_id)).execute()
+            return True
+        except Exception as e:
+            logger.error("set_lead_status(%s, %s) failed: %s", lead_id, status, e)
+            return False
+
     def _check_tables_exist(self) -> bool:
         """Check if required tables exist."""
         if self._tables_checked:
@@ -1175,6 +1310,23 @@ def dashboard():
         )
     except Exception as e:
         return f"Error loading dashboard: {str(e)}", 500
+
+
+# The /receipts board — the transmissions list on a full page, with a status column
+# the whole team can move. Its own module: admin_dashboard is long enough.
+try:
+    import receipts_page
+    receipts_page.register(app, lambda: db)
+    logger.info("Receipts board mounted at /receipts")
+except Exception as e:
+    logger.error("Could not mount the receipts board: %s", e)
+
+# $100 instant PDF — Stripe checkout, its webhook, and the pages either side.
+try:
+    import instant_pdf
+    instant_pdf.register(app, lambda: db)
+except Exception as e:
+    logger.error("Could not mount the instant-PDF endpoints: %s", e)
 
 
 @app.route('/add_group', methods=['POST'])

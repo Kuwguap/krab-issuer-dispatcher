@@ -421,6 +421,42 @@ class Database:
     # every receipt eventually became a dead link. The bytes live in a table now:
     # a row does not expire, and serving one is a single read.
 
+    # ── $100 instant PDF ────────────────────────────────────────────────
+    # Delivery is driven by these two columns, not by the webhook's request, so a
+    # payment that lands while the bot is restarting is still delivered afterwards.
+
+    def get_paid_instant_pdfs_undelivered(self, limit: int = 20) -> list:
+        """Instant tags that are paid for and have not reached the driver yet."""
+        try:
+            r = (
+                self.client.table("leads")
+                .select("*")
+                .not_.is_("instant_pdf_paid_at", "null")
+                .is_("instant_pdf_delivered_at", "null")
+                .order("instant_pdf_paid_at", desc=False)
+                .limit(max(1, min(int(limit or 20), 100)))
+                .execute()
+            )
+            return r.data or []
+        except Exception as e:
+            # The columns may not exist yet (migration not run). Quiet, because this
+            # runs every 20 seconds — but never silent about a real failure.
+            msg = str(e)
+            if "instant_pdf" not in msg and "42703" not in msg:
+                logger.warning("get_paid_instant_pdfs_undelivered: %s", e)
+            return []
+
+    def mark_instant_pdf_delivered(self, lead_id: str) -> bool:
+        """Stamped only once the document is actually in the driver's chat."""
+        try:
+            self.client.table("leads").update(
+                {"instant_pdf_delivered_at": "now()"}
+            ).eq("id", str(lead_id)).execute()
+            return True
+        except Exception as e:
+            logger.error("mark_instant_pdf_delivered(%s): %s", lead_id, e)
+            return False
+
     def save_receipt_file(
         self,
         lead_id: str,
