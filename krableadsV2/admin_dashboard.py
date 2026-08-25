@@ -3,6 +3,7 @@ from flask import Flask, render_template_string, request, jsonify, redirect, url
 from flask_cors import CORS
 import base64
 import hmac
+import json
 import os
 import re
 import logging
@@ -186,7 +187,7 @@ class AdminDatabase:
                 "id, reference_id, price, phone_number, receipt_image_url, "
                 "delivery_status, status_updated_at, status_updated_by, "
                 "created_at, updated_at, group_id, telegram_username, "
-                "vehicle_details, delivery_details, extra_info, email"
+                "vehicle_details, delivery_details, extra_info, email, extra_vehicles"
             )
             if status and status in self.DELIVERY_STATUSES:
                 if status == "new":
@@ -262,6 +263,24 @@ class AdminDatabase:
             if veh:
                 client = (veh[0] or "").strip()
             car = veh[6].strip() if len(veh) > 6 else ""
+            # A lead can carry more than one car, and each one owes its own tag.
+            # A row reading as ONE car when two tags are owed is exactly how a
+            # second tag goes undelivered with nobody noticing.
+            extra = r.get("extra_vehicles")
+            if isinstance(extra, str):
+                try:
+                    extra = json.loads(extra)
+                except Exception:
+                    extra = None
+            extra = [v for v in extra if isinstance(v, dict)] if isinstance(extra, list) else []
+            if extra:
+                more = ", ".join(
+                    " ".join(p for p in (str(v.get("car") or "").strip(),
+                                         str(v.get("vin") or "").strip()) if p)
+                    or "car"
+                    for v in extra
+                )
+                car = f"{car or 'car 1'} + {more}"
             row = {
                 "lead_id": lid,
                 "reference_id": (r.get("reference_id") or "N/A").strip(),
@@ -271,6 +290,7 @@ class AdminDatabase:
                 "driver_name": drivers_by_lead.get(lid) or "—",
                 "group_name": groups_by_id.get(str(r.get("group_id") or "")) or "—",
                 "issuer": (r.get("telegram_username") or "—").strip() or "—",
+                "tags": 1 + len(extra),
                 "status": (r.get("delivery_status") or "new"),
                 "status_updated_at": r.get("status_updated_at"),
                 "status_updated_by": r.get("status_updated_by") or "",

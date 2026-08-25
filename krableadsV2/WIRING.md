@@ -32,6 +32,7 @@ notice they are missing.
 | `database/migration_lead_delivery_status.sql` | the `/receipts` board renders but no status can be set |
 | `database/migration_instant_pdf.sql` | a paid instant tag is never delivered |
 | `database/migration_driver_manual_suspend.sql` | manual suspend/lift does nothing |
+| `database/migration_extra_vehicles.sql` | a lead's 2nd/3rd car is silently dropped and only ONE tag is issued |
 
 ---
 

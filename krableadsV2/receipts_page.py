@@ -85,11 +85,11 @@ BOARD_HTML = """<!doctype html>
 <main>
   <table>
     <thead><tr>
-      <th class="exp"></th><th>Ref</th><th>Client</th><th class="hide-sm">Car</th>
+      <th class="exp"></th><th>Ref</th><th>Client</th><th class="hide-sm">Car</th><th>Tags</th>
       <th>Driver</th><th class="hide-sm">Team</th><th>Price</th>
       <th>Receipt</th><th>Status</th><th class="hide-sm">Updated</th>
     </tr></thead>
-    <tbody id="rows"><tr><td colspan="10" class="none">Loading…</td></tr></tbody>
+    <tbody id="rows"><tr><td colspan="11" class="none">Loading…</td></tr></tbody>
   </table>
 </main>
 <script>
@@ -135,7 +135,7 @@ function draw() {
     `${rows.length} of ${ALL.length}`;
   const tb = document.getElementById("rows");
   if (!rows.length) {
-    tb.innerHTML = '<tr><td colspan="10" class="none">Nothing here yet.</td></tr>';
+    tb.innerHTML = '<tr><td colspan="11" class="none">Nothing here yet.</td></tr>';
     return;
   }
   tb.innerHTML = rows.map(r => {
@@ -150,6 +150,7 @@ function draw() {
       <td class="ref">${esc(r.reference_id)}</td>
       <td>${esc(r.client_name)}</td>
       <td class="hide-sm">${esc(r.car)}</td>
+      <td>${(r.tags || 1) > 1 ? `<b title="one tag per car">${esc(r.tags)}×</b>` : ""}</td>
       <td>${esc(r.driver_name)}</td>
       <td class="hide-sm">${esc(r.group_name)}</td>
       <td>${esc(r.price)}</td>
@@ -159,7 +160,7 @@ function draw() {
       <td class="hide-sm">${esc(when(r.status_updated_at))}<br>
           <span class="counts">${esc(r.status_updated_by || "")}</span></td>
     </tr>
-    <tr class="detail" id="d-${esc(r.lead_id)}" hidden><td colspan="10">
+    <tr class="detail" id="d-${esc(r.lead_id)}" hidden><td colspan="11">
       <dl>
         <dt>Delivery</dt><dd>${esc(r.delivery) || "—"}</dd>
         <dt>Notes</dt><dd>${esc(r.notes) || "—"}</dd>

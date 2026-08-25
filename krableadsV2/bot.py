@@ -755,11 +755,17 @@ async def _send_instant_tag_to_driver(context, lead, driver, chat_id) -> bool:
     number once per lead and reports how many chats actually received the document,
     which is the only honest basis for marking this delivered."""
     ref = str(lead.get("reference_id") or "N/A")
-    sent = await _build_and_send_tag_pdf(
+    counts = await _send_all_tag_pdfs(
         context, lead, [chat_id],
         accepted_by=f"PAID INSTANT — {driver.get('driver_name') or 'driver'}")
-    if not sent:
-        logger.error("instant pdf: the tag for %s reached nobody", lead.get("id"))
+    # EVERY car's tag, not just one. This return value is what stamps the lead
+    # delivered and takes it out of the retry sweep, so "the first of two
+    # arrived" must read as failure — the customer paid for both.
+    if not counts or not all(counts):
+        logger.error(
+            "instant pdf: lead %s sent %s of %d tag(s) — NOT marking delivered",
+            lead.get("id"), sum(1 for c in counts if c), len(counts) or 1,
+        )
         return False
     try:
         await context.bot.send_message(
@@ -2764,9 +2770,15 @@ PH1_REVIEW_CB_PATTERN = (
     r"^(ph1_accept|ph1_edit|ph1_vin_check|ph1_add_image|ph1_adjust|ph1_attach|"
     r"ph1_ins_toggle|adjust_cancel|ph1_back|ph1_pick_group|ph1_pick_driver|"
     r"ph1_pick_source|selgrp_|seldrv_|selsrc_|ph1_sel_back|driver_suspended_|"
-    r"edit_cancel|ph1edit_)"
+    r"edit_cancel|ph1edit_|ph1_add_car|ph1car_|ph1carrm_)"
 )
-PH1_EDIT_MENU_CB_PATTERN = r"^(ph1_back|ph1_accept|ph1edit_[a-z]+)$"
+# ``ph1edit_[a-z]+`` silently excluded every per-car key (v2vin, v2col, ...):
+# no digit could match, the pattern is anchored, and an unmatched callback in
+# this state replies nothing at all. [a-z0-9]+ is a strict superset — no
+# existing callback contains a digit, so nothing re-routes.
+PH1_EDIT_MENU_CB_PATTERN = (
+    r"^(ph1_back|ph1_accept|ph1_add_car|ph1car_\d+|ph1carrm_\d+|ph1edit_[a-z0-9]+)$"
+)
 PH1_VIN_CHOICE_CB_PATTERN = r"^(vin_use|vin_keep|vin_retype)$"
 
 
@@ -2815,6 +2827,126 @@ PH1_EDIT_PROMPT_LABEL = {
     "email": "Email (required for insurance)",
     "dl": "Driver license (required for insurance)",
 }
+
+
+# ── Extra-car buttons ───────────────────────────────────────────────────────
+# ``ph1edit_v2vin`` etc. carry the car number in the callback itself, so one
+# grammar covers a 2nd, 3rd or 20th tag without a new constant per car.
+PH1_ADD_CAR_CB = "ph1_add_car"
+PH1_CAR_MENU_CB = "ph1car_"       # ph1car_2 -> open the 2nd Tag's field picker
+PH1_CAR_REMOVE_CB = "ph1carrm_"   # ph1carrm_2 -> drop the 2nd Tag
+_VEHICLE_EDIT_KEY_RE = re.compile(r"^v(\d+)([a-z]+)$")
+
+# Which of car 1's edit keys an extra car also has. No delivery, phone, price,
+# note, email or DL: one transaction owns those, not one car.
+VEHICLE_EDIT_TO_FIELD = {
+    "addr": "address",
+    "csz": "city_state_zip",
+    "vin": "vin",
+    "car": "car",
+    "col": "color",
+    "ins": "insurance_company",
+    "pol": "insurance_policy_number",
+}
+# fn/ln are two buttons over the single stored ``name``, exactly as car 1 works.
+VEHICLE_EDIT_KEYS = ("fn", "ln") + tuple(VEHICLE_EDIT_TO_FIELD)
+
+
+def _vehicle_edit_key(n: int, base: str) -> str:
+    """(2, 'vin') -> 'v2vin'."""
+    return f"v{int(n)}{base}"
+
+
+def _vehicle_edit_key_parts(ek: str):
+    """'v2vin' -> (2, 'vin'). None for car 1's own keys, so callers can tell them
+    apart without a second lookup table."""
+    m = _VEHICLE_EDIT_KEY_RE.match(str(ek or ""))
+    if not m:
+        return None
+    n = int(m.group(1))
+    base = m.group(2)
+    if n < 2 or base not in VEHICLE_EDIT_KEYS:
+        return None
+    return (n, base)
+
+
+def _edit_key_base(ek: str) -> str:
+    """The underlying field of an edit key, car number stripped. Lets the colour
+    palette and price picker branch on 'col'/'price' without caring which car."""
+    parts = _vehicle_edit_key_parts(ek)
+    return parts[1] if parts else str(ek or "")
+
+
+def _is_known_edit_key(ek: str) -> bool:
+    """Guard for both edit entry points, which silently no-op on an unknown key."""
+    return ek in PH1_EDIT_PROMPT_LABEL or _vehicle_edit_key_parts(ek) is not None
+
+
+def _edit_prompt_label(ek: str) -> str:
+    """'v2vin' -> '2nd Tag — VIN (17 characters if known)', so the prompt says
+    which car it is about. Nine identical 'VIN' prompts would be a trap."""
+    parts = _vehicle_edit_key_parts(ek)
+    if not parts:
+        return PH1_EDIT_PROMPT_LABEL.get(ek, ek)
+    n, base = parts
+    return f"{_ordinal_tag_label(n)} — {PH1_EDIT_PROMPT_LABEL.get(base, base)}"
+
+
+def _vehicle_at(state_data: dict, n: int) -> dict:
+    """Car n's dict, or {} when it does not exist (a stale button after a
+    removal, or after a restart)."""
+    vehicles = _extra_vehicles(state_data)
+    idx = int(n) - 2
+    return vehicles[idx] if 0 <= idx < len(vehicles) else {}
+
+
+def _apply_vehicle_edit(state_data: dict, ek: str, new_text: str) -> bool:
+    """Write one typed/tapped value onto an extra car. True if it landed.
+
+    Kept separate from _apply_single_phase1_edit on purpose: that function's
+    fall-through routes by content, so a bare "Progressive" typed at the 2nd
+    Tag's insurer prompt would have been filed against car 1.
+    """
+    parts = _vehicle_edit_key_parts(ek)
+    if not parts:
+        return False
+    n, base = parts
+    vehicles = _extra_vehicles(state_data)
+    idx = n - 2
+    if not (0 <= idx < len(vehicles)):
+        return False
+    vehicle = vehicles[idx]
+    text = (new_text or "").strip()
+    cleared = text in ("", "-")
+
+    if base in ("fn", "ln"):
+        first, last = _name_parts_from_full(vehicle.get("name"))
+        first = "" if first == "-" else first
+        last = "" if last == "-" else last
+        if base == "fn":
+            first = "" if cleared else text
+        else:
+            last = "" if cleared else text
+        vehicle["name"] = ((first + " " + last).strip() or "") if (first or last) else ""
+    elif base == "addr":
+        # "11530 Mango terrace drive apt.102 Seffner Florida 33584" typed as one
+        # line fills BOTH address rows, mirroring _expand_address_pair for car 1.
+        if cleared:
+            vehicle["address"] = ""
+        else:
+            street, csz = _split_street_and_csz(text)
+            vehicle["address"] = street or text
+            if csz and _is_blank_field(vehicle.get("city_state_zip")):
+                vehicle["city_state_zip"] = csz
+    elif base == "col":
+        vehicle["color"] = "" if cleared else (
+            ai_vision.normalize_phase1_color(_clean_spoken_color(text) or text) or text)
+    else:
+        vehicle[VEHICLE_EDIT_TO_FIELD[base]] = "" if cleared else text
+
+    _clean_vehicle_vin(vehicle)
+    state_data[EXTRA_VEHICLES_KEY] = vehicles
+    return True
 
 
 # Tokens that mark a business/company name (case-insensitive). Used to keep
@@ -2902,6 +3034,180 @@ def _set_full_name(state_data: dict, first: str, last: str) -> None:
     state_data.pop("last_name", None)
 
 
+# ── Extra vehicles: one client, one transaction, one tag PER CAR ────────────
+# Car 1 stays exactly where it always was (the 11-line ``vehicle_details`` blob
+# plus ``plate``/``tag_control_number``), so every existing lead, query, message
+# and PDF is byte-identical. Cars 2..N live in their own JSONB column, never
+# appended to the blob: ``_clean_vin_and_car`` rewrites that blob from the eleven
+# car-1 keys on every single edit, and ``_phase1_from_stored_lead`` force-writes
+# the FIRST VIN it finds anywhere in it into car 1's slot — so an appended block
+# would be erased by the next keystroke, and until then could print car 2's VIN
+# on car 1's tag.
+EXTRA_VEHICLES_KEY = "extra_vehicles"
+
+# The eight fields an extra car carries, in the order the operator listed them.
+# Delivery address, date/time, phone, price, notes, email and DL are deliberately
+# absent: those belong to the transaction, not to a car.
+VEHICLE_FIELD_KEYS = (
+    "name", "address", "city_state_zip", "vin", "car", "color",
+    "insurance_company", "insurance_policy_number",
+)
+
+# Values that LOOK filled in but mean "nothing here". One copy so the review
+# card, the submit gate and the insurance rule cannot drift apart.
+#
+# Backslashes are normalised to "/" first because this repo carries a scar: the
+# sentinel list in _lead_already_insured reads "N\\A"/"n\\a", plainly meant to be
+# "N/A" -- and "\\a" is a VALID escape, so that entry is really "n" plus a bell
+# character and has never matched anything. Accepting both spellings here means a
+# car whose insurer reads "N/A" is correctly treated as needing coverage.
+_BLANK_FIELD_WORDS = frozenset({"-", "\u2014", "n/a", "na", "none", "null", "unknown"})
+
+
+def _is_blank_field(value) -> bool:
+    """True when a field is empty or holds one of the "nothing here" placeholders."""
+    v = str(value or "").strip()
+    if not v:
+        return True
+    return v.replace(chr(92), "/").casefold() in _BLANK_FIELD_WORDS
+
+
+def _extra_vehicles(obj) -> list:
+    """The extra cars on a lead row or a review state, always as a list of dicts.
+
+    Tolerant on purpose: the column may be absent (migration not run yet), JSON
+    null, or a string rather than parsed JSON. Any of those must read as "no
+    extra cars" and never raise in the middle of a dispatch.
+    """
+    raw = (obj or {}).get(EXTRA_VEHICLES_KEY)
+    if isinstance(raw, str):
+        try:
+            raw = json.loads(raw)
+        except Exception:
+            return []
+    if not isinstance(raw, list):
+        return []
+    return [dict(v) for v in raw if isinstance(v, dict)]
+
+
+def _lead_vehicle_indices(obj) -> list:
+    """[1] for an ordinary lead, [1, 2] for a two-car lead, and so on.
+
+    Every "send the tag" path loops this, so a single-car lead makes exactly the
+    one call it makes today.
+    """
+    return list(range(1, len(_extra_vehicles(obj)) + 2))
+
+
+def _vehicle_count(obj) -> int:
+    return len(_extra_vehicles(obj)) + 1
+
+
+def _blank_vehicle() -> dict:
+    """A fresh, empty extra car."""
+    return {k: "" for k in VEHICLE_FIELD_KEYS}
+
+
+def _vehicle_is_empty(vehicle: dict) -> bool:
+    """True when nothing has been typed into this car yet."""
+    return all(_is_blank_field((vehicle or {}).get(k)) for k in VEHICLE_FIELD_KEYS)
+
+
+def _ordinal_tag_label(n: int) -> str:
+    """2 -> '2nd Tag'. Car 1 is the lead itself, so this only ever sees 2 and up."""
+    n = int(n)
+    if 11 <= (n % 100) <= 13:
+        suffix = "th"
+    else:
+        suffix = {1: "st", 2: "nd", 3: "rd"}.get(n % 10, "th")
+    return f"{n}{suffix} Tag"
+
+
+def _vehicle_needs_coverage(vehicle: dict) -> bool:
+    """True when this car arrived with no insurer of its own.
+
+    The operator's rule: "if insurance is missing it means it needs tristate
+    coverage for that". A car that comes in with Geico or Progressive already has
+    a policy and must not be issued a second one.
+    """
+    return all(
+        _is_blank_field((vehicle or {}).get(k))
+        for k in ("insurance_company", "insurance_policy_number")
+    )
+
+
+def _all_vins_17(text: str) -> list:
+    """Every distinct 17-character VIN in the text, in the order they appear.
+
+    ``_extract_vin_17`` returns only the first, which is right for one car and is
+    exactly what hides the second one in a pasted two-car message. Runs that are
+    all digits or all letters are rejected: a real VIN mixes both, and a 17-digit
+    number is far more likely to be an account or policy number.
+    """
+    seen, out = set(), []
+    for m in VIN_PATTERN.finditer(text or ""):
+        v = m.group(0).upper()
+        if v in seen:
+            continue
+        if not (any(c.isdigit() for c in v) and any(c.isalpha() for c in v)):
+            continue
+        seen.add(v)
+        out.append(v)
+    return out
+
+
+def _clean_vehicle_vin(vehicle: dict) -> None:
+    """Validate an extra car's VIN in place, the way ``_clean_vin_and_car`` does
+    for car 1 — which only ever looks at car 1, so without this an extra car's
+    VIN would reach a printed tag with no length check at all.
+
+    A 17-char VIN typed into the Car field is rescued, and a VIN that is not 17
+    characters is kept (so the operator can see and fix their typo) but never
+    silently treated as valid.
+    """
+    if not isinstance(vehicle, dict):
+        return
+    vin = str(vehicle.get("vin") or "").strip()
+    car = str(vehicle.get("car") or "").strip()
+    if len(vin) != 17:
+        found = _extract_vin_17(vin) or _extract_vin_17(car)
+        if found:
+            vin = found
+            if car and _extract_vin_17(car) == found:
+                car = car.replace(found, "").strip(" ,;:-") or car
+    vehicle["vin"] = vin.upper() if len(vin) == 17 else vin
+    vehicle["car"] = car
+
+
+def _format_extra_vehicle_lines(vehicle: dict, n: int) -> str:
+    """One extra car rendered with the same labels, in the same order, as the
+    main card — the block the operator asked for."""
+    first, last = _name_parts_from_full((vehicle or {}).get("name"))
+    v = vehicle or {}
+    return "\n".join([
+        f"🚘 {_ordinal_tag_label(n)}",
+        f"👤First name: {first}",
+        f"👤Last name: {last}",
+        f"🏠Registration address: {v.get('address') or '-'}",
+        f"🏠Registration city, state, ZIP: {v.get('city_state_zip') or '-'}",
+        f"🔢VIN: {v.get('vin') or '-'}",
+        f"🚘Car: {v.get('car') or '-'}",
+        f"🎨Color: {v.get('color') or '-'}",
+        f"🛡Insurance company: {v.get('insurance_company') or '-'}",
+        f"🛡Insurance policy #: {v.get('insurance_policy_number') or '-'}",
+    ])
+
+
+def _format_all_extra_vehicle_lines(obj) -> str:
+    """Every extra car as one appended block, or "" when there are none — so a
+    single-car card renders byte-identically to before this feature existed."""
+    vehicles = _extra_vehicles(obj)
+    if not vehicles:
+        return ""
+    blocks = [_format_extra_vehicle_lines(v, i + 2) for i, v in enumerate(vehicles)]
+    return "\n\n" + "\n\n".join(blocks)
+
+
 def _format_phase1_field_lines(state_data: dict) -> str:
     """Plain-text list of all Phase 1 fields (same labels as the edit picker).
     Always renders Issuer note / Driver note so the summary matches the edit menu.
@@ -2927,7 +3233,9 @@ def _format_phase1_field_lines(state_data: dict) -> str:
         f"📧Email (required for insurance): {state_data.get('email') or '-'}",
         f"🪪Driver license (required for insurance): {state_data.get('driver_license_id') or '-'}",
     ]
-    return "\n".join(lines)
+    # Extra cars append their own block. With none, this adds "" and the card is
+    # byte-identical to before the feature existed.
+    return "\n".join(lines) + _format_all_extra_vehicle_lines(state_data)
 
 
 def _format_phase1_ai_review_text(state_data: dict) -> str:
@@ -3018,7 +3326,7 @@ def _build_review_keyboard_with_selections(state_data):
             callback_data="ph1_ins_toggle",
         )],
         [InlineKeyboardButton("🖼 Add image (title / license)", callback_data="ph1_add_image")],
-    ])
+    ] + _add_car_button_rows(state_data))
 
 async def _edit_message_keyboard(context, chat_id, message_id, keyboard):
     try:
@@ -3090,6 +3398,152 @@ async def _reanchor_review_card(context, chat_id, state_data) -> None:
         await _safe_delete_chat_message(context, old_cid, old_mid)
 
 
+def _add_car_button_rows(state_data: dict) -> list:
+    """The ➕ Add Car row, plus one shortcut per car already added.
+
+    Returned as rows so both the review card and the edit picker share exactly
+    one definition — a second copy is how the two screens drift apart.
+    """
+    rows = [[InlineKeyboardButton("➕ Add Car", callback_data=PH1_ADD_CAR_CB)]]
+    vehicles = _extra_vehicles(state_data)
+    if not vehicles:
+        return rows
+    shortcuts = [
+        InlineKeyboardButton(
+            f"🚘 {_ordinal_tag_label(i + 2)}",
+            callback_data=f"{PH1_CAR_MENU_CB}{i + 2}",
+        )
+        for i in range(len(vehicles))
+    ]
+    # Two per row so twenty cars stay usable on a phone.
+    rows += [shortcuts[i:i + 2] for i in range(0, len(shortcuts), 2)]
+    return rows
+
+
+def _vehicle_edit_fields_keyboard(state_data: dict, n: int) -> InlineKeyboardMarkup:
+    """One extra car's own field picker.
+
+    A sub-screen rather than nine more rows on the main picker: the main card is
+    already 18 lines and 19 buttons, and this keeps its size fixed however many
+    cars the client has.
+    """
+    v = _vehicle_at(state_data, n)
+    first, last = _name_parts_from_full(v.get("name"))
+    k = lambda base: f"ph1edit_{_vehicle_edit_key(n, base)}"
+    rows = [
+        [
+            InlineKeyboardButton(f"First name: {_truncate_btn_val(first)}", callback_data=k("fn")),
+            InlineKeyboardButton(f"Last name: {_truncate_btn_val(last)}", callback_data=k("ln")),
+        ],
+        [
+            InlineKeyboardButton(f"Reg address: {_truncate_btn_val(v.get('address'))}", callback_data=k("addr")),
+            InlineKeyboardButton(f"Reg city/ST/ZIP: {_truncate_btn_val(v.get('city_state_zip'))}", callback_data=k("csz")),
+        ],
+        [
+            InlineKeyboardButton(f"VIN: {_truncate_btn_val(v.get('vin'), 18)}", callback_data=k("vin")),
+            InlineKeyboardButton(f"Car: {_truncate_btn_val(v.get('car'))}", callback_data=k("car")),
+        ],
+        [
+            InlineKeyboardButton(f"Color: {_truncate_btn_val(v.get('color'))}", callback_data=k("col")),
+            InlineKeyboardButton(f"Insurance: {_truncate_btn_val(v.get('insurance_company'))}", callback_data=k("ins")),
+        ],
+        [
+            InlineKeyboardButton(f"Policy #: {_truncate_btn_val(v.get('insurance_policy_number'))}", callback_data=k("pol")),
+            InlineKeyboardButton("🗑 Remove this car", callback_data=f"{PH1_CAR_REMOVE_CB}{n}"),
+        ],
+        [
+            InlineKeyboardButton("✅ Submit", callback_data=PH1_REVIEW_ACCEPT),
+            InlineKeyboardButton("⬅️ Back to review", callback_data=PH1_EDIT_BACK),
+        ],
+    ]
+    return InlineKeyboardMarkup(rows)
+
+
+async def _show_vehicle_edit_picker(context, state_data, n: int, fallback_chat_id=None) -> None:
+    """Render the review message as one extra car's field picker."""
+    chat_id = context.user_data.get("review_chat_id")
+    mid = context.user_data.get("review_message_id")
+    if not chat_id or not mid:
+        if fallback_chat_id:
+            await _reanchor_review_card(context, fallback_chat_id, state_data)
+        return
+    try:
+        await context.bot.edit_message_text(
+            chat_id=chat_id,
+            message_id=mid,
+            text=f"🚘 {_ordinal_tag_label(n)} — tap a field to fill it in, "
+                 "then ⬅️ Back to review.\n\n"
+                 + _format_phase1_field_lines(state_data),
+            reply_markup=_vehicle_edit_fields_keyboard(state_data, n),
+        )
+    except Exception as e:
+        logger.warning("Could not show vehicle edit picker: %s", e)
+
+
+async def _handle_vehicle_menu_action(update, context, data: str, state_data: dict):
+    """➕ Add Car / open a car / remove a car. Returns the next state, or None if
+    ``data`` was not one of those.
+
+    Shared by BOTH callback entry points. The edit-menu state runs its own
+    handler first, so a copy living in only one of them would be a dead button on
+    whichever screen the operator happened to be on.
+    """
+    query = update.callback_query
+    user_id = query.from_user.id
+    chat_id = query.message.chat_id if query.message else None
+
+    if data == PH1_ADD_CAR_CB:
+        vehicles = _extra_vehicles(state_data)
+        # An untouched blank car already on the card: open that one instead of
+        # stacking up empties on repeated taps.
+        existing_blank = next(
+            (i for i, v in enumerate(vehicles) if _vehicle_is_empty(v)), None)
+        if existing_blank is None:
+            vehicles.append(_blank_vehicle())
+            state_data[EXTRA_VEHICLES_KEY] = vehicles
+            db.set_user_state(user_id, "phase1", state_data)
+            n = len(vehicles) + 1
+        else:
+            n = existing_blank + 2
+        await _close_open_field_prompt(context, chat_id)
+        await _show_vehicle_edit_picker(context, state_data, n, fallback_chat_id=chat_id)
+        return STATE_AI_REVIEW
+
+    if data.startswith(PH1_CAR_MENU_CB):
+        try:
+            n = int(data.replace(PH1_CAR_MENU_CB, "", 1))
+        except ValueError:
+            return STATE_AI_REVIEW
+        if not _vehicle_at(state_data, n):
+            # Stale button (car removed, or a restart). Say so rather than no-op.
+            await _show_edit_picker(context, state_data, fallback_chat_id=chat_id)
+            if chat_id:
+                await _send_vanishing(context, chat_id, "That car is no longer on this lead.")
+            return STATE_AI_REVIEW
+        await _close_open_field_prompt(context, chat_id)
+        await _show_vehicle_edit_picker(context, state_data, n, fallback_chat_id=chat_id)
+        return STATE_AI_REVIEW
+
+    if data.startswith(PH1_CAR_REMOVE_CB):
+        try:
+            n = int(data.replace(PH1_CAR_REMOVE_CB, "", 1))
+        except ValueError:
+            return STATE_AI_REVIEW
+        vehicles = _extra_vehicles(state_data)
+        idx = n - 2
+        if 0 <= idx < len(vehicles):
+            vehicles.pop(idx)
+            state_data[EXTRA_VEHICLES_KEY] = vehicles
+            db.set_user_state(user_id, "phase1", state_data)
+        await _close_open_field_prompt(context, chat_id)
+        await _show_edit_picker(context, state_data, fallback_chat_id=chat_id)
+        if chat_id:
+            await _send_vanishing(context, chat_id, f"🗑 Removed the {_ordinal_tag_label(n)}.")
+        return STATE_AI_REVIEW
+
+    return None
+
+
 def _phase1_edit_fields_keyboard(state_data: dict) -> InlineKeyboardMarkup:
     first, last = _display_name_parts(state_data)
     rows = [
@@ -3133,7 +3587,7 @@ def _phase1_edit_fields_keyboard(state_data: dict) -> InlineKeyboardMarkup:
             InlineKeyboardButton("✅ Submit", callback_data=PH1_REVIEW_ACCEPT),
             InlineKeyboardButton("⬅️ Back to review", callback_data=PH1_EDIT_BACK),
         ],
-    ]
+    ] + _add_car_button_rows(state_data)
     return InlineKeyboardMarkup(rows)
 
 
@@ -3360,7 +3814,12 @@ async def _continue_phase1_after_ai_review(message, context: ContextTypes.DEFAUL
     _apply_single_address_as_both(state_data)
     _clean_vin_and_car(state_data)
     _sanitize_phase1_pending_phone_price(state_data)
+    _prune_empty_extra_vehicles(state_data)
     db.set_user_state(user_id, "phase1", state_data)
+    blocked = _extra_vehicles_submit_block(state_data)
+    if blocked:
+        await message.reply_text(blocked)
+        return STATE_AI_REVIEW
     # VIN lookup is now opt-in via the "🔍 VIN" button on the review
     # screen; Submit no longer triggers a DMV decode automatically.
     # Re-check missing fields against a synthetic blob so detector still works
@@ -3381,6 +3840,71 @@ async def _continue_phase1_after_ai_review(message, context: ContextTypes.DEFAUL
 
 # Optional Phase 1 fields: never block with a question — blank shows as "-" in review.
 PHASE1_OPTIONAL_FIELDS = {"insurance_company", "insurance_policy_number", "extra_info", "delivery_date"}
+
+# What an extra car must have before a tag can be printed for it. Insurance is
+# absent on purpose: a blank insurer is the SIGNAL that this car needs coverage.
+_VEHICLE_REQUIRED_FOR_TAG = (
+    ("vin", "VIN"),
+    ("name", "first and last name"),
+    ("city_state_zip", "registration city, state, ZIP"),
+)
+
+
+def _prune_empty_extra_vehicles(state_data: dict) -> None:
+    """Drop extra cars nothing was ever typed into.
+
+    Tapping ➕ Add Car and changing your mind must not block the lead, and must
+    not mint a plate for a car that does not exist.
+    """
+    vehicles = _extra_vehicles(state_data)
+    kept = [v for v in vehicles if not _vehicle_is_empty(v)]
+    if len(kept) != len(vehicles):
+        state_data[EXTRA_VEHICLES_KEY] = kept
+
+
+def _extra_vehicles_submit_block(state_data: dict) -> str:
+    """Why this lead cannot be submitted yet, or "" when it can.
+
+    Deliberately NOT routed through the missing-field prompt queue: that
+    machinery walks one question at a time off an AI-produced list and has a
+    history of asking for values already on the card. Naming the car and the
+    field in one message is both clearer and far less fragile.
+    """
+    vehicles = _extra_vehicles(state_data)
+    if not vehicles:
+        return ""
+    problems = []
+    for i, v in enumerate(vehicles):
+        label = _ordinal_tag_label(i + 2)
+        for key, human in _VEHICLE_REQUIRED_FOR_TAG:
+            if _is_blank_field(v.get(key)):
+                problems.append(f"• {label}: {human} is missing")
+        vin = str(v.get("vin") or "").strip()
+        if vin and not _is_blank_field(vin) and len(vin) != 17:
+            problems.append(
+                f"• {label}: VIN is {len(vin)} characters, not 17 — {vin}")
+
+    # The same car entered twice would mint two plates for one vehicle, and
+    # nothing else in this project checks for a duplicate VIN.
+    all_vins = [str(state_data.get("vin") or "").strip().upper()] + [
+        str(v.get("vin") or "").strip().upper() for v in vehicles
+    ]
+    seen = set()
+    for i, vin in enumerate(all_vins):
+        if not vin or _is_blank_field(vin):
+            continue
+        if vin in seen:
+            where = "the first car" if i == 0 else _ordinal_tag_label(i + 1)
+            problems.append(f"• {where} repeats VIN {vin} — one car, one tag")
+        seen.add(vin)
+
+    if not problems:
+        return ""
+    return (
+        "🚘 Nearly there — the extra cars need a little more before their tags "
+        "can be printed:\n\n" + "\n".join(problems)
+        + "\n\nTap the car on the review card to fill it in, or 🗑 Remove it."
+    )
 
 
 def _track_missing_prompt(context: ContextTypes.DEFAULT_TYPE, sent_message) -> None:
@@ -3427,6 +3951,10 @@ async def _clear_vin_flow_msgs(context: ContextTypes.DEFAULT_TYPE) -> None:
 def _apply_single_phase1_edit(state_data: dict, edit_key: str, new_text: str) -> None:
     """Apply one field edit from the AI review flow."""
     new_text = (new_text or "").strip()
+    # An extra car's key ("v2vin") writes into that car and returns; a car-1 key
+    # is a no-op here and falls through to everything below, unchanged.
+    if _apply_vehicle_edit(state_data, edit_key, new_text):
+        return
     if edit_key in ("fn", "ln"):
         # Track first/last separately so editing them in EITHER order (or one without
         # the other) never clobbers the part you already set. Seed from the validated
@@ -3478,6 +4006,16 @@ def _clean_vin_and_car(state_data: dict) -> None:
     co = state_data.get("color")
     if co is not None and str(co).strip() and str(co).strip() != "-":
         state_data["color"] = ai_vision.normalize_phase1_color(str(co))
+    # Extra cars get the same VIN discipline. Their block is NOT part of the
+    # vehicle_details blob rebuilt below, so this only normalises the array.
+    extra = _extra_vehicles(state_data)
+    if extra:
+        for v in extra:
+            _clean_vehicle_vin(v)
+            c2 = v.get("color")
+            if c2 is not None and str(c2).strip() and str(c2).strip() != "-":
+                v["color"] = ai_vision.normalize_phase1_color(str(c2))
+        state_data[EXTRA_VEHICLES_KEY] = extra
     # Rebuild derived fields. Every line is coerced to a string with a "-" fallback:
     # a card that is still EMPTY (only dispatch selections saved, no field keys yet)
     # has these keys MISSING, and joining a None crashed the whole edit — the handler
@@ -4256,6 +4794,197 @@ def _parse_multi_field_line(line: str):
             merged = _clean_inline_value(prev_ek, (prev_val + " " + line[m.start():end]).strip())
             pairs[-1] = (prev_ek, merged or prev_val)
     return pairs or None
+
+
+# ── Two (or more) cars in one pasted message ────────────────────────────────
+_YEAR_IN_LINE_RE = re.compile(r"\b(19[89]\d|20[0-4]\d)\b")
+_MOSTLY_DIGITS_RE = re.compile(r"^[\s#:.\-]*\d[\d\s.\-]{4,}$")
+_COLOR_LABEL_RE = re.compile(r"^\s*colou?r\b[\s:.\-]*", re.IGNORECASE)
+
+
+def _split_vehicle_blocks(text: str):
+    """Split a paste into one block per car, or None when there is only one car.
+
+    Returns ``(blocks, shared)`` where ``blocks`` has one entry per VIN and
+    ``shared`` is everything that belongs to the job rather than to a car — the
+    header and the delivery/phone tail.
+
+    Paragraphs are the primary boundary because that is how these pastes actually
+    arrive; two VINs inside one paragraph fall back to cutting at the line holding
+    the second VIN.
+    """
+    vins = _all_vins_17(text)
+    if len(vins) < 2:
+        return None
+
+    paras, current = [], []
+    for line in (text or "").replace("\r\n", "\n").split("\n"):
+        if line.strip():
+            current.append(line)
+        elif current:
+            paras.append(current)
+            current = []
+    if current:
+        paras.append(current)
+
+    def vins_in(lines):
+        return _all_vins_17("\n".join(lines))
+
+    # One paragraph holding two VINs: cut it at the line carrying the later one.
+    expanded = []
+    for p in paras:
+        found = vins_in(p)
+        if len(found) < 2:
+            expanded.append(p)
+            continue
+        chunk, seen_one = [], False
+        for line in p:
+            if seen_one and _all_vins_17(line):
+                expanded.append(chunk)
+                chunk, seen_one = [line], True
+                continue
+            if _all_vins_17(line):
+                seen_one = True
+            chunk.append(line)
+        if chunk:
+            expanded.append(chunk)
+
+    blocks, shared, pending = [], [], []
+    for p in expanded:
+        if vins_in(p):
+            # Text sitting just above a car belongs to that car (its owner name).
+            blocks.append(pending + p)
+            pending = []
+        elif blocks:
+            pending = pending + p          # might belong to the next car
+        else:
+            shared.append(p)               # header, before any car
+    if pending:
+        # Nothing after it, so it is the job's tail: delivery, phone, price.
+        shared.append([ln for p in [pending] for ln in p])
+
+    if len(blocks) < 2:
+        return None
+    return (["\n".join(b) for b in blocks],
+            "\n".join("\n".join(p) for p in shared))
+
+
+def _fields_from_vehicle_block(block: str) -> dict:
+    """One car's fields out of its own block of a paste.
+
+    Deliberately ordered and consume-as-you-go: each line is claimed by the first
+    rule that recognises it, so the same line can never fill two fields.
+    """
+    v = _blank_vehicle()
+    lines = [ln.strip() for ln in (block or "").split("\n") if ln.strip()]
+    used = [False] * len(lines)
+
+    def claim(i):
+        used[i] = True
+
+    # 1. VIN — the anchor the whole block was found by.
+    for i, ln in enumerate(lines):
+        found = _extract_vin_17(ln)
+        if found:
+            v["vin"] = found.upper()
+            claim(i)
+            break
+
+    # 2. Colour — an explicit "Color: grey" label, else a line that is just a
+    #    colour word ("grey" on its own line, as these pastes are written).
+    for i, ln in enumerate(lines):
+        if used[i]:
+            continue
+        if _COLOR_LABEL_RE.match(ln):
+            v["color"] = ai_vision.normalize_phase1_color(
+                _clean_spoken_color(_COLOR_LABEL_RE.sub("", ln)) or "") or ""
+            claim(i)
+            break
+        if len(ln.split()) <= 2 and ln.replace("-", " ").split()[0].casefold() in _COMMON_COLORS:
+            v["color"] = ai_vision.normalize_phase1_color(_clean_spoken_color(ln) or ln) or ""
+            claim(i)
+            break
+
+    # 3. Car — a year makes it unambiguous, and an address line never has one
+    #    that is not also a house number, which the csz test below catches first.
+    for i, ln in enumerate(lines):
+        if used[i] or not _YEAR_IN_LINE_RE.search(ln):
+            continue
+        street, csz = _split_street_and_csz(ln)
+        if csz:
+            continue                       # "... Seffner Florida 33584" is an address
+        v["car"] = ln
+        claim(i)
+        break
+
+    # 4. Address — the line that splits into street + city/state/ZIP.
+    for i, ln in enumerate(lines):
+        if used[i]:
+            continue
+        street, csz = _split_street_and_csz(ln)
+        if street and csz:
+            v["address"] = street
+            v["city_state_zip"] = csz
+            claim(i)
+            break
+
+    # 5. Insurer, then the policy number POSITIONALLY. The classifier in this
+    #    codebase reads "0407306000" as a phone number, so asking it would file
+    #    Geico's policy as the client's phone.
+    for i, ln in enumerate(lines):
+        if used[i]:
+            continue
+        carrier = _insurer_name(ln)
+        if not carrier:
+            continue
+        v["insurance_company"] = carrier
+        claim(i)
+        for j in range(i + 1, len(lines)):
+            if used[j]:
+                continue
+            if _MOSTLY_DIGITS_RE.match(lines[j]):
+                v["insurance_policy_number"] = lines[j].strip(" #:.-")
+                claim(j)
+            break
+        break
+
+    # 6. Name — whatever is left that reads like one.
+    for i, ln in enumerate(lines):
+        if used[i]:
+            continue
+        words = ln.replace(",", " ").split()
+        if 2 <= len(words) <= 5 and all(w.replace(".", "").replace("-", "").isalpha() for w in words):
+            v["name"] = " ".join(words)
+            claim(i)
+            break
+
+    _clean_vehicle_vin(v)
+    return v
+
+
+def _apply_multi_vehicle_paste(state_data: dict, text: str):
+    """Pull cars 2..N out of a paste and put them on the card.
+
+    Returns ``(car1_text, added)``: the text still to be parsed for car 1 (its own
+    block plus the shared header/tail), and how many extra cars were added. On a
+    single-car paste returns ``(text, 0)`` and changes nothing.
+    """
+    if _extra_vehicles(state_data):
+        return (text, 0)                   # extra cars already on the card
+    split = _split_vehicle_blocks(text)
+    if not split:
+        return (text, 0)
+    blocks, shared = split
+    extras = [_fields_from_vehicle_block(b) for b in blocks[1:]]
+    extras = [v for v in extras if not _vehicle_is_empty(v)]
+    if not extras:
+        return (text, 0)
+    state_data[EXTRA_VEHICLES_KEY] = extras
+    # Car 1 keeps the existing, well-tested parser — it just no longer has the
+    # other cars' lines mixed into it, which is what made the first VIN, address
+    # and insurer ambiguous.
+    car1 = "\n".join(p for p in (shared, blocks[0]) if p.strip())
+    return (car1, len(extras))
 
 
 def _apply_bulk_review_text(state_data: dict, text: str):
@@ -5254,6 +5983,21 @@ async def handle_phase1_review_message(update: Update, context: ContextTypes.DEF
     handled = await _interpret_review_command(update, context, user_id, state_data, text)
     if handled is not None:
         return handled
+
+    # 2a. TWO CARS IN ONE PASTE: a whole job for a client with more than one car.
+    #     Cars 2..N come off the text here so car 1 is parsed from its own block,
+    #     by the same parser as always. A one-VIN paste is untouched by this.
+    text, _added_cars = _apply_multi_vehicle_paste(state_data, text)
+    if _added_cars:
+        db.set_user_state(user_id, "phase1", state_data)
+        _chat = update.effective_chat.id if update.effective_chat else message.chat_id
+        await _send_vanishing(
+            context, _chat,
+            f"🚘 Found {_added_cars + 1} cars — added the "
+            + ", ".join(_ordinal_tag_label(i + 2) for i in range(_added_cars))
+            + ". One client, one price, one receipt; a tag for each car.",
+            delay=8.0,
+        )
 
     # 2b. BULK PASTE: several lines where only some are labeled edits. Apply those,
     #     then let each remaining line find its own field (a bare email, phone, price
@@ -6664,6 +7408,9 @@ async def handle_another_tag_callback(update: Update, context: ContextTypes.DEFA
 
     # Same client & delivery; fresh vehicle.
     p1 = _phase1_from_stored_lead(lead)
+    # This is a NEW transaction for the same person, so the previous lead's extra
+    # cars must not come with it — their tags were already issued.
+    p1.pop(EXTRA_VEHICLES_KEY, None)
     p1["vin"] = ""
     p1["car"] = ""
     p1["color"] = ""
@@ -6965,6 +7712,22 @@ def _format_group_lead_message_html(
     else:
         tail_lines.append("📝 Issuer note: —")
     vehicle_block = f"🚗 Vehicle: {name_line}\n" + "\n".join(tail_lines)
+    # Extra cars, each with its own owner name, address, VIN, colour and insurer.
+    # One tag PDF follows per car; without this the team would see two documents
+    # and only one car described.
+    for i, v in enumerate(_extra_vehicles(phase1_data)):
+        vehicle_block += (
+            f"\n\n🚘 <b>{_h(_ordinal_tag_label(i + 2))}</b>: {_h(_safe_raw(v.get('name')))}\n"
+            + "\n".join([
+                f"🏠 Address: {_h(_safe_raw(v.get('address')))}",
+                f"🏙 City/ST/ZIP: {_h(_safe_raw(v.get('city_state_zip')))}",
+                f"🔢 VIN: {_h((v.get('vin') or '').strip() or '-')}",
+                f"🚘 Car: {_h((v.get('car') or '').strip() or '-')}",
+                f"🎨 Color: {_h(_safe_raw(v.get('color')))}",
+                f"🛡 Insurance: {_h(_safe_raw(v.get('insurance_company')))}",
+                f"📄 Policy #: {_h((v.get('insurance_policy_number') or '').strip() or '-')}",
+            ])
+        )
 
     issue_s = issue_dt.strftime("%Y-%m-%d %H:%M:%S %Z") if issue_dt else "N/A"
     expiry_s = expiry_dt.strftime("%Y-%m-%d %H:%M:%S %Z") if expiry_dt else "N/A"
@@ -7074,6 +7837,12 @@ def _phase1_from_stored_lead(lead: dict) -> dict:
         "extra_info": extra or lines[10] if lines[10] != "-" else "",
     }
 
+    # Extra cars ride along so every renderer downstream can show them without
+    # each one needing the raw lead row.
+    extra = _extra_vehicles(lead)
+    if extra:
+        phase1[EXTRA_VEHICLES_KEY] = extra
+
     # Override delivery details from the dedicated column
     if dd:
         phase1["delivery_details"] = dd
@@ -7154,6 +7923,12 @@ def _issuer_state_data_from_lead(lead: dict) -> dict:
     att = lead.get("phase1_attached_files")
     if isinstance(att, list) and att:
         out["attached_files"] = att
+    # Extra cars must survive a reassignment. The tags themselves are built from
+    # the lead row so they always go out, but without this the group getting the
+    # lead would read ONE car and receive two PDFs.
+    extra = _extra_vehicles(lead)
+    if extra:
+        out[EXTRA_VEHICLES_KEY] = extra
     return out
 
 
@@ -7309,25 +8084,81 @@ async def _send_full_group_lead_to_chat(
     # same targets. This runs only from accept handlers, so the tag now goes out for
     # EVERY lead type — including website leads — only after a team ACCEPTS.
     try:
-        await _build_and_send_tag_pdf(
+        await _send_all_tag_pdfs(
             context, lead, [tid for tid, _ in targets], renewal=renewal, accepted_by=accepted_by,
         )
     except Exception as e:
         logger.warning("Tag PDF send failed for ref %s: %s", reference_id, e)
 
 
-async def _tag_fields_from_lead(lead: dict, *, renewal: bool = False) -> dict:
+def _extra_vehicle_phase1(lead: dict, vehicle: int) -> dict:
+    """An extra car shaped like ``_phase1_from_stored_lead`` output, so the tag
+    builder needs no other change.
+
+    The delivery lines come from the LEAD: there is one delivery, one phone and
+    one price however many cars are on it.
+    """
+    vehicles = _extra_vehicles(lead)
+    idx = vehicle - 2
+    v = dict(vehicles[idx]) if 0 <= idx < len(vehicles) else {}
+    base = _phase1_from_stored_lead(lead)
+    return {
+        "name": v.get("name") or "",
+        "address": v.get("address") or "",
+        "city_state_zip": v.get("city_state_zip") or "",
+        "delivery_address": base.get("delivery_address") or "",
+        "delivery_city_state_zip": base.get("delivery_city_state_zip") or "",
+        "vin": v.get("vin") or "",
+        "car": v.get("car") or "",
+        "color": v.get("color") or "",
+        "insurance_company": v.get("insurance_company") or "",
+        "insurance_policy_number": v.get("insurance_policy_number") or "",
+        "extra_info": base.get("extra_info") or "",
+        "plate": v.get("plate") or "",
+        "tag_control_number": v.get("tag_control_number") or "",
+    }
+
+
+def _persist_extra_vehicle_plate(lead: dict, vehicle: int, plate: str, control: str) -> None:
+    """Write one extra car's plate back onto the lead, and into the in-memory
+    ``lead`` dict too so a re-read in the same request sees it.
+
+    Read-modify-write on a JSON array is only safe because plates are normally
+    minted at submit; this is the fallback for a lead created some other way
+    (HTTP ingest, an older row) or a renewal.
+    """
+    vehicles = _extra_vehicles(lead)
+    idx = vehicle - 2
+    if not (0 <= idx < len(vehicles)):
+        return
+    vehicles[idx]["plate"] = plate
+    vehicles[idx]["tag_control_number"] = control
+    lead[EXTRA_VEHICLES_KEY] = vehicles
+    db.update_lead(str(lead.get("id")), {EXTRA_VEHICLES_KEY: vehicles})
+
+
+async def _tag_fields_from_lead(lead: dict, *, renewal: bool = False,
+                                vehicle: int = 1) -> dict:
     """Resolve a stored lead into the field dict tag_pdf.build_tag_pdf expects.
 
-    Allocates (and persists) the plate + control number once per lead, decodes
+    Allocates (and persists) the plate + control number once per car, decodes
     the VIN for year/make/model/body (falling back to the typed vehicle line),
     and sets the registration state that picks the NJ vs non-NJ template. On a
     ``renewal`` the tag gets a FRESH plate + control and a new 30-day window
     (issued today) instead of the original, now-expired values.
+
+    ``vehicle`` is 1 for the lead's own car — the path every existing lead takes,
+    unchanged — and 2+ for an extra car, which carries its own name, address,
+    registration state, VIN, colour, insurer and plate. The state is read from
+    THAT car's city/state/ZIP, so a Florida second car cannot inherit a New York
+    first car's plate format or PDF template.
     """
     from utils import tag_pdf
 
-    phase1 = _phase1_from_stored_lead(lead)
+    if vehicle <= 1:
+        phase1 = _phase1_from_stored_lead(lead)
+    else:
+        phase1 = _extra_vehicle_phase1(lead, vehicle)
     first, last = tag_pdf.split_name(phase1.get("name", ""))
     csz = phase1.get("city_state_zip", "")
     state = tag_pdf.parse_state(csz)
@@ -7345,14 +8176,18 @@ async def _tag_fields_from_lead(lead: dict, *, renewal: bool = False) -> dict:
 
     # Plate + control number. A renewal always mints fresh ones (the old tag
     # expired); otherwise reuse the assigned values so re-sends are identical.
-    plate = "" if renewal else (lead.get("plate") or "").strip()
-    control = "" if renewal else (lead.get("tag_control_number") or "").strip()
+    plate = "" if renewal else (phase1.get("plate") or "").strip()
+    control = "" if renewal else (phase1.get("tag_control_number") or "").strip()
     if not plate or not control:
         alloc = await asyncio.to_thread(db.allocate_temp_plate, state == "NJ")
         plate = plate or alloc["plate"]
         control = control or alloc["control_number"]
         try:
-            db.update_lead(str(lead.get("id")), {"plate": plate, "tag_control_number": control})
+            if vehicle <= 1:
+                db.update_lead(str(lead.get("id")),
+                               {"plate": plate, "tag_control_number": control})
+            else:
+                _persist_extra_vehicle_plate(lead, vehicle, plate, control)
         except Exception as e:
             logger.warning("Could not persist plate for lead %s: %s", lead.get("id"), e)
 
@@ -7387,21 +8222,31 @@ async def _tag_fields_from_lead(lead: dict, *, renewal: bool = False) -> dict:
 async def _build_and_send_tag_pdf(
     context: ContextTypes.DEFAULT_TYPE, lead: dict, target_chat_ids: list,
     *, renewal: bool = False, accepted_by: str | None = None,
+    vehicle: int = 1, ride_insurance: bool = True,
 ) -> int:
-    """Generate the NJ temp-tag PDF for a lead and send it to each chat.
+    """Generate ONE car's NJ temp-tag PDF and send it to each chat.
 
     Returns the number of chats that actually received the PDF (0 if every
     send failed) so callers can avoid marking the tag delivered when it wasn't.
+
+    ``ride_insurance`` exists because the insurance hand-off is idempotent per
+    LEAD: on a multi-car lead only one of the calls can ever do anything, so
+    ``_send_all_tag_pdfs`` makes it exactly once instead of hoping the ordering
+    works out.
     """
     from utils import tag_pdf
 
     if not target_chat_ids:
         return 0
-    fields = await _tag_fields_from_lead(lead, renewal=renewal)
+    fields = await _tag_fields_from_lead(lead, renewal=renewal, vehicle=vehicle)
     pdf = await asyncio.to_thread(tag_pdf.build_tag_pdf, fields)
     reference_id = (lead.get("reference_id") or "N/A").strip()
     plate = fields.get("plate") or "tag"
-    caption = f"🧾 NJ 30-Day Temp Tag — {plate}\nReference: {reference_id}"
+    total = _vehicle_count(lead)
+    # "Car 1 of 2" only when there IS more than one — a single-car caption is
+    # exactly the string it has always been.
+    which = f" (Car {vehicle} of {total})" if total > 1 else ""
+    caption = f"🧾 NJ 30-Day Temp Tag — {plate}{which}\nReference: {reference_id}"
     if accepted_by:
         caption += f"\n✅ Accepted by {accepted_by}"
     filename = f"tag_{re.sub(r'[^A-Za-z0-9]+', '', plate) or 'tag'}.pdf"
@@ -7421,8 +8266,120 @@ async def _build_and_send_tag_pdf(
         except Exception as e:
             logger.warning("Could not send tag PDF to %s: %s", cid, e)
     # If the issuer opted into insurance, issue + drop the card right next to the tag.
-    await _maybe_ride_insurance_with_tag(context, lead, list(seen))
+    if ride_insurance:
+        await _maybe_ride_insurance_with_tag(context, lead, list(seen))
     return sent
+
+
+async def _send_all_tag_pdfs(
+    context: ContextTypes.DEFAULT_TYPE, lead: dict, target_chat_ids: list,
+    *, renewal: bool = False, accepted_by: str | None = None,
+) -> list:
+    """Every car on this lead gets its own tag. Returns per-car send counts.
+
+    A single-car lead loops exactly once, so it makes the identical call it
+    always made. The list (not a bool) is what lets the paid instant-PDF path
+    refuse to mark a lead delivered when the SECOND tag was the one that failed.
+    """
+    counts = []
+    for n in _lead_vehicle_indices(lead):
+        try:
+            counts.append(await _build_and_send_tag_pdf(
+                context, lead, target_chat_ids, renewal=renewal,
+                accepted_by=accepted_by, vehicle=n,
+                # Insurance is a per-lead hand-off; make it once, on the last car,
+                # so every car's details are already persisted when it runs.
+                ride_insurance=(n == _lead_vehicle_indices(lead)[-1]),
+            ))
+        except Exception as e:
+            logger.error("Tag PDF for car %s of lead %s failed: %s",
+                         n, lead.get("id"), e)
+            counts.append(0)
+    return counts
+
+
+async def _attach_extra_vehicles_for_create(payload: dict, source) -> dict:
+    """Put the card's extra cars, plates and all, onto a lead payload.
+
+    Called at EVERY ``db.create_lead`` site. There are five, only one of which is
+    the review card's own Submit — the rest are reached whenever the phone or
+    price still has to be asked for, and each of them would otherwise drop the
+    extra cars without a word and issue one tag.
+    """
+    extra = _extra_vehicles(source)
+    if extra:
+        payload[EXTRA_VEHICLES_KEY] = await _allocate_extra_vehicle_plates(extra)
+    return payload
+
+
+async def _warn_if_extra_vehicles_were_dropped(message, sent_payload: dict, lead: dict) -> None:
+    """Say so when the database could not store the extra cars.
+
+    ``create_lead`` drops columns the schema does not have and retries, which
+    keeps the lead saveable — and would otherwise mean the extra cars vanished
+    while the issuer was told it all worked.
+    """
+    wanted = sent_payload.get(EXTRA_VEHICLES_KEY) or []
+    if not wanted or _extra_vehicles(lead):
+        return
+    logger.error(
+        "Lead %s saved WITHOUT its %d extra vehicle(s) — extra_vehicles column missing",
+        (lead or {}).get("id"), len(wanted),
+    )
+    if message is None:
+        return
+    try:
+        await message.reply_text(
+            f"⚠️ This lead saved, but its {len(wanted)} extra car(s) did NOT — the "
+            "database is missing the extra_vehicles column, so only one tag will be "
+            "issued.\n\nRun database/migration_extra_vehicles.sql, then add the extra "
+            "car(s) again."
+        )
+    except Exception:
+        pass
+
+
+async def _allocate_extra_vehicle_plates(vehicles: list) -> list:
+    """Give every extra car its own plate and control number.
+
+    The NJ-vs-non-NJ format is read from EACH car's own registration city/state/
+    ZIP, not the lead's. In the case that prompted this feature car 1 is New York
+    and car 2 is Florida; using car 1's state would print an NJ ``H######`` plate
+    on a non-NJ template, or vice versa — a legally wrong document, silently.
+
+    Already-allocated plates are left alone so a re-send produces the identical
+    tag, exactly as car 1 behaves.
+    """
+    from utils import tag_pdf
+
+    out = []
+    for v in vehicles or []:
+        v = dict(v)
+        plate = str(v.get("plate") or "").strip()
+        control = str(v.get("tag_control_number") or "").strip()
+        if not plate or not control:
+            state = tag_pdf.parse_state(v.get("city_state_zip") or "")
+            alloc = await asyncio.to_thread(db.allocate_temp_plate, state == "NJ")
+            plate = plate or alloc["plate"]
+            control = control or alloc["control_number"]
+        v["plate"] = plate
+        v["tag_control_number"] = control
+        out.append(v)
+    return out
+
+
+def _multi_tag_notice_lines(lead: dict) -> list:
+    """["🏷 2 TAGS ON THIS JOB …"] for a multi-car lead, [] for an ordinary one.
+
+    A list rather than a string so it splices into an existing message with
+    ``*``: an empty string would add a blank line to every single-car message
+    that already ships today.
+    """
+    total = _vehicle_count(lead)
+    if total <= 1:
+        return []
+    return [f"🏷 {total} TAGS ON THIS JOB — one per car. "
+            f"Check you received all {total} PDFs."]
 
 
 def _insurance_chat_targets(lead: dict, target_chat_ids) -> list:
@@ -7475,6 +8432,113 @@ def _insurance_login_block(policy, portal_email, portal_pw,
     return "\n".join(lines)
 
 
+def _synthetic_lead_for_vehicle(lead: dict, vehicle: int) -> dict:
+    """One extra car dressed as a lead, so the insurance pipeline needs no change.
+
+    ``_build_and_send_insurance_card`` (and ``detect_card_state``, and
+    ``infer_car_and_color_from_vehicle_lines``) all read the 11 positional lines
+    of ``vehicle_details``. Handing them a blob containing ONLY this car means
+    they resolve this car's name, address, state, VIN, make and colour — with no
+    chance of picking up car 1's by index.
+    """
+    p1 = _extra_vehicle_phase1(lead, vehicle)
+    vd = "\n".join([
+        p1.get("name") or "-", p1.get("address") or "-", p1.get("city_state_zip") or "-",
+        p1.get("delivery_address") or "-", p1.get("delivery_city_state_zip") or "-",
+        p1.get("vin") or "-", p1.get("car") or "-", p1.get("color") or "-",
+        p1.get("insurance_company") or "-", p1.get("insurance_policy_number") or "-",
+        p1.get("extra_info") or "-",
+    ])
+    out = dict(lead)
+    out["vehicle_details"] = vd
+    # The extra cars must not travel with the copy — a synthetic single-car lead
+    # is the whole point, and leaving them on would recurse.
+    out.pop(EXTRA_VEHICLES_KEY, None)
+    return out
+
+
+async def _ride_insurance_for_extra_vehicles(context, lead: dict, chats: list) -> None:
+    """Coverage for each extra car that arrived without an insurer of its own.
+
+    Separate from the car-1 path on purpose: that path is idempotent on the
+    lead-level ``insurance_card_sent_at``, so a second call there could only ever
+    be a no-op. Each car stamps its own result inside its own entry.
+    """
+    vehicles = _extra_vehicles(lead)
+    if not vehicles:
+        return
+    email = (lead.get("email") or "").strip()
+    changed = False
+    for i, v in enumerate(vehicles):
+        n = i + 2
+        if not _vehicle_needs_coverage(v):
+            continue                      # already has Geico/Progressive/etc.
+        if str(v.get("insurance_card_sent_at") or "").strip():
+            continue                      # this car is already done
+        if not email:
+            for cid in chats:
+                try:
+                    await context.bot.send_message(
+                        chat_id=cid,
+                        text=f"🛡 The {_ordinal_tag_label(n)} needs coverage, but no "
+                             "client email is on file — card not issued.",
+                    )
+                except Exception:
+                    pass
+            return
+        try:
+            ok, policy, err, portal_email, portal_pw, pdf_bytes = (
+                await _build_and_send_insurance_card(_synthetic_lead_for_vehicle(lead, n)))
+        except Exception as e:
+            logger.warning("Insurance for car %s of lead %s failed: %s", n, lead.get("id"), e)
+            continue
+        now_iso = datetime.now(pytz.timezone("America/New_York")).isoformat()
+        if ok:
+            v["insurance_card_policy_number"] = policy
+            v["insurance_card_sent_at"] = now_iso
+            v["insurance_card_error"] = None
+            # The policy now belongs to this car, so the card shows it as insured.
+            v["insurance_company"] = v.get("insurance_company") or "TriState Coverage"
+            v["insurance_policy_number"] = v.get("insurance_policy_number") or (policy or "")
+        else:
+            v["insurance_card_error"] = (err or "Unknown error")[:500]
+        changed = True
+        for cid in chats:
+            if ok:
+                await _drop_insurance_pdf_in_chat(
+                    context, cid, pdf_bytes, policy,
+                    caption=f"🛡 Insurance card — {_ordinal_tag_label(n)}. "
+                            "Also emailed to the client.",
+                )
+                if portal_pw:
+                    try:
+                        await context.bot.send_message(
+                            chat_id=cid,
+                            text=_insurance_login_block(
+                                policy, portal_email, portal_pw,
+                                bool(lead.get("portal_password_unchanged"))),
+                        )
+                    except Exception:
+                        pass
+            else:
+                try:
+                    await context.bot.send_message(
+                        chat_id=cid,
+                        text=f"🛡 Couldn't issue the {_ordinal_tag_label(n)}'s insurance "
+                             f"card: {err or 'unknown error'}",
+                    )
+                except Exception:
+                    pass
+    if changed:
+        try:
+            await asyncio.to_thread(
+                db.update_lead, str(lead.get("id")), {EXTRA_VEHICLES_KEY: vehicles})
+            lead[EXTRA_VEHICLES_KEY] = vehicles
+        except Exception as e:
+            logger.warning("Could not persist extra-car insurance for lead %s: %s",
+                           lead.get("id"), e)
+
+
 async def _maybe_ride_insurance_with_tag(context, lead: dict, target_chat_ids: list) -> None:
     """Issuer opted into insurance → issue the card when the tag goes out: email +
     portal to the client (existing pipeline) and drop the PDF next to the tag. Idempotent
@@ -7485,8 +8549,6 @@ async def _maybe_ride_insurance_with_tag(context, lead: dict, target_chat_ids: l
         fresh = db.get_lead_by_id(lead.get("id")) or lead
         if not fresh.get("wants_insurance"):
             return
-        if (fresh.get("insurance_card_sent_at") or "").strip():
-            return  # already issued for this lead
         chats, seen = [], set()
         for cid in (_insurance_chat_targets(fresh, target_chat_ids)):
             key = _norm_chat_id(cid)
@@ -7494,6 +8556,11 @@ async def _maybe_ride_insurance_with_tag(context, lead: dict, target_chat_ids: l
                 continue
             seen.add(key)
             chats.append(cid)
+        # Extra cars first: car 1's guard below returns early once its card exists,
+        # which on a re-send would leave an uninsured second car untouched forever.
+        await _ride_insurance_for_extra_vehicles(context, fresh, chats)
+        if (fresh.get("insurance_card_sent_at") or "").strip():
+            return  # already issued for this lead
         email = (fresh.get("email") or "").strip()
         if not email:
             for cid in chats:
@@ -7598,6 +8665,7 @@ def _build_driver_lead_accepted_message_html(lead: dict) -> str:
         "✅ LEAD ACCEPTED — 🕊LET'S FLY 💸",
         "",
         f"Client name: {client_name}",
+        *_multi_tag_notice_lines(lead),
         "📍 Delivery Address",
         delivery,
         "",
@@ -8265,8 +9333,15 @@ async def handle_phase1_color_pick(update: Update, context: ContextTypes.DEFAULT
     if not state or state.get("data") is None or not color:
         return STATE_AI_REVIEW
     state_data = state["data"]
-    _apply_single_phase1_edit(state_data, "col", color)
-    _clean_vin_and_car(state_data)
+    # WHICH car's colour prompt is open. This used to be hardcoded to car 1, so
+    # tapping a colour for the 2nd Tag silently repainted the first car.
+    pending = context.user_data.get("phase1_pending_edit_key")
+    vehicle_parts = _vehicle_edit_key_parts(pending) if _edit_key_base(pending) == "col" else None
+    if vehicle_parts:
+        _apply_vehicle_edit(state_data, pending, color)
+    else:
+        _apply_single_phase1_edit(state_data, "col", color)
+        _clean_vin_and_car(state_data)
     context.user_data.pop("phase1_pending_edit_key", None)
     try:
         await query.message.delete()          # the palette itself
@@ -8275,9 +9350,14 @@ async def handle_phase1_color_pick(update: Update, context: ContextTypes.DEFAULT
     context.user_data.pop("edit_prompt_msg_id", None)
     db.set_user_state(user_id, "phase1", state_data)
     chat_id = query.message.chat_id if query.message else None
-    await _show_edit_picker(context, state_data, fallback_chat_id=chat_id)
+    if vehicle_parts:
+        await _show_vehicle_edit_picker(
+            context, state_data, vehicle_parts[0], fallback_chat_id=chat_id)
+    else:
+        await _show_edit_picker(context, state_data, fallback_chat_id=chat_id)
     if chat_id:
-        await _send_vanishing(context, chat_id, f"✅ Updated: color → {color}")
+        where = f"{_ordinal_tag_label(vehicle_parts[0])} " if vehicle_parts else ""
+        await _send_vanishing(context, chat_id, f"✅ Updated: {where}color → {color}")
     return STATE_AI_REVIEW
 
 
@@ -8423,6 +9503,15 @@ async def _place_text_at_field_prompt(state_data: dict, ek: str, text: str):
     of it, which is the only case worth warning about."""
     text = (text or "").strip()
     if not text:
+        return False, []
+    parts = _vehicle_edit_key_parts(ek)
+    if parts:
+        # An extra car's prompt is not a suggestion. Everything below routes by
+        # CONTENT, so "Progressive" or "grey" typed here would be filed against
+        # car 1 — the exact bug class this feature must not reintroduce.
+        n, base = parts
+        if _apply_vehicle_edit(state_data, ek, text):
+            return True, [f"{_ordinal_tag_label(n)} {PH1_EDIT_PROMPT_LABEL.get(base, base)}"]
         return False, []
     if ek not in _PROSE_EKS:
         labelled = _parse_multi_field_line(text)
@@ -8949,13 +10038,19 @@ async def handle_phase1_ai_review_callback(update, context):
         await _update_review_message_text(context, state_data)
         return STATE_AI_REVIEW
 
+    elif (data == PH1_ADD_CAR_CB
+          or data.startswith(PH1_CAR_MENU_CB)
+          or data.startswith(PH1_CAR_REMOVE_CB)):
+        handled = await _handle_vehicle_menu_action(update, context, data, state_data)
+        return handled if handled is not None else STATE_AI_REVIEW
+
     elif data.startswith("ph1edit_"):
         edit_key = data.replace("ph1edit_", "", 1)
         # Switching away from a field mid-edit: take its prompt down first.
         await _close_open_field_prompt(context, query.message.chat_id if query.message else None)
         context.user_data["phase1_pending_edit_key"] = edit_key
-        label = PH1_EDIT_PROMPT_LABEL.get(edit_key, edit_key)
-        if edit_key == "col":
+        label = _edit_prompt_label(edit_key)
+        if _edit_key_base(edit_key) == "col":
             # Colour gets the tap-to-pick palette; typing, a voice note and a photo
             # of the car all still work while this prompt is open.
             prompt = await query.message.reply_text(
@@ -9127,15 +10222,26 @@ async def handle_phase1_edit_menu_callback(update: Update, context: ContextTypes
             _build_review_keyboard_with_selections(state["data"]),
         )
         return STATE_AI_REVIEW
+    if (query.data == PH1_ADD_CAR_CB
+            or query.data.startswith(PH1_CAR_MENU_CB)
+            or query.data.startswith(PH1_CAR_REMOVE_CB)):
+        # This state runs its own handler FIRST, so the extra-car buttons have to
+        # be answered here too — not only on the review card.
+        state = db.get_user_state(user_id)
+        if not state or state.get("data") is None:
+            await query.message.reply_text("❌ Lead data not found. Please start over with /start")
+            return ConversationHandler.END
+        handled = await _handle_vehicle_menu_action(update, context, query.data, state["data"])
+        return handled if handled is not None else STATE_AI_EDIT_MENU
     if not query.data.startswith("ph1edit_"):
         return STATE_AI_EDIT_MENU
     edit_key = query.data.replace("ph1edit_", "", 1)
-    if edit_key not in PH1_EDIT_PROMPT_LABEL:
+    if not _is_known_edit_key(edit_key):
         return STATE_AI_EDIT_MENU
     await _close_open_field_prompt(context, query.message.chat_id if query.message else None)
     context.user_data["phase1_pending_edit_key"] = edit_key
-    label = PH1_EDIT_PROMPT_LABEL[edit_key]
-    if edit_key == "col":
+    label = _edit_prompt_label(edit_key)
+    if _edit_key_base(edit_key) == "col":
         await query.message.reply_text(_PH1_COLOR_PROMPT, reply_markup=_color_picker_keyboard())
     elif edit_key == "price":
         card = (db.get_user_state(user_id) or {}).get("data") or {}
@@ -9823,6 +10929,7 @@ async def _finalize_lead_after_notes(
         "contact_info_source": _resolve_contact_source_label(state_data),
         "phase1_attached_files": attached_for_dispatch,
     }
+    final_lead_data = await _attach_extra_vehicles_for_create(final_lead_data, state_data)
     lead = db.create_lead(final_lead_data)
     if not lead:
         await message.reply_text("❌ Error saving lead to database.")
@@ -9973,7 +11080,9 @@ async def _submit_lead_from_review(message, context, user_id, data):
     )
     if not attached_for_dispatch:
         attached_for_dispatch = data.get("attached_files") or []
+    lead_payload = await _attach_extra_vehicles_for_create({}, data)
     lead = db.create_lead({
+        **lead_payload,
         "user_id": user_id, "telegram_username": username,
         "vehicle_details": vd,
         "delivery_details": data.get("delivery_details", ""),
@@ -9993,6 +11102,7 @@ async def _submit_lead_from_review(message, context, user_id, data):
     if not lead:
         await message.reply_text("❌ Could not save lead.")
         return ConversationHandler.END
+    await _warn_if_extra_vehicles_were_dropped(message, lead_payload, lead)
     await _on_lead_created(context, lead)
 
     drivers_list: list = []
@@ -10167,6 +11277,7 @@ async def handle_group_selection(update: Update, context: ContextTypes.DEFAULT_T
             "contact_info_source": _resolve_contact_source_label(lead_data),
             "phase1_attached_files": _dispatch_attach_files(context, lead_data),
         }
+        final_lead_data = await _attach_extra_vehicles_for_create(final_lead_data, lead_data)
         lead = db.create_lead(final_lead_data)
         if not lead:
             await query.message.reply_text("❌ Error saving lead to database.")
@@ -10373,6 +11484,7 @@ async def handle_group_selection(update: Update, context: ContextTypes.DEFAULT_T
         "contact_info_source": _resolve_contact_source_label(lead_data),
         "phase1_attached_files": _dispatch_attach_files(context, lead_data),
     }
+    final_lead_data = await _attach_extra_vehicles_for_create(final_lead_data, lead_data)
     lead = db.create_lead(final_lead_data)
     if not lead:
         await query.message.reply_text("❌ Error saving lead to database.")
@@ -10590,6 +11702,7 @@ async def handle_driver_selection(update: Update, context: ContextTypes.DEFAULT_
             return ConversationHandler.END
         reference_id = lead.get("reference_id") or reference_id
     else:
+        final_lead_data = await _attach_extra_vehicles_for_create(final_lead_data, lead_data)
         lead = db.create_lead(final_lead_data)
         if not lead:
             await query.message.reply_text("❌ Error saving lead to database.")
@@ -14097,7 +15210,8 @@ def _build_renewal_group_message(renewal: dict) -> str:
         f"Expiration date: {exp_s}",
         f"Which driver accepted last month: {last_driver_name}",
         "",
-        f"🚗 Vehicle: {vd}",
+        f"🚗 Vehicle: {vd}" + _format_all_extra_vehicle_lines(lead),
+        *_multi_tag_notice_lines(lead),
         f"📍 Delivery: {dd}",
         f"📝 Extra info: {extra}",
         "",
@@ -14131,7 +15245,8 @@ def _build_renewal_driver_message(renewal: dict) -> str:
         "",
         "🏷 TAG INFO",
         f"👤 Client: {client_name}",
-        f"🚗 Vehicle: {vd}",
+        f"🚗 Vehicle: {vd}" + _format_all_extra_vehicle_lines(lead),
+        *_multi_tag_notice_lines(lead),
         f"📅 Issued: {issue_s}",
         f"⌛️ Expires: {exp_s}",
         "",

@@ -14,8 +14,10 @@ logger = logging.getLogger(__name__)
 #   phase1_attached_files          → migration_phase1_attached_files.sql
 #   email, driver_license_id,      → migration_email_dl_insurance_card.sql
 #   insurance_card_*
+#   extra_vehicles                 → migration_extra_vehicles.sql
 _OPTIONAL_LEADS_WRITE_KEYS = frozenset({
     "phase1_attached_files",
+    "extra_vehicles",
     "email",
     "driver_license_id",
     "insurance_card_policy_number",
