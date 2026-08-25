@@ -7453,8 +7453,13 @@ def _insurance_chat_targets(lead: dict, target_chat_ids) -> list:
     return out
 
 
-def _insurance_login_block(policy, portal_email, portal_pw) -> str:
-    """Plain-text portal login details to post next to the tag + card."""
+def _insurance_login_block(policy, portal_email, portal_pw,
+                           password_unchanged: bool = False) -> str:
+    """Plain-text portal login details to post next to the tag + card.
+
+    `password_unchanged` means this email ALREADY had an account, so the portal
+    kept its existing password rather than taking ours. Printing the one we sent
+    would hand the client a password that fails at the login screen."""
     base = (Config.TRISTATECOVERAGE_API_BASE or "https://tristatecoverage.com").rstrip("/")
     lines = ["🔐 Insurance portal login (also emailed to the client):"]
     if policy:
@@ -7462,7 +7467,10 @@ def _insurance_login_block(policy, portal_email, portal_pw) -> str:
     lines.append(f"🌐 {base}/login")
     if portal_email:
         lines.append(f"✉️ Email: {portal_email}")
-    if portal_pw:
+    if password_unchanged:
+        lines.append("🔑 Password: unchanged — this email already had an account.")
+        lines.append(f"   Forgotten it? Reset at {base}/login")
+    elif portal_pw:
         lines.append(f"🔑 Password: {portal_pw}")
     return "\n".join(lines)
 
@@ -7507,6 +7515,7 @@ async def _maybe_ride_insurance_with_tag(context, lead: dict, target_chat_ids: l
                 "insurance_card_error": None,
                 "portal_email": portal_email or email,
                 "portal_password": portal_pw,
+                "portal_password_unchanged": bool(fresh.get("portal_password_unchanged")),
             }
         else:
             payload = {
@@ -7522,7 +7531,11 @@ async def _maybe_ride_insurance_with_tag(context, lead: dict, target_chat_ids: l
         except Exception as e:
             logger.warning("Could not persist insurance result for lead %s: %s", fresh.get("id"), e)
         if ok:
-            login_txt = _insurance_login_block(policy, portal_email, portal_pw) if portal_pw else None
+            # The portal keeps an existing account's password, so a repeat client
+            # must not be handed the one we sent — it would fail at the login.
+            _unchanged = bool((fresh.get("portal_password_unchanged")))
+            login_txt = (_insurance_login_block(policy, portal_email, portal_pw, _unchanged)
+                         if (portal_pw or _unchanged) else None)
             for cid in chats:
                 await _drop_insurance_pdf_in_chat(
                     context, cid, pdf_bytes, policy,
@@ -11584,6 +11597,19 @@ async def _build_and_send_insurance_card(
         portal_payload,
         pdf_bytes,
     )
+    # The portal keeps an existing account's password rather than taking ours, and
+    # says so. Recorded on the lead dict the caller already holds: threading a
+    # seventh element through eleven return sites would be far more disruptive than
+    # this one documented out-parameter, and the caller reads it straight back.
+    try:
+        lead["portal_password_unchanged"] = bool(
+            (portal_result.payload or {}).get("passwordUnchanged")
+            or (portal_result.payload or {}).get("added") == "vehicle"
+            or (portal_result.payload or {}).get("alreadyExisted")
+        )
+    except Exception:
+        lead["portal_password_unchanged"] = False
+
     if not portal_result.ok:
         err = portal_result.error or "Portal create failed."
         return (

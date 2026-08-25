@@ -88,6 +88,54 @@ class RealFailuresStillFailTest(unittest.TestCase):
         self.assertFalse(_call(500, {}).ok)
 
 
+class TheClientIsNeverGivenAPasswordThatFailsTest(unittest.TestCase):
+    """The portal keeps an EXISTING account's password rather than taking ours.
+
+    The bot generates Temp#A9 and prints it as the login. On an account that
+    already existed createUser never ran, so that password does not work — handing
+    it over sends the client to a login screen that rejects them."""
+
+    def _block(self, unchanged):
+        import bot
+        return bot._insurance_login_block("POL123", "a@b.com", "Temp#A9", unchanged)
+
+    def test_a_new_account_gets_its_password(self):
+        self.assertIn("Temp#A9", self._block(False))
+
+    def test_an_existing_account_does_not(self):
+        block = self._block(True)
+        self.assertNotIn("Temp#A9", block)
+        self.assertIn("already had an account", block)
+
+    def test_it_says_how_to_recover_it(self):
+        self.assertIn("Reset at", self._block(True))
+
+    def test_the_email_and_policy_are_shown_either_way(self):
+        for unchanged in (True, False):
+            with self.subTest(unchanged=unchanged):
+                block = self._block(unchanged)
+                self.assertIn("a@b.com", block)
+                self.assertIn("POL123", block)
+
+    def test_the_server_reports_it(self):
+        """The route must tell us, or the bot cannot know to hold the password back."""
+        route = Path(r"C:/Users/tatia/Downloads/b_H821T7ehlpo/app/api/integrations/clients/route.ts")
+        if not route.exists():
+            self.skipTest("the tristatecoverage project is not on this machine")
+        src = route.read_text(encoding="utf-8")
+        self.assertIn("passwordUnchanged", src)
+
+    def test_an_existing_client_keeps_their_other_cars(self):
+        """delete().eq('user_id') is right for a new account and destructive on a
+        real one — it would remove the car they already had insured."""
+        action = Path(r"C:/Users/tatia/Downloads/b_H821T7ehlpo/app/actions/admin-create-client.ts")
+        if not action.exists():
+            self.skipTest("the tristatecoverage project is not on this machine")
+        src = action.read_text(encoding="utf-8")
+        self.assertIn(".eq('vin', input.vin)", src)
+        self.assertIn(".eq('policy_number', input.policyNumber)", src)
+
+
 class TheDuplicateDetectorTest(unittest.TestCase):
 
     def test_it_reads_every_field_the_portal_might_use(self):
