@@ -13910,33 +13910,90 @@ async def _issuer_open_driver_selection_after_group_accept(
 
 # A driver answering the offer in words. Deliberately narrow: these are answers to
 # a question that is on their screen, not general chat.
+# Answering an offer that is ALREADY PROVEN OPEN for this driver. Read the note
+# on handle_driver_word_answer before widening either of these: they are only
+# this generous because the offer is confirmed first.
+#
+# Anchored at the start but NOT at the end, so a reason can ride along — a driver
+# saying "no I'm in Newark till 6" is declining, and losing that to a blank lead
+# form is the failure this exists to prevent.
 _DRIVER_ACCEPT_RE = re.compile(
-    r"^\s*(?:accept(?:ed|ing)?|yes|yep|yeah|yup|ok|okay|sure|i'?ll\s+take\s+it|"
-    r"take\s+it|mine|got\s+it|on\s+it|i\s+got\s+it|claim(?:ed)?)\b[\s.!,]*$",
+    r"^\s*(?:"
+    r"accept(?:ed|ing)?|yes|yep|yeah|yup|ya|yea|y|ok|okay|k|kk|sure|"
+    r"i'?l?l?\s*(?:take|grab|do|get|run|handle)\s*(?:it|this|that|the\s+\w+)?|"
+    r"take\s+it|grab(?:bing)?\s+it|mine|got\s+it|on\s+it|i\s+got\s+(?:it|this)|"
+    r"claim(?:ed|ing)?(?:\s+it)?|"
+    r"on\s+my\s+way|omw|heading\s+(?:out|there)|going\s+now|"
+    r"count\s+me\s+in|i'?m\s+(?:in|on\s+it|good|free|available|close|nearby)|"
+    r"i\s+can\s+(?:take|do|grab|get)\s*(?:it|this|that)?|i'?ll\s+be\s+there|"
+    r"10[\s-]?4|copy(?:\s+that)?|roger(?:\s+that)?|wilco|bet|say\s+less"
+    r")\b[\s.!,]*"
+    # Emoji sit OUTSIDE the \b group: a word boundary needs a word character
+    # beside it, and an emoji is not one, so every emoji here used to be dead.
+    r"|^\s*[\U0001f44d\U0001f44c\u2705\U0001f64b\U0001f919\U0001f4aa]+\s*[.!,]*$",
     re.IGNORECASE,
 )
+# Words that defer or condition an answer. An accept carrying one of these is
+# not an acceptance of THIS offer, now — "accept the lead tomorrow", "yes but
+# after this one", "ok if nobody else takes it". Declines are unaffected: a
+# decline is already a no whatever the reason attached to it.
+_DRIVER_QUALIFIER_RE = re.compile(
+    r"\b(?:tomorrow|later|tonight|afterwards?|after|next\s+(?:week|one|run)|"
+    r"in\s+(?:a|an|\d+)\s*\w*|if|unless|but|maybe|might|probably|possibly|"
+    r"when|once|depend(?:s|ing)?|not\s+(?:now|yet)|another\s+time)\b",
+    re.IGNORECASE,
+)
+# Words that mean refusal on their own, so whatever follows is just the reason.
+_DRIVER_DECLINE_STRONG = (
+    r"decline[ds]?|pass|skip|"
+    r"can'?t|cannot|can\s+not|won'?t|unable|"
+    r"not\s+(?:me|able|today|now|free|available|interested)|"
+    r"i'?m\s+(?:busy|out|off|booked|tied\s+up|far|away|not\s+\w+)|"
+    r"too\s+far|different\s+driver|someone\s+else|give\s+it\s+to\s+\w+"
+)
+# A bare "no" is just the word "no", and it starts plenty of sentences that are
+# not answers — "no answer at the door", "no one is home", "no parking here".
+# Accepted only when the message ENDS there, or when what follows reads like a
+# reason rather than a noun.
+_DRIVER_DECLINE_BARE = r"no|nope|nah|naw|negative"
+_DRIVER_REASON_HEAD = (
+    r"i|i'?m|im|we|it'?s|its|not|too|sorry|just|cant|can'?t|wont|won'?t|"
+    r"unable|busy|far|out|off|booked|thanks|sir|man|bro"
+)
 _DRIVER_DECLINE_RE = re.compile(
-    r"^\s*(?:decline[d]?|no|nope|nah|pass|skip|can'?t|cannot|not\s+me|"
-    r"different\s+driver|someone\s+else)\b[\s.!,]*$",
+    rf"^\s*(?:{_DRIVER_DECLINE_STRONG})\b[\s.!,]*"
+    rf"|^\s*(?:{_DRIVER_DECLINE_BARE})\b\s*[.!]*\s*$"
+    rf"|^\s*(?:{_DRIVER_DECLINE_BARE})\b\s*[,;-]+\s*\S"
+    rf"|^\s*(?:{_DRIVER_DECLINE_BARE})\s+(?:{_DRIVER_REASON_HEAD})\b"
+    rf"|^\s*[\u274c\U0001f645\U0001f44e\U0001f6ab]+\s*[.!,]*$",
     re.IGNORECASE,
 )
 
 
 async def handle_driver_word_answer(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """"accept" / "yes" (or "no") from a driver with an open offer.
+    """"accept" / "yes" / "on my way" (or "no", with a reason) from a driver.
 
     Runs the button's own handler through _TypedAsTap rather than repeating the
     acceptance rules, so typing and tapping can never behave differently. Anything
-    else — or no open offer — passes straight through untouched."""
+    else — or no open offer — passes straight through untouched.
+
+    THE ORDER HERE IS THE DESIGN. Whether an offer is open is settled BEFORE the
+    text is read, which is what lets the vocabulary be generous: "bet", "10-4",
+    "on my way" and a bare 👍 are unmistakable from a driver who is looking at an
+    offer this second, and would be reckless to claim from anyone else.
+
+    Getting this wrong is expensive in one direction only. Unrecognised text from
+    a driver falls through to handle_idle_lead_start, so a miss does not just fail
+    to accept — it loses the offer and opens a blank lead form at them.
+    """
     msg = update.effective_message
     user = update.effective_user
-    if not msg or not user or not (msg.text or "").strip():
+    if not msg or not user:
+        return
+    text = ((msg.text or "") or (msg.caption or "")).strip()
+    if not text:
         return
     if getattr(msg, "chat", None) is not None and msg.chat.type != "private":
-        return
-    text = msg.text.strip()
-    accept = bool(_DRIVER_ACCEPT_RE.match(text))
-    if not accept and not _DRIVER_DECLINE_RE.match(text):
         return
     try:
         driver = await asyncio.to_thread(_driver_row_for_telegram_user, user.id)
@@ -13953,6 +14010,15 @@ async def handle_driver_word_answer(update: Update, context: ContextTypes.DEFAUL
     lead_id = str((pending or {}).get("lead_id") or "").strip()
     if not lead_id:
         return                                  # nothing open — could be anything
+    # Only now, with an offer proven open on this driver, read what they said.
+    accept = bool(_DRIVER_ACCEPT_RE.match(text)) and not _DRIVER_QUALIFIER_RE.search(text)
+    decline = bool(_DRIVER_DECLINE_RE.match(text))
+    if accept and decline:
+        return                                  # ambiguous — let them tap
+    if not accept and not decline:
+        return
+    logger.info("driver %s answered %r -> %s", driver.get("driver_name"),
+                text[:40], "accept" if accept else "decline")
     prefix = "accept_lead_" if accept else "decline_lead_"
     handler = handle_accept_lead if accept else handle_decline_lead
     await handler(_TypedAsTap(update, f"{prefix}{lead_id}"), context)
@@ -15225,6 +15291,25 @@ async def handle_reference_id_stray(update: Update, context: ContextTypes.DEFAUL
             "receipt photo.",
             parse_mode="Markdown")
     return STATE_WAITING_REFERENCE_ID
+
+
+async def handle_receipt_confirm_words(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """"yes" / "no" at the receipt confirmation.
+
+    Runs the button's own handler through _TypedAsTap so typing and tapping can
+    never drift apart. Anything else re-asks rather than dropping the message —
+    silence at a question is how an operator ends up staring at a dead screen.
+    """
+    msg = update.effective_message
+    text = ((msg.text if msg else "") or "").strip()
+    if _YES_RE.match(text) or _DRIVER_ACCEPT_RE.match(text):
+        return await handle_receipt_confirm_callback(
+            _TypedAsTap(update, "confirm_receipt"), context)
+    if _NO_RE.match(text) or _DRIVER_DECLINE_RE.match(text):
+        return await handle_receipt_confirm_callback(
+            _TypedAsTap(update, "cancel_receipt"), context)
+    await msg.reply_text("Please tap ✅ Confirm or ❌ Cancel above — or say yes or no.")
+    return STATE_WAITING_RECEIPT_CONFIRM
 
 
 async def handle_receipt_confirm_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -16896,7 +16981,7 @@ _CF_EDIT_TTL_SEC = 300
 async def handle_cf_edit_reply(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """The new email/phone for a client, typed after tapping Edit on a reminder.
 
-    Registered globally (group -1) because a reminder is answered wherever it was
+    Registered globally (group -45) because a reminder is answered wherever it was
     read — a team chat, a DM — not inside any conversation."""
     pending = (context.user_data or {}).get("cf_edit") or {}
     fid, field = pending.get("fid"), pending.get("field")
@@ -18424,7 +18509,15 @@ def main():
                 MessageHandler(filters.PHOTO | filters.Document.ALL,
                                handle_reference_id_stray),
             ],
-            STATE_WAITING_RECEIPT_CONFIRM: [CallbackQueryHandler(handle_receipt_confirm_callback, pattern="^(confirm_receipt|cancel_receipt)$")],
+            STATE_WAITING_RECEIPT_CONFIRM: [
+                CallbackQueryHandler(handle_receipt_confirm_callback,
+                                     pattern="^(confirm_receipt|cancel_receipt)$"),
+                # It asks "Please confirm this is the correct lead" and used to
+                # understand no word for yes — a typed or spoken answer reached
+                # nothing at all.
+                MessageHandler(filters.TEXT & ~filters.COMMAND,
+                               handle_receipt_confirm_words),
+            ],
             STATE_WAITING_RECEIPT_IMAGE: [
                 MessageHandler(_receipt_image_filter, handle_receipt_image),
                 MessageHandler(
@@ -18545,13 +18638,15 @@ def main():
         group=-1,
     )
 
-    # Voice notes work EVERYWHERE: group -5 runs before everything else,
-    # transcribes any private-chat voice/audio note, injects the transcript as the
-    # message text, then lets the update flow on — first through the group -2
-    # review-edit safety net below, then to whatever text handler is active.
+    # Voice notes work EVERYWHERE. This MUST be the lowest group number in the
+    # file: PTB runs groups lowest-first, so anything numerically below it reads
+    # the update before there is any text to read. It was at -5 while
+    # handle_cf_edit_reply sat at -45, which meant a SPOKEN answer to a follow-up
+    # reminder was transcribed only after the handler that wanted it had already
+    # been offered — and passed on — the wordless voice note.
     application.add_handler(
         MessageHandler(filters.VOICE | filters.AUDIO, _global_voice_to_text),
-        group=-5,
+        group=-50,
     )
 
     # Commands without the slash (group -3: after transcription, before everything
@@ -18567,11 +18662,15 @@ def main():
 
     # The new email/phone typed after tapping Edit on a follow-up reminder. Its own
     # group: a reminder is answered wherever it was read, inside no conversation.
-    # AFTER the group -5 transcriber, or a spoken answer never reaches it (its
-    # filter is TEXT, and voice only becomes text at -5).
+    # Runs after the transcriber at -50, so a SPOKEN answer arrives as text.
+    #
+    # No chat-type filter, deliberately: the follow-up keyboard posts its Edit
+    # prompt into the dispatch GROUP, and requiring a private chat meant the
+    # answer typed right underneath it was refused. Safe because the handler
+    # returns immediately unless that user tapped Edit in the last five minutes.
     application.add_handler(
         MessageHandler(
-            filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE,
+            filters.TEXT & ~filters.COMMAND,
             handle_cf_edit_reply),
         group=-45,
     )

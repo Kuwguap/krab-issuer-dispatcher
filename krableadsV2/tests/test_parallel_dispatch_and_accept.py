@@ -170,7 +170,13 @@ class ItStaysOutOfTheWayTest(unittest.TestCase):
         src = (ROOT / "bot.py").read_text(encoding="utf-8")
         block = src.split("handle_driver_word_answer,", 1)[1].split(")", 2)[1]
         self.assertIn("group=-4", block)
-        self.assertIn("group=-5,", src, "voice must still run BEFORE it")
+        # The invariant is the ORDER, not a magic number: PTB runs groups
+        # lowest-first, so the transcriber's group must be numerically below the
+        # driver handler's or a spoken "accept" arrives with no text in it.
+        import re as _re
+        voice = _re.search(r"_global_voice_to_text\),\s*group=(-?\d+)", src)
+        self.assertIsNotNone(voice, "voice transcriber is not registered")
+        self.assertLess(int(voice.group(1)), -4, "voice must still run BEFORE it")
         self.assertIn("group=-2,", src, "the review-edit net keeps its own group")
 
 
