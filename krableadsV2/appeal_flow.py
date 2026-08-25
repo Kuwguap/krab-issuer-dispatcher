@@ -102,7 +102,10 @@ def register_appeal_handlers(application: Application, deps: dict[str, Any]) -> 
             if msg:
                 await msg.reply_text("Please send the reference ID as text, or type /cancel.")
             return STATE_WAITING_APPEAL_REF
-        reference_id = msg.text.strip().upper()
+        # Same as the receipt flow: find the id inside the message rather than
+        # demanding it arrive alone.
+        from bot import extract_reference_id
+        reference_id = extract_reference_id(msg.text, db.get_lead_by_reference_id)
         lead = db.get_lead_by_reference_id(reference_id)
         if not lead:
             await msg.reply_text(

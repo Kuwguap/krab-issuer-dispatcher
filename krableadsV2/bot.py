@@ -2174,6 +2174,44 @@ def generate_reference_id() -> str:
     return ''.join(secrets.choice(alphabet) for _ in range(8))
 
 
+# A reference id as generate_reference_id() makes them: 8 uppercase alphanumerics.
+# The looser second form covers ids issued before that.
+_REF_ID_RE = re.compile(r"\b([A-Z0-9]{8}|[A-Z]{2}\d{5,8})\b")
+# "A B C 1 2 3 4 5" — a phone transcribing someone reading an id out loud.
+_REF_SPACED_RE = re.compile(r"\b(?:[A-Z0-9]\s+){5,}[A-Z0-9]\b")
+
+
+def extract_reference_id(text: str, exists=None) -> str:
+    """The reference id inside a message, or the message itself.
+
+    Drivers send "ref ABC12345", "Reference: ABC12345", "here it is ABC12345"
+    and "ABC12345 thanks" — all of which used to be handed whole to an exact
+    database match and come back "not found".
+
+    ``exists`` confirms a candidate before it is preferred, and the raw message
+    stays the fallback, so this can only turn a failed lookup into a working one.
+    """
+    raw = (text or "").strip()
+    up = raw.upper()
+    candidates = []
+    for m in _REF_SPACED_RE.finditer(up):
+        joined = re.sub(r"\s+", "", m.group(0))
+        if joined not in candidates:
+            candidates.append(joined)
+    for m in _REF_ID_RE.finditer(up):
+        if m.group(1) not in candidates:
+            candidates.append(m.group(1))
+    if exists is None:
+        return candidates[0] if candidates else up
+    for c in candidates:
+        try:
+            if exists(c):
+                return c
+        except Exception:
+            break
+    return up
+
+
 def parse_phase1_structured(message_text: str) -> dict:
     """
     Parse Phase 1 structured input into individual fields.
@@ -15221,7 +15259,9 @@ async def handle_reference_id_input(update: Update, context: ContextTypes.DEFAUL
         if msg:
             await msg.reply_text("Please send the reference ID as text, or type /cancel to restart from the top.")
         return STATE_WAITING_REFERENCE_ID
-    reference_id = msg.text.strip().upper()
+    # Pull the id out of whatever they typed around it — "ref ABC12345",
+    # "Reference: ABC12345", or the id read aloud and transcribed letter by letter.
+    reference_id = extract_reference_id(msg.text, db.get_lead_by_reference_id)
     
     # Get lead by reference ID
     lead = db.get_lead_by_reference_id(reference_id)
@@ -17855,6 +17895,15 @@ async def handle_settings_text(update: Update, context: ContextTypes.DEFAULT_TYP
         return SET_MENU
     if not _user_is_global_supervisor(update.effective_user.id):
         return ConversationHandler.END
+    # A named destination wins over a leading "back" or "close". "back to
+    # drivers" and "close the drivers list" both name a screen, and testing the
+    # escape words first threw that away — the operator asked for the driver list
+    # and landed on the main menu, or on nothing at all.
+    target = _settings_nav_target(text)
+    if target:
+        context.user_data.pop("tset_await", None)
+        await _show_settings_view(target, message=msg)
+        return SET_MENU
     if _SETTINGS_CLOSE_RE.match(text):
         context.user_data.pop("tset_await", None)
         await msg.reply_text("⚙️ Settings closed.")
@@ -17863,10 +17912,6 @@ async def handle_settings_text(update: Update, context: ContextTypes.DEFAULT_TYP
         context.user_data.pop("tset_await", None)
         await msg.reply_text(_SETTINGS_MENU_TEXT, parse_mode="Markdown",
                              reply_markup=_settings_main_kb())
-        return SET_MENU
-    target = _settings_nav_target(text)
-    if target:
-        await _show_settings_view(target, message=msg)
         return SET_MENU
     await msg.reply_text(_SETTINGS_HINT, parse_mode="Markdown",
                          reply_markup=_settings_main_kb())
