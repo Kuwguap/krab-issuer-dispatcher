@@ -2723,9 +2723,28 @@ _PH1_PRICE_PROMPT = "💲 type, speak, or tap the price"
 _PH1_TOLL_SUFFIX = " + toll"
 _TOLL_RE = re.compile(r"\btolls?\b", re.IGNORECASE)
 
+# Saying the word "toll" is not the same as wanting one. "150 no toll" used to
+# bill the client for a toll they had just declined, because the only test was
+# whether the word appeared at all. The window is short and stops at a full stop
+# so a later sentence cannot reach back and negate this one.
+_TOLL_NEG_RE = re.compile(
+    r"\b(?:no|not|non|without|minus|less|excluding|except|w/?o|drop|remove|skip)\b"
+    r"[^.]{0,14}?\btolls?\b"
+    r"|\btolls?\b[^.]{0,20}?\b(?:not\s+included|excluded|off)\b",
+    re.IGNORECASE,
+)
+
 
 def _price_has_toll(price) -> bool:
-    return bool(_TOLL_RE.search(str(price or "")))
+    """True only when a toll is actually WANTED.
+
+    The word alone is not consent: "150 no toll", "150 without toll" and
+    "150 toll not included" all name the toll in order to refuse it.
+    """
+    text = str(price or "")
+    if _TOLL_NEG_RE.search(text):
+        return False
+    return bool(_TOLL_RE.search(text))
 
 
 def _price_with_toll(price: str, on: bool) -> str:
@@ -3056,11 +3075,11 @@ VEHICLE_FIELD_KEYS = (
 # Values that LOOK filled in but mean "nothing here". One copy so the review
 # card, the submit gate and the insurance rule cannot drift apart.
 #
-# Backslashes are normalised to "/" first because this repo carries a scar: the
-# sentinel list in _lead_already_insured reads "N\\A"/"n\\a", plainly meant to be
-# "N/A" -- and "\\a" is a VALID escape, so that entry is really "n" plus a bell
-# character and has never matched anything. Accepting both spellings here means a
-# car whose insurer reads "N/A" is correctly treated as needing coverage.
+# Compared case-folded, and with backslashes read as "/", so every way an
+# operator writes "nothing" lands here: "N/A", "n/a", "N\\A" from a mangled
+# paste, "NONE", "null", "unknown". The hand-written tuple this replaced was
+# case-SENSITIVE and listed five spellings, so a car whose insurer field read
+# "none" counted as insured and never got the policy it needed.
 _BLANK_FIELD_WORDS = frozenset({"-", "\u2014", "n/a", "na", "none", "null", "unknown"})
 
 
@@ -3281,14 +3300,43 @@ def _truncate_btn_val(val: str, max_len: int = 22) -> str:
     return (v[: max_len - 1] + "…") if len(v) > max_len else v
 
 
-_INS_OFF_RE = re.compile(
-    r"\b(?:no|not?|remove|disable|turn\s*off|switch\s*off|skip|without|drop)\s+"
-    r"(?:the\s+)?insurance\b|^\s*insurance\s*(?:off|no)\s*[.!]*$",
+# The noun, however the operator says it.
+_INS_NOUN = r"(?:insurance|coverage)"
+
+# TALKING ABOUT insurance is not ASKING FOR it. "we need insurance info from him"
+# is a note to self about a missing document; it used to switch the policy on.
+_INS_REMARK_RE = re.compile(
+    rf"\b{_INS_NOUN}\s+(?:info|information|company|carrier|number|card\s+number|"
+    rf"paperwork|details|docs?|documents?|on\s+file|about)\b"
+    rf"|\b(?:no|any)\s+{_INS_NOUN}\s+(?:company|carrier|info|details)\b",
     re.I,
 )
+
+# Refusal, in the shapes people actually use. The apostrophe has to live INSIDE
+# the alternation: \bn't\b never matches inside "don't", which is why
+# "they don't need insurance" used to turn insurance ON.
+_INS_OFF_RE = re.compile(
+    rf"\b(?:no|not|never|remove|disable|skip|without|drop|cancel|scratch|forget)\b"
+    rf"[^.]{{0,16}}?{_INS_NOUN}\b"
+    rf"|\b(?:do|does|did|would|could|will|is|are|was|were|ca|wo)n'?t\b"
+    rf"[^.]{{0,16}}?{_INS_NOUN}\b"
+    rf"|{_INS_NOUN}[^.]{{0,14}}?\b(?:off|out)\b"
+    rf"|\balready\s+(?:has|have|had|got|is|are)\b[^.]{{0,14}}?{_INS_NOUN}\b"
+    rf"|\balready\s+insured\b"
+    rf"|\b(?:he|she|they|it)(?:'(?:s|re)|\s+(?:is|are))?\s+(?:already\s+)?covered\b"
+    rf"|^\s*{_INS_NOUN}\s*(?:off|no)\s*[.!]*$",
+    re.I,
+)
+
+# Asking for it. Stems are inflected ("need/needs", "want/wants") because the
+# operator talks about the client in the third person.
 _INS_ON_RE = re.compile(
-    r"\b(?:add|enable|turn\s*on|switch\s*on|include|want|with|need|do|get|issue)\s+"
-    r"(?:the\s+|an?\s+)?insurance\b|^\s*insurance\s*(?:on|yes|please)?\s*[.!]*$",
+    rf"\b(?:add|adds|enable|turn\s*on|switch\s*on|include|includes|want|wants|"
+    rf"with|need|needs|do|get|gets|issue|issues|give|gives|sell|sells)\s+"
+    rf"(?:the\s+|an?\s+|him\s+|her\s+|them\s+)?{_INS_NOUN}\b"
+    rf"|\bturn\s+(?:the\s+)?{_INS_NOUN}\s+on\b"
+    rf"|\bput\s+{_INS_NOUN}\s+on\b"
+    rf"|^\s*{_INS_NOUN}\s*(?:on|yes|please)\s*[.!]*$",
     re.I,
 )
 
@@ -3298,6 +3346,11 @@ def _insurance_intent(text: str):
     Whole-ish phrase match so a value like 'insurance GEICO' stays a field edit."""
     t = (text or "").strip()
     if not t:
+        return None
+    # Order is load-bearing: a remark about insurance is neither an on nor an off,
+    # and a refusal has to be read before the affirmation it contains ("do NOT add
+    # insurance" contains "add insurance").
+    if _INS_REMARK_RE.search(t):
         return None
     if _INS_OFF_RE.search(t):
         return False
@@ -12581,8 +12634,12 @@ def _lead_already_insured(lead: dict) -> bool:
     except Exception:
         phase1 = {}
     for key in ("insurance_company", "insurance_policy_number"):
-        val = str(phase1.get(key) or (lead or {}).get(key) or "").strip()
-        if val and val not in ("-", "—", "N/A", "n/a", "None"):
+        val = phase1.get(key) or (lead or {}).get(key) or ""
+        # One definition, shared with the per-car rule. The literal tuple this
+        # replaces compared case-SENSITIVELY and listed only five spellings, so
+        # "none", "na", "null" and "unknown" all counted as INSURED — and a car
+        # whose insurer field read "none" never got the policy it needed.
+        if not _is_blank_field(val):
             return True
     return False
 
