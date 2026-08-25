@@ -1887,6 +1887,34 @@ class Database:
             logger.error(f"Error getting contact info source: {e}")
             return None
 
+    def get_lead_counts_by_sender(self) -> list:
+        """[(name, count), …] — who ENTERED each lead, most first.
+
+        Counted from `leads` rather than assignments: this is about who put the
+        client into the bot, not who delivered it. Leads excluded from the count
+        (appeals, test entries) stay excluded here too, so the board agrees with
+        every other number in the system."""
+        if not self._check_tables_exist():
+            return []
+        try:
+            r = (
+                self.client.table("leads")
+                .select("user_id, telegram_username, exclude_from_count")
+                .execute()
+            )
+        except Exception as e:
+            logger.error("get_lead_counts_by_sender: %s", e)
+            return []
+        tally: Dict[str, int] = {}
+        for row in (r.data or []):
+            if row.get("exclude_from_count"):
+                continue
+            who = (row.get("telegram_username") or "").strip().lstrip("@")
+            if not who or who.lower() == "unknown":
+                who = f"id {row.get('user_id')}" if row.get("user_id") else "Unknown"
+            tally[who] = tally.get(who, 0) + 1
+        return sorted(tally.items(), key=lambda kv: (-kv[1], kv[0].lower()))
+
     def get_bot_usage(self, limit: int = 100) -> list:
         """Get recent bot usage (who sent to whom) for admin view."""
         if not self._check_tables_exist():

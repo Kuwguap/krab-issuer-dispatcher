@@ -299,6 +299,31 @@ async def cmd_test(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await msg.reply_text(_driverblock_status_text(_driverblock_enabled()), parse_mode="Markdown")
 
 
+async def cmd_leaderboard(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/stats and /leaderboard — who has entered the most clients.
+
+    Names and counts, nothing else: a roster with phone numbers on it is a list of
+    people to poach, and nobody needs one to see who is winning."""
+    msg = update.effective_message
+    if not msg:
+        return
+    rows = await asyncio.to_thread(db.get_lead_counts_by_sender)
+    if not rows:
+        await msg.reply_text("🏆 *Leaderboard*\n\n_No leads counted yet._",
+                             parse_mode="Markdown")
+        return
+    medals = {1: "🥇", 2: "🥈", 3: "🥉"}
+    total = sum(n for _, n in rows)
+    lines = [f"🏆 *Leaderboard* — {total} client{'s' if total != 1 else ''} entered", ""]
+    for i, (name, n) in enumerate(rows[:40], start=1):
+        mark = medals.get(i, f"{i}.")
+        lines.append(f"{mark} {_telegram_md1_escape(name)} — *{n}*")
+    if len(rows) > 40:
+        lines.append("")
+        lines.append(f"_…and {len(rows) - 40} more._")
+    await msg.reply_text("\n".join(lines), parse_mode="Markdown")
+
+
 async def cmd_drivers(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Supervisory-only roster: every driver with phone, email and chat id.
 
@@ -701,7 +726,10 @@ def _get_suspended_driver_ids() -> set[str]:
         logger.warning("_get_suspended_driver_ids: %s", e)
         return set()
     try:
-        s = set(s) | db.get_manually_suspended_driver_ids()
+        # set() on both sides: the method returns a set today, but `set | list` is
+        # a TypeError and the except below swallows it — which would drop every
+        # hand-suspended driver from the list without a word.
+        s = set(s) | set(db.get_manually_suspended_driver_ids() or ())
     except Exception as e:
         logger.warning("manual suspensions unavailable: %s", e)
     _SUSP_DRIVER_IDS_CACHE = (s, now)
@@ -5412,6 +5440,9 @@ async def handle_select_state_text(update: Update, context: ContextTypes.DEFAULT
 # Only the whole message counts, so a value that merely contains one of these words
 # is untouched.
 _BARE_COMMANDS = {
+    "start": "start", "begin": "start", "menu": "start",
+    "leaderboard": "leaderboard", "stats": "leaderboard", "board": "leaderboard",
+    "ranking": "leaderboard", "scoreboard": "leaderboard", "who is winning": "leaderboard",
     "help": "help", "commands": "help", "how do i use this": "help",
     "settings": "settings", "setting": "settings",
     "receipt": "receipt", "receipts": "receipt", "recipts": "receipt",
@@ -5660,7 +5691,9 @@ _IDLE_CHATTER = frozenset({
 # → open a fresh empty lead and wait for the details.
 _PURE_TRIGGER_RE = re.compile(
     r"^\s*(?:(?:new|add|another)\s+)?(?:lead|client|sale|tag|entry|order)s?\s*$"
-    r"|^\s*(?:start|new)\s*$",
+    # "start" is NOT here: bare "start" runs /start (see _BARE_COMMANDS), which is
+    # what someone typing it expects — the same screen the slash gives them.
+    r"|^\s*new\s*$",
     re.I,
 )
 # Optional leading trigger to strip when the message ALSO carries lead info.
@@ -8215,7 +8248,12 @@ async def handle_edit_field_text(update, context):
     await _autoclean_user_msg(update, context)
     ek = context.user_data.get("phase1_pending_edit_key")
     if not ek:
-        return STATE_AI_REVIEW
+        # Which field the prompt was for lives in memory a restart wipes, and a
+        # conversation re-entered from a stale button never had it. The card is
+        # still on screen and the words are still an edit — apply them as one
+        # rather than returning without a sound, which is what "price 150 did
+        # nothing" was.
+        return await handle_phase1_review_message(update, context)
 
     state = db.get_user_state(user_id)
     if not state or not state.get("data"):
@@ -8901,11 +8939,10 @@ async def handle_phase1_edit_input(update: Update, context: ContextTypes.DEFAULT
     user_id = update.effective_user.id
     ek = context.user_data.get("phase1_pending_edit_key")
     if not ek:
-        await update.message.reply_text(
-            "Use the buttons above (**Change another field** or **Done — continue lead**), or /start to begin again.",
-            parse_mode="Markdown",
-        )
-        return STATE_AI_EDIT_INPUT
+        # Same as above: the text is an edit even when we have forgotten which
+        # button opened the prompt. Telling them to use the buttons loses the value
+        # they just typed.
+        return await handle_phase1_review_message(update, context)
     text = (update.message.text or "").strip()
     state = db.get_user_state(user_id)
     if not state or not state.get("data"):
@@ -10596,7 +10633,17 @@ async def _background_dispatch_lead_after_driver_pick(
             + _telegram_md1_escape(_sanitize_phones_for_send(driver_note_disp))
         )
 
+    # The receipt link travels WITH the offer, so a driver has it in hand before the
+    # delivery rather than hunting for it after. It is a web page, not Telegram, so
+    # it still works tomorrow.
     accept_keyboard = _keyboard_lead_accept_decline(str(lead_id))
+    try:
+        accept_keyboard = InlineKeyboardMarkup(
+            list(accept_keyboard.inline_keyboard)
+            + [[InlineKeyboardButton("🧾 Upload receipt", url=receipt_portal_url(lead_id))]]
+        )
+    except Exception as e:
+        logger.warning("could not attach the receipt link to the offer: %s", e)
 
     async def _notify_one_driver(driver: dict) -> bool:
         """Deliver offer + optional receipt strike to one driver. Returns True if primary DM sent."""
@@ -14834,6 +14881,120 @@ async def cmd_my_followups(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         await update.message.reply_text("\n".join(lines), reply_markup=kb)
 
 
+# ── Where follow-ups and renewals go ────────────────────────────────────────
+# All of this used to be fixed in the environment, so changing who gets a reminder
+# meant a redeploy. It lives in the settings table now and every piece is editable
+# from /settings → Follow-ups: the email a copy goes to, the phone shown to clients,
+# the chat ids that get the reminder, and the dispatch chat the team watches.
+# Unset means "use the default" — the env value, or every supervisor for the ids.
+FU_EMAIL_KEY = "followup_email"
+FU_PHONE_KEY = "followup_phone"
+FU_CHATIDS_KEY = "followup_chat_ids"
+FU_TEAM_CHAT_KEY = "followup_dispatch_chat_id"
+
+
+def _fu_setting(key: str, default: str = "") -> str:
+    try:
+        return (db.get_setting(key) or "").strip() or default
+    except Exception:
+        return default
+
+
+def followup_email() -> str:
+    """Where the copy of every client email goes."""
+    return _fu_setting(FU_EMAIL_KEY, Config.FOLLOWUP_EMAIL_COPY)
+
+
+def followup_phone() -> str:
+    """The number clients are told to call."""
+    return _fu_setting(FU_PHONE_KEY, Config.FOLLOWUP_PHONE)
+
+
+def followup_chat_ids() -> list:
+    """Who gets the reminder. Defaults to every supervisor; editable to anyone."""
+    raw = _fu_setting(FU_CHATIDS_KEY)
+    if not raw:
+        return list(_global_supervisory_chat_ids())
+    out, seen = [], set()
+    for tok in re.split(r"[\s,;]+", raw):
+        cid = _parse_chat_id(tok)
+        # _parse_chat_id passes a non-numeric string straight through (it serves
+        # @username lookups elsewhere). A reminder needs a real chat id, so anything
+        # that is not one is dropped rather than failing later at send time.
+        if not isinstance(cid, int):
+            continue
+        key = _norm_chat_id(cid)
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(cid)
+    return out
+
+
+def followup_team_chat_id():
+    """The dispatch team's own chat, where the whole team sees the reminder.
+    Defaults to the first active dispatcher group so it works before anyone sets it."""
+    raw = _fu_setting(FU_TEAM_CHAT_KEY)
+    if raw:
+        return _parse_chat_id(raw)
+    try:
+        for g in (db.get_all_groups() or []):
+            if record_is_active(g):
+                cid = _parse_chat_id(g.get("group_telegram_id") or g.get("chat_id"))
+                if cid is not None:
+                    return cid
+    except Exception:
+        pass
+    return None
+
+
+def _followup_team_keyboard(short: str) -> InlineKeyboardMarkup:
+    """What the team can do with a reminder without leaving their chat."""
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("✅ Close (sold)", callback_data=f"cf_close_{short}"),
+         InlineKeyboardButton("🔕 Stop", callback_data=f"cf_stop_{short}")],
+        [InlineKeyboardButton("⏸ Pause 1 week", callback_data=f"cf_post_{short}"),
+         InlineKeyboardButton("⏭ Snooze 1 day", callback_data=f"cf_snooze_{short}")],
+        [InlineKeyboardButton("📧 Edit email", callback_data=f"cf_email_{short}"),
+         InlineKeyboardButton("📞 Edit phone", callback_data=f"cf_phone_{short}")],
+    ])
+
+
+async def handle_cf_edit_reply(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """The new email/phone for a client, typed after tapping Edit on a reminder.
+
+    Registered globally (group -1) because a reminder is answered wherever it was
+    read — a team chat, a DM — not inside any conversation."""
+    pending = (context.user_data or {}).get("cf_edit") or {}
+    fid, field = pending.get("fid"), pending.get("field")
+    if not fid or not field:
+        return
+    msg = update.effective_message
+    text = ((msg.text if msg else "") or "").strip()
+    if not text:
+        return
+    context.user_data.pop("cf_edit", None)
+    if text in ("-", "—", "none", "None"):
+        value = ""
+    elif field == "email":
+        value = ai_vision.normalize_email(text) or ""
+        if not value:
+            await msg.reply_text("❌ That is not an email address. Tap Edit again to retry.")
+            raise ApplicationHandlerStop
+    else:
+        value = _clean_inline_value("phone", text)
+        if not value:
+            await msg.reply_text("❌ That is not a phone number. Tap Edit again to retry.")
+            raise ApplicationHandlerStop
+    col = "email" if field == "email" else "phone_number"
+    ok = await asyncio.to_thread(db.update_client_followup, fid, {col: value})
+    await msg.reply_text(
+        (f"✅ {field.title()} updated to {value}." if value and ok
+         else f"✅ {field.title()} cleared — no more {field} on this client."
+         if ok else "❌ Could not save that."))
+    raise ApplicationHandlerStop
+
+
 async def _handle_cf_action(update: Update, context: ContextTypes.DEFAULT_TYPE, prefix: str) -> None:
     query = update.callback_query
     await query.answer()
@@ -14841,6 +15002,33 @@ async def _handle_cf_action(update: Update, context: ContextTypes.DEFAULT_TYPE, 
         fid = _long_uuid(query.data[len(prefix):])
     except (ValueError, Exception):
         await query.message.reply_text("❌ Invalid request.")
+        return
+
+    if prefix == "cf_post_":
+        # "Next week" — the one everybody actually wants when a client says
+        # "call me later".
+        from datetime import timezone
+        nxt = datetime.now(timezone.utc) + timedelta(days=7)
+        db.update_client_followup(fid, {"next_reminder_at": nxt.isoformat()})
+        try:
+            await query.edit_message_reply_markup(reply_markup=None)
+        except Exception:
+            pass
+        await query.message.reply_text("⏸ Paused — next reminder in a week.")
+        return
+
+    if prefix in ("cf_email_", "cf_phone_"):
+        # Change where THIS client's outreach goes, from the reminder itself.
+        what = "email" if prefix == "cf_email_" else "phone"
+        context.user_data["cf_edit"] = {"fid": fid, "field": what}
+        try:
+            await query.edit_message_reply_markup(reply_markup=None)
+        except Exception:
+            pass
+        await query.message.reply_text(
+            f"✏️ Send the new *{what}* for this client — or *-* to stop contacting "
+            f"them on it.",
+            parse_mode="Markdown")
         return
 
     if prefix == "cf_snooze_":
@@ -14919,6 +15107,18 @@ async def handle_cf_close(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
 async def handle_cf_stop(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await _handle_cf_action(update, context, "cf_stop_")
+
+
+async def handle_cf_postpone(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await _handle_cf_action(update, context, "cf_post_")
+
+
+async def handle_cf_edit_email(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await _handle_cf_action(update, context, "cf_email_")
+
+
+async def handle_cf_edit_phone(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await _handle_cf_action(update, context, "cf_phone_")
 
 
 async def handle_cf_snooze(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -15278,6 +15478,7 @@ def _settings_main_kb() -> InlineKeyboardMarkup:
         [InlineKeyboardButton("🚫 Suspensions", callback_data="tset_susp")],
         [InlineKeyboardButton("📊 Client Sources", callback_data="tset_srcs")],
         [InlineKeyboardButton("👑 Supervisors", callback_data="tset_sups")],
+        [InlineKeyboardButton("🔁 Follow-ups", callback_data="tset_fu")],
         [InlineKeyboardButton("✖️ Close", callback_data="tset_close")],
     ])
 
@@ -15474,6 +15675,44 @@ async def _settings_view_plates() -> tuple:
     return (txt, kb)
 
 
+async def _settings_view_followups() -> tuple:
+    """Who follow-ups and renewals reach. Every line is editable — this all used to
+    be fixed in the environment, so changing a recipient meant a redeploy."""
+    email = await asyncio.to_thread(followup_email)
+    phone = await asyncio.to_thread(followup_phone)
+    ids = await asyncio.to_thread(followup_chat_ids)
+    team = await asyncio.to_thread(followup_team_chat_id)
+    custom = await asyncio.to_thread(_fu_setting, FU_CHATIDS_KEY)
+    lines = [
+        "🔁 *Follow-ups & Renewals*",
+        "_Where every reminder goes._",
+        "",
+        f"📧 Email copy: `{email or '—'}`",
+        f"📞 Phone shown to clients: `{phone or '—'}`",
+        "",
+        "🆔 Reminders go to:",
+    ]
+    for cid in (ids or []):
+        lines.append(f"   • `{cid}`")
+    if not ids:
+        lines.append("   • _nobody_")
+    if not custom:
+        lines.append("   _(every supervisor — the default)_")
+    lines.append("")
+    lines.append(f"🏢 Dispatch team chat: `{team if team is not None else '—'}`")
+    lines.append("")
+    lines.append("_The whole team sees reminders there and can close, stop, pause a "
+                 "week, or change the client's email or phone from the message._")
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("📧 Edit email", callback_data="tset_fuemail"),
+         InlineKeyboardButton("📞 Edit phone", callback_data="tset_fuphone")],
+        [InlineKeyboardButton("🆔 Edit chat ids", callback_data="tset_fuids")],
+        [InlineKeyboardButton("🏢 Edit team chat", callback_data="tset_futeam")],
+        [InlineKeyboardButton("⬅️ Back", callback_data="tset_menu")],
+    ])
+    return ("\n".join(lines), kb)
+
+
 async def _settings_view_supervisors() -> tuple:
     """Who can open /settings. The env-configured ones are shown but fixed —
     removing the last way in from inside the room is not a thing to allow."""
@@ -15529,6 +15768,7 @@ _SETTINGS_VIEWS = {
     "tset_susp": _settings_view_suspensions,
     "tset_srcs": _settings_view_sources,
     "tset_sups": _settings_view_supervisors,
+    "tset_fu": _settings_view_followups,
 }
 # Spoken/typed navigation. Ordered: "suspend driver kita" is about suspensions even
 # though it also says "driver", so suspensions is tested before drivers.
@@ -15540,6 +15780,7 @@ _SETTINGS_NAV = [
     (re.compile(r"\b(?:drivers?|drv)\b", re.I), "tset_drivers"),
     (re.compile(r"\b(?:sources?|client\s*source|lead\s*source|origin)\b", re.I), "tset_srcs"),
     (re.compile(r"\b(?:supervisors?|admins?|administrators?|owners?)\b", re.I), "tset_sups"),
+    (re.compile(r"\b(?:follow[\s-]*ups?|renewals?|reminders?)\b", re.I), "tset_fu"),
 ]
 _SETTINGS_BACK_RE = re.compile(r"^\s*(?:back|menu|main|home|up|return)\b", re.I)
 _SETTINGS_CLOSE_RE = re.compile(r"^\s*(?:close|exit|quit|dismiss|finished|done)\b", re.I)
@@ -15551,6 +15792,7 @@ _SETTINGS_HINT = (
     "• *suspensions*\n"
     "• *client sources*\n"
     "• *supervisors*\n"
+    "• *follow-ups*\n"
     "…or *back* / *close*."
 )
 
@@ -15634,6 +15876,18 @@ async def handle_settings_cb(update: Update, context: ContextTypes.DEFAULT_TYPE)
     if data.startswith("tset_gtog:"):
         await asyncio.to_thread(db.toggle_group_status, data.split(":", 1)[1])
         await _show_settings_view("tset_groups", query=query); return SET_MENU
+    if data == "tset_fu":
+        await _show_settings_view("tset_fu", query=query); return SET_MENU
+    if data in ("tset_fuemail", "tset_fuphone", "tset_fuids", "tset_futeam"):
+        what = {"tset_fuemail": ("fu_email", "email a copy of every client message goes to"),
+                "tset_fuphone": ("fu_phone", "phone number clients are told to call"),
+                "tset_fuids": ("fu_ids", "chat ids that get the reminders (space or comma "
+                                          "separated, or *-* for every supervisor)"),
+                "tset_futeam": ("fu_team", "dispatch team chat id (*-* to use the first "
+                                            "active dispatcher)")}[data]
+        context.user_data["tset_await"] = {"kind": what[0]}
+        await query.message.reply_text(f"Send the new {what[1]}.", parse_mode="Markdown")
+        return SET_INPUT
     if data == "tset_sups":
         await _show_settings_view("tset_sups", query=query); return SET_MENU
     if data == "tset_supadd":
@@ -15801,6 +16055,30 @@ async def apply_settings_input(update: Update, context: ContextTypes.DEFAULT_TYP
             (f"✅ Added driver “{parts[0]}”." if ok else "❌ Could not add the driver."),
             reply_markup=_settings_main_kb())
         return SET_MENU
+    if st.get("kind") in ("fu_email", "fu_phone", "fu_ids", "fu_team"):
+        kind = st["kind"]
+        key = {"fu_email": FU_EMAIL_KEY, "fu_phone": FU_PHONE_KEY,
+               "fu_ids": FU_CHATIDS_KEY, "fu_team": FU_TEAM_CHAT_KEY}[kind]
+        raw = "" if text.strip() in ("-", "—") else text.strip()
+        if raw and kind == "fu_email":
+            raw = ai_vision.normalize_email(raw) or ""
+            if not raw:
+                return await _retry("❌ That is not an email address.")
+        if raw and kind == "fu_phone":
+            raw = _clean_inline_value("phone", raw)
+            if not raw:
+                return await _retry("❌ That is not a phone number.")
+        if raw and kind in ("fu_ids", "fu_team"):
+            found = [t for t in re.split(r"[\s,;]+", raw) if _parse_chat_id(t) is not None]
+            if not found:
+                return await _retry("❌ Send numeric chat ids — /whoami gives you yours.")
+            raw = " ".join(found) if kind == "fu_ids" else found[0]
+        ok = await asyncio.to_thread(db.set_setting, key, raw)
+        await update.message.reply_text(
+            ("✅ Saved." if raw else "✅ Cleared — back to the default.") if ok
+            else "❌ Could not save it.",
+            reply_markup=_settings_main_kb())
+        return SET_MENU
     if st.get("kind") == "add_supervisor":
         parts = [p.strip() for p in text.split("|")]
         cid = parts[-1] if parts else ""
@@ -15909,6 +16187,7 @@ def main():
             from telegram import BotCommand
             await app.bot.set_my_commands([
                 BotCommand("start", "Open the bot"),
+                BotCommand("leaderboard", "Who has entered the most clients"),
                 BotCommand("lead", "Add a new client/lead"),
                 BotCommand("newclient", "Add a new client/lead"),
                 BotCommand("newsale", "Add a new client/lead"),
@@ -16319,6 +16598,14 @@ def main():
         group=-3,
     )
 
+    # The new email/phone typed after tapping Edit on a follow-up reminder. Its own
+    # group: a reminder is answered wherever it was read, inside no conversation.
+    application.add_handler(
+        MessageHandler(
+            filters.TEXT & ~filters.COMMAND, handle_cf_edit_reply),
+        group=-6,
+    )
+
     # A driver answering their offer in words (its OWN group -4, after voice
     # transcription so a SPOKEN "accept" works too — only one handler per group
     # ever runs, so sharing a group with the review-edit net would mute one of them):
@@ -16352,6 +16639,9 @@ def main():
     application.add_handler(CommandHandler("test", cmd_test))
     # Self-check (anyone): shows your Telegram ID + supervisor/AI status.
     application.add_handler(CommandHandler(["whoami", "id", "me"], cmd_whoami))
+    # Who has entered the most clients. Open to everyone — it is a scoreboard.
+    application.add_handler(
+        CommandHandler(["leaderboard", "stats", "board", "ranking"], cmd_leaderboard))
     application.add_handler(CommandHandler("driverblock", cmd_driverblock))
     # Supervisory-only driver roster (phone / email / chat id), split over as many
     # messages as it takes — the /settings screen is capped at one.
@@ -16396,6 +16686,9 @@ def main():
     application.add_handler(CallbackQueryHandler(handle_cf_close, pattern="^cf_close_"))
     application.add_handler(CallbackQueryHandler(handle_cf_stop, pattern="^cf_stop_"))
     application.add_handler(CallbackQueryHandler(handle_cf_snooze, pattern="^cf_snooze_"))
+    application.add_handler(CallbackQueryHandler(handle_cf_postpone, pattern="^cf_post_"))
+    application.add_handler(CallbackQueryHandler(handle_cf_edit_email, pattern="^cf_email_"))
+    application.add_handler(CallbackQueryHandler(handle_cf_edit_phone, pattern="^cf_phone_"))
     application.add_handler(CallbackQueryHandler(handle_cf_renew, pattern="^cf_renew_"))
     application.add_handler(CallbackQueryHandler(handle_cf_done, pattern="^cf_done_"))
     application.add_handler(CallbackQueryHandler(handle_cf_delete, pattern="^cf_del_"))
@@ -16718,7 +17011,7 @@ def main():
                 if f.get("contact_client"):
                     agency = Config.FOLLOWUP_AGENCY_NAME
                     site = Config.FOLLOWUP_WEBSITE
-                    tel = Config.FOLLOWUP_PHONE
+                    tel = followup_phone()          # editable in /settings
                     if is_renewal:
                         sms_body = client_outreach.build_renewal_sms(name, agency, site, tel)
                         subj, mail_body = client_outreach.build_renewal_email(name, agency, site, tel)
@@ -16734,7 +17027,7 @@ def main():
                         ok, err = await asyncio.to_thread(
                             client_outreach.send_client_email,
                             f.get("email"), subj, mail_body,
-                            Config.FOLLOWUP_EMAIL_COPY,
+                            followup_email(),           # editable in /settings
                         )
                         client_results.append("📧 emailed" if ok else f"📧 email failed ({err})")
                     if client_results:
@@ -16772,16 +17065,35 @@ def main():
                 ]])
                 agent_label = f.get("telegram_username")
                 sup_lines = [f"👁 Supervisor copy" + (f" (agent @{agent_label})" if agent_label else "")] + lines
-                for sup_id in _global_supervisory_chat_ids():
-                    if _norm_chat_id(sup_id) == agent_key:
+                # Whoever is on the list — supervisors by default, editable to anyone.
+                sent_to = {agent_key}
+                for sup_id in followup_chat_ids():
+                    if _norm_chat_id(sup_id) in sent_to:
                         continue
+                    sent_to.add(_norm_chat_id(sup_id))
                     try:
                         await context.bot.send_message(
                             chat_id=sup_id, text="\n".join(sup_lines),
                             reply_markup=sup_kb, parse_mode="Markdown",
                         )
                     except Exception as e:
-                        logger.warning("Could not send follow-up copy to supervisor %s: %s", sup_id, e)
+                        logger.warning("Could not send follow-up copy to %s: %s", sup_id, e)
+                # And the dispatch team's own chat, so the whole team sees it and can
+                # act on it there — close, stop, pause a week, or change where the
+                # client is contacted.
+                team_chat = followup_team_chat_id()
+                if team_chat is not None and _norm_chat_id(team_chat) not in sent_to:
+                    team_lines = [("🔁 *Renewal due*" if is_renewal else "⏰ *Follow-up due*")
+                                  + (f" — agent @{agent_label}" if agent_label else "")] + lines[1:]
+                    try:
+                        await context.bot.send_message(
+                            chat_id=team_chat, text="\n".join(team_lines),
+                            reply_markup=_followup_team_keyboard(short),
+                            parse_mode="Markdown",
+                        )
+                    except Exception as e:
+                        logger.warning("Could not post the follow-up to the team chat %s: %s",
+                                       team_chat, e)
 
                 # 3) Schedule the next tick off the frequency (advance past now to avoid a burst).
                 days = _FU_FREQ_DAYS.get(f.get("frequency"), 7)
