@@ -82,6 +82,25 @@ take money without eventually delivering.
 
 ---
 
+## Understanding what people type
+
+The bot reads an instruction out of ordinary speech: "I'd like to select all
+drivers", "driver: Susan", "colour black please". Three switches control how far
+that goes. All are read at call time, so changing one needs a restart but not a
+deploy.
+
+| Variable | Default | What it does |
+|---|---|---|
+| `KRAB_FLUENCY` | on | The whole layer. Set to `0` and every command falls back to the exact phrasings that worked before it existed. This is the switch to reach for if the bot ever starts mis-reading messages. |
+| `KRAB_FLUENCY_SUBMIT` | **off** | Lets one sentence both comment and dispatch — "looks good send it out". Submitting is irreversible and that sentence is indistinguishable from a note ending the same way, so it is off until you want it. |
+| `KRAB_FLUENCY_BARENAME` | **off** | Lets a bare name pick a driver — "give it to Susan". The only evidence is that Susan is on the roster, which is also how a client named Will Smith could stop being a client. Off until you want it. |
+
+The layer can only ever ADD understanding: a phrase the bot already understood
+keeps its existing meaning, and a test asserts that the fluent pass can never
+overrule the strict one.
+
+---
+
 ## What is deliberately not automatic
 
 **The insurance account.** `/api/integrations/clients` lives on the deployed

@@ -5927,6 +5927,114 @@ def _source_by_exact_label(text: str):
     return None
 
 
+# Words that end a clause hard enough to start a new instruction after them.
+# Without one of these there is no boundary, and "send the tag out to the client"
+# would split into a note plus a submit.
+_SUBMIT_SPLIT_RE = re.compile(
+    r"^(?P<head>.+?)[\s,;]+(?P<tail>(?:"
+    r"send\s+it(?:\s+out)?|send\s+out|ship\s+it|submit\s+it|submit|dispatch\s+it|"
+    r"go\s+ahead|push\s+it|fire\s+it\s+off|let'?s\s+go|do\s+it"
+    r"))\s*[.!]*$",
+    re.IGNORECASE,
+)
+# A head made only of these is an opinion, not a field value: "looks good",
+# "that's everything", "I think we're good". Discarding it is the point — letting
+# it reach _smart_place_single_value files an assessment as the client's name.
+_ASSESSMENT_ONLY = frozenset({
+    "looks", "look", "looking", "good", "great", "fine", "perfect", "nice",
+    "ok", "okay", "alright", "all", "set", "that's", "thats", "that", "is",
+    "everything", "done", "ready", "i", "think", "we're", "were", "we", "yeah",
+    "yep", "cool", "sweet", "and", "so", "then", "now", "it", "this",
+})
+
+
+def _split_trailing_submit(text: str):
+    """("looks good", "send it out") when a message both comments and dispatches.
+
+    OFF unless KRAB_FLUENCY_SUBMIT=1. Submitting is irreversible, and
+    "looks good send it out" is genuinely indistinguishable from a driver note
+    that happens to end that way — so this ships dark and gets switched on
+    deliberately.
+
+    Returns None unless every gate passes: a hard boundary word before the tail,
+    one line, at most twelve words, and a head that is not a note.
+    """
+    if os.getenv("KRAB_FLUENCY_SUBMIT", "0") != "1":
+        return None
+    t = (text or "").strip()
+    if not t or "\n" in t or len(t.split()) > 12:
+        return None
+    m = _SUBMIT_SPLIT_RE.match(t)
+    if not m:
+        return None
+    head = m.group("head").strip(" ,;.")
+    if not head:
+        return None
+    # A head that is a real field edit stays a field edit — and a NOTE never
+    # splits, because a note is allowed to end with "send it out".
+    kind, payload = _classify_review_command_once(head, vin_pending=False)
+    if kind == "FIELD_EDITS" and any(ek in _PROSE_EKS for ek, _ in (payload or [])):
+        return None
+    return (head, m.group("tail"))
+
+
+def _bare_name_pick(text: str, state_data: dict):
+    """("SELECT_DRIVER", "Susan") for "give it to Susan" — or None.
+
+    OFF unless KRAB_FLUENCY_BARENAME=1. This is the only rule in the file that
+    acts on a message containing no command vocabulary at all: the sole evidence
+    is that a word in it happens to name somebody on the roster. That is exactly
+    how a client called Will Smith stops being a client.
+
+    So the gates are severe:
+      * strong matches only — an exact full name, an exact name token, or a
+        prefix of at least four characters. Never the fuzzy rung, which returns
+        "Ana Lopez" for the query "an".
+      * one pool only. A word naming both a driver and a dispatcher is ambiguous
+        and returns None rather than a guess.
+      * the card slot must still be unset, so this can never overwrite a choice
+        the operator already made.
+    """
+    if os.getenv("KRAB_FLUENCY_BARENAME", "0") != "1":
+        return None
+    t = (text or "").strip()
+    if not t or len(t.split()) > 8:
+        return None
+
+    def strong(pool, key):
+        q = t.casefold()
+        best = None
+        for row in pool or []:
+            name = str(row.get(key) or "").strip()
+            if not name:
+                continue
+            low = name.casefold()
+            if low == q or low in q.split() or (len(q) >= 4 and low.startswith(q)):
+                if best is not None and best is not row:
+                    return None              # two candidates — not evidence
+                best = row
+            elif len(low) >= 4 and low in q:
+                if best is not None and best is not row:
+                    return None
+                best = row
+        return best
+
+    try:
+        drivers = [d for d in _get_all_drivers_cached() if record_is_active(d)]
+        groups = [g for g in db.get_all_groups() if record_is_active(g)]
+    except Exception:
+        return None
+    d = strong(drivers, "driver_name") if not (state_data or {}).get("selected_driver_ids") else None
+    g = strong(groups, "group_name") if not (state_data or {}).get("selected_group_id") else None
+    if d and g:
+        return None                          # names both — ask, never guess
+    if d:
+        return ("SELECT_DRIVER", str(d.get("driver_name") or ""))
+    if g:
+        return ("SELECT_GROUP", str(g.get("group_name") or ""))
+    return None
+
+
 def _classify_review_command(text: str, *, vin_pending: bool = True):
     """What the operator just asked for, in their own words.
 
@@ -6162,6 +6270,27 @@ async def _interpret_review_command(update, context, user_id, state_data, text):
     # waiting. Without that, the VIN verbs must not fire at all.
     kind, payload = _classify_review_command(
         text, vin_pending=bool(context.user_data.get("vin_choice_api_car")))
+    if kind == "NONE":
+        # Last resort, and only with their flags on. Both act on messages that
+        # ordinary rules found nothing in, so they run AFTER everything else has
+        # declined — never instead of it.
+        split = _split_trailing_submit(text)
+        if split:
+            head, _tail = split
+            head_kind, _ = _classify_review_command_once(head, vin_pending=False)
+            if head_kind in ("NONE", "FIELD_EDITS"):
+                # "looks good" is an opinion; only a real edit is worth applying.
+                if head_kind == "FIELD_EDITS" and not all(
+                        w.strip(".,'").lower() in _ASSESSMENT_ONLY for w in head.split()):
+                    _apply_inline_review_text(state_data, head)
+                    db.set_user_state(user_id, "phase1", state_data)
+                logger.info("trailing submit: %r -> submit", text[:60])
+                kind, payload = "SUBMIT", None
+        if kind == "NONE":
+            guess = _bare_name_pick(text, state_data)
+            if guess:
+                logger.info("bare-name pick: %r -> %s %s", text[:60], *guess)
+                kind, payload = guess
     if kind in ("NONE", "FIELD_EDITS"):
         return None
     chat_id = update.effective_chat.id if update.effective_chat else None
