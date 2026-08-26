@@ -24,6 +24,7 @@ from telegram.error import BadRequest, Conflict, RetryAfter
 from telegram.ext import (
     Application,
     ApplicationHandlerStop,
+    BaseUpdateProcessor,
     CommandHandler,
     MessageHandler,
     ConversationHandler,
@@ -6297,6 +6298,129 @@ async def _open_source_picker(context: ContextTypes.DEFAULT_TYPE) -> None:
     await _edit_message_keyboard(context, chat_id, mid, InlineKeyboardMarkup(buttons))
 
 
+# What the model may do to the lead on screen. Deliberately a small set: these
+# are the operations the review card itself offers, so an AI-chosen one lands in
+# exactly the same code a tap does.
+_AI_CARD_TOOLS = frozenset({
+    "update_lead", "select_driver", "select_dispatcher", "add_vehicle",
+    "submit_lead",
+})
+
+
+async def _ai_review_command(update, context, user_id, state_data, text):
+    """The model's reading of a message the local rules did not understand.
+
+    Returns the next conversation state, or None to carry on falling through —
+    which is what happens with no key, no credit, a timeout, or a message the
+    model also declines to claim.
+    """
+    from utils import nl_router
+
+    # A parked call is waiting on one answer, so THIS message is that answer.
+    # Taken before anything else, and popped whatever happens: a slot left open
+    # is how the next unrelated sentence gets filed as somebody's name.
+    parked = nl_router.take_parked(context.user_data)
+    if parked:
+        # Unless the answer is plainly a new instruction, in which case the old
+        # call is abandoned rather than fed the word "cancel" as a driver name.
+        if not _COMMAND_LIKE_RE.search(text) and not _cancel_restart_kind(text):
+            args = dict(parked["args"])
+            args[parked["needs"]] = text.strip()
+            return await _run_ai_card_tool(update, context, user_id, state_data,
+                                           parked["tool"], args)
+
+    if not nl_router.is_configured():
+        return None
+    try:
+        cls = await asyncio.to_thread(nl_router.classify, text, card=state_data)
+    except ai_vision.AIVisionQuotaError:
+        await _warn_ai_unavailable(update, context)
+        return None
+    except Exception as e:
+        logger.warning("ai review command failed: %s", e)
+        return None
+    if not cls:
+        return None
+
+    tool = cls.get("tool") or ""
+    if tool not in _AI_CARD_TOOLS:
+        return None                    # not a card operation — let it fall through
+    args = cls.get("args") or {}
+
+    needs = nl_router.missing_args(tool, args)
+    if needs:
+        nl_router.park(context.user_data, tool, args, needs[0])
+        await update.effective_message.reply_text(nl_router.ask_for(tool, needs[0]))
+        return STATE_AI_REVIEW
+
+    return await _run_ai_card_tool(update, context, user_id, state_data, tool, args)
+
+
+async def _run_ai_card_tool(update, context, user_id, state_data, tool, args):
+    """Execute one AI-chosen card operation through the SAME code a tap uses.
+
+    Nothing is reimplemented here — each branch hands off to the function the
+    button already calls, so a tap and a sentence cannot drift apart.
+    """
+    logger.info("ai card tool: %s %s", tool, {k: str(v)[:40] for k, v in args.items()})
+    try:
+        import sentry_sdk
+        sentry_sdk.set_tag("ai_invoked", tool)
+    except Exception:
+        pass
+
+    if tool == "update_lead":
+        ek = _AI_FIELD_TO_EK.get(args.get("field") or "")
+        if not ek:
+            return None
+        vehicle = args.get("vehicle") or 1
+        if int(vehicle) > 1:
+            ek = _vehicle_edit_key(int(vehicle), _AI_FIELD_TO_VEHICLE_EK.get(
+                args.get("field") or "", ek))
+        _apply_single_phase1_edit(state_data, ek, str(args.get("value") or ""))
+        _clean_vin_and_car(state_data)
+        db.set_user_state(user_id, "phase1", state_data)
+        await _update_review_message_text(context, state_data)
+        return STATE_AI_REVIEW
+
+    if tool in ("select_driver", "select_dispatcher"):
+        kind = "SELECT_DRIVER" if tool == "select_driver" else "SELECT_GROUP"
+        payload = args.get("driver") or args.get("dispatcher") or ""
+        # Straight into the interpreter's own selection branch, so an ambiguous
+        # or unknown name opens the same picker a typed one does.
+        return await _interpret_review_command(
+            update, context, user_id, state_data,
+            f"{'driver' if kind == 'SELECT_DRIVER' else 'dispatcher'} {payload}")
+
+    if tool == "add_vehicle":
+        return await _handle_vehicle_menu_action(
+            update, context, PH1_ADD_CAR_CB, state_data)
+
+    if tool == "submit_lead":
+        return await _continue_phase1_after_ai_review(
+            update.effective_message, context, user_id)
+
+    return None
+
+
+# The tool's field name → the edit key the card already uses.
+_AI_FIELD_TO_EK = {
+    "first_name": "fn", "last_name": "ln", "address": "addr",
+    "city_state_zip": "csz", "delivery_address": "daddr",
+    "delivery_city_state_zip": "dcsz", "vin": "vin", "car": "car",
+    "color": "col", "insurance_company": "ins",
+    "insurance_policy_number": "pol", "phone": "phone", "price": "price",
+    "issuer_note": "issuer", "driver_note": "driver", "email": "email",
+    "driver_license": "dl",
+}
+# An extra car carries only the eight fields it owns.
+_AI_FIELD_TO_VEHICLE_EK = {
+    "first_name": "fn", "last_name": "ln", "address": "addr",
+    "city_state_zip": "csz", "vin": "vin", "car": "car", "color": "col",
+    "insurance_company": "ins", "insurance_policy_number": "pol",
+}
+
+
 async def _interpret_review_command(update, context, user_id, state_data, text):
     """Execute a natural-language review command (group/driver/source select, VIN).
     Returns the next conversation state, or None when the text is not a command (the
@@ -6326,6 +6450,12 @@ async def _interpret_review_command(update, context, user_id, state_data, text):
             if guess:
                 logger.info("bare-name pick: %r -> %s %s", text[:60], *guess)
                 kind, payload = guess
+        if kind == "NONE":
+            # Nothing local understood it. Ask the model what was meant.
+            handled = await _ai_review_command(update, context, user_id,
+                                               state_data, text)
+            if handled is not None:
+                return handled
     if kind in ("NONE", "FIELD_EDITS"):
         return None
     chat_id = update.effective_chat.id if update.effective_chat else None
@@ -7606,6 +7736,78 @@ async def _stage_plate_confirm(msg, context, col: str, digits: str) -> None:
     })
 
 
+# The operator is told the model is down, but not on every message — an outage
+# lasting an afternoon would otherwise become its own kind of noise.
+_AI_WARN_INTERVAL_SEC = 3600
+_ai_warned_at: dict = {}
+
+
+async def _warn_ai_unavailable(update, context) -> None:
+    """Say once an hour that AI understanding is off, so someone tops up.
+
+    Deliberately not silent: the deterministic layer still understands labelled
+    phrasings, so the bot keeps working — but nobody would know to fix the
+    account, and the fancy phrasings would just quietly stop being understood.
+    """
+    chat = update.effective_chat.id if update.effective_chat else 0
+    now = time.time()
+    if now - float(_ai_warned_at.get(chat) or 0) < _AI_WARN_INTERVAL_SEC:
+        return
+    _ai_warned_at[chat] = now
+    try:
+        await update.effective_message.reply_text(
+            "🤖 AI understanding is unavailable right now (the OpenAI account is "
+            "out of credit or rate limited). Everything still works — use a "
+            "labelled phrase like “price 150” or “driver Susan”, or the buttons."
+        )
+    except Exception:
+        pass
+
+
+class PerChatUpdateProcessor(BaseUpdateProcessor):
+    """Run different chats concurrently; run one chat's updates in order.
+
+    PTB warns against concurrent updates with ConversationHandler, and it is
+    right — the conversation state, context.user_data and the review card are all
+    written as though a chat's messages arrive one after another. Two interleaved
+    updates from the same person would read a card the other is halfway through
+    rewriting.
+
+    But that ordering only ever mattered WITHIN a chat. Holding a per-chat lock
+    keeps the guarantee the handlers actually rely on, and drops the one that was
+    only ever an accident of the default — that everybody queues behind everybody
+    else, which is what makes a one-second model call look like a dead bot.
+    """
+
+    def __init__(self, max_concurrent_updates: int = 32):
+        super().__init__(max_concurrent_updates)
+        self._locks: dict = {}
+
+    def _lock_for(self, update) -> asyncio.Lock:
+        """One lock per chat, created on demand.
+
+        Never evicted, on purpose: an asyncio.Lock is a few bytes, the number of
+        chats is bounded by the number of people who use this bot, and evicting
+        one while somebody holds it is a race with no upside.
+        """
+        chat = getattr(getattr(update, "effective_chat", None), "id", None)
+        key = str(chat if chat is not None else id(update))
+        lock = self._locks.get(key)
+        if lock is None:
+            lock = self._locks[key] = asyncio.Lock()
+        return lock
+
+    async def do_process_update(self, update, coroutine) -> None:
+        async with self._lock_for(update):
+            await coroutine
+
+    async def initialize(self) -> None:
+        return None
+
+    async def shutdown(self) -> None:
+        self._locks.clear()
+
+
 async def _route_supervisor_message(update, context, user_id, text: str) -> bool:
     """Interpret a supervisor's freeform message. Returns True if handled (caller
     then stops the update so no lead is started); False = not a router command."""
@@ -7651,9 +7853,17 @@ async def _route_supervisor_message(update, context, user_id, text: str) -> bool
     if not _ROUTER_HINT_RE.search(text):
         return False
     try:
-        cls = ai_vision.classify_supervisor_command(text)
+        # Function calling rather than prompt-coaxed JSON: the model gets a typed
+        # contract, so a missing argument is a validation result we can ask about
+        # instead of a guess written into a record.
+        #
+        # On a thread because this is a network call in an async handler — the
+        # version it replaces blocked the event loop for its whole duration.
+        from utils import nl_router
+        cls = await asyncio.to_thread(nl_router.classify, text)
     except ai_vision.AIVisionQuotaError:
         cls = None
+        await _warn_ai_unavailable(update, context)
     except Exception as e:
         logger.warning("router classify failed: %s", e)
         cls = None
@@ -18464,6 +18674,9 @@ def main():
     application = (
         Application.builder()
         .token(Config.TELEGRAM_BOT_TOKEN)
+        # Different chats in parallel, each chat still in order. See
+        # PerChatUpdateProcessor for why the blanket switch would not do.
+        .concurrent_updates(PerChatUpdateProcessor(max_concurrent_updates=32))
         .post_init(_post_init_set_commands)
         .build()
     )
