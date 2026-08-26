@@ -150,15 +150,23 @@ class Transport:
     def __init__(self):
         self.calls = []
         self.next_message_id = 1000
+        # The production failure of 2026-08-26: the chat's "Send Files" is off
+        # and the bot is not an admin, so sendDocument is refused while every
+        # sendMessage goes through.
+        self.fail_documents = False
 
     def reset(self):
         self.calls.clear()
+        self.fail_documents = False
 
     def endpoints(self):
         return [e for e, _ in self.calls]
 
     async def do_post(self, endpoint, data, **kwargs):
         self.calls.append((endpoint, dict(data or {})))
+        if endpoint == "sendDocument" and self.fail_documents:
+            raise telegram.error.BadRequest(
+                "Not enough rights to send documents to the chat")
         if endpoint == "getMe":
             return {"id": 1, "is_bot": True, "first_name": "TestBot",
                     "username": "testbot"}
@@ -384,6 +392,37 @@ class TagPdfReachesTheGroup(unittest.TestCase):
         docs = self._accept(EXTRA)
         self.assertEqual(len(docs), 2,
                          f"expected a tag per car; calls={TRANSPORT.endpoints()}")
+
+    def test_a_files_restricted_chat_is_told_in_text_why_there_is_no_tag(self):
+        """Telegram refusing the upload must not read as "waiting on a driver".
+
+        A chat with "Send Files" off (bot not an admin) accepts every TEXT the
+        handler sends and rejects the PDF, so the accept looked complete minus
+        the one message that mattered. The handler now says what happened, in
+        the chat, in the one format such a chat still lets through — with the
+        permission fix spelled out.
+        """
+        FAKE_DB.lead.pop("extra_vehicles", None)
+        FAKE_DB.group_accepted = False
+        FAKE_DB.driver_accepted = False
+        FAKE_DB.offered_to_a_team = True
+        TRANSPORT.reset()
+        TRANSPORT.fail_documents = True
+
+        async def go():
+            with mock.patch.object(telegram.Bot, "_do_post", TRANSPORT.do_post), \
+                 mock.patch.object(bot, "db", FAKE_DB):
+                await self.app.initialize()
+                await self.app.process_update(_accept_update(self.app, 7011))
+        asyncio.run(go())
+        notices = [d for e, d in TRANSPORT.calls
+                   if e == "sendMessage" and "Send Files" in str(d.get("text", ""))]
+        self.assertEqual(
+            len(notices), 1,
+            f"no failure notice reached the chat; calls={TRANSPORT.endpoints()}")
+        self.assertEqual(str(notices[0].get("chat_id")), str(GROUP_CHAT))
+        self.assertIn("ABC12345", str(notices[0].get("text", "")),
+                      "the notice must name the reference the tag belongs to")
 
 
 if __name__ == "__main__":

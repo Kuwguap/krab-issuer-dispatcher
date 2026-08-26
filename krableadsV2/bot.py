@@ -9150,7 +9150,28 @@ async def _build_and_send_tag_pdf(
             )
             sent += 1
         except Exception as e:
-            logger.warning("Could not send tag PDF to %s: %s", cid, e)
+            logger.error("Could not send tag PDF to %s: %s", cid, e)
+            # Every acceptance TEXT still arrives in a chat that blocks file
+            # uploads ("Send Files" off, bot not an admin), so a swallowed
+            # failure here reads as "still waiting on a driver". Say it in the
+            # one format such a chat still lets through.
+            hint = (
+                "\n\nFix: make this bot an admin of the group, or turn on "
+                "“Send Files” for members in the group permissions, "
+                "then ask for the tag again."
+                if "not enough rights" in str(e).lower()
+                else ""
+            )
+            try:
+                await context.bot.send_message(
+                    chat_id=cid,
+                    text=(
+                        f"⚠️ Tag {plate} for {reference_id} was generated but "
+                        f"could not be uploaded here: {e}{hint}"
+                    ),
+                )
+            except Exception as e2:
+                logger.warning("Tag-failure notice also undeliverable to %s: %s", cid, e2)
     # If the issuer opted into insurance, issue + drop the card right next to the tag.
     if ride_insurance:
         await _maybe_ride_insurance_with_tag(context, lead, list(seen))
