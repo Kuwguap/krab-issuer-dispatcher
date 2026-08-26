@@ -21,6 +21,12 @@ load_dotenv(dotenv_path=env_path)
 # Import Supabase directly - admin dashboard only needs Supabase, NOT Telegram
 from supabase import create_client, Client
 
+from utils.observability import init_sentry
+
+# Tagged separately from the bot worker: they deploy from one repo but fail in
+# very different ways, and an issue has to say which process it came from.
+init_sentry("dashboard")
+
 app = Flask(__name__)
 # CORS: allow frontend from any origin (Vercel, localhost) so preflight and responses always have headers
 CORS(app, resources={r"/api/*": {"origins": "*", "allow_headers": ["Content-Type", "Authorization"], "methods": ["GET", "POST", "PUT", "DELETE", "OPTIONS"]}})

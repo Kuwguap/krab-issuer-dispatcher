@@ -16715,6 +16715,21 @@ async def handle_fu_menu_text(update: Update, context: ContextTypes.DEFAULT_TYPE
     pending = fu.pop("pending", None)
     text = (update.message.text or "").strip()
     if not pending or pending not in _FU_TEXT_FIELDS:
+        # A LEAD is not a follow-up. This conversation stays open until it is
+        # finished or cancelled, so a lead pasted while it happens to be up used
+        # to be swallowed whole — two owners, two addresses, two VINs and two
+        # insurers compressed into a 500-character notes field, with the lead
+        # never created. A 17-character VIN is unmistakable; refuse and say why.
+        vins = _all_vins_17(text)
+        if vins:
+            fu["pending"] = pending          # nothing was consumed
+            await update.message.reply_text(
+                f"🚗 That looks like a LEAD ({len(vins)} VIN"
+                f"{'s' if len(vins) > 1 else ''}), not client follow-up info — "
+                "so I have not touched anything here.\n\n"
+                "Send /cancel to close this follow-up, then paste the lead again.",
+            )
+            return STATE_FU_MENU
         # No field tapped → treat as a data paste and parse it (AI first, regex fallback).
         parsed = None
         try:
@@ -18400,6 +18415,9 @@ async def _close_open_field_prompt(context, chat_id) -> None:
 
 
 def main():
+    # Before anything else, so a crash during startup is still reported.
+    from utils.observability import init_sentry
+    init_sentry("bot")
     """Main function to start the bot."""
     logger.info("Bot starting...")
     sys.stdout.flush()

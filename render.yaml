@@ -121,6 +121,12 @@ services:
     plan: starter
     healthCheckPath: /api/health
     envVars:
+      # Error reporting. Everything is scrubbed by utils/observability.py
+      # before it leaves the process; leave SENTRY_DSN unset to turn it off.
+      - key: SENTRY_DSN
+        sync: false
+      - key: SENTRY_ENVIRONMENT
+        value: production
       - key: SUPABASE_URL
         sync: false
       - key: SUPABASE_KEY
@@ -172,6 +178,12 @@ services:
     numInstances: 1
     maxShutdownDelaySeconds: 60
     envVars:
+      # Error reporting. Everything is scrubbed by utils/observability.py
+      # before it leaves the process; leave SENTRY_DSN unset to turn it off.
+      - key: SENTRY_DSN
+        sync: false
+      - key: SENTRY_ENVIRONMENT
+        value: production
       - key: TELEGRAM_BOT_TOKEN
         sync: false
       - key: MONDAY_API_KEY

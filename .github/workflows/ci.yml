@@ -1,0 +1,62 @@
+name: CI
+
+# Every push and every pull request. The suite is the only automated gate this
+# repo has before a change reaches a live dispatch bot, so it runs on both.
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  # A newer push supersedes an older run on the same branch.
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  krableadsV2:
+    name: krableadsV2 tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    defaults:
+      run:
+        working-directory: krableadsV2
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          # Render deploys on 3.11. Testing on anything else is testing a
+          # different program — an f-string backslash has bitten this repo
+          # before, and it only bites on the older interpreter.
+          python-version: '3.11'
+          cache: pip
+          cache-dependency-path: krableadsV2/requirements.txt
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pytest pytest-subtests
+
+      - name: Compile every module
+        # Catches a syntax error the tests would not reach, in seconds rather
+        # than minutes, and on the interpreter that actually runs in production.
+        run: python -m compileall -q bot.py admin_dashboard.py utils appeal_flow.py
+
+      - name: Run the suite
+        env:
+          # Dummies: the tests must never reach a real service. A missing key
+          # here is what makes the AI paths take their deterministic branch.
+          SUPABASE_URL: https://dummy.supabase.co
+          SUPABASE_KEY: dummy-key
+          TELEGRAM_BOT_TOKEN: '123456:ABC-DEF1234ghIkl-zyx57W2v1u123ew11'
+          # Explicitly empty: nothing from CI may reach the live Sentry project.
+          SENTRY_DSN: ''
+        run: python -m pytest tests/ -q
+
+      - name: Check that nothing personal can reach Sentry
+        # Its own step, so a failure here reads as what it is — a privacy
+        # regression, not a flaky test.
+        run: python -m pytest tests/test_observability.py -q

@@ -15,4 +15,6 @@ pillow>=10.0.0
 # tesseract system binary (apt-get install tesseract-ocr).
 pytesseract>=0.3.10
 resend>=2.0.0
-
+# Error reporting. Optional at runtime: utils/observability.py is a no-op
+# without SENTRY_DSN, so a developer machine reports nothing anywhere.
+sentry-sdk>=2.0.0

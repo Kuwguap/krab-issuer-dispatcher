@@ -1,0 +1,48 @@
+name: Sentry release
+
+# Tells Sentry which commit is live, and which commits went into it.
+#
+# This is what turns an issue into something an agent can act on. Without a
+# release, a stack trace says "bot.py line 9412" with no way to know WHICH
+# bot.py — and this file changes many times a day. With one, Sentry can show
+# the exact source, name the commits in the deploy, and suggest whose change
+# introduced a regression.
+#
+# Runs only after CI passes on main: a release that points at a commit which
+# never deployed is worse than no release at all.
+
+on:
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
+    branches: [main]
+
+jobs:
+  release:
+    # Only on green. A failed CI run means nothing deployed.
+    if: ${{ github.event.workflow_run.conclusion == 'success' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.workflow_run.head_sha }}
+          # Full history, so Sentry can work out which commits are new in this
+          # release rather than reporting every deploy as containing one commit.
+          fetch-depth: 0
+
+      - name: Create the release and associate its commits
+        uses: getsentry/action-release@v1
+        env:
+          SENTRY_AUTH_TOKEN: ${{ secrets.SENTRY_AUTH_TOKEN }}
+          SENTRY_ORG: ${{ secrets.SENTRY_ORG }}
+          SENTRY_PROJECT: ${{ secrets.SENTRY_PROJECT }}
+        with:
+          environment: production
+          # MUST match utils/observability.py's release string exactly, or the
+          # events land under a release that carries no source.
+          version: krableads@${{ github.event.workflow_run.head_sha }}
+          set_commits: auto
+          # Render redeploys on the same push, so the deploy is happening now.
+          finalize: true
