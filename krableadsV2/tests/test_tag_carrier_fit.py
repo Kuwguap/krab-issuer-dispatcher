@@ -99,12 +99,21 @@ class TheCarrierNeverTouchesThePolicyTest(unittest.TestCase):
                 self.assertIsNotNone(carrier, name)
                 self.assertLessEqual(carrier[1][2], policy[1][0], f"{name} -> {carrier[0]!r}")
 
-    def test_it_stays_inside_its_own_box_too(self):
-        """The box ends at x=345.16 — overflowing it is what reached the neighbour."""
+    def test_it_stays_inside_the_column_the_reference_tags_use(self):
+        """The bound is the POLICY COLUMN at x=353.00, not the ins widget's own
+        x1=345.16.
+
+        The authoritative tag disproves the widget: ED CASTILLO.pdf prints
+        AMERICAN ROAD INS CO from 260.50 out to 345.68 — past that widget — and
+        begins the policy number at 353.00, which is not where the policy widget
+        begins either (353.67). Both rects are approximations of a grid sitting
+        slightly left of them, so the carrier is fitted to the real gap with a
+        1pt gutter, and 352.00 is where it must stop.
+        """
         for name in LONG_NAMES:
             with self.subTest(carrier=name):
                 carrier, _ = _ins_and_policy(_render(name))
-                self.assertLessEqual(carrier[1][2], 345.16 + 0.5, f"{name} -> {carrier[0]!r}")
+                self.assertLessEqual(carrier[1][2], 352.0, f"{name} -> {carrier[0]!r}")
 
     def test_the_non_resident_template_too(self):
         carrier, policy = _ins_and_policy(

@@ -53,12 +53,109 @@ _LAYOUT = {
     "plate": {"left": 38.6, "bottom": 341.9, "width": 707.5, "height": 156.3, "size": 180, "baseline_top": 238.0, "x_left": 30.0},
     "exp": {"left": 120.8, "bottom": 292.1, "width": 512.4, "height": 54.9, "size": 60, "baseline_top": 309.0, "x_left": 117.0},
     "car": {"left": 37.1, "bottom": 234.1, "width": 712.98, "height": 40, "size": 20, "baseline_top": 376.0, "x_left": 338.0},
-    "plate_left": {"left": 35.8, "bottom": 138.0, "width": 72, "height": 8, "size": 7.5, "baseline_top": 472.6},
+    # 7.0, not the ported 7.5 — matches the plate1 widget's own /ArialMT 7 Tf
+    # and both reference tags.
+    "plate_left": {"left": 35.8, "bottom": 138.0, "width": 72, "height": 8, "size": 7.0, "baseline_top": 472.6},
 }
 
 # Filled AcroForm fields are drawn manually at their widget rects; these three
 # are the hero elements drawn separately and never filled.
 _HERO_FIELDS = {"plate1", "exp3", "car"}
+
+# The shipped templates' baked artwork is one revision behind the authoritative
+# tags. Two text matrices are wrong, and both are painted by the template itself
+# rather than drawn by this module:
+#
+#   "TEMPORARY VEHICLE REGISTRATION" sits 3pt above its own row-mate "DEALER
+#   COPY", which the template already places correctly;
+#   the non-resident "30 Day Non-Resident Temporary Plate" banner is 2.812pt
+#   right of where the reference tags put it.
+#
+# NJ.pdf carries the header defect byte-identically, so fixing it there makes the
+# resident tag internally consistent. It does NOT contain the banner literal —
+# its resident title is a different string — so that substitution is a measured
+# no-op on NJ, which is the correct outcome: there is no resident ground truth
+# that would justify moving it.
+#
+# Patched in memory on every render rather than by rewriting the .pdf assets, so
+# the shipped templates stay byte-identical to what the operator's other tools
+# use. The `== 1` guard makes this a silent no-op on any re-exported template.
+# Where the authoritative generator actually prints each small value. Its
+# flattened stream draws at absolute coordinates in whole tenths of a point,
+# exactly the way _LAYOUT already anchors the hero fields — the widget rects are
+# a near-miss stand-in, off by 0.8 to 2.7pt depending on the column.
+#
+# Every value below is byte-identical in ED CASTILLO.pdf and CAIN CHERNICE.pdf,
+# including the owner name, which renders at 12.76pt in one and 9.00/8.60 in the
+# other yet starts at the same x — so x is an anchor, not a computation.
+#
+# Keyed by (field name, widget x0 to 0.1) because date1, vin1 and exp1 each name
+# TWO widgets at different x. Add rows here rather than starting a second table.
+_FIELD_ANCHOR = {
+    ("vehiclename", 23.6): {"x": 24.8, "baseline": 390.50},
+    ("year",        33.7): {"x": 35.6, "baseline": 498.70},
+    ("first",       34.0): {"x": 36.0, "baseline": 524.00},
+    ("last",        34.0): {"x": 36.0, "baseline": 533.00},
+    ("vin1",        43.6): {"x": 46.2, "baseline": 373.50},
+    ("date1",       99.9): {"x": 102.0, "baseline": 356.40},
+    ("date1",      115.0): {"x": 117.0, "baseline": 472.50},
+    ("make1",      115.1): {"x": 117.0, "baseline": 498.60},
+    ("address",    118.1): {"x": 119.1, "baseline": 522.00},
+    ("exp1",       181.0): {"x": 182.7, "baseline": 472.50},
+    ("model1",     181.2): {"x": 185.1, "baseline": 498.50},
+    ("vin1",       257.5): {"x": 259.0, "baseline": 472.50},
+    ("body",       257.9): {"x": 260.0, "baseline": 498.00},
+    # avail is the measured gap to the POLICY column at 353.00, not the ins
+    # widget's own right edge — the authoritative tag itself prints AMERICAN
+    # ROAD INS CO out to 345.68, past its own widget.
+    ("ins",        258.6): {"x": 260.5, "baseline": 587.50, "avail": 91.50},
+    # avail is the measured gap to the STATE column at 354.00, not the city
+    # widget's own 55.22 — "POUGHKEEPSIE" is 55.63pt at 7pt, so the widget
+    # forced a shrink the authoritative tag does not have.
+    ("city",       260.3): {"x": 262.7, "baseline": 523.00, "avail": 90.30},
+    ("color",      351.4): {"x": 353.2, "baseline": 498.40},
+    ("state",      351.9): {"x": 354.0, "baseline": 523.00},
+    ("policy",     353.7): {"x": 353.0, "baseline": 587.50, "avail": 85.62},
+    ("zip",        406.4): {"x": 408.0, "baseline": 523.00},
+    ("date2",      485.1): {"x": 487.5, "baseline": 498.50},
+    ("plate2",     485.4): {"x": 487.2, "baseline": 472.60},
+    ("make2",      485.9): {"x": 488.0, "baseline": 526.00},
+    ("model2",     587.8): {"x": 589.0, "baseline": 527.00},
+    ("exp1",       588.6): {"x": 590.566, "baseline": 498.80},
+    ("vin3",       589.3): {"x": 590.2, "baseline": 472.50},
+}
+
+# The owner name renders at 12.76pt on the reference tags, not the 12.0 its
+# widget declares, and each line is sized on its own. 80.0 is the printable width
+# of the 82.48pt box less its padding; a name wider than that shrinks, which is
+# what keeps a long business name inside its box.
+_NAME_START_PT = 12.76
+_NAME_MAX_W = 80.0
+_NAME_MIN_PT = 5.5
+
+_ART_FIX = (
+    (b"16 0 0 16 34.9307 178.547 Tm", b"16 0 0 16 34.9307 175.547 Tm"),
+    (b"1 0 0 1 122.69 272.48 Tm", b"1 0 0 1 119.878 272.48 Tm"),
+)
+
+
+def _patch_template_artwork(doc) -> None:
+    """Correct the two stale text matrices in a freshly opened template."""
+    try:
+        xref = doc[0].get_contents()[0]
+        stream = doc.xref_stream(xref)
+    except Exception:
+        logger.warning("temp-tag: could not read template artwork", exc_info=True)
+        return
+    fixed = stream
+    for old, new in _ART_FIX:
+        if fixed.count(old) == 1:
+            fixed = fixed.replace(old, new)
+    if fixed != stream:
+        try:
+            doc.update_stream(xref, fixed, compress=1)
+        except Exception:
+            logger.warning("temp-tag: template artwork patch skipped", exc_info=True)
 
 # Font search order: bundled Arial (drop-in) → OS Arial → Liberation Sans
 # (metric-identical, installed via fonts-liberation on the Linux image) →
@@ -694,14 +791,37 @@ def shorten_carrier(name: str, avail: float, size: float, font) -> str:
     return _fit_by_trimming(text, avail, size, font)
 
 
-def _draw_field(tw: fitz.TextWriter, rect: fitz.Rect, text: str, size: float, font: fitz.Font) -> None:
+def fit_owner_name(text: str, font: fitz.Font) -> float:
+    """The point size the reference generator prints this name line at.
+
+    Proportional, then floored: the shrink and the floor are reached together,
+    so a name past the floor is trimmed by _draw_field rather than printed over
+    the column beside it.
+    """
+    t = (text or "").strip()
+    if not t:
+        return _NAME_START_PT
+    w = font.text_length(t, _NAME_START_PT)
+    if w <= _NAME_MAX_W:
+        return _NAME_START_PT
+    return max(_NAME_MIN_PT, _NAME_START_PT * _NAME_MAX_W / w)
+
+
+def _draw_field(tw: fitz.TextWriter, rect: fitz.Rect, text: str, size: float,
+                font: fitz.Font, anchor: dict | None = None) -> None:
     """Left-aligned value inside a form widget rect (fitz top-origin), baseline
     vertically centered like the flattened AcroForm appearance. The font size
     auto-shrinks so long values (full carrier names, long owner names) stay
-    inside their box instead of spilling across the form."""
+    inside their box instead of spilling across the form.
+
+    ``anchor`` pins x, the baseline and the available width absolutely, for the
+    fields whose widget rect is a poor stand-in for the reference grid — which
+    is all of them, by between 0.8 and 2.7pt.
+    """
     if not text:
         return
-    avail = rect.width - 2.4
+    anchor = anchor or {}
+    avail = anchor.get("avail", rect.width - 2.4)
     if avail > 4:
         text_w = font.text_length(text, size)
         if text_w > avail:
@@ -716,8 +836,56 @@ def _draw_field(tw: fitz.TextWriter, rect: fitz.Rect, text: str, size: float, fo
                 text = _fit_by_trimming(text, avail, size, font)
                 if not text:
                     return
-    baseline_y = (rect.y0 + rect.y1) / 2 + size * 0.34
-    tw.append((rect.x0 + 1.2, baseline_y), text, font=font, fontsize=size)
+    x = anchor.get("x", rect.x0 + 1.2)
+    baseline_y = anchor.get("baseline", (rect.y0 + rect.y1) / 2 + size * 0.34)
+    tw.append((x, baseline_y), text, font=font, fontsize=size)
+
+
+# MuPDF builds a font's /ToUnicode by reverse-mapping the font's own cmap, so
+# when two codepoints share one glyph the HIGHER one wins. Arial reaches the
+# space glyph from U+0020 AND U+00A0, and the hyphen glyph from U+002D AND
+# U+00AD — measured to be the only two characters a tag can contain that are
+# affected. Left alone, every space on the tag extracts and copy-pastes as a
+# non-breaking space and every hyphen as a soft hyphen, so the text layer stops
+# matching the authoritative system's — and stops matching a VIN search.
+_GLYPH_TWINS = ((0x20, 0x00A0), (0x2D, 0x00AD))
+
+
+def _fix_tounicode(doc, *fonts) -> None:
+    """Point each shared glyph's /ToUnicode entry back at its ASCII codepoint.
+
+    Only the glyph-to-text hint is rewritten; no drawing operator is touched, so
+    the rendered page is identical to the pixel.
+    """
+    pairs = []
+    for font in fonts:
+        for want, got in _GLYPH_TWINS:
+            gid = font.has_glyph(want)
+            if gid and gid == font.has_glyph(got):
+                pairs.append((
+                    re.compile(rb"^<%04x>([ \t]+)<%04x>[ \t]*$" % (gid, got), re.M | re.I),
+                    rb"<%04x>\g<1><%04x>" % (gid, want),
+                ))
+    if not pairs:
+        return
+    for page in doc:
+        for finfo in page.get_fonts():
+            tu = doc.xref_get_key(finfo[0], "ToUnicode")
+            if tu[0] != "xref":
+                continue
+            try:
+                xref = int(tu[1].split()[0])
+                data = doc.xref_stream(xref)
+            except Exception:
+                continue
+            fixed = data
+            for pat, repl in pairs:
+                fixed = pat.sub(repl, fixed)
+            if fixed != data:
+                try:
+                    doc.update_stream(xref, fixed)
+                except Exception:
+                    logger.warning("temp-tag: ToUnicode fix skipped", exc_info=True)
 
 
 def build_tag_pdf(fields: Dict[str, Any]) -> bytes:
@@ -782,6 +950,7 @@ def build_tag_pdf(fields: Dict[str, Any]) -> bytes:
     bold = _load_font("bold")
 
     doc = fitz.open(template)
+    _patch_template_artwork(doc)
     page = doc[0]
 
     # Snapshot each fillable widget (rect + font size) BEFORE removing the form.
@@ -818,12 +987,18 @@ def build_tag_pdf(fields: Dict[str, Any]) -> bytes:
 
     tw = fitz.TextWriter(page.rect)
     for rect, val, size, name in small:
+        anchor = _FIELD_ANCHOR.get((name, round(rect.x0, 1)))
+        if name in ("first", "last"):
+            # The widget declares 12.0; the reference tags print 12.76, each line
+            # sized on its own.
+            size = fit_owner_name(val, regular)
         if name == "ins":
             # The carrier name is the one field whose real data routinely outgrows
             # its box, and the box to its right is the POLICY NUMBER — so it is
             # abbreviated to fit rather than shrunk into its neighbour.
-            val = shorten_carrier(val, rect.width - 2.4, size, regular)
-        _draw_field(tw, rect, val, size, regular)
+            val = shorten_carrier(
+                val, (anchor or {}).get("avail", rect.width - 2.4), size, regular)
+        _draw_field(tw, rect, val, size, regular, anchor)
     _draw_centered(tw, plate, _LAYOUT["plate"], bold, max_width=PAGE_W - 56)
     _draw_centered(tw, exp_banner, _LAYOUT["exp"], bold, max_width=PAGE_W - 40)
     _draw_centered(tw, control, _LAYOUT["car"], bold, max_width=_LAYOUT["car"]["width"])
@@ -834,5 +1009,8 @@ def build_tag_pdf(fields: Dict[str, Any]) -> bytes:
         doc.subset_fonts()  # embed only used glyphs — keeps the file small
     except Exception:
         pass
+    # AFTER subset_fonts(): that call re-embeds the font and rebuilds ToUnicode
+    # from scratch, which would put the non-breaking spaces straight back.
+    _fix_tounicode(doc, regular, bold)
     # clean=True drops any residual form/annotation cruft from the catalog.
     return doc.tobytes(garbage=4, deflate=True, clean=True)

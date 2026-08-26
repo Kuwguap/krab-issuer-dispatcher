@@ -5978,6 +5978,36 @@ def _split_trailing_submit(text: str):
     return (head, m.group("tail"))
 
 
+def _is_default_selection(label, ids=None) -> bool:
+    """True when a dispatch slot still holds its default rather than a choice.
+
+    A fresh card reads "All Drivers" / "All Dispatchers" — that is what the bot
+    put there, not what the operator picked.
+
+    ``ids`` is checked as well, and either half counts. _select_driver writes the
+    label and the ids together so they normally agree, but this guard protects a
+    choice the operator made from being silently replaced, and that is not worth
+    resting on two fields staying in step.
+    """
+    v = str(label or "").strip()
+    if v and v.lower() not in ("all drivers", "all dispatchers", "all", "auto"):
+        return False
+    if not v and ids:
+        # A slot holding an id but no label is not a shape this bot writes — a
+        # default card carries "All Drivers"/"All Dispatchers". Treat the unknown
+        # as a choice: refusing to pick costs a convenience, overwriting a real
+        # dispatcher costs a delivery.
+        return False
+    # Only the LIST form carries this signal. Drivers are selected as a list, so
+    # exactly one entry means one driver was named; a group is a single scalar id
+    # that is present even on a default card, where the label is the only signal.
+    if isinstance(ids, (list, tuple)):
+        picked = [i for i in ids if i]
+        if len(picked) == 1:
+            return False
+    return True
+
+
 def _bare_name_pick(text: str, state_data: dict):
     """("SELECT_DRIVER", "Susan") for "give it to Susan" — or None.
 
@@ -5992,8 +6022,10 @@ def _bare_name_pick(text: str, state_data: dict):
         "Ana Lopez" for the query "an".
       * one pool only. A word naming both a driver and a dispatcher is ambiguous
         and returns None rather than a guess.
-      * the card slot must still be unset, so this can never overwrite a choice
-        the operator already made.
+      * the operator must not have chosen already. The card arrives with its
+        slots DEFAULTED to "All Drivers"/"All Dispatchers", which is the absence
+        of a choice, not one — an earlier version tested for an empty slot and so
+        never fired at all on a real card.
     """
     if os.getenv("KRAB_FLUENCY_BARENAME", "0") != "1":
         return None
@@ -6024,8 +6056,11 @@ def _bare_name_pick(text: str, state_data: dict):
         groups = [g for g in db.get_all_groups() if record_is_active(g)]
     except Exception:
         return None
-    d = strong(drivers, "driver_name") if not (state_data or {}).get("selected_driver_ids") else None
-    g = strong(groups, "group_name") if not (state_data or {}).get("selected_group_id") else None
+    card = state_data or {}
+    d = strong(drivers, "driver_name") if _is_default_selection(
+        card.get("selected_driver_names"), card.get("selected_driver_ids")) else None
+    g = strong(groups, "group_name") if _is_default_selection(
+        card.get("selected_group_name"), card.get("selected_group_id")) else None
     if d and g:
         return None                          # names both — ask, never guess
     if d:
