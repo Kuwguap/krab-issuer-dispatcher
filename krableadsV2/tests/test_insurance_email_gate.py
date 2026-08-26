@@ -24,6 +24,9 @@ sys.path.insert(0, str(ROOT))
 
 os.environ.setdefault("SUPABASE_URL", "https://dummy.supabase.co")
 os.environ.setdefault("SUPABASE_KEY", "dummy-key")
+# Config freezes at first import, and in a clean checkout (CI) there is no .env:
+# whichever e2e module imports bot first must supply the token for ALL of them.
+os.environ.setdefault("TELEGRAM_BOT_TOKEN", "123456:ABC-DEF1234ghIkl-zyx57W2v1u123ew11")
 os.environ.pop("OPENAI_API_KEY", None)
 
 import utils.database as udb  # noqa: E402
