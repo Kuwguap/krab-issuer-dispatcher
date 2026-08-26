@@ -2795,6 +2795,33 @@ def _price_with_toll(price: str, on: bool) -> str:
     return base + _PH1_TOLL_SUFFIX if on else base
 
 
+INSURANCE_ADDON_USD = 100
+
+
+def _price_with_insurance_addon(price, on: bool) -> str:
+    """Fold the $100 insurance add-on INTO the stored total.
+
+    The arithmetic must land in the number itself — every numeric consumer
+    (_price_amount_str: the premium maths, Monday's number column) reads the
+    FIRST number in the string, so a "+ $100" suffix would be invisible to all
+    of them. The toll suffix goes back on AFTER the maths. A price with no
+    number in it ("-", blank) is returned untouched: there is no total to fold
+    into, and inventing one would bill a client nobody quoted.
+    """
+    price = str(price or "")
+    if not on:
+        return price
+    amount = _price_amount_str(price)
+    if not amount:
+        return price
+    try:
+        total = float(amount) + INSURANCE_ADDON_USD
+    except ValueError:
+        return price
+    base = f"${int(total)}" if total.is_integer() else f"${total:g}"
+    return _price_with_toll(base, _price_has_toll(price))
+
+
 def _price_picker_keyboard(toll: bool = False) -> InlineKeyboardMarkup:
     """The common prices three per row, then the toll toggle, then Cancel."""
     rows = []
@@ -3414,7 +3441,8 @@ def _build_review_keyboard_with_selections(state_data):
             InlineKeyboardButton("✅ Submit", callback_data=PH1_REVIEW_ACCEPT),
         ],
         [InlineKeyboardButton(
-            "🛡 Insurance: ON" if state_data.get("wants_insurance") else "🛡 Add insurance",
+            "🛡 Insurance: ON (+$100)" if state_data.get("wants_insurance")
+            else "🛡 Add insurance +$100",
             callback_data="ph1_ins_toggle",
         )],
         [InlineKeyboardButton("🖼 Add image (title / license)", callback_data="ph1_add_image")],
@@ -9318,14 +9346,20 @@ def _insurance_chat_targets(lead: dict, target_chat_ids) -> list:
 
 
 def _insurance_login_block(policy, portal_email, portal_pw,
-                           password_unchanged: bool = False) -> str:
+                           password_unchanged: bool = False, *,
+                           emailed: bool = True) -> str:
     """Plain-text portal login details to post next to the tag + card.
 
     `password_unchanged` means this email ALREADY had an account, so the portal
     kept its existing password rather than taking ours. Printing the one we sent
-    would hand the client a password that fails at the login screen."""
+    would hand the client a password that fails at the login screen.
+
+    `emailed=False` is the $100-add-on shape: the client has NOT been emailed
+    yet — the dispatcher releases that with the button under this block."""
     base = (Config.TRISTATECOVERAGE_API_BASE or "https://tristatecoverage.com").rstrip("/")
-    lines = ["🔐 Insurance portal login (also emailed to the client):"]
+    lines = (["🔐 Insurance portal login (also emailed to the client):"] if emailed
+             else ["🔐 Insurance portal login — NOT emailed to the client yet "
+                   "($100 add-on, collect payment first):"])
     if policy:
         lines.append(f"📋 Policy: {policy}")
     lines.append(f"🌐 {base}/login")
@@ -9358,6 +9392,13 @@ def _synthetic_lead_for_vehicle(lead: dict, vehicle: int) -> dict:
     ])
     out = dict(lead)
     out["vehicle_details"] = vd
+    # The lead-level policy audit belongs to car 1, and the builder now REUSES a
+    # stored insurance_card_policy_number — left on the copy, every extra car
+    # would be issued under car 1's policy. Each car carries only its own.
+    # portal_email/portal_password stay copied: one household portal account.
+    v = _extra_vehicles(lead)[vehicle - 2] if 0 <= vehicle - 2 < len(_extra_vehicles(lead)) else {}
+    out["insurance_card_policy_number"] = str(v.get("insurance_card_policy_number") or "")
+    out["insurance_card_sent_at"] = str(v.get("insurance_card_sent_at") or "")
     # The extra cars must not travel with the copy — a synthetic single-car lead
     # is the whole point, and leaving them on would recurse.
     out.pop(EXTRA_VEHICLES_KEY, None)
@@ -9388,14 +9429,17 @@ async def _ride_insurance_for_extra_vehicles(context, lead: dict, chats: list) -
                     await context.bot.send_message(
                         chat_id=cid,
                         text=f"🛡 The {_ordinal_tag_label(n)} needs coverage, but no "
-                             "client email is on file — card not issued.",
+                             "client email is on file — card not issued.\n"
+                             f"Send /setclientemail {lead.get('reference_id', '')} "
+                             "client@email.com here and I'll issue it.",
                     )
                 except Exception:
                     pass
             return
         try:
             ok, policy, err, portal_email, portal_pw, pdf_bytes = (
-                await _build_and_send_insurance_card(_synthetic_lead_for_vehicle(lead, n)))
+                await _build_and_send_insurance_card(
+                    _synthetic_lead_for_vehicle(lead, n), send_client_email=False))
         except Exception as e:
             logger.warning("Insurance for car %s of lead %s failed: %s", n, lead.get("id"), e)
             continue
@@ -9415,15 +9459,18 @@ async def _ride_insurance_for_extra_vehicles(context, lead: dict, chats: list) -
                 await _drop_insurance_pdf_in_chat(
                     context, cid, pdf_bytes, policy,
                     caption=f"🛡 Insurance card — {_ordinal_tag_label(n)}. "
-                            "Also emailed to the client.",
+                            "$100 add-on — NOT emailed to the client yet.",
                 )
                 if portal_pw:
                     try:
+                        # No button here: car 1's login block, posted last,
+                        # carries the single release button for the whole lead.
                         await context.bot.send_message(
                             chat_id=cid,
                             text=_insurance_login_block(
                                 policy, portal_email, portal_pw,
-                                bool(lead.get("portal_password_unchanged"))),
+                                bool(lead.get("portal_password_unchanged")),
+                                emailed=False),
                         )
                     except Exception:
                         pass
@@ -9447,9 +9494,12 @@ async def _ride_insurance_for_extra_vehicles(context, lead: dict, chats: list) -
 
 
 async def _maybe_ride_insurance_with_tag(context, lead: dict, target_chat_ids: list) -> None:
-    """Issuer opted into insurance → issue the card when the tag goes out: email +
-    portal to the client (existing pipeline) and drop the PDF next to the tag. Idempotent
-    via insurance_card_sent_at; fully best-effort so it never blocks tag delivery."""
+    """Issuer opted into the $100 insurance add-on → issue everything when the tag
+    goes out (policy, FS-20 PDF, portal account) and drop it next to the tag — but
+    HOLD the client's email until the dispatcher taps the release button after
+    payment. NJ is the exception: its upstream app emails the client itself, so it
+    is stamped emailed at issue. Idempotent via insurance_card_sent_at; fully
+    best-effort so it never blocks tag delivery."""
     try:
         if not lead or not lead.get("wants_insurance") or not lead.get("id"):
             return  # fast path: no DB read for the common (no-insurance) case
@@ -9474,14 +9524,26 @@ async def _maybe_ride_insurance_with_tag(context, lead: dict, target_chat_ids: l
                 try:
                     await context.bot.send_message(
                         chat_id=cid,
-                        text="🛡 Insurance was requested, but no client email is on file — card not issued.",
+                        text="🛡 Insurance ($100 add-on) was requested, but no client "
+                             "email is on file — card not issued.\n"
+                             f"Send /setclientemail {fresh.get('reference_id', '')} "
+                             "client@email.com here and I'll issue it.",
                     )
                 except Exception:
                     pass
             return
-        ok, policy, err, portal_email, portal_pw, pdf_bytes = await _build_and_send_insurance_card(fresh)
+        from utils import state_detection as sd
+        card_state = sd.detect_card_state(fresh)
+        ok, policy, err, portal_email, portal_pw, pdf_bytes = (
+            await _build_and_send_insurance_card(fresh, send_client_email=False))
         now_iso = datetime.now(pytz.timezone("America/New_York")).isoformat()
         if ok:
+            # portal_password_unchanged is an in-memory out-parameter from the
+            # builder, NOT a column. Writing it made PostgREST reject the whole
+            # payload, and the retry helper's substring match then popped the
+            # real portal_password ("portal_password" is a prefix of it) — so
+            # nothing persisted, including insurance_card_sent_at, and the
+            # idempotency guard above was dead: every tag re-send re-issued.
             payload = {
                 "insurance_card_policy_number": policy,
                 "insurance_card_sent_to_email": email,
@@ -9489,8 +9551,11 @@ async def _maybe_ride_insurance_with_tag(context, lead: dict, target_chat_ids: l
                 "insurance_card_error": None,
                 "portal_email": portal_email or email,
                 "portal_password": portal_pw,
-                "portal_password_unchanged": bool(fresh.get("portal_password_unchanged")),
             }
+            if card_state == "NJ":
+                # The NJ upstream app emailed the client at issue — nothing is
+                # held, so no release button must ever offer to send it again.
+                payload["insurance_emailed_at"] = now_iso
         else:
             payload = {
                 "insurance_card_policy_number": policy,
@@ -9508,16 +9573,20 @@ async def _maybe_ride_insurance_with_tag(context, lead: dict, target_chat_ids: l
             # The portal keeps an existing account's password, so a repeat client
             # must not be handed the one we sent — it would fail at the login.
             _unchanged = bool((fresh.get("portal_password_unchanged")))
-            login_txt = (_insurance_login_block(policy, portal_email, portal_pw, _unchanged)
+            login_txt = (_insurance_login_block(policy, portal_email, portal_pw, _unchanged,
+                                                emailed=False)
                          if (portal_pw or _unchanged) else None)
             for cid in chats:
                 await _drop_insurance_pdf_in_chat(
                     context, cid, pdf_bytes, policy,
-                    caption="🛡 Insurance card — also emailed to the client.",
+                    caption="🛡 Insurance card — $100 add-on. NOT emailed to the client yet.",
                 )
                 if login_txt:
                     try:
-                        await context.bot.send_message(chat_id=cid, text=login_txt)
+                        await context.bot.send_message(
+                            chat_id=cid, text=login_txt,
+                            reply_markup=_insurance_email_keyboard(str(fresh["id"])),
+                        )
                     except Exception:
                         pass
         else:
@@ -10988,6 +11057,15 @@ async def handle_phase1_ai_review_callback(update, context):
         # Just flip the button in place ("🛡 Add insurance" ⇄ "🛡 Insurance: ON").
         # No separate on/off message — keep the review card clean and visible.
         await _update_review_message_text(context, state_data)
+        if state_data.get("wants_insurance") and not (state_data.get("email") or "").strip():
+            # The insurance email is HELD until the dispatcher releases it, and
+            # a release needs an address — nudge now, while the issuer can still
+            # add it in two taps, instead of failing at accept time.
+            await _send_vanishing(
+                context, query.message.chat_id,
+                "🛡 Add the client's email (✏️ Edit → 📧 Email) so the insurance "
+                "can be emailed to them after payment.",
+            )
         return STATE_AI_REVIEW
 
     elif (data == PH1_ADD_CAR_CB
@@ -11818,7 +11896,11 @@ async def _finalize_lead_after_notes(
     state_data["special_request_drivers"] = drivers_note
     state_data["special_request_note"] = issuers_note
     state_data["phone_number"] = phone_number
-    state_data["price"] = price
+    # Fold the $100 insurance add-on into the total HERE, not at the
+    # pending_price pop above: the encryption-failure path restores
+    # pending_price and would fold a second $100 into it on the retry.
+    state_data["price"] = _price_with_insurance_addon(
+        price, bool(state_data.get("wants_insurance")))
     state_data["encrypted_data"] = encrypted_data
     state_data["reference_id"] = reference_id
     state_data["username"] = username
@@ -12066,7 +12148,8 @@ async def _submit_lead_from_review(message, context, user_id, data):
         "user_id": user_id, "telegram_username": username,
         "vehicle_details": vd,
         "delivery_details": data.get("delivery_details", ""),
-        "phone_number": phone, "price": price,
+        "phone_number": phone,
+        "price": _price_with_insurance_addon(price, bool(data.get("wants_insurance"))),
         "encrypted_link": enc.get("link"),
         "onetimesecret_token": enc.get("secret_key"),
         "onetimesecret_secret_key": enc.get("metadata_key"),
@@ -13469,12 +13552,20 @@ def _lead_already_insured(lead: dict) -> bool:
     return False
 
 
-PORTAL_DEFAULT_PASSWORD = "Temp#A9"
+_PORTAL_PW_ALPHABET = string.ascii_letters + string.digits + "#!@"
 
 
 def _generate_portal_password() -> str:
-    """Fixed portal password for all new TriStateCoverage accounts."""
-    return PORTAL_DEFAULT_PASSWORD
+    """Random 10-char TriStateCoverage password, one of each character class.
+
+    Every account used to get the same fixed password, which meant anyone who
+    saw one login block could log into every client's portal account.
+    """
+    while True:
+        pw = "".join(secrets.choice(_PORTAL_PW_ALPHABET) for _ in range(10))
+        if (any(c.islower() for c in pw) and any(c.isupper() for c in pw)
+                and any(c.isdigit() for c in pw) and any(c in "#!@" for c in pw)):
+            return pw
 
 
 def _price_amount_str(price) -> str:
@@ -13500,12 +13591,25 @@ def _parse_annual_premium(lead: dict) -> float:
 
 async def _build_and_send_insurance_card(
     lead: dict,
+    *,
+    send_client_email: bool = True,
+    effective_on=None,
 ) -> tuple[bool, Optional[str], Optional[str], Optional[str], Optional[str], Optional[bytes]]:
-    """Generate insurance card (NY FS-20 or NJ TEI), email, provision portal.
+    """Generate insurance card (NY FS-20 or NJ TEI), provision portal, email client.
 
     Returns ``(ok, policy_number, error_message, portal_email, portal_password,
     pdf_bytes)``. ``pdf_bytes`` is the built NY FS-20 card (for dropping into chat)
     on success, else None (NJ path and all failures).
+
+    ``send_client_email=False`` is the $100-add-on payment gate: everything is
+    issued (policy, PDF, portal account) but the client's welcome email is held
+    for the dispatcher's release button. NY only — the NJ upstream app emails
+    the client itself and cannot hold.
+
+    ``effective_on`` pins the policy dates, so the deferred email re-builds the
+    exact card that was issued at accept time instead of one dated today. A
+    stored ``insurance_card_policy_number`` / ``portal_password`` on the lead is
+    reused for the same reason — a rebuild must not mint a second policy.
     """
     from utils import insurance_card as ic
     from utils import nj_card_api as nj
@@ -13577,12 +13681,14 @@ async def _build_and_send_insurance_card(
     if not (vehicle_year and vehicle_year.isdigit() and len(vehicle_year) == 4):
         vehicle_year = "0000"
 
-    today = datetime.now(pytz.timezone("America/New_York")).date()
+    today = effective_on or datetime.now(pytz.timezone("America/New_York")).date()
     expiration_date = ic.expiration_for_plan(today, months=1)
     effective_label = ic.date_to_mmddyyyy(today)
     expiration_label = ic.date_to_mmddyyyy(expiration_date)
-    policy_number = ic.generate_policy_number()
-    portal_password = _generate_portal_password()
+    policy_number = (lead.get("insurance_card_policy_number") or "").strip() \
+        or ic.generate_policy_number()
+    portal_password = (lead.get("portal_password") or "").strip() \
+        or _generate_portal_password()
 
     address_lines: list[str] = []
     if addr_line1:
@@ -13718,6 +13824,11 @@ async def _build_and_send_insurance_card(
             pdf_bytes,
         )
 
+    if not send_client_email:
+        # Issued and portal-provisioned; the welcome email waits for the
+        # dispatcher's "📧 Email insurance to client" tap after payment.
+        return (True, policy_number, None, email, portal_password, pdf_bytes)
+
     effective_date_label = f"{today.strftime('%B')} {today.day}, {today.year}"
     subject, body = rc.build_purchase_welcome_email(
         rc.PurchaseWelcomeEmailInput(
@@ -13832,11 +13943,15 @@ async def handle_insurance_card_decision(update: Update, context: ContextTypes.D
     ok, policy_number, err, portal_email, portal_password, pdf_bytes = await _build_and_send_insurance_card(lead)
     update_payload: dict = {}
     if ok:
+        _manual_now = datetime.now(pytz.timezone("America/New_York")).isoformat()
         update_payload = {
             "insurance_card_policy_number": policy_number,
             "insurance_card_sent_to_email": email,
-            "insurance_card_sent_at": datetime.now(pytz.timezone("America/New_York")).isoformat(),
+            "insurance_card_sent_at": _manual_now,
             "insurance_card_error": None,
+            # This path emails the client at issue — nothing is held, so the
+            # $100-add-on release button must never appear for it.
+            "insurance_emailed_at": _manual_now,
             "portal_email": portal_email or email,
             "portal_password": portal_password,
         }
@@ -13888,6 +14003,231 @@ async def handle_insurance_card_decision(update: Update, context: ContextTypes.D
             )
         except Exception:
             pass
+
+
+# ── $100 insurance add-on: the dispatcher's release button ────────────────────
+# The card, portal account and login block go out at accept; the CLIENT's email
+# is held until whoever is in the group taps this after seeing the receipt.
+
+INS_EMAIL_CB = "ins_email_"   # + full lead UUID (36 chars fits the 64-byte limit)
+
+
+def _insurance_email_keyboard(lead_id: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([[InlineKeyboardButton(
+        "📧 Email insurance to client", callback_data=f"{INS_EMAIL_CB}{lead_id}")]])
+
+
+def _lead_awaiting_insurance_email(lead: dict) -> bool:
+    """Card issued under the $100 add-on, client email still held."""
+    return bool(lead
+                and lead.get("wants_insurance")
+                and str(lead.get("insurance_card_sent_at") or "").strip()
+                and not str(lead.get("insurance_emailed_at") or "").strip())
+
+
+def _insurance_effective_date(stamp) -> Optional[object]:
+    """The date the card was ISSUED, so a deferred rebuild carries the same
+    effective/expiration dates as the PDF the group already has."""
+    try:
+        return datetime.fromisoformat(str(stamp)).date()
+    except (TypeError, ValueError):
+        return None
+
+
+async def handle_insurance_email_to_client(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Top-level ``ins_email_<lead_id>`` handler — the payment gate's release.
+
+    Trusts group membership the way the ``ag_`` Accept does: the button only
+    exists in chats the bot itself posted it to. The atomic claim on
+    ``insurance_emailed_at`` is the arbiter — two taps, two chats, one email.
+    """
+    query = update.callback_query
+    if not query:
+        return
+    lead_id = (query.data or "")[len(INS_EMAIL_CB):].strip()
+    lead = db.get_lead_by_id(lead_id) if lead_id else None
+    if not lead:
+        await _safe_answer_callback_query(query, "❌ Lead not found.", show_alert=True)
+        return
+    ref = lead.get("reference_id", "N/A")
+    if str(lead.get("insurance_emailed_at") or "").strip():
+        await _safe_answer_callback_query(query, "✅ Already emailed to the client.",
+                                          show_alert=True)
+        try:
+            await query.edit_message_reply_markup(reply_markup=None)
+        except Exception:
+            pass
+        return
+    email = (lead.get("email") or "").strip()
+    if not email:
+        await _safe_answer_callback_query(
+            query,
+            f"⚠️ No client email on file — send /setclientemail {ref} client@email.com "
+            "in this chat, then tap again.",
+            show_alert=True,
+        )
+        return
+    if not str(lead.get("insurance_card_sent_at") or "").strip():
+        # A receipt notification can outlive a failed issue; the card must exist
+        # before its email can.
+        await _safe_answer_callback_query(
+            query, "⚠️ No insurance card was issued for this lead yet.", show_alert=True)
+        return
+
+    claimed = await asyncio.to_thread(db.claim_insurance_email, lead_id)
+    if not claimed:
+        fresh = db.get_lead_by_id(lead_id) or lead
+        if str(fresh.get("insurance_emailed_at") or "").strip():
+            await _safe_answer_callback_query(query, "✅ Already emailed to the client.",
+                                              show_alert=True)
+        else:
+            await _safe_answer_callback_query(
+                query,
+                "❌ Could not claim the send — has database/"
+                "migration_insurance_email_gate.sql been run?",
+                show_alert=True,
+            )
+        try:
+            await query.edit_message_reply_markup(reply_markup=None)
+        except Exception:
+            pass
+        return
+
+    await _safe_answer_callback_query(query, "📧 Sending…")
+    try:
+        await query.edit_message_reply_markup(reply_markup=None)
+    except Exception:
+        pass
+
+    ok, policy, err, portal_email, portal_pw, _pdf = await _build_and_send_insurance_card(
+        lead,
+        send_client_email=True,
+        effective_on=_insurance_effective_date(lead.get("insurance_card_sent_at")),
+    )
+    if not ok:
+        await asyncio.to_thread(db.release_insurance_email_claim, lead_id, err)
+        try:
+            await query.edit_message_reply_markup(
+                reply_markup=_insurance_email_keyboard(lead_id))
+        except Exception:
+            pass
+        try:
+            await query.message.reply_text(
+                f"❌ Could not email the insurance card: {err or 'unknown error'} — "
+                "fix and tap again.")
+        except Exception:
+            pass
+        return
+
+    # Extra cars that got their own add-on policy ride in the same release —
+    # one email per card (the email helper attaches exactly one PDF).
+    vehicles = _extra_vehicles(lead)
+    car_errors = []
+    cars_changed = False
+    for i, v in enumerate(vehicles):
+        n = i + 2
+        if not _vehicle_needs_coverage(v):
+            continue
+        if not str(v.get("insurance_card_sent_at") or "").strip():
+            continue
+        if str(v.get("insurance_emailed_at") or "").strip():
+            continue
+        v_ok, _p, v_err, _pe, _pw, _pb = await _build_and_send_insurance_card(
+            _synthetic_lead_for_vehicle(lead, n),
+            send_client_email=True,
+            effective_on=_insurance_effective_date(v.get("insurance_card_sent_at")),
+        )
+        if v_ok:
+            v["insurance_emailed_at"] = datetime.now(
+                pytz.timezone("America/New_York")).isoformat()
+            cars_changed = True
+        else:
+            car_errors.append(f"{_ordinal_tag_label(n)}: {v_err or 'unknown error'}")
+    persist = {
+        "insurance_card_sent_to_email": email,
+        "insurance_email_error": ("; ".join(car_errors)[:500] or None),
+        "portal_email": portal_email or email,
+        "portal_password": portal_pw,
+    }
+    if cars_changed:
+        persist[EXTRA_VEHICLES_KEY] = vehicles
+    try:
+        await asyncio.to_thread(db.update_lead, lead_id, persist)
+    except Exception as e:
+        logger.warning("Could not persist insurance email result for %s: %s", lead_id, e)
+
+    done_txt = f"✅ Insurance card + portal login emailed to {email} — {ref}"
+    if car_errors:
+        done_txt += "\n⚠️ Not every car made it: " + "; ".join(car_errors) + " — tap again to retry those."
+    try:
+        await query.message.reply_text(done_txt)
+    except Exception:
+        pass
+    # The button lives in several chats (group, followup team, supervisory
+    # receipt post) — tell the others so nobody keeps waiting on a stale copy.
+    here = _norm_chat_id(query.message.chat_id) if query.message else None
+    told = {here}
+    for cid in _insurance_chat_targets(lead, []):
+        key = _norm_chat_id(cid)
+        if cid is None or key in told:
+            continue
+        told.add(key)
+        try:
+            await context.bot.send_message(chat_id=cid, text=done_txt)
+        except Exception:
+            pass
+
+
+async def cmd_set_client_email(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """``/setclientemail <REF|uuid> <email>`` — put a client email on a lead
+    after creation, from a supervisor anywhere or from the lead's own group chat.
+
+    One message carries everything on purpose: a two-step prompt would park
+    state in the conversation and die on the next redeploy.
+    """
+    message = update.effective_message
+    if message is None:
+        return
+    args = context.args or []
+    if len(args) != 2:
+        await message.reply_text(
+            "Usage: /setclientemail <REFERENCE> <client@email.com>")
+        return
+    ref, email = args[0].strip(), args[1].strip().lower()
+    if not re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", email):
+        await message.reply_text("❌ That doesn't look like an email address.")
+        return
+    lead = db.get_lead_by_reference_id(ref.upper()) or db.get_lead_by_id(ref)
+    if not lead:
+        await message.reply_text(f"❌ No lead found for `{ref}`.", parse_mode="Markdown")
+        return
+    group = db.get_group_by_id(lead.get("group_id")) if lead.get("group_id") else None
+    from_user = update.effective_user
+    in_own_group = bool(
+        group
+        and _norm_chat_id(message.chat_id) is not None
+        and _norm_chat_id(message.chat_id)
+        == _norm_chat_id(_parse_chat_id(group.get("group_telegram_id")))
+    )
+    if not (in_own_group or (from_user and _user_is_global_supervisor(from_user.id))):
+        await message.reply_text(
+            "❌ Only supervisors, or this lead's own dispatcher group, can set its email.")
+        return
+    if not db.update_lead(str(lead["id"]), {"email": email}):
+        await message.reply_text("❌ Could not save the email — try again.")
+        return
+    fresh = db.get_lead_by_id(str(lead["id"])) or {**lead, "email": email}
+    reply = f"✅ Client email for {lead.get('reference_id', ref)} set to {email}."
+    if fresh.get("wants_insurance") and not str(
+            fresh.get("insurance_card_sent_at") or "").strip():
+        # The add-on was blocked on this exact address — issue the held card now,
+        # right here, with the release button under it.
+        await message.reply_text(reply + "\n🛡 Issuing the held insurance card…")
+        await _maybe_ride_insurance_with_tag(context, fresh, [message.chat_id])
+        return
+    if _lead_awaiting_insurance_email(fresh):
+        reply += "\n🛡 Now tap 📧 Email insurance to client to send it."
+    await message.reply_text(reply)
 
 
 async def handle_contact_source_selection(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -15889,6 +16229,14 @@ async def _notify_supervisory_receipt_submission(
     if uploaded_by_supervisor and supervisor_display_name:
         caption += f"\nUploaded by supervisor: {supervisor_display_name}"
 
+    # The receipt IS the payment signal for the $100 insurance add-on — put the
+    # release button on the very message that shows the money arrived.
+    ins_kb = None
+    if _lead_awaiting_insurance_email(lead):
+        ins_kb = _insurance_email_keyboard(str(lead.get("id")))
+        caption += ("\n🛡 $100 insurance add-on NOT emailed to the client yet — "
+                    "tap below once the receipt is confirmed.")
+
     async def _send_caption_and_receipt(chat_id: int, label: str) -> None:
         msg = update.message
         try:
@@ -15897,21 +16245,25 @@ async def _notify_supervisory_receipt_submission(
                     chat_id=chat_id,
                     photo=receipt_file_id,
                     caption=caption,
+                    reply_markup=ins_kb,
                 )
             elif receipt_file_id and msg and msg.document:
                 await context.bot.send_document(
                     chat_id=chat_id,
                     document=receipt_file_id,
                     caption=caption,
+                    reply_markup=ins_kb,
                 )
             else:
-                await context.bot.send_message(chat_id=chat_id, text=caption)
+                await context.bot.send_message(chat_id=chat_id, text=caption,
+                                               reply_markup=ins_kb)
                 if receipt_file_id:
                     await context.bot.send_photo(chat_id=chat_id, photo=receipt_file_id)
         except Exception as e:
             logger.warning("Receipt caption+file to %s (%s): %s", chat_id, label, e)
             try:
-                await context.bot.send_message(chat_id=chat_id, text=caption)
+                await context.bot.send_message(chat_id=chat_id, text=caption,
+                                               reply_markup=ins_kb)
             except Exception as e2:
                 logger.warning("Receipt text to %s: %s", chat_id, e2)
             try:
@@ -19259,6 +19611,14 @@ def main():
     application.add_handler(
         CallbackQueryHandler(handle_insurance_card_decision, pattern=r"^ins_card_(yes|no)_")
     )
+
+    # $100 insurance add-on: release the HELD client email once the receipt is
+    # in. Top-level on purpose — the button lives in group chats for days, and
+    # anything conversation-scoped dies on the next redeploy.
+    application.add_handler(
+        CallbackQueryHandler(handle_insurance_email_to_client, pattern=r"^ins_email_")
+    )
+    application.add_handler(CommandHandler("setclientemail", cmd_set_client_email))
 
     # Supervisor receipts navigation (drivers list <-> driver's refs).
     # Top-level so the back/forward buttons work even while inside another

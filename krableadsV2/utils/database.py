@@ -15,6 +15,8 @@ logger = logging.getLogger(__name__)
 #   email, driver_license_id,      → migration_email_dl_insurance_card.sql
 #   insurance_card_*
 #   extra_vehicles                 → migration_extra_vehicles.sql
+#   insurance_emailed_at,          → migration_insurance_email_gate.sql
+#   insurance_email_error
 _OPTIONAL_LEADS_WRITE_KEYS = frozenset({
     "phase1_attached_files",
     "extra_vehicles",
@@ -24,6 +26,8 @@ _OPTIONAL_LEADS_WRITE_KEYS = frozenset({
     "insurance_card_sent_to_email",
     "insurance_card_sent_at",
     "insurance_card_error",
+    "insurance_emailed_at",
+    "insurance_email_error",
     "portal_email",
     "portal_password",
     "ingest_dispatch_pending",
@@ -44,7 +48,10 @@ def _retry_lead_write_without_phase1_files(exc: Exception, payload: Dict[str, An
     msg = str(exc).lower()
     matched_specific = False
     for key in list(candidates):
-        if key in msg:
+        # Token-bounded: "portal_password" must not match inside
+        # "portal_password_unchanged", nor "email" inside "insurance_emailed_at"
+        # — a bad key in the payload would otherwise evict the REAL column.
+        if re.search(rf"(?<![a-z0-9_]){re.escape(key)}(?![a-z0-9_])", msg):
             payload.pop(key, None)
             matched_specific = True
     if matched_specific:
@@ -231,7 +238,40 @@ class Database:
                     logger.error(f"Error updating lead: {e}")
                 return False
         return False
-    
+
+    def claim_insurance_email(self, lead_id: str) -> bool:
+        """Atomically claim the one client insurance email (NULL -> now).
+
+        True = this tap owns the send; False = someone already sent it — or the
+        column is missing, which must read as "not claimed" rather than crash,
+        because a claim that cannot be recorded cannot stop a second one.
+        """
+        if not self._check_tables_exist():
+            return False
+        try:
+            from datetime import datetime, timezone
+            r = (
+                self.client.table("leads")
+                .update({"insurance_emailed_at": datetime.now(timezone.utc).isoformat()})
+                .eq("id", lead_id)
+                .is_("insurance_emailed_at", "null")
+                .execute()
+            )
+            return bool(r.data)
+        except Exception as e:
+            logger.error(
+                "claim_insurance_email(%s): %s — run database/migration_insurance_email_gate.sql",
+                lead_id, e,
+            )
+            return False
+
+    def release_insurance_email_claim(self, lead_id: str, error: Optional[str] = None) -> bool:
+        """The send failed after the claim: reopen it and record why."""
+        return self.update_lead(lead_id, {
+            "insurance_emailed_at": None,
+            "insurance_email_error": (error or "")[:500] or None,
+        })
+
     def get_lead_by_id(self, lead_id: str) -> Optional[Dict[str, Any]]:
         """Get a lead by ID."""
         if not self._check_tables_exist():

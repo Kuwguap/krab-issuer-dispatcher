@@ -60,7 +60,8 @@ class TheBotCanCallWhatItCallsTest(unittest.TestCase):
     NEEDED = ("save_receipt_file", "get_receipt_file",
               "get_paid_instant_pdfs_undelivered", "mark_instant_pdf_delivered",
               "get_lead_counts_by_sender", "get_driver_pending_assignment",
-              "get_setting", "set_setting", "get_user_state", "set_user_state")
+              "get_setting", "set_setting", "get_user_state", "set_user_state",
+              "claim_insurance_email", "release_insurance_email_claim")
 
     def test_every_method_exists(self):
         missing = [m for m in self.NEEDED
@@ -100,9 +101,20 @@ class EveryNewColumnHasAMigrationTest(unittest.TestCase):
         for name in ("migration_receipt_files.sql",
                      "migration_lead_delivery_status.sql",
                      "migration_instant_pdf.sql",
-                     "migration_driver_manual_suspend.sql"):
+                     "migration_driver_manual_suspend.sql",
+                     "migration_insurance_email_gate.sql"):
             with self.subTest(migration=name):
                 self.assertTrue((ROOT / "database" / name).exists(), name)
+
+    def test_the_insurance_email_gate_is_fully_declared(self):
+        """Both columns, AND the backfill — without it the release button would
+        offer to re-email every historical client whose card already went out."""
+        sql = (ROOT / "database" / "migration_insurance_email_gate.sql").read_text(encoding="utf-8")
+        for col in ("insurance_emailed_at", "insurance_email_error"):
+            with self.subTest(column=col):
+                self.assertIn(col, sql, col)
+        self.assertIn("UPDATE leads", sql, "backfill UPDATE missing")
+        self.assertIn("insurance_card_sent_at IS NOT NULL", sql)
 
     def test_the_instant_pdf_columns_are_all_declared(self):
         sql = (ROOT / "database" / "migration_instant_pdf.sql").read_text(encoding="utf-8")
@@ -142,6 +154,17 @@ class EveryNewButtonReachesAHandlerTest(unittest.TestCase):
         src = (ROOT / "bot.py").read_text(encoding="utf-8")
         self.assertIn("url=receipt_portal_url(lead_id)", src)
 
+    def test_the_insurance_email_button_reaches_its_handler(self):
+        src = (ROOT / "bot.py").read_text(encoding="utf-8")
+        data = [b.callback_data for row in bot._insurance_email_keyboard(LEAD).inline_keyboard
+                for b in row]
+        self.assertEqual([f"ins_email_{LEAD}"], data)
+        self.assertIn('pattern=r"^ins_email_"', src)
+
+    def test_setclientemail_is_registered(self):
+        src = (ROOT / "bot.py").read_text(encoding="utf-8")
+        self.assertIn('CommandHandler("setclientemail", cmd_set_client_email)', src)
+
 
 class TheDocumentationMatchesTheCodeTest(unittest.TestCase):
     """A variable the code reads but nothing documents is a variable nobody sets."""
@@ -159,7 +182,8 @@ class TheDocumentationMatchesTheCodeTest(unittest.TestCase):
         doc = (ROOT / "WIRING.md").read_text(encoding="utf-8")
         for name in ("migration_receipt_files.sql",
                      "migration_lead_delivery_status.sql",
-                     "migration_instant_pdf.sql"):
+                     "migration_instant_pdf.sql",
+                     "migration_insurance_email_gate.sql"):
             with self.subTest(migration=name):
                 self.assertIn(name, doc, name)
 
