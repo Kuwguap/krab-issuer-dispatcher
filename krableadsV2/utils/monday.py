@@ -1,4 +1,5 @@
 """Monday.com GraphQL API integration."""
+import re
 import requests
 import json
 from config import Config
