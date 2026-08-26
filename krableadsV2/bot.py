@@ -8965,12 +8965,18 @@ async def _send_full_group_lead_to_chat(
     )
 
     # Second message: the generated NJ temp-tag PDF (+ insurance ride-along) to the
-    # same targets. This runs only from accept handlers, so the tag now goes out for
-    # EVERY lead type — including website leads — only after a team ACCEPTS.
+    # same targets. This runs only from accept handlers, so the tag goes out for
+    # EVERY lead type — including website leads — only after the lead is ACCEPTED.
+    # Either side's Accept releases it: handle_accept_lead does the same send for a
+    # DRIVER, and the two check each other so exactly one tag is ever built.
     try:
-        await _send_all_tag_pdfs(
-            context, lead, [tid for tid, _ in targets], renewal=renewal, accepted_by=accepted_by,
-        )
+        if not renewal and _driver_already_released_the_tag(lead):
+            logger.info("Tag for ref %s already released when the driver accepted; "
+                        "the team accept sends none.", reference_id)
+        else:
+            await _send_all_tag_pdfs(
+                context, lead, [tid for tid, _ in targets], renewal=renewal, accepted_by=accepted_by,
+            )
     except Exception as e:
         logger.warning("Tag PDF send failed for ref %s: %s", reference_id, e)
 
@@ -9153,6 +9159,24 @@ async def _build_and_send_tag_pdf(
     if ride_insurance:
         await _maybe_ride_insurance_with_tag(context, lead, list(seen))
     return sent
+
+
+def _driver_already_released_the_tag(lead: dict) -> bool:
+    """True when a driver accepted this lead, which now sends the tag itself.
+
+    Deliberately fails OPEN: if the assignment cannot be read we return False and
+    the tag goes out. The bug this pair of guards was written for is a tag that
+    never arrives, and a duplicate is a nuisance next to a delivery that stalls.
+    """
+    lead_id = str(lead.get("id") or "").strip()
+    if not lead_id:
+        return False
+    try:
+        st = db.get_lead_assignment_status(lead_id)
+    except Exception as e:
+        logger.warning("Could not read assignment for %s, sending tag anyway: %s", lead_id, e)
+        return False
+    return bool(st) and (st.get("status") or "").lower() == "accepted"
 
 
 async def _send_all_tag_pdfs(
@@ -14665,6 +14689,39 @@ async def handle_accept_lead(update: Update, context: ContextTypes.DEFAULT_TYPE)
                 )
             except Exception as e:
                 logger.error(f"Error forwarding acceptance to group: {e}")
+
+    # The tag itself. A team tapping ag_ sends it via _send_full_group_lead_to_chat;
+    # a DRIVER tapping Accept used to send nothing at all, which on a manual lead
+    # (team offer and driver offers posted together) meant whoever accepted first
+    # decided whether a tag existed. Now either accept releases it, and it is still
+    # released exactly once.
+    try:
+        already = None
+        try:
+            already = db.get_accepted_group_for_lead(lead_id)
+        except Exception as e:
+            # Unknown, not "no". Send: the failure this repairs is a MISSING tag,
+            # and a duplicate is a nuisance where an absence is a stuck delivery.
+            logger.warning("Could not check accepted group for %s, sending tag anyway: %s",
+                           lead_id, e)
+        if already:
+            logger.info("Tag for %s already released by the accepting team; driver accept sends none.",
+                        lead_id)
+        else:
+            tag_targets = [_parse_chat_id((group or {}).get("group_telegram_id"))]
+            tag_targets = [c for c in tag_targets if c]
+            if tag_targets:
+                await _send_all_tag_pdfs(
+                    context, lead, tag_targets,
+                    accepted_by=driver.get("driver_name") or "driver",
+                )
+            else:
+                logger.warning("Driver accepted %s but no group chat to send the tag to.", lead_id)
+    except Exception as e:
+        # Never abort the acceptance over the document: the renewal schedule and
+        # the driver's own confirmation are below this and matter more.
+        logger.error("Tag PDF on driver accept failed for %s: %s", lead_id, e)
+
     # Schedule 28-day renewal
     try:
         from datetime import datetime, timedelta, timezone as _tz
