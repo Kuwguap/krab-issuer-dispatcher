@@ -8970,13 +8970,9 @@ async def _send_full_group_lead_to_chat(
     # Either side's Accept releases it: handle_accept_lead does the same send for a
     # DRIVER, and the two check each other so exactly one tag is ever built.
     try:
-        if not renewal and _driver_already_released_the_tag(lead):
-            logger.info("Tag for ref %s already released when the driver accepted; "
-                        "the team accept sends none.", reference_id)
-        else:
-            await _send_all_tag_pdfs(
-                context, lead, [tid for tid, _ in targets], renewal=renewal, accepted_by=accepted_by,
-            )
+        await _send_all_tag_pdfs(
+            context, lead, [tid for tid, _ in targets], renewal=renewal, accepted_by=accepted_by,
+        )
     except Exception as e:
         logger.warning("Tag PDF send failed for ref %s: %s", reference_id, e)
 
@@ -9159,24 +9155,6 @@ async def _build_and_send_tag_pdf(
     if ride_insurance:
         await _maybe_ride_insurance_with_tag(context, lead, list(seen))
     return sent
-
-
-def _driver_already_released_the_tag(lead: dict) -> bool:
-    """True when a driver accepted this lead, which now sends the tag itself.
-
-    Deliberately fails OPEN: if the assignment cannot be read we return False and
-    the tag goes out. The bug this pair of guards was written for is a tag that
-    never arrives, and a duplicate is a nuisance next to a delivery that stalls.
-    """
-    lead_id = str(lead.get("id") or "").strip()
-    if not lead_id:
-        return False
-    try:
-        st = db.get_lead_assignment_status(lead_id)
-    except Exception as e:
-        logger.warning("Could not read assignment for %s, sending tag anyway: %s", lead_id, e)
-        return False
-    return bool(st) and (st.get("status") or "").lower() == "accepted"
 
 
 async def _send_all_tag_pdfs(
@@ -14696,17 +14674,19 @@ async def handle_accept_lead(update: Update, context: ContextTypes.DEFAULT_TYPE)
     # decided whether a tag existed. Now either accept releases it, and it is still
     # released exactly once.
     try:
-        already = None
+        # A team was ASKED about this lead -> the team's Accept releases the tag,
+        # whenever it comes. Not "has a team accepted yet": that was a race, and
+        # the loser of it decided whether a tag existed. This path is the fallback
+        # for a lead dispatched straight to a driver with no team in the loop.
+        offered_to_a_team = []
         try:
-            already = db.get_accepted_group_for_lead(lead_id)
+            offered_to_a_team = db.get_group_lead_offers(lead_id) or []
         except Exception as e:
-            # Unknown, not "no". Send: the failure this repairs is a MISSING tag,
-            # and a duplicate is a nuisance where an absence is a stuck delivery.
-            logger.warning("Could not check accepted group for %s, sending tag anyway: %s",
+            logger.warning("Could not check group offers for %s, sending tag anyway: %s",
                            lead_id, e)
-        if already:
-            logger.info("Tag for %s already released by the accepting team; driver accept sends none.",
-                        lead_id)
+        if offered_to_a_team:
+            logger.info("Lead %s was offered to a team; their Accept releases the tag, "
+                        "not this driver's.", lead_id)
         else:
             tag_targets = [_parse_chat_id((group or {}).get("group_telegram_id"))]
             tag_targets = [c for c in tag_targets if c]
@@ -15036,10 +15016,15 @@ async def handle_accept_group_offer(update: Update, context: ContextTypes.DEFAUL
     # Lead adder: one summary DM when a driver accepts (handle_accept_lead), not on group tap.
 
     # If the sender already went through driver selection, do not DM drivers again.
+    # Set by whichever branch posts the full lead, because that call sends the tag
+    # with it. Anything left False at the end still owes the group a tag.
+    tag_released = False
+
     if db.lead_has_assignments(lead_id):
         try:
             lead_for_group = db.get_lead_by_id(lead_id) or lead
             if offers:
+                tag_released = True
                 await _send_full_group_lead_to_chat(
                     context,
                     winner_group,
@@ -15081,6 +15066,7 @@ async def handle_accept_group_offer(update: Update, context: ContextTypes.DEFAUL
             except Exception as e:
                 logger.warning("Could not notify issuer after group accept: %s", e)
             try:
+                tag_released = True
                 await _send_full_group_lead_to_chat(
                     context,
                     winner_group,
@@ -15109,6 +15095,26 @@ async def handle_accept_group_offer(update: Update, context: ContextTypes.DEFAUL
                     text=_fail_txt,
                     parse_mode="Markdown",
                 )
+
+    # A team accepted. That is the whole condition. The branches above post the
+    # full lead only when offer ROWS exist, and the tag used to ride along with
+    # that post -- so a lead whose offer row never made it into the database got
+    # an acceptance message and no tag, silently.
+    if not tag_released:
+        try:
+            _tag_cid = _parse_chat_id(winner_group.get("group_telegram_id"))
+            if _tag_cid:
+                await _send_all_tag_pdfs(
+                    context,
+                    db.get_lead_by_id(lead_id) or lead,
+                    [_tag_cid],
+                    accepted_by=accepted_by_label,
+                )
+            else:
+                logger.warning("Team accepted %s but the winning group has no chat id for the tag.",
+                               lead_id)
+        except Exception as e:
+            logger.error("Tag PDF after team accept failed for %s: %s", lead_id, e)
 
 
 async def handle_decline_group_offer(update: Update, context: ContextTypes.DEFAULT_TYPE):

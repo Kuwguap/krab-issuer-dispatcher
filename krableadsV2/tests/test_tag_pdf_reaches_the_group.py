@@ -107,6 +107,12 @@ class FakeDB:
         return None
 
     def get_group_lead_offers(self, lead_id):
+        # The switch the driver path now reads: was a team ever asked? Returns []
+        # for a lead dispatched straight to a driver, and -- importantly -- also
+        # whenever the table is missing or the insert failed at dispatch, which
+        # is the production shape that used to suppress the tag entirely.
+        if not getattr(self, "offered_to_a_team", True):
+            return []
         return [{"group_id": GROUP_ID, "group_chat_id": str(GROUP_CHAT),
                  "group_message_id": 500}]
 
@@ -250,6 +256,7 @@ class TagPdfReachesTheGroup(unittest.TestCase):
         FAKE_DB.lead.pop("extra_vehicles", None)
         FAKE_DB.group_accepted = False
         FAKE_DB.driver_accepted = False
+        FAKE_DB.offered_to_a_team = True
         if lead_extra is not None:
             FAKE_DB.lead["extra_vehicles"] = lead_extra
         TRANSPORT.reset()
@@ -267,83 +274,107 @@ class TagPdfReachesTheGroup(unittest.TestCase):
         self.assertEqual(len(docs), 1,
                          f"no tag PDF reached the group; calls={TRANSPORT.endpoints()}")
 
-    def test_a_driver_accepting_also_gets_the_tag(self):
-        """The other half of dispatch.
+    def test_a_team_accept_still_sends_when_there_are_no_offer_rows(self):
+        """The production shape that sent nothing.
 
-        A lead sent to ONE named driver is accepted with accept_lead_, not ag_.
-        If that path sends no tag, the operator sees the lead go out and then
-        nothing — which is exactly the report this file exists to catch.
+        get_group_lead_offers() returns [] for a missing table, an insert that
+        failed back at dispatch, or any exception -- all silent, none of them
+        meaning the team did not accept. The tag used to ride along with a full
+        lead post that only happened when offer rows existed, so the team tapped
+        Accept, saw "your group claimed this lead", and no tag was ever built.
         """
         FAKE_DB.lead.pop("extra_vehicles", None)
         FAKE_DB.group_accepted = False
         FAKE_DB.driver_accepted = False
+        FAKE_DB.offered_to_a_team = False        # no offer rows survived
         TRANSPORT.reset()
 
         async def go():
             with mock.patch.object(telegram.Bot, "_do_post", TRANSPORT.do_post), \
                  mock.patch.object(bot, "db", FAKE_DB):
                 await self.app.initialize()
-                await self.app.process_update(_driver_accept_update(self.app, 7002))
+                await self.app.process_update(_accept_update(self.app, 7006))
+        asyncio.run(go())
+        docs = [d for e, d in TRANSPORT.calls if e == "sendDocument"]
+        self.assertEqual(len(docs), 1,
+                         f"team accepted, no tag went out; calls={TRANSPORT.endpoints()}")
+
+    def test_a_team_accept_sends_even_if_a_driver_accepted_first(self):
+        """The team is the authority on a lead; the driver is the courier.
+
+        Deferring to whoever tapped first made the tag a race, and made the
+        team's own Accept sometimes do nothing.
+        """
+        FAKE_DB.lead.pop("extra_vehicles", None)
+        FAKE_DB.group_accepted = False
+        FAKE_DB.driver_accepted = True
+        FAKE_DB.offered_to_a_team = True
+        TRANSPORT.reset()
+
+        async def go():
+            with mock.patch.object(telegram.Bot, "_do_post", TRANSPORT.do_post), \
+                 mock.patch.object(bot, "db", FAKE_DB):
+                await self.app.initialize()
+                await self.app.process_update(_accept_update(self.app, 7007))
+        asyncio.run(go())
+        docs = [d for e, d in TRANSPORT.calls if e == "sendDocument"]
+        self.assertEqual(len(docs), 1,
+                         f"team accept was suppressed; calls={TRANSPORT.endpoints()}")
+
+    def test_a_driver_on_a_lead_no_team_saw_gets_the_tag(self):
+        """Dispatched straight to a driver: nobody else will ever release it."""
+        FAKE_DB.lead.pop("extra_vehicles", None)
+        FAKE_DB.group_accepted = False
+        FAKE_DB.driver_accepted = False
+        FAKE_DB.offered_to_a_team = False
+        TRANSPORT.reset()
+
+        async def go():
+            with mock.patch.object(telegram.Bot, "_do_post", TRANSPORT.do_post), \
+                 mock.patch.object(bot, "db", FAKE_DB):
+                await self.app.initialize()
+                await self.app.process_update(_driver_accept_update(self.app, 7008))
         asyncio.run(go())
         docs = [d for e, d in TRANSPORT.calls if e == "sendDocument"]
         self.assertEqual(len(docs), 1,
                          f"driver accepted, no tag went out; calls={TRANSPORT.endpoints()}")
 
-    def test_a_driver_accepting_a_two_car_lead_gets_both_tags(self):
+    def test_that_driver_gets_both_tags_on_a_two_car_lead(self):
         """One client, one receipt, two tags — released by the driver's Accept."""
         FAKE_DB.lead["extra_vehicles"] = EXTRA
         FAKE_DB.group_accepted = False
         FAKE_DB.driver_accepted = False
+        FAKE_DB.offered_to_a_team = False
         TRANSPORT.reset()
 
         async def go():
             with mock.patch.object(telegram.Bot, "_do_post", TRANSPORT.do_post), \
                  mock.patch.object(bot, "db", FAKE_DB):
                 await self.app.initialize()
-                await self.app.process_update(_driver_accept_update(self.app, 7005))
+                await self.app.process_update(_driver_accept_update(self.app, 7009))
         asyncio.run(go())
         FAKE_DB.lead.pop("extra_vehicles", None)
         docs = [d for e, d in TRANSPORT.calls if e == "sendDocument"]
         self.assertEqual(len(docs), 2,
                          f"second car got no tag; calls={TRANSPORT.endpoints()}")
 
-    def test_a_driver_accepting_after_the_team_sends_no_second_tag(self):
-        """The guard, from the other side.
+    def test_a_driver_defers_when_a_team_was_asked(self):
+        """The other half of "exactly one".
 
-        On a website lead the team accepts first and the tag is already out; the
-        drivers are notified only afterwards. That driver's Accept must not put a
-        duplicate of the same tag in the group.
-        """
-        FAKE_DB.lead.pop("extra_vehicles", None)
-        FAKE_DB.group_accepted = True          # a team already released the tag
-        TRANSPORT.reset()
-
-        async def go():
-            with mock.patch.object(telegram.Bot, "_do_post", TRANSPORT.do_post), \
-                 mock.patch.object(bot, "db", FAKE_DB):
-                await self.app.initialize()
-                await self.app.process_update(_driver_accept_update(self.app, 7003))
-        asyncio.run(go())
-        docs = [d for e, d in TRANSPORT.calls if e == "sendDocument"]
-        self.assertEqual(len(docs), 0,
-                         f"tag sent twice for one lead; calls={TRANSPORT.endpoints()}")
-
-    def test_a_team_accepting_after_the_driver_sends_no_second_tag(self):
-        """The mirror of the guard above.
-
-        Both offers are live on a manual lead. Whichever is tapped second must
-        not put a duplicate of the same tag in the group.
+        A team was offered this lead, so their Accept releases the tag whenever
+        it comes. This driver must not put a second copy in the group.
         """
         FAKE_DB.lead.pop("extra_vehicles", None)
         FAKE_DB.group_accepted = False
-        FAKE_DB.driver_accepted = True         # the driver already released it
+        FAKE_DB.driver_accepted = False
+        FAKE_DB.offered_to_a_team = True
         TRANSPORT.reset()
 
         async def go():
             with mock.patch.object(telegram.Bot, "_do_post", TRANSPORT.do_post), \
                  mock.patch.object(bot, "db", FAKE_DB):
                 await self.app.initialize()
-                await self.app.process_update(_accept_update(self.app, 7004))
+                await self.app.process_update(_driver_accept_update(self.app, 7010))
         asyncio.run(go())
         docs = [d for e, d in TRANSPORT.calls if e == "sendDocument"]
         self.assertEqual(len(docs), 0,
