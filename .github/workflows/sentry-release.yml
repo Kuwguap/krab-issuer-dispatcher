@@ -36,8 +36,10 @@ jobs:
         uses: getsentry/action-release@v1
         env:
           SENTRY_AUTH_TOKEN: ${{ secrets.SENTRY_AUTH_TOKEN }}
-          SENTRY_ORG: ${{ secrets.SENTRY_ORG }}
-          SENTRY_PROJECT: ${{ secrets.SENTRY_PROJECT }}
+          # Not secrets — an org and project slug are public identifiers, and
+          # putting them here means one secret to configure instead of three.
+          SENTRY_ORG: tristate-70
+          SENTRY_PROJECT: tristate
         with:
           environment: production
           # MUST match utils/observability.py's release string exactly, or the

@@ -92,13 +92,17 @@ def _scrub_text(value: str, known: tuple = ()) -> str:
     caught, even though nothing about the message itself says it is a name.
     """
     out = value
-    for pattern, replacement in _PATTERNS:
-        out = pattern.sub(replacement, out)
-    # A stringified dict still names its fields; use them.
-    out = _KV_IN_TEXT_RE.sub(lambda m: m.group(1) + _REDACTED, out)
+    # Known values FIRST. These came from a sensitive key elsewhere in this same
+    # event, so they are certainties, and a fuzzy pattern running first can eat
+    # part of one and leave the rest readable -- a licence number surfaced as
+    # "J1234[phone]" exactly that way.
     for value_seen in known:
         if value_seen and len(value_seen) >= 3:
             out = out.replace(value_seen, _REDACTED)
+    # A stringified dict still names its fields; use them.
+    out = _KV_IN_TEXT_RE.sub(lambda m: m.group(1) + _REDACTED, out)
+    for pattern, replacement in _PATTERNS:
+        out = pattern.sub(replacement, out)
     return out
 
 

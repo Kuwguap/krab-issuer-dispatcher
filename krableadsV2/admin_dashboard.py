@@ -73,6 +73,11 @@ def api_health():
         "service": "krab-issuer-admin",
         "commit": (os.environ.get("RENDER_GIT_COMMIT") or "local")[:7],
         "lead_ingest_configured": Config.is_lead_ingest_configured(),
+        # Whether error reporting is on, so "did the env var land?" is a curl
+        # rather than a dashboard login. The DSN is deliberately NOT echoed --
+        # it permits event submission, and this endpoint is public.
+        "sentry": bool((os.environ.get("SENTRY_DSN") or "").strip()),
+        "environment": os.environ.get("SENTRY_ENVIRONMENT") or "unset",
     })
 
 

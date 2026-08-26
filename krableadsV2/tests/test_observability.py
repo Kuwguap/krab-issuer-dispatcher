@@ -127,6 +127,34 @@ class NoCustomerDataLeavesTheProcessTest(unittest.TestCase):
         self.assertNotIn(NAME, blob)
         self.assertNotIn("CHARLES", blob)
 
+    def test_the_suite_itself_cannot_report_anywhere(self):
+        """conftest.py blanks SENTRY_DSN before any bot module is imported.
+
+        Without it, a developer with the live DSN exported -- the same person
+        debugging Sentry -- would send every test-run error into the production
+        project, because bot.main() and admin_dashboard both call init_sentry.
+        """
+        self.assertEqual(os.environ.get("SENTRY_DSN"), "",
+                         "the test suite could transmit to a live Sentry project")
+        self.assertFalse(obs.init_sentry("should-never-be-on"),
+                         "init_sentry came on during a test run")
+
+    def test_a_fuzzy_pattern_cannot_eat_half_of_a_known_value(self):
+        """Exact redactions run before the guessers.
+
+        A NJ licence is a letter and fourteen digits, whose tail also looks like
+        a phone number. With the patterns first, the phone rule matched the last
+        ten digits and left "J1234" readable -- a fragment of a real licence,
+        surviving a scrubber that reported success. The value is known from the
+        event's own driver_license field, so it must be spent before any rule
+        that only guesses.
+        """
+        licence = "J12345678901234"
+        blob = sent({"extra": {"driver_license": licence},
+                     "message": f"tag build failed, DL {licence}"})
+        self.assertNotIn(licence, blob)
+        self.assertNotIn("J1234", blob, "a fragment of the licence survived")
+
     def test_json_and_keyword_shapes_too(self):
         for text in (f'{{"vin": "{VIN}", "phone": "{PHONE}"}}',
                      f"vin={VIN} phone={PHONE}",
