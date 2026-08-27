@@ -1,0 +1,194 @@
+{% extends "dispatch/base.html" %}
+{% block title %}Lead {{ lead.reference_id if lead and lead.reference_id else lead_id }}{% endblock %}
+{% block content %}
+{# error= is rendered by base.html (the shared DB-banner convention) — only the
+   page-local bits live here. Scoped styles cover just what dispatch.css has no
+   opinion on: the card grid, and key/value tables narrow enough to sit inside
+   grid cells (the global table min-width is for wide data tables). #}
+<style>
+  .ld-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(310px, 1fr)); gap: 16px; align-items: start; }
+  .ld-grid .card { margin-bottom: 0; }
+  .ld-kv { min-width: 0; }
+  .ld-kv td { padding: 4px 0; border-top: 0; }
+  .ld-kv td:first-child { color: var(--muted); padding-right: 14px; white-space: nowrap; width: 1%; }
+  .ld-kv td:last-child { word-break: break-word; }
+  .ld-kv tr:hover { background: transparent; }
+  .ld-head { display: flex; flex-wrap: wrap; gap: 10px 14px; align-items: center; margin-bottom: 14px; }
+  .ld-head h1 { margin: 0; }
+  .ld-head .actions { margin-left: auto; display: flex; gap: 8px; }
+  .ld-card-title { font-size: 12px; text-transform: uppercase; letter-spacing: 0.04em; color: var(--muted); margin: 0 0 10px; }
+</style>
+
+{% if notice %}<div class="flash flash-success">{{ notice }}</div>{% endif %}
+
+{% if not lead %}
+  <div class="card">Nothing to show for lead <span class="mono">{{ lead_id }}</span>.</div>
+{% else %}
+
+<div class="ld-head">
+  <h1>Lead {{ lead.reference_id or "(no ref)" }}</h1>
+  {% if lead.created_at %}<span class="muted">entered {{ lead.created_at|fmt_ts }}</span>{% endif %}
+  {% if struck %}<span class="badge badge-struck">STRUCK</span>{% endif %}
+  <div class="actions">
+    <a class="btn btn-ghost btn-sm" href="/dispatch/lead/{{ lead_id }}/tag.pdf">Tag PDF</a>
+    {% if struck %}
+    <form class="inline" method="post" action="{{ url_for('dispatch_web.lead_restore', lead_id=lead_id) }}">
+      <button class="btn btn-ghost btn-sm" type="submit">Restore to counts</button>
+    </form>
+    {% else %}
+    <form class="inline" method="post" action="{{ url_for('dispatch_web.lead_strike', lead_id=lead_id) }}"
+          onsubmit="return confirm('Strike this lead from every count (leaderboard, receipts owed, usage)?');">
+      <button class="btn btn-danger btn-sm" type="submit">Strike from counts</button>
+    </form>
+    {% endif %}
+  </div>
+</div>
+
+{% if struck %}
+<div class="flash flash-warning">
+  This lead is <strong>struck</strong>: excluded from the leaderboard, receipts owed and usage.
+  It stays listed so the strike is visible and reversible.
+  {% if appeal_status %} Appeal status: <strong>{{ appeal_status }}</strong>.{% endif %}
+</div>
+{% elif appeal_status %}
+<div class="flash">Appeal status: <strong>{{ appeal_status }}</strong>.</div>
+{% endif %}
+
+{# tone → house badge class; "muted" stays the plain grey badge #}
+{% set tone_cls = {"ok": "badge-paid", "warn": "badge-pending", "bad": "badge-struck", "muted": ""} %}
+
+<div class="ld-grid">
+
+  <div class="card">
+    <p class="ld-card-title">Entrant</p>
+    <table class="ld-kv">
+      <tr><td>Name</td><td>{{ entrant.name or "—" }}</td></tr>
+      <tr><td>Username</td><td>{% if entrant.username %}@{{ entrant.username }}{% else %}—{% endif %}</td></tr>
+      <tr><td>Telegram ID</td><td class="mono">{{ entrant.user_id or "—" }}</td></tr>
+      <tr><td>Dispatcher</td><td>{{ entrant.group_name or "—" }}</td></tr>
+      {% if entrant.contact_source %}<tr><td>Contact source</td><td>{{ entrant.contact_source }}</td></tr>{% endif %}
+    </table>
+  </div>
+
+  <div class="card">
+    <p class="ld-card-title">Price &amp; contact</p>
+    <table class="ld-kv">
+      <tr><td>Price</td><td>{{ money.price or "—" }}</td></tr>
+      <tr><td>Driver amount</td><td>{{ money.driver_amount or "—" }}</td></tr>
+      {% if money.receipt_price %}<tr><td>Receipt total</td><td>{{ money.receipt_price }}</td></tr>{% endif %}
+      <tr><td>Phone</td><td>{{ contact.phone or "—" }}</td></tr>
+      <tr><td>Client email</td><td>{{ contact.email or "—" }}</td></tr>
+      <tr><td>Driver license #</td><td class="mono">{{ contact.dl or "—" }}</td></tr>
+      {% if contact.encrypted_link %}<tr><td>Encrypted link</td><td><a href="{{ contact.encrypted_link }}" rel="noopener noreferrer">open</a></td></tr>{% endif %}
+    </table>
+  </div>
+
+  <div class="card">
+    <p class="ld-card-title">Dispatch</p>
+    <table class="ld-kv">
+      <tr><td>Board status</td><td>{{ dispatch.delivery_status }}
+        {% if dispatch.status_updated_at %}<span class="muted"> · {{ dispatch.status_updated_at|fmt_ts }}{% if dispatch.status_updated_by %} by {{ dispatch.status_updated_by }}{% endif %}</span>{% endif %}
+      </td></tr>
+      <tr><td>Queued for dispatch</td><td>{% if dispatch.ingest_pending %}<span class="badge badge-pending">yes — bot picks it up ~10s</span>{% else %}no{% endif %}</td></tr>
+      {# awaiting_group_accept is derived in leaddetail.py: the raw flag is
+         write-only (nothing clears it on accept), so "yes" holds only while
+         no accepted offer row exists for the lead. #}
+      <tr><td>Awaiting accept</td><td>{% if dispatch.awaiting_group_accept %}<span class="badge badge-pending">yes</span>{% elif dispatch.accepted %}no — a team accepted{% else %}no{% endif %}</td></tr>
+      {% if dispatch.external_order_id %}<tr><td>Website order</td><td class="mono">#{{ dispatch.external_order_id }}</td></tr>{% endif %}
+      {% if dispatch.monday_status %}<tr><td>Monday</td><td>{{ dispatch.monday_status }}</td></tr>{% endif %}
+      {# NEVER the stored receipt_image_url (the view pops it off the row):
+         old rows hold api.telegram.org file links that embed the BOT TOKEN in
+         the path. The link goes through the host app's token-free resolver —
+         same Flask process — which streams DB/storage bytes and re-signs
+         expired Telegram links. Plain path, not url_for: a host-app route name
+         must 404 the click at worst, never BuildError this page into a 500. #}
+      {% if has_receipt %}<tr><td>Receipt</td><td><a href="/api/receipts/image/{{ lead.id }}" target="_blank" rel="noopener">image</a></td></tr>{% endif %}
+    </table>
+  </div>
+
+  <div class="card">
+    <p class="ld-card-title">Insurance</p>
+    <p><span class="badge {{ tone_cls[insurance.tone] }}">{{ insurance.status }}</span></p>
+    <table class="ld-kv">
+      <tr><td>Wants insurance</td><td>{{ "yes" if insurance.wants else "no" }}</td></tr>
+      {% if insurance.policy_number %}<tr><td>Policy #</td><td class="mono">{{ insurance.policy_number }}</td></tr>{% endif %}
+      {% if insurance.sent_at %}<tr><td>Card issued</td><td>{{ insurance.sent_at|fmt_ts }}</td></tr>{% endif %}
+      {% if insurance.sent_to_email %}<tr><td>Card sent to</td><td>{{ insurance.sent_to_email }}</td></tr>{% endif %}
+      <tr><td>Client email</td><td>
+        {% if insurance.emailed_at %}released {{ insurance.emailed_at|fmt_ts }}
+        {% elif insurance.sent_at %}<span class="badge badge-pending">held — not released</span>
+        {% else %}—{% endif %}
+      </td></tr>
+      {% if insurance.portal_email %}<tr><td>Portal email</td><td>{{ insurance.portal_email }}</td></tr>{% endif %}
+      <tr><td>Portal password</td><td>{{ "set (hidden)" if insurance.portal_password_set else "—" }}</td></tr>
+      {% if insurance.card_error %}<tr><td>Card error</td><td><span class="badge badge-struck">{{ insurance.card_error }}</span></td></tr>{% endif %}
+      {% if insurance.email_error %}<tr><td>Email error</td><td><span class="badge badge-struck">{{ insurance.email_error }}</span></td></tr>{% endif %}
+    </table>
+  </div>
+
+  <div class="card">
+    <p class="ld-card-title">Instant / skip dispatch</p>
+    <p><span class="badge {{ tone_cls[instant.tone] }}">{{ instant.status }}</span></p>
+    <table class="ld-kv">
+      <tr><td>Instant tag</td><td>{{ "on" if instant.instant_tag else "off" }}</td></tr>
+      {# "Charged" only once paid_at is stamped — before that the amount is a
+         checkout quote, and saying money was taken would be untrue. #}
+      {% if instant.amount_charged %}<tr><td>Charged</td><td>{{ instant.amount_charged }}</td></tr>{% endif %}
+      {% if instant.amount_quoted %}<tr><td>Quoted</td><td>{{ instant.amount_quoted }}</td></tr>{% endif %}
+      {% if instant.requested_at %}<tr><td>Checkout created</td><td>{{ instant.requested_at|fmt_ts }}</td></tr>{% endif %}
+      {% if instant.paid_at %}<tr><td>Paid</td><td>{{ instant.paid_at|fmt_ts }}</td></tr>{% endif %}
+      {% if instant.delivered_at %}<tr><td>Delivered</td><td>{{ instant.delivered_at|fmt_ts }}</td></tr>{% endif %}
+      {% if instant.driver_name or instant.driver_id %}
+        <tr><td>Driver</td><td>{{ instant.driver_name or instant.driver_id }}</td></tr>
+      {% endif %}
+      {% if instant.session_id %}<tr><td>Stripe session</td><td class="mono">{{ instant.session_id }}</td></tr>{% endif %}
+      <tr><td>Tag sent at creation</td><td>{{ "yes" if instant.tag_sent_at_creation else "no" }}</td></tr>
+    </table>
+  </div>
+
+  <div class="card">
+    <p class="ld-card-title">Vehicle &amp; client{% if extra_cars %} — car 1 of {{ extra_cars|length + 1 }}{% endif %}</p>
+    <table class="ld-kv">
+      {% for label, value in phase1 %}
+      <tr><td>{{ label }}</td><td>
+        {% if value %}{% if label == "VIN" %}<span class="mono">{{ value }}</span>{% else %}{{ value }}{% endif %}
+        {% elif label == "Insurance" %}<span class="muted">empty — TriState coverage</span>
+        {% else %}<span class="muted">—</span>{% endif %}
+      </td></tr>
+      {% endfor %}
+    </table>
+  </div>
+
+  {% for rows in extra_cars %}
+  <div class="card">
+    <p class="ld-card-title">Car {{ loop.index + 1 }}</p>
+    <table class="ld-kv">
+      {% for label, value in rows %}
+      <tr><td>{{ label }}</td><td>{% if label == "VIN" %}<span class="mono">{{ value }}</span>{% else %}{{ value }}{% endif %}</td></tr>
+      {% endfor %}
+    </table>
+  </div>
+  {% endfor %}
+
+  {% if notes.issuers or notes.drivers %}
+  <div class="card">
+    <p class="ld-card-title">Notes</p>
+    <table class="ld-kv">
+      {% if notes.issuers %}<tr><td>For dispatchers</td><td>{{ notes.issuers }}</td></tr>{% endif %}
+      {% if notes.drivers %}<tr><td>For drivers</td><td>{{ notes.drivers }}</td></tr>{% endif %}
+    </table>
+  </div>
+  {% endif %}
+
+</div>
+
+<details style="margin-top:16px">
+  <summary class="muted">Raw stored blob (what the bot actually keeps)</summary>
+  <div class="card" style="margin-top:8px">
+    <pre class="blob">{{ lead.vehicle_details or "(empty)" }}</pre>
+    {% if lead.delivery_details %}<hr><pre class="blob">{{ lead.delivery_details }}</pre>{% endif %}
+  </div>
+</details>
+
+{% endif %}
+{% endblock %}

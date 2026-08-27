@@ -1,0 +1,47 @@
+{% extends "dispatch/base.html" %}
+{% block title %}Leaderboard{% endblock %}
+{% block content %}
+{# Scoped styles: dispatch.css belongs to base; the board must look right even
+   if it ships nothing for these classes. Everything here hides under
+   .dw-leaderboard so nothing leaks into other pages. #}
+<style>
+  .dw-leaderboard { max-width: 560px; }
+  .dw-leaderboard .dw-board { list-style: none; margin: 0; padding: 0; }
+  .dw-leaderboard .dw-board-row {
+    display: flex; align-items: baseline; gap: .6em;
+    padding: .55em .75em; border-bottom: 1px solid rgba(128, 128, 128, .25);
+  }
+  .dw-leaderboard .dw-board-medal { font-size: 1.1em; }
+  .dw-leaderboard .dw-board-mark { flex: 0 0 2.2em; text-align: right; }
+  .dw-leaderboard .dw-board-name {
+    flex: 1 1 auto; min-width: 0; overflow-wrap: anywhere;
+  }
+  .dw-leaderboard .dw-board-count { flex: 0 0 auto; white-space: nowrap; }
+  .dw-leaderboard .dw-board-count b { font-size: 1.05em; }
+  .dw-leaderboard .dw-total { opacity: .75; margin-top: .25em; }
+  .dw-leaderboard .dw-error-banner {
+    padding: .6em .8em; margin: .8em 0; border: 1px solid #c0392b;
+    border-radius: 6px; color: #c0392b; background: rgba(192, 57, 43, .08);
+  }
+</style>
+<section class="dw-leaderboard">
+  <h1>&#127942; Leaderboard</h1>
+  {% if error %}
+  <div class="dw-error-banner">{{ error }}</div>
+  {% endif %}
+  {% if board %}
+  <p class="dw-total">{{ total }} client{{ '' if total == 1 else 's' }} entered</p>
+  <ol class="dw-board">
+    {% for row in board %}
+    <li class="dw-board-row{% if row.rank <= 3 %} dw-board-medal{% endif %}">
+      <span class="dw-board-mark">{{ row.mark }}</span>
+      <span class="dw-board-name">{{ row.name }}</span>
+      <span class="dw-board-count"><b>{{ row.count }}</b> client{{ '' if row.count == 1 else 's' }}</span>
+    </li>
+    {% endfor %}
+  </ol>
+  {% elif not error %}
+  <p class="dw-total"><em>No leads counted yet.</em></p>
+  {% endif %}
+</section>
+{% endblock %}

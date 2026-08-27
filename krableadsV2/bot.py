@@ -9738,8 +9738,16 @@ async def _tag_fields_from_lead(lead: dict, *, renewal: bool = False,
 
     # Plate + control number. A renewal always mints fresh ones (the old tag
     # expired); otherwise reuse the assigned values so re-sends are identical.
-    plate = "" if renewal else (phase1.get("plate") or "").strip()
-    control = "" if renewal else (phase1.get("tag_control_number") or "").strip()
+    # Car 1's assigned values live on the LEAD ROW (persisted just below); the
+    # phase1 blob never carried them, so reading only the blob re-minted a fresh
+    # plate on every single send — a different legal plate each time, and a
+    # burned plate number too. Extra cars keep their own plate in the blob
+    # (_extra_vehicle_phase1), so their lookup is unchanged.
+    _assigned_plate = phase1.get("plate") or (lead.get("plate") if vehicle <= 1 else "")
+    _assigned_control = (phase1.get("tag_control_number")
+                         or (lead.get("tag_control_number") if vehicle <= 1 else ""))
+    plate = "" if renewal else str(_assigned_plate or "").strip()
+    control = "" if renewal else str(_assigned_control or "").strip()
     if not plate or not control:
         alloc = await asyncio.to_thread(db.allocate_temp_plate, state == "NJ")
         plate = plate or alloc["plate"]

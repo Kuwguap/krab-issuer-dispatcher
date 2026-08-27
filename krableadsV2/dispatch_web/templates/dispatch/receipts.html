@@ -1,0 +1,69 @@
+{% extends "dispatch/base.html" %}
+{% block title %}Receipts{% endblock %}
+{% block content %}
+{# Styles stay scoped (rcpt- prefix) so nothing here can fight dispatch.css;
+   colors lean on currentColor/rgba so the base theme — light or dark — wins. #}
+<style>
+  .rcpt-head { display:flex; align-items:baseline; gap:10px; flex-wrap:wrap; margin:0 0 14px; }
+  .rcpt-head h2 { margin:0; }
+  .rcpt-muted { opacity:.6; font-size:.85em; }
+  .rcpt-error { background:rgba(191,38,0,.12); border-left:4px solid #de350b;
+                padding:10px 14px; border-radius:6px; margin:0 0 14px; }
+  .rcpt-grid { display:grid; grid-template-columns:repeat(auto-fill, minmax(180px, 1fr));
+               gap:14px; }
+  .rcpt-card { margin:0; border:1px solid rgba(128,128,128,.35); border-radius:10px;
+               overflow:hidden; background:rgba(128,128,128,.06); }
+  .rcpt-thumb { display:block; height:170px; position:relative; }
+  .rcpt-thumb img { width:100%; height:100%; object-fit:cover; display:block; }
+  /* The resolver 404s/502s when no copy of the receipt is reachable any more:
+     the img removes itself and the card says so instead of a broken-image glyph. */
+  .rcpt-thumb.rcpt-broken::after { content:"receipt unavailable — open \2197";
+      position:absolute; inset:0; display:flex; align-items:center; justify-content:center;
+      text-align:center; padding:10px; font-size:.85em; opacity:.65; }
+  .rcpt-card figcaption { display:flex; justify-content:space-between; align-items:baseline;
+      gap:8px; padding:8px 10px; border-top:1px solid rgba(128,128,128,.25);
+      font-size:.9em; white-space:nowrap; }
+  .rcpt-ref { font-family:ui-monospace, SFMono-Regular, Consolas, monospace; font-weight:650;
+              overflow:hidden; text-overflow:ellipsis; }
+  .rcpt-empty { opacity:.65; padding:30px 0; text-align:center; }
+</style>
+
+<div class="rcpt-head">
+  <h2>Receipts</h2>
+  <span class="rcpt-muted">newest {{ rows|length }} stored — thumbnail opens the receipt, ref opens the lead</span>
+</div>
+
+{% if error %}<div class="rcpt-error">{{ error }}</div>{% endif %}
+
+{% if rows %}
+<div class="rcpt-grid">
+  {% for row in rows %}
+  <figure class="rcpt-card">
+    {# NEVER the stored receipt_image_url here (the view does not even select
+       it): old rows hold api.telegram.org file links that embed the BOT TOKEN
+       in the path. Both affordances go through the host app's token-free
+       resolver instead — same Flask process — which streams DB/storage bytes
+       and re-signs expired Telegram links, so those now display too. Plain
+       path, not url_for: a host-app route name must 404 the click at worst,
+       never BuildError this page into a 500. #}
+    <a class="rcpt-thumb" href="/api/receipts/image/{{ row.id }}" target="_blank" rel="noopener"
+       title="Open receipt {{ row.reference_id or '' }}">
+      {# Alt text is the ref on purpose: no client name ever renders on this page. #}
+      <img loading="lazy" src="/api/receipts/image/{{ row.id }}"
+           alt="Receipt {{ row.reference_id or row.id }}"
+           onerror="this.parentElement.classList.add('rcpt-broken');this.remove()">
+    </a>
+    <figcaption>
+      {# Plain path, not url_for: a missing lead endpoint must 404 the click,
+         never BuildError this page into a 500. #}
+      <a class="rcpt-ref" href="/dispatch/lead/{{ row.id }}"
+         title="Open lead {{ row.reference_id or row.id }}">{{ row.reference_id or "(no ref)" }}</a>
+      <span class="rcpt-muted">{% if row.updated_at %}{{ row.updated_at | fmt_ts }}{% else %}&mdash;{% endif %}</span>
+    </figcaption>
+  </figure>
+  {% endfor %}
+</div>
+{% elif not error %}
+<p class="rcpt-empty">No receipts stored yet &mdash; they land here the moment a driver hands one in.</p>
+{% endif %}
+{% endblock %}

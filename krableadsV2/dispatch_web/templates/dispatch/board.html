@@ -1,0 +1,56 @@
+{% extends "dispatch/base.html" %}
+{% block title %}Board{% endblock %}
+{% block content %}
+{#- base.html renders the error= banner; this page only supplies content. -#}
+<div class="toolbar">
+  <h1>Board</h1>
+  <span class="spacer"></span>
+  <span class="muted">newest {{ leads | length }} of <span id="board-total" data-refresh-text="total">{{ total }}</span> — refreshes every 10s</span>
+  <span class="muted" data-refresh-stamp></span>
+</div>
+<p class="muted">Strike a fake lead from its page and it stops counting everywhere —
+the leaderboard included. Struck rows stay listed so the strike is visible, and reversible.</p>
+
+{#- The refresh contract with dispatch.js (initAutoRefresh), which owns the
+    ONLY poller on this page — there is no inline fallback, so double-polling
+    Supabase is impossible. The bare data-autorefresh attribute arms it:
+    every 10s (data-autorefresh-interval, ms) it fetches the board_data feed
+    and swaps ONLY this table's first tbody with the payload's tbody_html —
+    the same partial as the initial render — while #board-total tracks the
+    payload's total via data-refresh-text and the data-refresh-stamp span
+    above shows "Updated …" / "Refresh failed — showing last data".
+
+    Deliberately NO data-autorefresh-url: dispatch.js fetches that attribute
+    VERBATIM (it never rebases it), so the absolute path url_for emits would
+    resolve outside the tristatetags.com /backend proxy and 404 forever. The
+    bare attribute makes dispatch.js build BASE + "/data.json" itself, BASE
+    being everything up to the page's own first "/dispatch" path segment —
+    the one form that survives both deployments. That derived URL is why
+    board_data must stay routed at exactly /dispatch/data.json (pinned by
+    test_board_data_route_matches_dispatch_js_derived_url).
+
+    Failure behavior lives server-side: board_data answers DB trouble with
+    HTTP 503, which the poller treats as "keep the last good rows, stamp the
+    failure, retry" (a 200 with empty tbody_html would be swapped in and
+    blank the board); a dead session is a redirect, which it treats the same
+    way — no navigating away mid-shift. -#}
+<div class="tablewrap">
+<table data-autorefresh data-autorefresh-interval="10000">
+  <thead>
+    <tr>
+      <th class="num">#</th>
+      <th>Ref</th>
+      <th>Client</th>
+      <th>Entered by</th>
+      <th>Price</th>
+      <th>Created</th>
+      <th>Status</th>
+      <th></th>
+    </tr>
+  </thead>
+  <tbody id="board-tbody">
+    {% include "dispatch/_board_rows.html" %}
+  </tbody>
+</table>
+</div>
+{% endblock %}

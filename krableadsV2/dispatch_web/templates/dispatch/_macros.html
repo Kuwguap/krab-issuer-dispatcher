@@ -1,0 +1,59 @@
+{# Shared lead rendering so every table that lists leads agrees on columns.
+   Rows arrive in two shapes: list_recent_leads_for_review (thin — no receipt,
+   insurance or price columns) and get_lead_by_id (full). Every key is treated
+   as optional and missing values render as an em-dash — a missing key joined
+   into output is exactly the crash that once killed the bot's review cards.
+
+   Usage:
+     {% from "dispatch/_macros.html" import lead_head, lead_row, badges %}
+     <div class="tablewrap"><table>
+       {{ lead_head(actions=true) }}
+       <tbody>
+         {% for lead in rows %}
+           {% call lead_row(lead) %}<a class="btn btn-sm btn-ghost" href="...">Open</a>{% endcall %}
+         {% endfor %}
+       </tbody>
+     </table></div>
+   Plain {{ lead_row(lead) }} (with lead_head(actions=false)) skips the actions cell. #}
+
+{% macro sender(lead) -%}
+  {#- Same fallback order the leaderboard counts by: operator name, then
+      handle, then bare id — so both screens name people identically. -#}
+  {%- set name = (lead.telegram_name or '') | trim -%}
+  {%- set handle = ((lead.telegram_username or '') | trim).lstrip('@') -%}
+  {{- name or handle or ('id ' ~ lead.user_id if lead.user_id else '—') -}}
+{%- endmacro %}
+
+{% macro badges(lead) -%}
+  {#- awaiting_group_accept is WRITE-ONLY on the bot side: set at web create
+      and at ingest claim, cleared by nothing — read raw it says "dispatching"
+      forever. A macro cannot query, so a view rendering full rows stamps
+      lead.group_offer_accepted (from Database.get_accepted_group_for_lead —
+      the DB-enforced one-accepted-row-per-lead truth, the derivation
+      leaddetail.py uses) to clear the badge once a team took the lead; rows
+      without the stamp keep the raw reading. ingest_dispatch_pending is
+      independent: the bot clears it itself when its ~10s poll claims the row. -#}
+  {%- if lead.exclude_from_count %}<span class="badge badge-struck">struck</span> {% endif -%}
+  {%- if lead.receipt_image_url or lead.monday_status == 'Paid' %}<span class="badge badge-paid">paid</span> {% endif -%}
+  {%- if lead.wants_insurance %}<span class="badge badge-insured">insured</span> {% endif -%}
+  {%- if lead.ingest_dispatch_pending or (lead.awaiting_group_accept and not lead.group_offer_accepted) %}<span class="badge badge-pending">dispatching</span>{% endif -%}
+{%- endmacro %}
+
+{% macro lead_head(actions=false) -%}
+<thead><tr>
+  <th>Ref</th><th>Client</th><th>Sender</th><th>Created</th><th>Status</th>
+  {%- if actions %}<th></th>{% endif %}
+</tr></thead>
+{%- endmacro %}
+
+{% macro lead_row(lead) -%}
+<tr{% if lead.exclude_from_count %} class="struck"{% endif %}>
+  <td class="mono strikeable">{{ lead.reference_id or '—' }}</td>
+  {#- First line of the 11-line vehicle blob is the client's name. -#}
+  <td class="strikeable">{{ ((lead.vehicle_details or '').split('\n') | first) or '—' }}</td>
+  <td>{{ sender(lead) }}</td>
+  <td class="muted">{{ (lead.created_at | fmt_ts) if lead.created_at else '—' }}</td>
+  <td>{{ badges(lead) }}</td>
+  {%- if caller %}<td class="row-actions">{{ caller() }}</td>{% endif %}
+</tr>
+{%- endmacro %}

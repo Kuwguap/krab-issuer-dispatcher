@@ -1,0 +1,146 @@
+{% extends "dispatch/base.html" %}
+{% block title %}New Lead{% endblock %}
+{% block content %}
+<style>
+  /* Scoped nl-* so nothing here fights dispatch.css; colors inherit the theme. */
+  .nl-wrap { max-width: 980px; margin: 0 auto; }
+  .nl-banner { border: 1px solid rgba(128,128,128,.45); border-left-width: 4px;
+               border-radius: 6px; padding: .6rem .9rem; margin: .75rem 0; }
+  .nl-err  { border-left-color: #c0392b; }
+  .nl-warn { border-left-color: #e67e22; }
+  .nl-ok   { border-left-color: #27ae60; }
+  .nl-banner ul { margin: 0; padding-left: 1.1rem; }
+  .nl-paste textarea { width: 100%; box-sizing: border-box; font: inherit;
+               padding: .6rem; border-radius: 6px; border: 1px solid rgba(128,128,128,.45);
+               background: transparent; color: inherit; resize: vertical; }
+  .nl-actions { display: flex; gap: .5rem; margin: .5rem 0 1rem; align-items: center; }
+  .nl-btn { font: inherit; padding: .45rem 1rem; border-radius: 6px; cursor: pointer;
+            border: 1px solid rgba(128,128,128,.55); background: transparent; color: inherit; }
+  .nl-btn-primary { font-weight: 600; }
+  .nl-ghost { opacity: .7; }
+  .nl-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr));
+             gap: .6rem .9rem; margin: .75rem 0; }
+  @media (max-width: 760px) { .nl-grid { grid-template-columns: 1fr; } }
+  .nl-field { display: flex; flex-direction: column; gap: .2rem; }
+  .nl-field > span { font-size: .78rem; opacity: .75; }
+  .nl-field input { font: inherit; padding: .45rem .55rem; border-radius: 6px;
+             border: 1px solid rgba(128,128,128,.45); background: transparent;
+             color: inherit; width: 100%; box-sizing: border-box; }
+  .nl-field--wide { grid-column: 1 / -1; }
+  .nl-note { font-size: .82rem; opacity: .7; margin: .35rem 0 0; }
+  .nl-entrant { display: flex; gap: .9rem; align-items: end; flex-wrap: wrap;
+                margin: 1rem 0 .5rem; padding-top: .75rem;
+                border-top: 1px solid rgba(128,128,128,.3); }
+  .nl-entrant .nl-field { min-width: 240px; }
+</style>
+
+<div class="nl-wrap">
+  <h1>New Lead</h1>
+
+  {% if db_banner %}<div class="nl-banner nl-warn">{{ db_banner }}</div>{% endif %}
+  {% if errors %}
+    <div class="nl-banner nl-err">
+      <ul>{% for e in errors %}<li>{{ e }}</li>{% endfor %}</ul>
+    </div>
+  {% endif %}
+
+  <section class="nl-paste">
+    <textarea id="nl-raw" rows="12"
+      placeholder='Paste the "New Lead" text here (Order #, Customer:, Phone:, VIN:, ...)'></textarea>
+    <div class="nl-actions">
+      <button type="button" id="nl-parse-btn" class="nl-btn nl-btn-primary">Parse</button>
+      <button type="button" id="nl-sample-btn" class="nl-btn nl-ghost">Load sample</button>
+      <span class="nl-note">Parse fills the grid below — review and fix anything before submitting.</span>
+    </div>
+    <div id="nl-parse-msg" class="nl-banner" hidden></div>
+  </section>
+
+  <form method="post" action="{{ url_for('dispatch_web.new_lead') }}" id="nl-form" autocomplete="off">
+    {# One-shot token (see newlead._mint_form_nonce): the server refuses a
+       duplicate/replayed POST, so a double-click can never dispatch the same
+       client to the Dispatcher groups twice. #}
+    <input type="hidden" name="form_nonce" value="{{ form_nonce }}">
+    <div class="nl-grid">
+      {% for key, label in grid %}
+      <label class="nl-field {% if key == 'extra_info' %}nl-field--wide{% endif %}">
+        <span>{{ label }}</span>
+        <input name="{{ key }}" value="{{ vals.get(key, '') }}">
+      </label>
+      {% endfor %}
+    </div>
+    <p class="nl-note">"-" means not provided. Leave Insurance company as "-" when the client needs TriState coverage.</p>
+
+    <div class="nl-entrant">
+      <label class="nl-field">
+        <span>Your name (shown as the lead's entrant)</span>
+        <input name="entered_by" value="{{ vals.get('entered_by', '') }}" required
+               placeholder="Who is entering this lead?">
+      </label>
+      <button type="submit" class="nl-btn nl-btn-primary">Submit — dispatch via the bot</button>
+    </div>
+    <p class="nl-note">Submitting saves the lead for the live bot, which offers it to every active
+      Dispatcher in Telegram within ~10 seconds — the first team to accept wins it.</p>
+  </form>
+</div>
+
+<script>
+(function () {
+  var rawEl = document.getElementById('nl-raw');
+  var msgBox = document.getElementById('nl-parse-msg');
+  var form = document.getElementById('nl-form');
+
+  // First line of double-submit defense: only ONE POST ever leaves this page.
+  // (The server's one-shot form_nonce is the backstop for everything else —
+  // back-button resubmits, replayed requests, JS-less browsers.)
+  var submitted = false;
+  form.addEventListener('submit', function (e) {
+    if (submitted) { e.preventDefault(); return; }
+    submitted = true;
+    var btn = form.querySelector('button[type="submit"]');
+    if (btn) { btn.disabled = true; btn.textContent = 'Submitting…'; }
+  });
+
+  function showMsg(text, cls) {
+    msgBox.className = 'nl-banner ' + cls;
+    msgBox.textContent = text;
+    msgBox.hidden = false;
+  }
+
+  function fill(fields) {
+    Object.keys(fields || {}).forEach(function (k) {
+      var input = form.querySelector('[name="' + k + '"]');
+      if (input && fields[k] !== null && fields[k] !== undefined) input.value = fields[k];
+    });
+  }
+
+  document.getElementById('nl-parse-btn').addEventListener('click', function () {
+    var text = rawEl.value || '';
+    if (!text.trim()) { showMsg('Paste the New Lead text first', 'nl-err'); return; }
+    fetch('{{ url_for("dispatch_web.api_parse_lead") }}', {
+      method: 'POST',
+      headers: { 'Content-Type': 'text/plain;charset=UTF-8' },
+      body: text
+    }).then(function (r) {
+      if (((r.headers.get('content-type')) || '').indexOf('application/json') === -1) {
+        throw new Error('not-json'); // a login redirect answers HTML
+      }
+      return r.json();
+    }).then(function (data) {
+      fill(data.fields);
+      if (data.ok) {
+        showMsg('Parsed — review the grid, then submit.', 'nl-ok');
+      } else {
+        showMsg((data.errors || []).join(' · ') || 'Could not parse that text', 'nl-err');
+      }
+    }).catch(function () {
+      showMsg('Parse request failed — reload the page (your session may have expired).', 'nl-err');
+    });
+  });
+
+  var sampleBtn = document.getElementById('nl-sample-btn');
+  if (sampleBtn) {
+    sampleBtn.addEventListener('click', function () { rawEl.value = {{ sample|tojson }}; });
+  }
+})();
+</script>
+{% endblock %}

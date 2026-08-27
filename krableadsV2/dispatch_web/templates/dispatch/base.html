@@ -1,0 +1,63 @@
+{# Every dispatch page extends this. Blocks: title, content.
+   Nav hrefs are RELATIVE paths, not url_for() and not literal "/dispatch/..."
+   ones: view modules register their endpoints independently, and one missing
+   endpoint name must not BuildError every page on the site — and the PUBLIC
+   url may carry a proxy prefix (tristatetags.com/backend/dispatch/…; the
+   /backend proxy strips its prefix before forwarding, so the server never
+   sees it and every absolute "/dispatch/…" URL — url_for's included —
+   resolves outside the proxy and 404s there). Relative URLs survive both
+   deployments. `up` climbs from the current page's directory back to the
+   blueprint root: request.path is proxy-stripped, so each "/" after
+   "/dispatch/" is one directory level down (/dispatch/lead/<id> → "../"). #}
+{% set _tail = request.path.split('/dispatch/', 1)[1] if '/dispatch/' in request.path else '' %}
+{% set up = '../' * _tail.count('/') %}
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="referrer" content="no-referrer">
+  <title>{% block title %}Dispatch{% endblock %} — Krab Dispatch</title>
+  {# Inline favicon: zero external assets, and no stray favicon.ico 404s. #}
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>⚡</text></svg>">
+  <link rel="stylesheet" href="{{ up }}static/dispatch.css">
+</head>
+<body>
+<header class="topbar">
+  <div class="topbar-in">
+    <a class="brand" href="{{ up or './' }}">⚡ Krab Dispatch <span class="tag">— the bot, mirrored</span></a>
+    {% if session.get('dw_ok') %}
+    <nav class="nav">
+      {% for slug, label in [
+        ('', 'Board'),
+        ('new', 'New Lead'),
+        ('leaderboard', 'Leaderboard'),
+        ('rosters', 'Rosters'),
+        ('receipts', 'Receipts'),
+        ('settings', 'Settings'),
+      ] %}
+        {# Active-state matching stays on the server-visible literal path;
+           only the emitted href is relative. #}
+        {% set here = request.path == '/dispatch/' if not slug else request.path.startswith('/dispatch/' ~ slug) %}
+        <a href="{{ (up ~ slug) if slug else (up or './') }}"{% if here %} class="active"{% endif %}>{{ label }}</a>
+      {% endfor %}
+      <a href="{{ up }}logout" class="logout">Logout</a>
+    </nav>
+    {% endif %}
+  </div>
+</header>
+<main class="wrap">
+  {% with msgs = get_flashed_messages(with_categories=true) %}
+    {% for category, msg in msgs %}
+      <div class="flash flash-{{ category }}">{{ msg }}</div>
+    {% endfor %}
+  {% endwith %}
+  {# Convention: a view that caught a DB exception passes error= and still
+     renders its page — banner here, never a 500 traceback. #}
+  {% if error %}<div class="flash flash-error">{{ error }}</div>{% endif %}
+  {% block content %}{% endblock %}
+</main>
+<footer class="foot">Krab Dispatch mirrors the Telegram bot — same database, same rules.</footer>
+<script src="{{ up }}static/dispatch.js" defer></script>
+</body>
+</html>

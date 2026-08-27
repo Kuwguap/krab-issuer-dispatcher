@@ -1,0 +1,25 @@
+{#- The Board's tbody rows — ONE renderer for both the full page and the
+    data.json refresh fragment, so a 10s swap can never drift from a reload.
+
+    Not _macros.lead_row: the Board adds columns that macro lacks (price, the
+    bot's NAME (@handle) entrant form, row numbers) and renders SHAPED rows
+    from board._shape — display strings only, identical to the JSON feed.
+    Struck badge sits in its own Status cell (house pattern) so the
+    .strikeable line-through never crosses the badge. -#}
+{%- for r in leads %}
+<tr{% if r.struck %} class="struck"{% endif %} data-lead-id="{{ r.id }}">
+  <td class="num muted">{{ loop.index }}</td>
+  <td class="mono strikeable">
+    {%- if r.url %}<a href="{{ r.url }}">{{ r.reference }}</a>
+    {%- else %}{{ r.reference }}{% endif -%}
+  </td>
+  <td class="strikeable">{{ r.client }}</td>
+  <td>{{ r.entrant }}</td>
+  <td>{{ r.price }}</td>
+  <td class="muted" title="{{ r.created }}">{{ r.created_fmt }}</td>
+  <td>{% if r.struck %}<span class="badge badge-struck" title="Excluded from every count — the leaderboard included. Restorable from the lead page.">struck</span>{% endif %}</td>
+  <td class="row-actions">{% if r.url %}<a class="btn btn-sm btn-ghost" href="{{ r.url }}">Open</a>{% endif %}</td>
+</tr>
+{%- else %}
+<tr><td colspan="8" class="muted"><i>No leads yet.</i></td></tr>
+{%- endfor %}

@@ -1390,6 +1390,16 @@ try:
 except Exception as e:
     logger.error("Could not mount the instant-PDF endpoints: %s", e)
 
+# Dispatch web mirror — the bot's flows on a browser page, same Supabase. It
+# builds its own utils.database wrapper via get_db(); the dashboard's minimal
+# AdminDatabase is deliberately NOT passed in.
+try:
+    import dispatch_web
+    dispatch_web.register(app)
+    logger.info("Dispatch web mounted at /dispatch")
+except Exception as e:
+    logger.error("Could not mount dispatch web: %s", e)
+
 
 @app.route('/add_group', methods=['POST'])
 def add_group():

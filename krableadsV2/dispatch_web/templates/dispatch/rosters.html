@@ -1,0 +1,114 @@
+{% extends "dispatch/base.html" %}
+{% block title %}Rosters{% endblock %}
+{% block content %}
+{# Scoped styles ride along so the page holds up whatever dispatch.css ships;
+   every class is dw-roster-* to stay out of the shared sheet's way. #}
+<style>
+  .dw-roster-banner { padding: 10px 14px; border-radius: 6px; margin: 0 0 16px; }
+  .dw-roster-banner.ok { background: #e6f6ea; color: #14532d; border: 1px solid #86d99c; }
+  .dw-roster-banner.bad { background: #fdecec; color: #7f1d1d; border: 1px solid #f2a6a6; }
+  .dw-roster-section { margin: 0 0 28px; }
+  .dw-roster-section h2 { margin: 0 0 8px; font-size: 1.15em; }
+  .dw-roster-scroll { overflow-x: auto; }
+  .dw-roster-table { border-collapse: collapse; width: 100%; min-width: 480px; }
+  .dw-roster-table th, .dw-roster-table td {
+    text-align: left; padding: 8px 12px; border-bottom: 1px solid #e2e2e2;
+    vertical-align: middle;
+  }
+  .dw-roster-table th { font-size: 0.85em; text-transform: uppercase; letter-spacing: .04em; opacity: .7; }
+  .dw-roster-badge {
+    display: inline-block; padding: 2px 10px; border-radius: 999px;
+    font-size: 0.82em; white-space: nowrap;
+  }
+  .dw-roster-badge.on { background: #e6f6ea; color: #14532d; }
+  .dw-roster-badge.off { background: #eeeeee; color: #555; }
+  .dw-roster-badge.susp { background: #fdecec; color: #7f1d1d; margin-right: 4px; }
+  .dw-roster-actions { display: flex; gap: 6px; flex-wrap: wrap; }
+  .dw-roster-actions form { display: inline; margin: 0; }
+  .dw-roster-btn {
+    padding: 4px 12px; border-radius: 5px; border: 1px solid #bbb;
+    background: #fafafa; cursor: pointer; font-size: 0.88em;
+  }
+  .dw-roster-btn:hover { background: #f0f0f0; }
+  .dw-roster-btn.warn { border-color: #d9a0a0; color: #7f1d1d; }
+  .dw-roster-empty { padding: 14px 12px; opacity: .65; font-style: italic; }
+</style>
+
+{% if error %}<div class="dw-roster-banner bad">{{ error }}</div>{% endif %}
+{% if problem %}<div class="dw-roster-banner bad">{{ problem }}</div>{% endif %}
+{% if notice %}<div class="dw-roster-banner ok">{{ notice }}</div>{% endif %}
+
+<section class="dw-roster-section">
+  <h2>Dispatchers ({{ dispatchers|length }})</h2>
+  <div class="dw-roster-scroll">
+    <table class="dw-roster-table">
+      <thead>
+        <tr><th>Name</th><th>Status</th><th></th></tr>
+      </thead>
+      <tbody>
+        {% for g in dispatchers %}
+        <tr>
+          <td>{{ g.name }}</td>
+          <td>
+            {% if g.active %}<span class="dw-roster-badge on">Active</span>
+            {% else %}<span class="dw-roster-badge off">Off</span>{% endif %}
+          </td>
+          <td class="dw-roster-actions">
+            <form method="post" action="{{ url_for('dispatch_web.rosters_toggle_group', group_id=g.id) }}">
+              <button type="submit" class="dw-roster-btn{% if g.active %} warn{% endif %}">
+                {{ 'Turn off' if g.active else 'Turn on' }}
+              </button>
+            </form>
+          </td>
+        </tr>
+        {% else %}
+        <tr><td colspan="3" class="dw-roster-empty">No Dispatchers yet.</td></tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</section>
+
+<section class="dw-roster-section">
+  <h2>Drivers ({{ drivers|length }})</h2>
+  <div class="dw-roster-scroll">
+    <table class="dw-roster-table">
+      <thead>
+        <tr><th>Name</th><th>Status</th><th>Suspension</th><th></th></tr>
+      </thead>
+      <tbody>
+        {% for d in drivers %}
+        <tr>
+          <td>{{ d.name }}</td>
+          <td>
+            {% if d.active %}<span class="dw-roster-badge on">Active</span>
+            {% else %}<span class="dw-roster-badge off">Off</span>{% endif %}
+          </td>
+          <td>
+            {% if d.manual_suspended %}<span class="dw-roster-badge susp">Suspended (manual)</span>{% endif %}
+            {% if d.receipt_suspended %}<span class="dw-roster-badge susp" title="Lifts when the owed receipts are uploaded or waived — no button for it here.">Suspended (owes receipts)</span>{% endif %}
+            {% if not d.suspended %}&mdash;{% endif %}
+          </td>
+          <td class="dw-roster-actions">
+            <form method="post" action="{{ url_for('dispatch_web.rosters_toggle_driver', driver_id=d.id) }}">
+              <button type="submit" class="dw-roster-btn{% if d.active %} warn{% endif %}">
+                {{ 'Turn off' if d.active else 'Turn on' }}
+              </button>
+            </form>
+            <form method="post" action="{{ url_for('dispatch_web.rosters_suspend_driver', driver_id=d.id) }}">
+              {# Explicit target state: replaying/double-clicking cannot flip it back. #}
+              <input type="hidden" name="suspended" value="{{ '0' if d.manual_suspended else '1' }}">
+              <button type="submit" class="dw-roster-btn{% if not d.manual_suspended %} warn{% endif %}">
+                {{ 'Lift suspension' if d.manual_suspended else 'Suspend' }}
+              </button>
+            </form>
+          </td>
+        </tr>
+        {% else %}
+        <tr><td colspan="4" class="dw-roster-empty">No Drivers yet.</td></tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</section>
+{% endblock %}

@@ -1,0 +1,96 @@
+{% extends "dispatch/base.html" %}
+{% block title %}Settings{% endblock %}
+{% block content %}
+<style>
+  /* Scoped to this page (sl- prefix) so nothing collides with dispatch.css. */
+  .sl-wrap { max-width: 760px; margin: 0 auto; }
+  .sl-card { border: 1px solid rgba(128,128,128,.35); border-radius: 10px;
+             padding: 16px 18px; margin: 0 0 18px; }
+  .sl-card h2 { margin: 0 0 10px; font-size: 1.05rem; }
+  .sl-muted { opacity: .7; font-size: .85rem; margin: 8px 0 0; }
+  .sl-banner { border-radius: 8px; padding: 10px 14px; margin: 0 0 14px; }
+  .sl-banner.err { background: rgba(220,53,69,.12); border: 1px solid rgba(220,53,69,.5); }
+  .sl-banner.ok  { background: rgba(25,135,84,.12);  border: 1px solid rgba(25,135,84,.5); }
+  .sl-pill { display: inline-block; border-radius: 999px; padding: 2px 12px;
+             font-size: .8rem; font-weight: 600; vertical-align: middle; }
+  .sl-pill.on   { background: rgba(25,135,84,.18);  color: #198754; }
+  .sl-pill.off  { background: rgba(128,128,128,.18); }
+  .sl-pill.miss { background: rgba(220,53,69,.15);  color: #dc3545; }
+  .sl-row { display: flex; align-items: center; justify-content: space-between;
+            gap: 12px; padding: 7px 0; border-top: 1px solid rgba(128,128,128,.2); }
+  .sl-row:first-of-type { border-top: 0; }
+  .sl-row code { font-size: .85rem; }
+  .sl-num { font-variant-numeric: tabular-nums; font-weight: 600; }
+  .sl-toggle-btn { border: 1px solid rgba(128,128,128,.5); border-radius: 8px;
+                   padding: 7px 16px; cursor: pointer; font-weight: 600;
+                   background: transparent; color: inherit; }
+  .sl-toggle-btn:hover { border-color: currentColor; }
+  .sl-envgroup { margin: 0 0 4px; font-size: .9rem; font-weight: 600; opacity: .85; }
+  .sl-envgroup:not(:first-child) { margin-top: 14px; }
+</style>
+
+<div class="sl-wrap">
+  <h1>Settings</h1>
+
+  {% for e in errors %}
+  <div class="sl-banner err">{{ e }}</div>
+  {% endfor %}
+  {% if notice %}
+  <div class="sl-banner ok">{{ notice }}</div>
+  {% endif %}
+
+  <div class="sl-card">
+    <h2>⚡ Instant Tag — Send to All Drivers</h2>
+    <div class="sl-row">
+      <span>All-drivers broadcast for instant leads:
+        {% if instant_on %}<span class="sl-pill on">ON</span>
+        {% else %}<span class="sl-pill off">OFF</span>{% endif %}
+      </span>
+      <form method="post" action="{{ url_for('dispatch_web.settings_instant_all') }}">
+        {# The value is the state this page wants NEXT, so a stale double-submit
+           is idempotent instead of flipping twice. The csrf token is
+           per-session (not per-request), so that idempotency still holds. #}
+        <input type="hidden" name="csrf" value="{{ csrf_token }}">
+        <input type="hidden" name="value" value="{{ '0' if instant_on else '1' }}">
+        <button type="submit" class="sl-toggle-btn">
+          {{ 'Turn all-drivers OFF' if instant_on else 'Allow Send to All Drivers' }}
+        </button>
+      </form>
+    </div>
+    <p class="sl-muted">ON means every driver gets their own payment link — the
+      first card to clear wins the tag; later links refuse with
+      &ldquo;already paid&rdquo;. OFF means instant leads go to one driver.
+      The bot reads this switch live.</p>
+  </div>
+
+  <div class="sl-card">
+    <h2>🔢 Plate counters (read-only)</h2>
+    {% if plate_rows %}
+      {% for label, value in plate_rows %}
+      <div class="sl-row"><span>{{ label }}</span><span class="sl-num">{{ value }}</span></div>
+      {% endfor %}
+      <p class="sl-muted">Set these from the bot: Settings → Plate Numbers —
+        typing a number or sending a photo of the newest tag both work.
+        Control numbers are random per tag; nothing to set.</p>
+    {% else %}
+      <p class="sl-muted">No plate settings row to show.</p>
+    {% endif %}
+  </div>
+
+  <div class="sl-card">
+    <h2>🔑 Environment sanity</h2>
+    {% for label, rows in env_groups %}
+      <p class="sl-envgroup">{{ label }}</p>
+      {% for name, present in rows %}
+      <div class="sl-row">
+        <code>{{ name }}</code>
+        {% if present %}<span class="sl-pill on">configured</span>
+        {% else %}<span class="sl-pill miss">missing</span>{% endif %}
+      </div>
+      {% endfor %}
+    {% endfor %}
+    <p class="sl-muted">Presence only — key values are never displayed or logged.
+      Changing any of these means editing the service environment and redeploying.</p>
+  </div>
+</div>
+{% endblock %}
