@@ -304,6 +304,51 @@ BOARD_HTML = r"""<!doctype html>
  footer { position:fixed; left:0; right:0; bottom:0; padding:6px 20px;
           font-size:11px; color:var(--muted); background:var(--bg); text-align:right;
           pointer-events:none; }
+ /* ── Phone layout: the same transmissions as cards, thumb-first ─────────── */
+ #cards { display:none; }
+ .card { background:var(--card); border:1px solid var(--line); border-radius:12px;
+         padding:12px 14px; }
+ .c-top { display:flex; gap:10px; align-items:flex-start; justify-content:space-between; }
+ .c-top .ref { margin-top:2px; }
+ .c-mid { display:flex; gap:12px; margin-top:10px; align-items:flex-start; }
+ .c-mid .thumb, .c-mid .nothumb { width:96px; height:72px; flex:0 0 auto; }
+ .c-facts { flex:1; min-width:0; display:flex; flex-direction:column; gap:6px; }
+ .c-facts select.status { margin-top:2px; align-self:flex-start; }
+ .c-phone a { font-weight:650; }
+ .c-parties { margin-top:10px; border-top:1px solid var(--line); }
+ .prow { display:flex; align-items:center; gap:8px; padding:7px 0;
+         border-bottom:1px solid var(--line); }
+ .plabel { flex:0 0 78px; color:var(--muted); font-size:11px; letter-spacing:.05em;
+           text-transform:uppercase; }
+ .pwho { flex:1; min-width:0; overflow:hidden; text-overflow:ellipsis;
+         white-space:nowrap; font-weight:600; font-size:13px; }
+ .pacts { display:flex; gap:6px; flex:0 0 auto; }
+ .c-more { margin-top:8px; border:0; background:transparent; color:var(--muted);
+           font:inherit; font-size:13px; font-weight:650; cursor:pointer;
+           padding:6px 0; text-align:left; }
+ .c-detail { border-top:1px dashed var(--line); padding-top:10px; margin-top:2px;
+             font-size:13px; }
+ .detail dd { margin:0; min-width:0; overflow-wrap:anywhere; }
+ .c-detail img { max-width:100%; }
+ .empty { padding:30px 10px; text-align:center; }
+ @media (max-width:860px) {
+   header { padding:12px 14px 10px; gap:10px; }
+   h1 { font-size:16px; }
+   .sub { display:none; }
+   main { padding:10px 10px 24px; }
+   .wrap { display:none; }
+   #cards { display:flex; flex-direction:column; gap:10px; }
+   .tabs { width:100%; order:3; overflow-x:auto; flex-wrap:nowrap;
+           scrollbar-width:none; padding-bottom:2px; }
+   .tab { flex:0 0 auto; }
+   input[type=search] { flex:1; min-width:120px; font-size:16px; }
+   select.status, .sheet input, .sheet textarea { font-size:16px; }
+   .act { padding:8px 12px; }
+   .overlay { padding:0; align-items:flex-end; }
+   .sheet { width:100%; max-height:88vh; border-radius:14px 14px 0 0; padding:16px; }
+   #toasts { left:12px; right:12px; bottom:10px; }
+   footer { display:none; }
+ }
  @media (max-width:760px) { .hide-sm { display:none; } }
 </style></head><body>
 <header>
@@ -338,6 +383,7 @@ BOARD_HTML = r"""<!doctype html>
     <tbody id="rows"><tr><td colspan="11" class="none">Loading…</td></tr></tbody>
   </table>
   </div>
+  <div id="cards"><div class="none empty">Loading…</div></div>
 </main>
 
 <div class="overlay" id="compose" hidden>
@@ -371,6 +417,17 @@ const IMG = "/receipts/receipt/";
 let ALL = [], filter = "", q = "";
 let CFG = {email: true, sms: "unknown"};   // refreshed from /receipts/api/sendconfig
 let COMPOSE = null;                        // {row, party, channel}
+const PARTY_KEYS = ["client", "driver", "issuer", "dispatcher"];
+// Below this width the table becomes cards — same data, thumb-first.
+const MQ = window.matchMedia("(max-width: 860px)");
+let LAST_LAYOUT = null;                    // what draw() last rendered for
+if (MQ.addEventListener) MQ.addEventListener("change", () => draw());
+else if (MQ.addListener) MQ.addListener(() => draw());
+// Some embedded/emulated viewports resize without firing the media-query
+// listener — the resize event redraws only when the layout actually flips.
+window.addEventListener("resize", () => {
+  if (MQ.matches !== LAST_LAYOUT) draw();
+});
 
 const esc = s => String(s == null ? "" : s).replace(/[&<>"']/g,
   c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
@@ -466,17 +523,20 @@ function contactLine(ic, val, href) {
   return `<div class="cl" title="${esc(val)}"><span class="ic">${ic}</span>${inner}</div>`;
 }
 
+function actButton(r, party, ch, label) {
+  const ok = ch === "email" ? CFG.email : CFG.sms;
+  const title = ch === "email"
+    ? (CFG.email ? "Send an email to the " + party : "Email sender not configured on this service")
+    : (CFG.sms ? "Send an SMS to the " + party + " via " + CFG.sms : "SMS sender not configured on this service");
+  return `<button class="act ${ok ? "" : "dim"}" data-id="${esc(r.lead_id)}"
+    data-party="${party}" data-ch="${ch}" title="${title}">${label}</button>`;
+}
+
 function block(r, party) {
   const c = contacts(r)[party];
   const btns = [];
-  if (c.email) btns.push(
-    `<button class="act ${CFG.email ? "" : "dim"}" data-id="${esc(r.lead_id)}"
-      data-party="${party}" data-ch="email"
-      title="${CFG.email ? "Send an email to the " + party : "Email sender not configured on this service"}">✉ Email</button>`);
-  if (c.phone) btns.push(
-    `<button class="act ${CFG.sms ? "" : "dim"}" data-id="${esc(r.lead_id)}"
-      data-party="${party}" data-ch="sms"
-      title="${CFG.sms ? "Send an SMS to the " + party + " via " + CFG.sms : "SMS sender not configured on this service"}">💬 SMS</button>`);
+  if (c.email) btns.push(actButton(r, party, "email", "✉ Email"));
+  if (c.phone) btns.push(actButton(r, party, "sms", "💬 SMS"));
   return `<div class="party">`
     + `<div class="pname">${c.name ? esc(c.name) : '<span class="none">—</span>'}</div>`
     + contactLine("✈", c.tg, c.tgHref)
@@ -496,94 +556,179 @@ function receiptCell(r) {
   return `${img}<div class="rinfo"><b>${esc(r.price)}</b> · ${esc(date)}<br>${esc(LABELS[r.status] || r.status)}</div>`;
 }
 
+function statusBits(r) {
+  const opts = STATUSES.map(s =>
+    `<option value="${s}" ${r.status === s ? "selected" : ""}>${esc(LABELS[s])}</option>`
+  ).join("");
+  return {
+    pill: `<span class="pill s-${esc(r.status)}">${esc(LABELS[r.status] || r.status)}</span>`,
+    select: `<select class="status" data-id="${esc(r.lead_id)}">${opts}</select>`,
+  };
+}
+
+function detailBody(r) {
+  const c = contacts(r);
+  const partyLines = PARTY_KEYS.map(p => {
+    const cc = c[p];
+    const bits = [cc.name, cc.tg, cc.phone, cc.email].filter(Boolean).map(esc).join(" · ");
+    return `<dt>${cc.label}</dt><dd>${bits || "—"}</dd>`;
+  }).join("");
+  return `<dl>
+      <dt>Reference</dt><dd class="ref">${esc(r.reference_id)}</dd>
+      <dt>Car</dt><dd>${esc(r.car)} ${(r.tags || 1) > 1 ? `— <b>${esc(r.tags)} tags owed</b>` : ""}</dd>
+      <dt>Price</dt><dd>${esc(r.price)}</dd>
+      <dt>Delivery</dt><dd>${esc(r.delivery) || "—"}</dd>
+      <dt>Notes</dt><dd>${esc(r.notes) || "—"}</dd>
+      <dt>Entered by</dt><dd>${esc(r.issuer)}</dd>
+      <dt>Created</dt><dd>${esc(when(r.created_at))}</dd>
+      <dt>Receipt</dt><dd>${r.receipt_in_db ? "stored here (never expires)"
+                            : (r.has_receipt ? "external link" : "not handed in")}</dd>
+      ${partyLines}
+    </dl>
+    ${r.has_receipt ? `<img loading="lazy" src="${IMG + encodeURIComponent(r.lead_id)}"
+                         data-full="${IMG + encodeURIComponent(r.lead_id)}" alt="receipt">` : ""}`;
+}
+
+function rowHtml(r) {
+  const s = statusBits(r);
+  const phone = r.client_phone
+    ? `<a href="${esc(telHref(r.client_phone) || "#")}">${esc(r.client_phone)}</a>`
+    : '<span class="none">—</span>';
+  return `<tr class="row" data-id="${esc(r.lead_id)}">
+    <td class="exp" data-x="${esc(r.lead_id)}">▸</td>
+    <td><div class="cname">${esc(r.client_name)}</div>
+        <div class="ref">${esc(r.reference_id)}</div>
+        <div class="carline">${esc(r.car)}</div></td>
+    <td>${receiptCell(r)}</td>
+    <td class="phone">${phone}</td>
+    <td>${(r.tags || 1) > 1 ? `<b title="one tag per car">${esc(r.tags)}×</b>` : ""}</td>
+    <td>${block(r, "client")}</td>
+    <td>${block(r, "driver")}</td>
+    <td>${block(r, "issuer")}</td>
+    <td>${block(r, "dispatcher")}</td>
+    <td>${s.pill}<br>${s.select}</td>
+    <td class="hide-sm">${esc(when(r.status_updated_at))}<br>
+        <span class="counts">${esc(r.status_updated_by || "")}</span></td>
+  </tr>
+  <tr class="detail" id="d-${esc(r.lead_id)}" hidden><td colspan="11">${detailBody(r)}</td></tr>`;
+}
+
+// One card per transmission on a phone — the same data, thumb-first.
+function cardHtml(r) {
+  const c = contacts(r);
+  const s = statusBits(r);
+  const partyRow = p => {
+    const cc = c[p];
+    const btns = [];
+    if (cc.email) btns.push(actButton(r, p, "email", "✉ Email"));
+    if (cc.phone) btns.push(actButton(r, p, "sms", "💬 SMS"));
+    return `<div class="prow">
+      <span class="plabel">${cc.label}</span>
+      <span class="pwho">${cc.name ? esc(cc.name) : '<span class="none">—</span>'}</span>
+      <span class="pacts">${btns.join("")}</span>
+    </div>`;
+  };
+  const img = r.has_receipt
+    ? `<img class="thumb" loading="lazy" src="${IMG + encodeURIComponent(r.lead_id)}"
+         data-full="${IMG + encodeURIComponent(r.lead_id)}" alt="receipt"
+         onerror="this.outerHTML='<div class=nothumb>no image</div>'">`
+    : `<div class="nothumb">no receipt</div>`;
+  const date = r.receipt_at ? when(r.receipt_at) : (r.has_receipt ? "on file" : "—");
+  const phone = r.client_phone
+    ? `<a href="${esc(telHref(r.client_phone) || "#")}">☎ ${esc(r.client_phone)}</a>`
+    : '<span class="none">☎ —</span>';
+  return `<div class="card" data-id="${esc(r.lead_id)}">
+    <div class="c-top">
+      <div class="c-id">
+        <div class="cname">${esc(r.client_name)}</div>
+        <div class="ref">${esc(r.reference_id)} · ${esc(r.car)}${(r.tags || 1) > 1 ? ` · <b>${esc(r.tags)}× tags</b>` : ""}</div>
+      </div>
+      ${s.pill}
+    </div>
+    <div class="c-mid">
+      ${img}
+      <div class="c-facts">
+        <div><b>${esc(r.price)}</b> · <span class="counts">${esc(date)}</span></div>
+        <div class="c-phone">${phone}</div>
+        ${s.select}
+      </div>
+    </div>
+    <div class="c-parties">${PARTY_KEYS.map(partyRow).join("")}</div>
+    <button class="exp c-more" data-x="${esc(r.lead_id)}">▸ details</button>
+    <div class="detail c-detail" id="d-${esc(r.lead_id)}" hidden>${detailBody(r)}</div>
+  </div>`;
+}
+
 function draw() {
   tabs();
+  LAST_LAYOUT = MQ.matches;
   const rows = visible();
   document.getElementById("counts").textContent = `${rows.length} of ${ALL.length}`;
   const tb = document.getElementById("rows");
-  if (!rows.length) {
-    tb.innerHTML = '<tr><td colspan="11" class="none">Nothing here yet.</td></tr>';
+  const cards = document.getElementById("cards");
+  if (MQ.matches) {
+    tb.innerHTML = "";
+    cards.innerHTML = rows.length ? rows.map(cardHtml).join("")
+      : '<div class="none empty">Nothing here yet.</div>';
+  } else {
+    cards.innerHTML = "";
+    tb.innerHTML = rows.length ? rows.map(rowHtml).join("")
+      : '<tr><td colspan="11" class="none">Nothing here yet.</td></tr>';
+  }
+}
+
+// One set of listeners for both layouts — rows and cards come and go, the
+// container stays.
+document.querySelector("main").addEventListener("click", e => {
+  const exp = e.target.closest(".exp");
+  if (exp && exp.dataset.x) {
+    const d = document.getElementById("d-" + exp.dataset.x);
+    if (d) {
+      d.hidden = !d.hidden;
+      exp.textContent = exp.classList.contains("c-more")
+        ? (d.hidden ? "▸ details" : "▾ details")
+        : (d.hidden ? "▸" : "▾");
+    }
     return;
   }
-  tb.innerHTML = rows.map(r => {
-    const opts = STATUSES.map(s =>
-      `<option value="${s}" ${r.status === s ? "selected" : ""}>${esc(LABELS[s])}</option>`
-    ).join("");
-    const phone = r.client_phone
-      ? `<a href="${esc(telHref(r.client_phone) || "#")}">${esc(r.client_phone)}</a>`
-      : '<span class="none">—</span>';
-    return `<tr class="row" data-id="${esc(r.lead_id)}">
-      <td class="exp" data-x="${esc(r.lead_id)}">▸</td>
-      <td><div class="cname">${esc(r.client_name)}</div>
-          <div class="ref">${esc(r.reference_id)}</div>
-          <div class="carline">${esc(r.car)}</div></td>
-      <td>${receiptCell(r)}</td>
-      <td class="phone">${phone}</td>
-      <td>${(r.tags || 1) > 1 ? `<b title="one tag per car">${esc(r.tags)}×</b>` : ""}</td>
-      <td>${block(r, "client")}</td>
-      <td>${block(r, "driver")}</td>
-      <td>${block(r, "issuer")}</td>
-      <td>${block(r, "dispatcher")}</td>
-      <td><span class="pill s-${esc(r.status)}">${esc(LABELS[r.status] || r.status)}</span><br>
-          <select class="status" data-id="${esc(r.lead_id)}">${opts}</select></td>
-      <td class="hide-sm">${esc(when(r.status_updated_at))}<br>
-          <span class="counts">${esc(r.status_updated_by || "")}</span></td>
-    </tr>
-    <tr class="detail" id="d-${esc(r.lead_id)}" hidden><td colspan="11">
-      <dl>
-        <dt>Reference</dt><dd class="ref">${esc(r.reference_id)}</dd>
-        <dt>Car</dt><dd>${esc(r.car)} ${(r.tags || 1) > 1 ? `— <b>${esc(r.tags)} tags owed</b>` : ""}</dd>
-        <dt>Price</dt><dd>${esc(r.price)}</dd>
-        <dt>Delivery</dt><dd>${esc(r.delivery) || "—"}</dd>
-        <dt>Notes</dt><dd>${esc(r.notes) || "—"}</dd>
-        <dt>Entered by</dt><dd>${esc(r.issuer)}</dd>
-        <dt>Created</dt><dd>${esc(when(r.created_at))}</dd>
-        <dt>Receipt</dt><dd>${r.receipt_in_db ? "stored here (never expires)"
-                              : (r.has_receipt ? "external link" : "not handed in")}</dd>
-      </dl>
-      ${r.has_receipt ? `<img loading="lazy" src="${IMG + encodeURIComponent(r.lead_id)}"
-                           data-full="${IMG + encodeURIComponent(r.lead_id)}" alt="receipt">` : ""}
-    </td></tr>`;
-  }).join("");
-
-  tb.querySelectorAll(".exp").forEach(td => td.onclick = () => {
-    const d = document.getElementById("d-" + td.dataset.x);
-    d.hidden = !d.hidden;
-    td.textContent = d.hidden ? "▸" : "▾";
-  });
-  tb.querySelectorAll("select.status").forEach(sel => sel.onchange = async () => {
-    const id = sel.dataset.id, next = sel.value;
-    const tr = sel.closest("tr");
-    tr.classList.add("saving");
-    try {
-      const res = await fetch(`${API}/transmissions/${encodeURIComponent(id)}/status`, {
-        method: "POST",
-        headers: {"Content-Type": "application/json"},
-        body: JSON.stringify({status: next, by: whoAmI(true)}),
-      });
-      if (!res.ok) throw new Error(await res.text());
-      const row = ALL.find(r => r.lead_id === id);
-      if (row) {
-        row.status = next;
-        row.status_updated_at = new Date().toISOString();
-        row.status_updated_by = localStorage.getItem("krab_who") || "";
-      }
-      draw();
-    } catch (e) {
-      document.getElementById("err").innerHTML =
-        `<div class="err">Could not save that status: ${esc(e.message)}</div>`;
-      tr.classList.remove("saving");
-    }
-  });
-  tb.querySelectorAll(".act").forEach(b => b.onclick = () => {
-    const row = ALL.find(r => r.lead_id === b.dataset.id);
-    if (row) openCompose(row, b.dataset.party, b.dataset.ch);
-  });
-  tb.querySelectorAll("img[data-full]").forEach(img => img.onclick = () => {
+  const act = e.target.closest(".act");
+  if (act) {
+    const row = ALL.find(r => r.lead_id === act.dataset.id);
+    if (row) openCompose(row, act.dataset.party, act.dataset.ch);
+    return;
+  }
+  const img = e.target.closest("img[data-full]");
+  if (img) {
     document.getElementById("lb-img").src = img.dataset.full;
     document.getElementById("lightbox").hidden = false;
-  });
-}
+  }
+});
+document.querySelector("main").addEventListener("change", async e => {
+  const sel = e.target.closest("select.status");
+  if (!sel) return;
+  const id = sel.dataset.id, next = sel.value;
+  const holder = sel.closest("tr") || sel.closest(".card");
+  if (holder) holder.classList.add("saving");
+  try {
+    const res = await fetch(`${API}/transmissions/${encodeURIComponent(id)}/status`, {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({status: next, by: whoAmI(true)}),
+    });
+    if (!res.ok) throw new Error(await res.text());
+    const row = ALL.find(r => r.lead_id === id);
+    if (row) {
+      row.status = next;
+      row.status_updated_at = new Date().toISOString();
+      row.status_updated_by = localStorage.getItem("krab_who") || "";
+    }
+    draw();
+  } catch (err) {
+    document.getElementById("err").innerHTML =
+      `<div class="err">Could not save that status: ${esc(err.message)}</div>`;
+    if (holder) holder.classList.remove("saving");
+  }
+});
 
 // ── Compose ────────────────────────────────────────────────────────────────
 function statusLine(r) {

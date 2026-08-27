@@ -67,8 +67,11 @@ class TheBigBoardRendersTest(unittest.TestCase):
         self.assertEqual(positions, sorted(positions), "columns out of order")
 
     def test_every_party_gets_send_buttons(self):
-        self.assertIn('data-ch="email"', self.body)
-        self.assertIn('data-ch="sms"', self.body)
+        # Both channels are wired through the one button builder, on the table
+        # blocks and the phone cards alike.
+        self.assertIn('"email", "✉ Email"', self.body)
+        self.assertIn('"sms", "💬 SMS"', self.body)
+        self.assertIn('data-ch="${ch}"', self.body)
         for party in ("client", "driver", "issuer", "dispatcher"):
             self.assertIn(f'block(r, "{party}")', self.body, party)
 
