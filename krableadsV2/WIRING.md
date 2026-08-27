@@ -102,6 +102,41 @@ overrule the strict one.
 
 ---
 
+## Chat layer
+
+In front of every parser above sits the model. **`KRAB_CHAT_LAYER`** (default
+on) has it read each message first — on the review card and at idle — and turn
+what it understands into card edits, selections, or a submit. Everything in the
+previous section is the fallback: no key, no credit, a timeout, or a message the
+model declines to claim all fall through to the deterministic ladder unchanged,
+so this layer too can only add understanding. The variable is read at call time:
+set `0` and restart to kill it, no deploy.
+
+Two rules keep the model on a leash:
+
+**Submitting asks first.** With the model reading everything, prose like "ok
+looks good, send it out" can classify as submit. Only the strict submit words
+send immediately; anything softer gets "Reply **yes** to confirm" and 90 seconds
+to answer. A temp tag is a legal document — the confirmation is one word or one
+tap.
+
+**Extraction never overwrites.** A paste or dictation naming several fields
+fills only the fields still empty on the card, the same rule the bulk-leftover
+placer lives by. An explicit single-field correction may overwrite.
+
+A circuit breaker keeps a dead OpenAI account from taxing every message with a
+network timeout before its fallback: out of quota opens it for 300 seconds,
+three transport failures in a row for 60. RAM-only on purpose — a restart is
+already a fresh start, and a breaker that survives one is a breaker nobody
+remembers to reset.
+
+The test suite runs with the layer OFF — `tests/conftest.py` sets
+`KRAB_CHAT_LAYER=0`, or a local `.env` would leak a real key into every e2e run.
+The layer's own suite, `tests/test_chat_layer.py`, flips it back on with a
+mocked classifier.
+
+---
+
 ## What is deliberately not automatic
 
 **The insurance account.** `/api/integrations/clients` lives on the deployed
@@ -110,6 +145,7 @@ tristatecoverage.com and is not in the local project (which has only `purchase`,
 as success rather than failure, so repeat customers work — but if you want the
 server side changed, that repository is needed.
 
-**OpenAI.** Photo and PDF parsing, VIN reading, plate reading and the AI field
-classifier all need credits on the key. Everything else — labelled edits, the
-pickers, dispatch, tags — is deterministic and works without them.
+**OpenAI.** Photo and PDF parsing, VIN reading, plate reading, the AI field
+classifier and the chat layer all need credits on the key. Everything else —
+labelled edits, the pickers, dispatch, tags — is deterministic and works
+without them.

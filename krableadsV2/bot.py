@@ -6575,9 +6575,25 @@ async def _open_source_picker(context: ContextTypes.DEFAULT_TYPE) -> None:
 # are the operations the review card itself offers, so an AI-chosen one lands in
 # exactly the same code a tap does.
 _AI_CARD_TOOLS = frozenset({
-    "update_lead", "select_driver", "select_dispatcher", "add_vehicle",
-    "submit_lead",
+    "update_lead", "update_lead_fields", "select_driver", "select_dispatcher",
+    "add_vehicle", "submit_lead", "set_insurance_addon",
 })
+
+
+def _chat_layer_enabled() -> bool:
+    """THE CHAT LAYER: the model reads a message before any deterministic parser.
+
+    Read from the environment at call time, not frozen on Config, so the test
+    suite (conftest sets KRAB_CHAT_LAYER=0 — a local .env would otherwise leak
+    a real key into every e2e run) and a production kill switch both work
+    without a restart-order dance. The breaker keeps a dead OpenAI account from
+    taxing every message with a timeout before its fallback.
+    """
+    from utils import nl_router
+    return (os.getenv("KRAB_CHAT_LAYER", "1").strip().lower()
+            not in ("0", "false", "off", "no")
+            and nl_router.is_configured()
+            and not nl_router.breaker_open())
 
 
 async def _ai_review_command(update, context, user_id, state_data, text):
@@ -6594,13 +6610,43 @@ async def _ai_review_command(update, context, user_id, state_data, text):
     # is how the next unrelated sentence gets filed as somebody's name.
     parked = nl_router.take_parked(context.user_data)
     if parked:
-        # Unless the answer is plainly a new instruction, in which case the old
-        # call is abandoned rather than fed the word "cancel" as a driver name.
-        if not _COMMAND_LIKE_RE.search(text) and not _cancel_restart_kind(text):
+        # Unless the answer is plainly a new instruction OR a labeled field edit
+        # ("price 150" typed while "which driver?" is waiting answers the CARD,
+        # not the question) — in those cases the old call is abandoned rather
+        # than fed the edit as a driver name. The probe runs on a deep copy: the
+        # applier mutates, and a shared nested list would corrupt the real card.
+        import copy as _copy
+        _probe_hit = bool(_apply_inline_review_text(_copy.deepcopy(state_data), text))
+        if (not _probe_hit and not _COMMAND_LIKE_RE.search(text)
+                and not _cancel_restart_kind(text)):
             args = dict(parked["args"])
             args[parked["needs"]] = text.strip()
             return await _run_ai_card_tool(update, context, user_id, state_data,
                                            parked["tool"], args)
+
+    # A pending "reply yes to send" from a soft submit. Popped whatever the
+    # answer: any other message abandons the confirmation and is read normally.
+    _sub_ts = context.user_data.pop("chat_submit_pending", None)
+    if _sub_ts and time.time() - float(_sub_ts) <= _CHAT_SUBMIT_CONFIRM_TTL_SEC:
+        if _CHAT_SUBMIT_YES_RE.match(text):
+            await _autoclean_user_msg(update, context)
+            await _cleanup_voice_echo(
+                context, update.effective_chat.id if update.effective_chat else None)
+            return await _continue_phase1_after_ai_review(
+                update.effective_message, context, user_id)
+
+    # While the DMV VIN-conflict question is on screen, its yes/no/use/keep
+    # answers are deterministic and context-gated — the model knows nothing of
+    # the question (card_summary carries no prompt state) and would read "use
+    # the new one" as a car edit. Stand down until the conflict is resolved.
+    if context.user_data.get("vin_choice_api_car"):
+        return None
+
+    # A giant paste or a MULTI-CAR paste belongs to the specialized parsers:
+    # classify truncates at 2000 chars, and a two-VIN job claimed as a flat
+    # field update would silently drop car 2.
+    if len(text) > 1500 or len(re.findall(r"[A-HJ-NPR-Z0-9]{17}", text.upper())) >= 2:
+        return None
 
     if not nl_router.is_configured():
         return None
@@ -6629,31 +6675,112 @@ async def _ai_review_command(update, context, user_id, state_data, text):
     return await _run_ai_card_tool(update, context, user_id, state_data, tool, args)
 
 
+_CHAT_SUBMIT_YES_RE = re.compile(
+    r"^\s*(?:yes|yep|yeah|confirm|confirmed|send\s*(?:it)?(?:\s*out)?|submit)\s*[.!]*\s*$",
+    re.I,
+)
+# How long a "reply yes to send" confirmation stays live. RAM-only: after a
+# redeploy the card's own ✅ Submit button is the recovery path.
+_CHAT_SUBMIT_CONFIRM_TTL_SEC = 90
+
+
+def _ai_field_current(state_data: dict, field: str, ek: str) -> str:
+    """What the card already holds for a tool field, for fill-only-empty checks."""
+    if ek in ("fn", "ln"):
+        pf, pl = _display_name_parts(state_data)
+        v = pf if ek == "fn" else pl
+        return "" if v == "-" else (v or "")
+    sk = PH1_EDIT_TO_STATE_KEY.get(ek) or field
+    return str(state_data.get(sk) or "")
+
+
+async def _ai_card_housekeeping(update, context, state_data, chat_id, toast=None):
+    """The chat hygiene every applied edit owes: the typed message goes, the
+    voice echo goes, the card repaints in place, feedback vanishes on its own."""
+    await _autoclean_user_msg(update, context)
+    await _cleanup_voice_echo(context, chat_id)
+    await _update_review_message_text(context, state_data)
+    if toast and chat_id:
+        await _send_vanishing(context, chat_id, toast)
+
+
 async def _run_ai_card_tool(update, context, user_id, state_data, tool, args):
     """Execute one AI-chosen card operation through the SAME code a tap uses.
 
     Nothing is reimplemented here — each branch hands off to the function the
-    button already calls, so a tap and a sentence cannot drift apart.
+    button already calls, so a tap and a sentence cannot drift apart. Values
+    pass through _clean_inline_value first: the model repeats what the operator
+    said, and the sanitizers ('$' on prices, the phone pulled out of a sentence,
+    'gieco' → GEICO) are part of what a field means in this bot.
     """
-    logger.info("ai card tool: %s %s", tool, {k: str(v)[:40] for k, v in args.items()})
+    # Keys only: the values are client PII (phones, addresses, DL numbers) and
+    # log lines become Sentry breadcrumbs.
+    logger.info("ai card tool: %s args=%s", tool, sorted(args.keys()))
     try:
         import sentry_sdk
         sentry_sdk.set_tag("ai_invoked", tool)
     except Exception:
         pass
+    chat_id = update.effective_chat.id if update.effective_chat else None
 
     if tool == "update_lead":
         ek = _AI_FIELD_TO_EK.get(args.get("field") or "")
         if not ek:
             return None
+        cleaned = _clean_inline_value(ek, str(args.get("value") or ""))
+        if not cleaned:
+            # The value does not fit the field ("phone is dead"). Decline the
+            # tool; the deterministic ladder gets the message unchanged.
+            return None
         vehicle = args.get("vehicle") or 1
         if int(vehicle) > 1:
             ek = _vehicle_edit_key(int(vehicle), _AI_FIELD_TO_VEHICLE_EK.get(
                 args.get("field") or "", ek))
-        _apply_single_phase1_edit(state_data, ek, str(args.get("value") or ""))
+        _apply_single_phase1_edit(state_data, ek, cleaned)
         _clean_vin_and_car(state_data)
+        # A whole address landed in one street field leaves city/ST/ZIP empty on
+        # the printed tag — same re-split the labeled path has always done.
+        await _ai_split_addresses_if_needed(state_data)
         db.set_user_state(user_id, "phase1", state_data)
-        await _update_review_message_text(context, state_data)
+        await _ai_card_housekeeping(
+            update, context, state_data, chat_id,
+            toast="✅ Updated: " + str(args.get("field") or "").replace("_", " "))
+        return STATE_AI_REVIEW
+
+    if tool == "update_lead_fields":
+        # A paste/dictation naming several fields. Fill-only-empty: extraction
+        # from prose must never clobber a value already on the card (the same
+        # rule the bulk-leftover placer lives by). Explicit corrections arrive
+        # as update_lead, which may overwrite.
+        updated, unread = [], []
+        for field, raw in (args or {}).items():
+            ek = _AI_FIELD_TO_EK.get(field)
+            raw = str(raw or "").strip()
+            if not ek or not raw:
+                continue
+            if not _is_blank_field(_ai_field_current(state_data, field, ek)):
+                continue
+            cleaned = _clean_inline_value(ek, raw)
+            if not cleaned:
+                unread.append(field.replace("_", " "))
+                continue
+            _apply_single_phase1_edit(state_data, ek, cleaned)
+            updated.append(field.replace("_", " "))
+        if not updated:
+            return None                # nothing landed — let the old bulk path try
+        _clean_vin_and_car(state_data)
+        await _ai_split_addresses_if_needed(state_data)
+        db.set_user_state(user_id, "phase1", state_data)
+        toast = "✅ Updated: " + ", ".join(dict.fromkeys(updated))
+        if unread:
+            toast += "\n🤔 Couldn't read: " + ", ".join(unread[:3])
+        await _ai_card_housekeeping(update, context, state_data, chat_id, toast=toast)
+        return STATE_AI_REVIEW
+
+    if tool == "set_insurance_addon":
+        state_data["wants_insurance"] = bool(args.get("enable"))
+        db.set_user_state(user_id, "phase1", state_data)
+        await _ai_card_housekeeping(update, context, state_data, chat_id)
         return STATE_AI_REVIEW
 
     if tool in ("select_driver", "select_dispatcher"):
@@ -6670,8 +6797,33 @@ async def _run_ai_card_tool(update, context, user_id, state_data, tool, args):
             update, context, PH1_ADD_CAR_CB, state_data)
 
     if tool == "submit_lead":
-        return await _continue_phase1_after_ai_review(
-            update.effective_message, context, user_id)
+        # With the model reading every message, prose like "ok looks good, send
+        # it out later" can classify as submit. A strict submit word sends as it
+        # always has; anything softer asks first — a temp tag is a legal
+        # document, and the confirmation is one word or one tap.
+        raw = ((update.effective_message.text if update.effective_message else "") or "").strip()
+        if _SUBMIT_RE.match(raw):
+            await _autoclean_user_msg(update, context)
+            await _cleanup_voice_echo(context, chat_id)
+            return await _continue_phase1_after_ai_review(
+                update.effective_message, context, user_id)
+        if context.user_data.get("vin_choice_api_car"):
+            # A "reply yes" ask while the DMV question owns the word "yes" would
+            # be answered by the WRONG handler (VIN_USE overwrites the car).
+            try:
+                await update.effective_message.reply_text(
+                    "🚗 Answer the DMV question above first — then say submit.")
+            except Exception:
+                pass
+            return STATE_AI_REVIEW
+        context.user_data["chat_submit_pending"] = time.time()
+        try:
+            await update.effective_message.reply_text(
+                "🛑 Send this lead out now? Reply **yes** to confirm, or tap "
+                "✅ Submit on the card.", parse_mode="Markdown")
+        except Exception:
+            pass
+        return STATE_AI_REVIEW
 
     return None
 
@@ -6723,12 +6875,10 @@ async def _interpret_review_command(update, context, user_id, state_data, text):
             if guess:
                 logger.info("bare-name pick: %r -> %s %s", text[:60], *guess)
                 kind, payload = guess
-        if kind == "NONE":
-            # Nothing local understood it. Ask the model what was meant.
-            handled = await _ai_review_command(update, context, user_id,
-                                               state_data, text)
-            if handled is not None:
-                return handled
+        # The model is no longer consulted HERE: the chat layer at the top of
+        # handle_phase1_review_message already read this message before any of
+        # the deterministic parsing ran. Asking again would double the latency
+        # and re-take a parked slot that was already consumed.
     if kind in ("NONE", "FIELD_EDITS"):
         return None
     chat_id = update.effective_chat.id if update.effective_chat else None
@@ -6957,6 +7107,23 @@ async def handle_phase1_review_message(update: Update, context: ContextTypes.DEF
         return ConversationHandler.END
     context.user_data.pop("state_miss_once", None)
     state_data = state["data"]
+
+    # ── THE CHAT LAYER ───────────────────────────────────────────────────────
+    # The model reads EVERY review message FIRST; the deterministic ladder below
+    # is its fallback, not its gatekeeper. None means the model abstained, timed
+    # out, or is unconfigured/tripped — and then nothing below behaves any
+    # differently than it did before this line existed. Cancel words and the
+    # armed one-shot slots never reach here (handled above / in earlier groups).
+    # A parked follow-up must be consumed even with the layer off (a breaker can
+    # trip between the question and its answer), which is the OR: the parked
+    # take happens inside _ai_review_command, before any new classification.
+    from utils import nl_router as _nlr_front
+    if (_chat_layer_enabled()
+            or _nlr_front.NL_PENDING_KEY in (context.user_data or {})
+            or "chat_submit_pending" in (context.user_data or {})):
+        handled = await _ai_review_command(update, context, user_id, state_data, text)
+        if handled is not None:
+            return handled
 
     # 0. Insurance on/off by voice/text ("add insurance", "no insurance") — before the
     #    field editor, so "insurance" isn't swallowed as an insurance-company edit.
@@ -8123,7 +8290,12 @@ async def _route_supervisor_message(update, context, user_id, text: str) -> bool
             await _stage_plate_confirm(msg, context, pfu["col"], digits)
             return True
 
-    if not _ROUTER_HINT_RE.search(text):
+    # THE CHAT LAYER: with the layer on, the model reads EVERY idle supervisor
+    # message — commands phrased without a hint word ("shut HighKage down") used
+    # to skip AI entirely and BECOME A LEAD. The create_lead bias in the model's
+    # system prompt hands real client dossiers back to the lead flow. With the
+    # layer off or tripped, the old hint gate stands and nothing changes.
+    if not _chat_layer_enabled() and not _ROUTER_HINT_RE.search(text):
         return False
     try:
         # Function calling rather than prompt-coaxed JSON: the model gets a typed
@@ -8251,6 +8423,35 @@ async def _route_supervisor_message(update, context, user_id, text: str) -> bool
                 "📷 Send the temp-tag photo or PDF now — I'll read the number and confirm. "
                 "The H/V letter is kept automatically."
             )
+        elif intent in ("update_lead", "update_lead_fields", "select_driver",
+                        "select_dispatcher", "add_vehicle", "submit_lead",
+                        "set_insurance_addon"):
+            if not _chat_layer_enabled():
+                # Layer off, key present: the old hint path classified this and
+                # answered with the help text. Keep that cell byte-identical.
+                await msg.reply_text(_ROUTER_HELP)
+            else:
+                # A redeploy can strand a lead mid-dispatch (DB says
+                # select_group/select_driver, RAM conversation gone). "give it
+                # to John" then classifies select_driver — the guidance for
+                # that belongs to the mid-dispatch guard downstream, not to a
+                # "no lead on screen" reply that tells them to paste a new one.
+                _mid = None
+                try:
+                    _mid = ((db.get_user_state(user_id) or {}).get("state") or "")
+                except Exception:
+                    pass
+                if _mid in _LEAD_MID_DISPATCH_STATES:
+                    return False
+                # A card operation with no card on screen. Saying so beats
+                # starting a junk lead out of "change the color to black".
+                await msg.reply_text(
+                    "🪪 No lead is on screen. Paste the client's info to start "
+                    "one — then send that again once the card is open.")
+        elif not _ROUTER_HINT_RE.search(text):
+            # "none" on hint-less text: chatter or a dossier the model declined
+            # to claim. The lead flow has always owned these — keep owning them.
+            return False
         else:  # "none" — matched a command hint but isn't actionable; don't start a lead
             await msg.reply_text(_ROUTER_HELP)
     except Exception as e:

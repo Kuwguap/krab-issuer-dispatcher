@@ -326,15 +326,26 @@ class TheBotWorksWithNoApiAtAllTest(unittest.TestCase):
                 self.assertEqual(
                     bot._classify_review_command(text, vin_pending=False)[0], want)
 
-    def test_the_model_is_only_asked_after_the_local_rules_decline(self):
-        """The ordering IS the safety property. Reversing it would put a network
-        call on every message and let the model overrule a working answer."""
+    def test_the_model_reads_first_and_the_rules_are_its_fallback(self):
+        """THE CHAT LAYER inverted the old order — deliberately, on operator
+        demand: the model reads every review message BEFORE any deterministic
+        parser. The safety property moved with it: the layer is gated on
+        _chat_layer_enabled() (no key = exactly the old pipeline; breaker open
+        or KRAB_CHAT_LAYER=0 = the deterministic ladder alone, which also
+        removes the old tail consult — deliberate: the switch exists to stop
+        ALL model traffic), and _interpret_review_command may no longer
+        consult the model itself — that would be a second network hop for the
+        same message and a second take on an already-consumed parked slot."""
         src = (ROOT / "bot.py").read_text(encoding="utf-8")
-        body = src.split("async def _interpret_review_command", 1)[1][:3000]
-        local = body.index("_classify_review_command(")
-        ai = body.index("_ai_review_command(")
-        self.assertLess(local, ai)
-        self.assertIn('if kind == "NONE":', body[:ai])
+        review = src.split("async def handle_phase1_review_message", 1)[1][:12000]
+        ai = review.index("_ai_review_command(")
+        self.assertLess(review.index("_chat_layer_enabled()"), ai)
+        self.assertLess(ai, review.index("_insurance_intent("))
+        self.assertLess(ai, review.index("_apply_inline_review_text("))
+        self.assertLess(ai, review.index("_interpret_review_command("))
+        interp = src.split("async def _interpret_review_command", 1)[1]
+        interp = interp.split("\nasync def ", 1)[0]
+        self.assertNotIn("_ai_review_command(", interp)
 
 
 class OneChatAtATimeButNotOnePersonAtATimeTest(unittest.TestCase):

@@ -36,6 +36,7 @@ deterministically and cost nothing.
 """
 import json
 import logging
+import os
 import time
 from typing import Optional
 
@@ -54,6 +55,39 @@ NL_PENDING_TTL_SEC = 180
 # worse than being approximately right after one — and the deterministic answer
 # is already waiting.
 ROUTE_TIMEOUT_SEC = 8.0
+
+# ── circuit breaker ──────────────────────────────────────────────────────────
+# With the chat layer in FRONT of every message, a dead OpenAI account would
+# otherwise tax EVERY text with a full network round-trip before its fallback.
+# Quota trips long (the account has actually run out of credits before);
+# repeated transport failures trip short. RAM-only on purpose: a restart is
+# already a fresh start, and a breaker that survives one is a breaker nobody
+# remembers to reset.
+BREAKER_QUOTA_COOLDOWN_SEC = 300
+BREAKER_FAIL_COOLDOWN_SEC = 60
+BREAKER_FAILS_TO_TRIP = 3
+_breaker = {"until": 0.0, "fails": 0}
+
+
+def breaker_open() -> bool:
+    return time.time() < _breaker["until"]
+
+
+def _breaker_trip(seconds: float) -> None:
+    _breaker["until"] = time.time() + seconds
+    _breaker["fails"] = 0
+    logger.warning("nl_router: breaker open for %ss", int(seconds))
+
+
+def _breaker_note_failure() -> None:
+    _breaker["fails"] += 1
+    if _breaker["fails"] >= BREAKER_FAILS_TO_TRIP:
+        _breaker_trip(BREAKER_FAIL_COOLDOWN_SEC)
+
+
+def _breaker_reset() -> None:
+    _breaker["until"] = 0.0
+    _breaker["fails"] = 0
 
 
 def _fn(name: str, description: str, properties: dict) -> dict:
@@ -143,6 +177,23 @@ TOOLS = [
             "vehicle": {"type": ["integer", "null"],
                         "description": "null or 1 for the lead's own car; 2+ for an extra car"},
         },
+    ),
+    _fn(
+        "update_lead_fields",
+        "The message names SEVERAL fields for the lead on the review card — a "
+        "paste, a dictation, or lines like 'Color white / Email now / price 200'. "
+        "Fill ONLY what was actually said, verbatim as the operator gave it; "
+        "leave every other field null. Prose that is not a field value ('Email "
+        "now', 'sorry for the late reply') belongs in none of them.",
+        {f: _opt() for f in LEAD_FIELDS},
+    ),
+    _fn(
+        "set_insurance_addon",
+        "Turn the $100 TriState insurance add-on for the lead on screen on or "
+        "off: 'add insurance' → true; 'no insurance', 'they already have "
+        "coverage', 'client has Geico' → false. NOT for naming an insurance "
+        "company — that is update_lead with field insurance_company.",
+        {"enable": _flag()},
     ),
     _fn(
         "select_driver",
@@ -341,7 +392,7 @@ def classify(user_message: str, *, card: Optional[dict] = None) -> Optional[dict
     are on.
     """
     txt = (user_message or "").strip()
-    if not txt or not is_configured():
+    if not txt or not is_configured() or breaker_open():
         return None
     try:
         from openai import OpenAI
@@ -353,7 +404,11 @@ def classify(user_message: str, *, card: Optional[dict] = None) -> Optional[dict
         client = OpenAI(api_key=str(Config.OPENAI_API_KEY).strip(),
                         max_retries=0, timeout=ROUTE_TIMEOUT_SEC)
         resp = client.chat.completions.create(
-            model=getattr(Config, "OPENAI_VISION_MODEL", None) or "gpt-4o",
+            # With the chat layer fronting EVERY message, the router's model is
+            # its own cost knob: KRAB_ROUTER_MODEL (e.g. gpt-4o-mini) without
+            # touching the vision model. Default unchanged.
+            model=(os.getenv("KRAB_ROUTER_MODEL") or "").strip()
+            or getattr(Config, "OPENAI_VISION_MODEL", None) or "gpt-4o",
             messages=[
                 {"role": "system",
                  "content": _SYSTEM + "\n\n" + card_summary(card or {})},
@@ -368,9 +423,12 @@ def classify(user_message: str, *, card: Optional[dict] = None) -> Optional[dict
         msg = str(e).lower()
         if any(s in msg for s in ("429", "insufficient_quota", "quota",
                                   "rate limit", "credit balance")):
+            _breaker_trip(BREAKER_QUOTA_COOLDOWN_SEC)
             raise AIVisionQuotaError("API quota exceeded") from e
+        _breaker_note_failure()
         logger.warning("nl_router: classify failed: %s", e)
         return None
+    _breaker_reset()
 
     try:
         calls = resp.choices[0].message.tool_calls or []
