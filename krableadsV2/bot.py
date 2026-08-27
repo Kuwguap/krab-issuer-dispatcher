@@ -619,6 +619,13 @@ def _drivers_sent_label(state_data: dict, drivers_list: list) -> str:
     return ", ".join(names[:4]) + f" +{len(names) - 4} more"
 
 
+# A newline inside an f-string expression, which Python 3.11 forbids writing
+# directly. Six places in the instant-PDF flow already used this name and NOTHING
+# ever defined it, so every one of them raised NameError the moment it ran --
+# which is why that button has never actually produced a payment link.
+NL = "\n"
+
+
 # ── $100 instant PDF ────────────────────────────────────────────────────────
 # Pay, and the tag goes straight to the chosen driver — no dispatch team, no wait.
 # The money is the approval.
@@ -665,14 +672,107 @@ async def request_instant_pdf_link(lead_id, driver_id, reference_id="") -> tuple
     return data["url"], None
 
 
+SKIP_DISPATCH_DRIVER_CB = "skipdrv_"
+SKIP_DISPATCH_PENDING_KEY = "skip_dispatch_pending"
+# Long enough to walk to a card reader, short enough that a forgotten prompt does
+# not silently eat whatever the operator types an hour later.
+_SKIP_DISPATCH_TTL_SEC = 900
+_DISPATCH_MSGS_KEY = "dispatch_msgs"
+
+
+def _skip_dispatch_password() -> str:
+    """The typed bypass for the $100 charge.
+
+    Read from the environment so it can be rotated without a deploy. The default
+    is the one the operator specified; a password living in a public repository
+    is worth exactly as much as the repository is private, so setting
+    SKIP_DISPATCH_PASSWORD on Render is the thing to do.
+    """
+    return (os.getenv("SKIP_DISPATCH_PASSWORD") or "AdminPassword123!").strip()
+
+
+def _remember_dispatch_message(context, lead_id, chat_id, message_id) -> None:
+    """Note a message this dispatch sent, so Skip Dispatch can take it back.
+
+    bot_data, not the database: the alternative is a fifth migration on top of
+    four the operator has not run. The cost is that a restart forgets, and
+    _delete_dispatch_messages says so rather than reporting a clean sweep.
+    """
+    if not (lead_id and chat_id and message_id):
+        return
+    try:
+        book = context.application.bot_data.setdefault(_DISPATCH_MSGS_KEY, {})
+        book.setdefault(str(lead_id), []).append((str(chat_id), int(message_id)))
+    except Exception as e:
+        logger.warning("could not remember dispatch message for %s: %s", lead_id, e)
+
+
+async def _delete_dispatch_messages(context, lead_id) -> tuple:
+    """Unsend every team offer and driver DM for this lead. Returns (gone, left).
+
+    Group offers come from group_lead_offers, which persists them, so those
+    survive a restart. Driver DMs come from bot_data and do not.
+    """
+    targets, seen = [], set()
+
+    try:
+        for o in (db.get_group_lead_offers(lead_id) or []):
+            cid, mid = _parse_chat_id(o.get("group_chat_id")), o.get("group_message_id")
+            if cid and mid:
+                targets.append((cid, int(mid)))
+    except Exception as e:
+        logger.warning("skip dispatch: could not read group offers for %s: %s", lead_id, e)
+
+    try:
+        book = context.application.bot_data.get(_DISPATCH_MSGS_KEY, {})
+        for cid, mid in book.get(str(lead_id), []):
+            targets.append((_parse_chat_id(cid) or cid, int(mid)))
+    except Exception as e:
+        logger.warning("skip dispatch: could not read remembered messages for %s: %s", lead_id, e)
+
+    gone = left = 0
+    for cid, mid in targets:
+        if (str(cid), mid) in seen:
+            continue
+        seen.add((str(cid), mid))
+        try:
+            await context.bot.delete_message(chat_id=cid, message_id=mid)
+            gone += 1
+        except Exception as e:
+            # Telegram refuses deletes older than 48h and messages the bot did not
+            # send. Neither is recoverable here, so count it and move on.
+            left += 1
+            logger.info("skip dispatch: could not delete %s/%s: %s", cid, mid, e)
+
+    try:
+        context.application.bot_data.get(_DISPATCH_MSGS_KEY, {}).pop(str(lead_id), None)
+    except Exception:
+        pass
+    return gone, left
+
+
+def _skip_dispatch_driver_keyboard(lead_id) -> InlineKeyboardMarkup:
+    """Every active driver, one per row. No "All Drivers" on purpose: this path
+    sends ONE tag to ONE person, and a broadcast is the thing it just undid."""
+    rows = []
+    for d in (_get_all_drivers_cached() or []):
+        if not record_is_active(d):
+            continue
+        name = str(d.get("driver_name") or "Driver").strip()
+        rows.append([InlineKeyboardButton(
+            f"🚗 {name}",
+            callback_data=f"{SKIP_DISPATCH_DRIVER_CB}{lead_id}|{d.get('id')}")])
+    return InlineKeyboardMarkup(rows) if rows else InlineKeyboardMarkup([])
+
+
 def _instant_pdf_keyboard(lead_id) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([[InlineKeyboardButton(
-        "⚡ Instant PDF — $100 (skip dispatch)",
+        "🚫 Skip Dispatch",
         callback_data=f"{INSTANT_PDF_CB}{lead_id}")]])
 
 
 async def handle_instant_pdf_request(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """"Instant PDF" tapped — hand back a pay link for THIS lead's chosen driver."""
+    """"Skip Dispatch" tapped: unsend what went out, then ask who gets the tag."""
     query = update.callback_query
     await _safe_answer_callback_query(query)
     lead_id = (query.data or "").replace(INSTANT_PDF_CB, "", 1).strip()
@@ -681,39 +781,184 @@ async def handle_instant_pdf_request(update: Update, context: ContextTypes.DEFAU
         await query.message.reply_text("❌ That lead is gone — start a new one.")
         return
 
-    # The driver already chosen for this lead. Without one there is nobody to send
-    # the tag to, and charging for that would be worse than refusing.
-    driver_id = ""
-    try:
-        st = await asyncio.to_thread(db.get_lead_assignment_status, lead_id)
-        driver_id = str((st or {}).get("driver_id") or "")
-    except Exception:
-        driver_id = ""
-    if not driver_id:
-        ids = _resolve_dispatch_driver_ids(
-            _issuer_state_data_from_lead(lead), group_id=lead.get("group_id"))
-        driver_id = ids[0] if len(ids) == 1 else ""
-    if not driver_id:
+    # Take it back FIRST. A team that reads the offer while the operator is still
+    # choosing a driver will work a lead that has already been pulled.
+    gone, left = await _delete_dispatch_messages(context, lead_id)
+
+    kb = _skip_dispatch_driver_keyboard(lead_id)
+    if not kb.inline_keyboard:
         await query.message.reply_text(
-            "🚗 Pick ONE driver for this lead first — an instant tag goes straight "
-            "to them, so there has to be exactly one.")
+            "❌ No active driver to send this to. Add one in /settings first.")
         return
 
-    url, err = await request_instant_pdf_link(
-        lead_id, driver_id, lead.get("reference_id") or "")
-    if not url:
-        await query.message.reply_text(f"❌ Could not open the payment page.{NL}{NL}{err}")
-        return
     ref = html.escape(str(lead.get("reference_id") or "N/A"), quote=False)
+    lines = ["🚫 <b>Dispatch skipped</b>", f"📋 Reference: <code>{ref}</code>", ""]
+    if gone:
+        lines.append(f"🗑 Pulled back {gone} message(s) from the team and drivers.")
+    if left:
+        # Telegram will not delete a message older than 48h, and a restart forgets
+        # the driver DMs. Say so rather than implying a clean sweep.
+        lines.append(f"⚠️ {left} could not be deleted — over 48h old, or sent before a restart. "
+                     "Remove those by hand.")
+    if not gone and not left:
+        lines.append("<i>Nothing had gone out yet.</i>")
+    lines += ["", "🚗 <b>Who should get this tag?</b>"]
+    await query.message.reply_text(NL.join(lines), parse_mode="HTML", reply_markup=kb)
+
+
+async def handle_skip_dispatch_driver_pick(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """A driver was chosen: offer the pay link, or the password."""
+    query = update.callback_query
+    await _safe_answer_callback_query(query)
+    payload = (query.data or "").replace(SKIP_DISPATCH_DRIVER_CB, "", 1)
+    lead_id, _, driver_id = payload.partition("|")
+    lead = await asyncio.to_thread(db.get_lead_by_id, lead_id.strip()) if lead_id else None
+    driver = await asyncio.to_thread(_driver_row_by_id, driver_id.strip()) if driver_id else None
+    if not lead or not driver:
+        await query.message.reply_text("❌ That lead or driver is gone — start again.")
+        return
+
+    context.user_data[SKIP_DISPATCH_PENDING_KEY] = {
+        "lead_id": lead_id.strip(),
+        "driver_id": driver_id.strip(),
+        "at": time.time(),
+    }
+
+    ref = html.escape(str(lead.get("reference_id") or "N/A"), quote=False)
+    dname = html.escape(str(driver.get("driver_name") or "driver"), quote=False)
+    url, err = await request_instant_pdf_link(
+        lead_id.strip(), driver_id.strip(), lead.get("reference_id") or "")
+
+    body = [
+        f"⚡ <b>Skip Dispatch — {dname}</b>",
+        f"📋 Reference: <code>{ref}</code>",
+        "",
+        "The tag goes straight to them — no dispatch approval, no waiting.",
+        "",
+    ]
+    if url:
+        body.append("💳 <b>Pay $100</b> with the button below,")
+        body.append("🔑 <b>or reply here with the password.</b>")
+    else:
+        # No checkout is not a dead end when a password can still release it.
+        body.append("🔑 <b>Reply here with the password</b> to release it.")
+        body.append(f"<i>The payment page is unavailable: {html.escape(str(err or ''), quote=False)}</i>")
     await query.message.reply_text(
-        f"⚡ <b>Instant PDF — $100</b>{NL}{NL}"
-        f"📋 Reference: <code>{ref}</code>{NL}"
-        f"Pay and the tag goes straight to the driver — no dispatch approval, "
-        f"no waiting.{NL}{NL}<i>It arrives within a minute of the payment clearing.</i>",
+        NL.join(body),
         parse_mode="HTML",
-        reply_markup=InlineKeyboardMarkup(
-            [[InlineKeyboardButton("💳 Pay $100 and send", url=url)]]),
+        reply_markup=(InlineKeyboardMarkup([[InlineKeyboardButton("💳 Pay $100 and send", url=url)]])
+                      if url else None),
     )
+
+
+async def handle_skip_dispatch_password(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """The typed bypass. Only ever looks at a chat that is mid-Skip-Dispatch.
+
+    Silent on a non-match rather than "wrong password": this handler sits above
+    every conversation, and anything it answers is something it has taken away
+    from the handler the operator was actually talking to.
+    """
+    pending = (context.user_data or {}).get(SKIP_DISPATCH_PENDING_KEY)
+    if not pending:
+        return
+    if time.time() - float(pending.get("at") or 0) > _SKIP_DISPATCH_TTL_SEC:
+        context.user_data.pop(SKIP_DISPATCH_PENDING_KEY, None)
+        return
+    msg = update.effective_message
+    text = (msg.text or "").strip()
+    if not text or not hmac.compare_digest(text, _skip_dispatch_password()):
+        return
+
+    context.user_data.pop(SKIP_DISPATCH_PENDING_KEY, None)
+    # The password must not sit in the chat history where the next person scrolls.
+    try:
+        await msg.delete()
+    except Exception as e:
+        logger.info("skip dispatch: could not delete the password message: %s", e)
+
+    lead = await asyncio.to_thread(db.get_lead_by_id, pending.get("lead_id"))
+    driver = await asyncio.to_thread(_driver_row_by_id, pending.get("driver_id"))
+    if not lead or not driver:
+        await context.bot.send_message(chat_id=update.effective_chat.id,
+                                       text="❌ That lead or driver is gone — start again.")
+        raise ApplicationHandlerStop
+    await _deliver_skip_dispatch(context, lead, driver,
+                                 notify_chat_id=update.effective_chat.id,
+                                 how="password")
+    raise ApplicationHandlerStop
+
+
+async def _deliver_skip_dispatch(context, lead: dict, driver: dict, *,
+                                 notify_chat_id=None, how: str = "password") -> None:
+    """The send itself: the driver first, then every group and supervisory chat.
+
+    The driver is treated as a delivery target of the same shape as a group, so
+    this reuses _send_full_group_lead_to_chat rather than growing a second way to
+    format a lead — which is also how the tag and the insurance ride along for
+    free, and how the client's phone reaches them as a one-time link instead of
+    raw digits.
+    """
+    ref = str(lead.get("reference_id") or "N/A")
+    dname = str(driver.get("driver_name") or "driver")
+    label = f"SKIP DISPATCH — {dname}" + ("" if how == "password" else " (PAID)")
+
+    driver_cid = _parse_chat_id(driver.get("driver_telegram_id"))
+    driver_ok = False
+    if driver_cid:
+        try:
+            await _send_full_group_lead_to_chat(
+                context,
+                {"group_telegram_id": driver_cid, "group_name": dname},
+                lead,
+                html_prefix="<b>⚡ This one skipped dispatch — it is yours.</b>\n\n",
+                mirror_supervisory=False,
+                accepted_by=label,
+            )
+            driver_ok = True
+        except Exception as e:
+            logger.error("skip dispatch: could not send to driver %s: %s", dname, e)
+    else:
+        logger.error("skip dispatch: driver %s has no chat id", dname)
+
+    # Then the usual audience, exactly the way an accepted lead reaches them.
+    # mirror_supervisory only on the first, or every group re-posts to the same
+    # supervisory chats.
+    groups = [g for g in (db.get_all_groups() or []) if record_is_active(g)]
+    group_ok = 0
+    for i, g in enumerate(groups):
+        try:
+            await _send_full_group_lead_to_chat(
+                context, g, lead,
+                html_prefix="<b>⚡ Sent direct to a driver (dispatch skipped)</b>\n\n",
+                mirror_supervisory=(i == 0),
+                accepted_by=label,
+            )
+            group_ok += 1
+        except Exception as e:
+            logger.warning("skip dispatch: group %s post failed: %s",
+                           g.get("group_name"), e)
+
+    try:
+        await asyncio.to_thread(db.update_lead, lead.get("id"), {"group_id": lead.get("group_id")})
+    except Exception:
+        pass
+
+    if notify_chat_id:
+        lines = [
+            "⚡ <b>Skip Dispatch complete</b>",
+            f"📋 Reference: <code>{html.escape(ref, quote=False)}</code>",
+            f"🚗 Driver: {html.escape(dname, quote=False)}"
+            + ("" if driver_ok else "  ⚠️ <b>not delivered</b>"),
+            f"🏢 Posted to {group_ok} of {len(groups)} group(s).",
+        ]
+        if not driver_ok:
+            lines.append("")
+            lines.append("The driver did not get it — check their Telegram ID in /settings.")
+        try:
+            await context.bot.send_message(chat_id=notify_chat_id, text=NL.join(lines),
+                                           parse_mode="HTML")
+        except Exception as e:
+            logger.warning("skip dispatch: could not confirm to the operator: %s", e)
 
 
 async def deliver_paid_instant_pdfs(context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -802,7 +1047,7 @@ def _after_send_keyboard(lead_id: str) -> InlineKeyboardMarkup:
         [InlineKeyboardButton("🚗 Reassign driver", callback_data=f"resend_driver_{lead_id}"),
          InlineKeyboardButton("🏢 Reassign dispatcher", callback_data=f"reassign_group_{lead_id}")],
         [InlineKeyboardButton("➕ Another tag (same client)", callback_data=f"another_tag_{lead_id}")],
-        [InlineKeyboardButton("⚡ Instant PDF — $100 (skip dispatch)",
+        [InlineKeyboardButton("🚫 Skip Dispatch",
                               callback_data=f"{INSTANT_PDF_CB}{lead_id}")],
     ])
 
@@ -13048,7 +13293,7 @@ async def _background_dispatch_lead_after_driver_pick(
         try:
             db.create_lead_assignment(lead_id, driver["id"], group_id)
             try:
-                await context.bot.send_message(
+                _offer_msg = await context.bot.send_message(
                     chat_id=driver_chat_id,
                     text=driver_request_message,
                     parse_mode="Markdown",
@@ -13056,13 +13301,16 @@ async def _background_dispatch_lead_after_driver_pick(
                 )
             except BadRequest as e:
                 if "parse" in str(e).lower():
-                    await context.bot.send_message(
+                    _offer_msg = await context.bot.send_message(
                         chat_id=driver_chat_id,
                         text=driver_request_message.replace("`", ""),
                         reply_markup=accept_keyboard,
                     )
                 else:
                     raise
+            # Kept so "Skip Dispatch" can take this offer back off the driver.
+            _remember_dispatch_message(
+                context, lead_id, driver_chat_id, getattr(_offer_msg, "message_id", None))
             pending = db.get_driver_pending_receipts(driver["id"])
             if pending and len(pending) < SUSPENSION_THRESHOLD:
                 ref_buttons = [
@@ -14349,7 +14597,7 @@ async def _handle_resend_to_drivers(
         try:
             db.create_lead_assignment(lead_id, driver["id"], group_id)
             try:
-                await context.bot.send_message(
+                _offer_msg = await context.bot.send_message(
                     chat_id=driver_chat_id,
                     text=driver_request_message,
                     parse_mode="Markdown",
@@ -14357,13 +14605,16 @@ async def _handle_resend_to_drivers(
                 )
             except BadRequest as e:
                 if "parse" in str(e).lower():
-                    await context.bot.send_message(
+                    _offer_msg = await context.bot.send_message(
                         chat_id=driver_chat_id,
                         text=driver_request_message.replace("`", ""),
                         reply_markup=accept_keyboard,
                     )
                 else:
                     raise
+            # Kept so "Skip Dispatch" can take this offer back off the driver.
+            _remember_dispatch_message(
+                context, lead_id, driver_chat_id, getattr(_offer_msg, "message_id", None))
             assigned_count += 1
             pending = db.get_driver_pending_receipts(driver["id"])
             if pending and len(pending) < SUSPENSION_THRESHOLD:
@@ -19179,6 +19430,8 @@ def main():
             CallbackQueryHandler(handle_resend_driver, pattern="^resend_driver_"),
             CallbackQueryHandler(handle_reassign_group_pick, pattern="^reassign_group_"),
             CallbackQueryHandler(handle_instant_pdf_request, pattern=f"^{INSTANT_PDF_CB}"),
+            CallbackQueryHandler(handle_skip_dispatch_driver_pick,
+                                 pattern=f"^{SKIP_DISPATCH_DRIVER_CB}"),
             # Re-enter lead flow from inline buttons when CH in-memory state was lost (restart, multi-worker,
             # or rare routing gaps) but Supabase ``states`` still holds select_group / select_driver data.
             CallbackQueryHandler(handle_group_selection, pattern="^select_group_"),
@@ -19352,6 +19605,8 @@ def main():
             CallbackQueryHandler(handle_resend_driver, pattern="^resend_driver_"),
             CallbackQueryHandler(handle_reassign_group_pick, pattern="^reassign_group_"),
             CallbackQueryHandler(handle_instant_pdf_request, pattern=f"^{INSTANT_PDF_CB}"),
+            CallbackQueryHandler(handle_skip_dispatch_driver_pick,
+                                 pattern=f"^{SKIP_DISPATCH_DRIVER_CB}"),
         ],
     )
 
@@ -19549,6 +19804,17 @@ def main():
             filters.TEXT & ~filters.COMMAND,
             handle_cf_edit_reply),
         group=-45,
+    )
+
+    # The Skip Dispatch password. Its own group above every conversation, because
+    # the operator is usually parked in one when they tap the button, and a
+    # conversation state would otherwise swallow the reply as a field value.
+    # Returns immediately unless this chat is mid-Skip-Dispatch.
+    application.add_handler(
+        MessageHandler(
+            filters.TEXT & ~filters.COMMAND,
+            handle_skip_dispatch_password),
+        group=-46,
     )
 
     # A driver answering their offer in words (its OWN group -4, after voice

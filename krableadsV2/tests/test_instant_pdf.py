@@ -224,9 +224,11 @@ class TheCheckoutEndpointTest(unittest.TestCase):
 class TheBotAsksAndDeliversTest(unittest.TestCase):
 
     def test_the_button_is_on_the_confirmation(self):
+        """Renamed to "Skip Dispatch": the label is the only warning an operator
+        gets that tapping it withdraws the lead from the team and every driver."""
         labels = [b.text for row in bot._after_send_keyboard("L1").inline_keyboard
                   for b in row]
-        self.assertTrue(any("Instant PDF" in l and "$100" in l for l in labels), labels)
+        self.assertTrue(any("Skip Dispatch" in l for l in labels), labels)
 
     def test_the_button_reaches_a_handler_from_anywhere(self):
         """Entry point AND fallback — the lesson from every other button here."""
