@@ -237,6 +237,8 @@ class VoiceAndTextNavigationTest(unittest.TestCase):
         "open plate numbers please": "tset_plates",
         "show me the drivers": "tset_drivers",
         "i want to suspend a driver": "tset_susp",
+        "recent leads": "tset_recent", "latest clients": "tset_recent",
+        "show the last leads": "tset_recent",
     }
 
     def test_phrases_resolve_to_the_right_screen(self):
@@ -253,7 +255,8 @@ class VoiceAndTextNavigationTest(unittest.TestCase):
                 self.assertIn(b.callback_data, bot._SETTINGS_VIEWS, b.text)
         spoken = {bot._settings_nav_target(w) for w in
                   ("plate numbers", "dispatchers", "drivers", "suspensions",
-                   "client sources", "supervisors", "follow-ups")}
+                   "client sources", "supervisors", "follow-ups",
+                   "recent leads")}
         self.assertEqual(spoken, set(bot._SETTINGS_VIEWS))
 
     def test_spoken_navigation_opens_the_screen(self):

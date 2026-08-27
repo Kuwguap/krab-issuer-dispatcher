@@ -34,6 +34,7 @@ notice they are missing.
 | `database/migration_driver_manual_suspend.sql` | manual suspend/lift does nothing |
 | `database/migration_extra_vehicles.sql` | a lead's 2nd/3rd car is silently dropped and only ONE tag is issued |
 | `database/migration_insurance_email_gate.sql` | the "📧 Email insurance to client" button cannot claim its send — every tap says to run this file |
+| `database/migration_telegram_name.sql` | the leaderboard and Skip Dispatch posts fall back to @usernames — new leads cannot store the sender's name |
 
 ---
 

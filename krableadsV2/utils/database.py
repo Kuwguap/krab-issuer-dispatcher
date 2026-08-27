@@ -20,6 +20,7 @@ logger = logging.getLogger(__name__)
 _OPTIONAL_LEADS_WRITE_KEYS = frozenset({
     "phase1_attached_files",
     "extra_vehicles",
+    "telegram_name",
     "email",
     "driver_license_id",
     "insurance_card_policy_number",
@@ -2022,21 +2023,72 @@ class Database:
         try:
             r = (
                 self.client.table("leads")
-                .select("user_id, telegram_username, exclude_from_count")
+                .select("user_id, telegram_name, telegram_username, exclude_from_count")
                 .execute()
             )
         except Exception as e:
-            logger.error("get_lead_counts_by_sender: %s", e)
-            return []
+            # A DB behind migration_telegram_name.sql answers 42703 for the new
+            # column — the board must not go blank over it.
+            if "telegram_name" in str(e) or "42703" in str(e):
+                try:
+                    r = (
+                        self.client.table("leads")
+                        .select("user_id, telegram_username, exclude_from_count")
+                        .execute()
+                    )
+                except Exception as e2:
+                    logger.error("get_lead_counts_by_sender: %s", e2)
+                    return []
+            else:
+                logger.error("get_lead_counts_by_sender: %s", e)
+                return []
         tally: Dict[str, int] = {}
         for row in (r.data or []):
             if row.get("exclude_from_count"):
                 continue
-            who = (row.get("telegram_username") or "").strip().lstrip("@")
+            # The NAME the operator goes by ("JB"), never the @handle — the
+            # board groups and displays by it. Older rows without one keep
+            # counting under their handle so history does not vanish.
+            who = (row.get("telegram_name") or "").strip()
+            if not who:
+                who = (row.get("telegram_username") or "").strip().lstrip("@")
             if not who or who.lower() == "unknown":
                 who = f"id {row.get('user_id')}" if row.get("user_id") else "Unknown"
             tally[who] = tally.get(who, 0) + 1
         return sorted(tally.items(), key=lambda kv: (-kv[1], kv[0].lower()))
+
+    def list_recent_leads_for_review(self, offset: int = 0, limit: int = 10) -> tuple:
+        """(rows, total) — newest leads first, for the supervisors' browser.
+
+        The browser exists so a fake lead entered to climb the leaderboard can
+        be spotted and struck (exclude_from_count) the moment it is noticed —
+        removed rows stay LISTED so the strike is visible and reversible."""
+        if not self._check_tables_exist():
+            return [], 0
+        cols = ("id, reference_id, telegram_name, telegram_username, user_id, "
+                "vehicle_details, created_at, exclude_from_count")
+        for attempt_cols in (cols, cols.replace("telegram_name, ", "")):
+            try:
+                r = (
+                    self.client.table("leads")
+                    .select(attempt_cols, count="exact")
+                    .order("created_at", desc=True)
+                    .range(int(offset), int(offset) + int(limit) - 1)
+                    .execute()
+                )
+                return (r.data or []), int(getattr(r, "count", None) or 0)
+            except Exception as e:
+                if attempt_cols is cols and ("telegram_name" in str(e) or "42703" in str(e)):
+                    continue
+                logger.error("list_recent_leads_for_review: %s", e)
+                return [], 0
+        return [], 0
+
+    def set_lead_excluded(self, lead_id: str, excluded: bool) -> bool:
+        """Strike (or restore) one lead from every count — the same
+        exclude_from_count flag an accepted appeal sets, so the leaderboard,
+        receipts owed and usage all agree about it."""
+        return bool(self.update_lead(str(lead_id), {"exclude_from_count": bool(excluded)}))
 
     def get_bot_usage(self, limit: int = 100) -> list:
         """Get recent bot usage (who sent to whom) for admin view."""

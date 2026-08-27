@@ -319,7 +319,7 @@ async def cmd_leaderboard(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     lines = [f"🏆 *Leaderboard* — {total} client{'s' if total != 1 else ''} entered", ""]
     for i, (name, n) in enumerate(rows[:40], start=1):
         mark = medals.get(i, f"{i}.")
-        lines.append(f"{mark} {_telegram_md1_escape(name)} — *{n}*")
+        lines.append(f"{mark} {_telegram_md1_escape(name)} — *{n}* client{'s' if n != 1 else ''}")
     if len(rows) > 40:
         lines.append("")
         lines.append(f"_…and {len(rows) - 40} more._")
@@ -2127,10 +2127,27 @@ def _telegram_chat_link_html(chat_id: object, label: str) -> str:
     return txt
 
 
+def _user_display_name(user) -> Optional[str]:
+    """The human's NAME ("JB", "Sensei") off their Telegram profile.
+
+    Never a bot's (a review-card Submit arrives on the BOT's own message, and
+    "Krab Issuer" must not become the entrant), and never an @handle.
+    """
+    if not user or getattr(user, "is_bot", False):
+        return None
+    name = (getattr(user, "full_name", None) or "").strip()
+    return name or None
+
+
 def _issuer_display_html_from_lead(lead: dict) -> str:
-    """Lead issuer line with username first, then Telegram-ID fallback."""
-    un = (lead.get("telegram_username") or "").strip()
+    """Lead issuer line: their NAME first ("just the name" — the operator's
+    words, for the Skip Dispatch posts everyone sees), then the old
+    username/Telegram-ID fallbacks for rows created before the name existed."""
+    nm = (lead.get("telegram_name") or "").strip()
     uid = lead.get("user_id")
+    if nm:
+        return _telegram_user_link_html(uid, nm)
+    un = (lead.get("telegram_username") or "").strip()
     if un and un.lower() != "unknown":
         label = un if un.startswith("@") else f"@{un}"
         return _telegram_user_link_html(uid, label)
@@ -9238,9 +9255,14 @@ def _lead_issue_expiry_supervisory_line(lead: dict) -> str:
 
 
 def _lead_issuer_display_from_lead(lead: dict) -> str:
-    """Telegram @username of the lead submitter (for supervisory lines)."""
+    """The lead submitter, NAME first ("just the name"), for supervisory lines.
+
+    Rows from before telegram_name existed keep the @username; some older rows
+    stored a numeric Telegram user_id in telegram_username — never show that."""
+    nm = (lead.get("telegram_name") or "").strip()
+    if nm:
+        return nm
     un = (lead.get("telegram_username") or "").strip()
-    # Some older rows stored a numeric Telegram user_id in telegram_username; don't show that as a username.
     if un and un.lower() != "unknown" and not un.isdigit():
         return un if un.startswith("@") else f"@{un}"
     return "Unknown"
@@ -12350,6 +12372,8 @@ async def _finalize_lead_after_notes(
     state_data["encrypted_data"] = encrypted_data
     state_data["reference_id"] = reference_id
     state_data["username"] = username
+    state_data["telegram_name"] = (
+        _user_display_name(msg_user) or state_data.get("telegram_name") or None)
 
     groups = db.get_all_groups()
     active_groups = [g for g in groups if record_is_active(g)]
@@ -12419,6 +12443,7 @@ async def _finalize_lead_after_notes(
     final_lead_data = {
         "user_id": user_id,
         "telegram_username": username,
+        "telegram_name": state_data.get("telegram_name") or _user_display_name(msg_user),
         "vehicle_details": phase1_data.get("vehicle_details", ""),
         "delivery_details": phase1_data.get("delivery_details", ""),
         "phone_number": state_data.get("phone_number"),
@@ -12592,6 +12617,8 @@ async def _submit_lead_from_review(message, context, user_id, data):
     lead = db.create_lead({
         **lead_payload,
         "user_id": user_id, "telegram_username": username,
+        "telegram_name": data.get("telegram_name")
+        or _user_display_name(getattr(message, "from_user", None)),
         "vehicle_details": vd,
         "delivery_details": data.get("delivery_details", ""),
         "phone_number": phone,
@@ -12768,6 +12795,7 @@ async def handle_group_selection(update: Update, context: ContextTypes.DEFAULT_T
         final_lead_data = {
             "user_id": user_id,
             "telegram_username": (query.from_user.username or "Unknown"),
+            "telegram_name": _user_display_name(query.from_user),
             "vehicle_details": phase1_data.get("vehicle_details", ""),
             "delivery_details": phase1_data.get("delivery_details", ""),
             "phone_number": lead_data.get("phone_number"),
@@ -12975,6 +13003,7 @@ async def handle_group_selection(update: Update, context: ContextTypes.DEFAULT_T
     final_lead_data = {
         "user_id": user_id,
         "telegram_username": (query.from_user.username or "Unknown"),
+        "telegram_name": _user_display_name(query.from_user),
         "vehicle_details": phase1_data.get("vehicle_details", ""),
         "delivery_details": phase1_data.get("delivery_details", ""),
         "phone_number": lead_data.get("phone_number"),
@@ -13184,6 +13213,7 @@ async def handle_driver_selection(update: Update, context: ContextTypes.DEFAULT_
     final_lead_data = {
         "user_id": user_id,
         "telegram_username": username,
+        "telegram_name": _user_display_name(query.from_user),
         "vehicle_details": phase1_data.get("vehicle_details", ""),
         "delivery_details": phase1_data.get("delivery_details", ""),
         "phone_number": phone_number,
@@ -18819,6 +18849,7 @@ def _settings_main_kb() -> InlineKeyboardMarkup:
         [InlineKeyboardButton("📊 Client Sources", callback_data="tset_srcs")],
         [InlineKeyboardButton("👑 Supervisors", callback_data="tset_sups")],
         [InlineKeyboardButton("🔁 Follow-ups", callback_data="tset_fu")],
+        [InlineKeyboardButton("🧾 Recent Leads", callback_data="tset_recent")],
         [InlineKeyboardButton("✖️ Close", callback_data="tset_close")],
     ])
 
@@ -19098,9 +19129,114 @@ async def _settings_view_groups() -> tuple:
     return ("\n".join(lines), InlineKeyboardMarkup(rows))
 
 
+_RECENT_LEADS_PAGE_SIZE = 10
+
+
+async def _recent_leads_text_kb(page: int) -> tuple:
+    """One page of the newest leads, with a strike/restore button per lead.
+
+    The anti-gaming browser: a fake lead entered to climb the leaderboard gets
+    struck here — exclude_from_count, the same flag every count already honors,
+    so the board, receipts owed and usage all agree the moment it lands. Struck
+    rows stay LISTED so the strike is visible, and reversible in one tap.
+    """
+    page = max(0, int(page))
+    offset = page * _RECENT_LEADS_PAGE_SIZE
+    rows, total = await asyncio.to_thread(
+        db.list_recent_leads_for_review, offset, _RECENT_LEADS_PAGE_SIZE)
+    if not rows and page > 0:
+        # A stale Next button past the end lands on the first page, not a blank.
+        page, offset = 0, 0
+        rows, total = await asyncio.to_thread(
+            db.list_recent_leads_for_review, 0, _RECENT_LEADS_PAGE_SIZE)
+    pages = max(1, (int(total) + _RECENT_LEADS_PAGE_SIZE - 1) // _RECENT_LEADS_PAGE_SIZE)
+    lines = [
+        f"🧾 <b>Recent Leads</b> — page {page + 1} of {pages} ({total} total)",
+        "Strike a fake lead and it stops counting everywhere — the "
+        "leaderboard included. Struck rows can be restored.",
+        "",
+    ]
+    kb_rows = []
+    for i, lead in enumerate(rows, start=offset + 1):
+        ref = str(lead.get("reference_id") or "N/A")
+        client = _client_display_name_from_lead(lead)
+        nm = (lead.get("telegram_name") or "").strip()
+        un = (lead.get("telegram_username") or "").strip().lstrip("@")
+        if un.lower() == "unknown":
+            un = ""
+        if nm and un:
+            who = f"{nm} (@{un})"
+        else:
+            who = nm or (f"@{un}" if un else f"id {lead.get('user_id') or '?'}")
+        struck = bool(lead.get("exclude_from_count"))
+        mark = " — 🚫 struck" if struck else ""
+        lines.append(f"{i}. <code>{html.escape(ref, quote=False)}</code> — "
+                     f"{html.escape(client, quote=False)}{mark}")
+        lines.append(f"    👤 {html.escape(who, quote=False)}")
+        lid = str(lead.get("id") or "")
+        if lid:
+            kb_rows.append([InlineKeyboardButton(
+                (f"↩️ Restore {ref}" if struck else f"🗑 Remove {ref}"),
+                callback_data=f"rlv_{'un' if struck else 'rm'}_{page}_{lid}")])
+    if not rows:
+        lines.append("<i>No leads yet.</i>")
+    nav = []
+    if page > 0:
+        nav.append(InlineKeyboardButton("⬅️ Prev", callback_data=f"rlv_p_{page - 1}"))
+    nav.append(InlineKeyboardButton("⚙️ Menu", callback_data="rlv_menu"))
+    if offset + len(rows) < total:
+        nav.append(InlineKeyboardButton("➡️ Next", callback_data=f"rlv_p_{page + 1}"))
+    kb_rows.append(nav)
+    return "\n".join(lines), InlineKeyboardMarkup(kb_rows)
+
+
+async def handle_recent_leads_cb(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """The 🧾 Recent Leads browser: page turns, strikes, restores.
+
+    TOP-LEVEL on purpose — a redeploy must not kill the strike button (that IS
+    the feature), so the supervisor gate lives in here, where top-level
+    handlers trust nobody.
+    """
+    query = update.callback_query
+    if not query:
+        return
+    if not update.effective_user or not _user_is_global_supervisor(update.effective_user.id):
+        await _safe_answer_callback_query(query, "Supervisors only.", show_alert=True)
+        return
+    await _safe_answer_callback_query(query)
+    data = str(query.data or "")
+    if data == "rlv_menu":
+        try:
+            await query.edit_message_text(_SETTINGS_MENU_TEXT, parse_mode="Markdown",
+                                          reply_markup=_settings_main_kb())
+        except Exception:
+            pass
+        return
+    m = re.match(r"^rlv_(p|rm|un)_(\d+)(?:_([0-9a-fA-F-]{36}))?$", data)
+    if not m:
+        return
+    action, page = m.group(1), int(m.group(2))
+    if action in ("rm", "un") and m.group(3):
+        ok = await asyncio.to_thread(db.set_lead_excluded, m.group(3), action == "rm")
+        if not ok:
+            await _safe_answer_callback_query(
+                query, "⚠️ Could not update that lead — try again.", show_alert=True)
+    text, kb = await _recent_leads_text_kb(page)
+    try:
+        await query.edit_message_text(text, parse_mode="HTML", reply_markup=kb)
+    except BadRequest as e:
+        if "not modified" not in str(e).lower():
+            logger.warning("recent leads render failed: %s", e)
+
+
 _SETTINGS_MENU_TEXT = "⚙️ *Settings*"
 # Every settings screen, keyed by the callback data its button carries — so a spoken
 # or typed request opens exactly the same view the button does.
+async def _settings_view_recent():
+    """Page 0 of the Recent Leads browser, shaped like every other view."""
+    return await _recent_leads_text_kb(0)
+
+
 _SETTINGS_VIEWS = {
     "tset_plates": _settings_view_plates,
     "tset_groups": _settings_view_groups,
@@ -19109,7 +19245,11 @@ _SETTINGS_VIEWS = {
     "tset_srcs": _settings_view_sources,
     "tset_sups": _settings_view_supervisors,
     "tset_fu": _settings_view_followups,
+    "tset_recent": _settings_view_recent,
 }
+# Refs and client names carry characters Markdown v1 chokes on, so the Recent
+# Leads screen renders as HTML while every other view keeps Markdown.
+_SETTINGS_VIEW_PARSE = {"tset_recent": "HTML"}
 # Spoken/typed navigation. Ordered: "suspend driver kita" is about suspensions even
 # though it also says "driver", so suspensions is tested before drivers.
 _SETTINGS_NAV = [
@@ -19121,6 +19261,8 @@ _SETTINGS_NAV = [
     (re.compile(r"\b(?:sources?|client\s*source|lead\s*source|origin)\b", re.I), "tset_srcs"),
     (re.compile(r"\b(?:supervisors?|admins?|administrators?|owners?)\b", re.I), "tset_sups"),
     (re.compile(r"\b(?:follow[\s-]*ups?|renewals?|reminders?)\b", re.I), "tset_fu"),
+    (re.compile(r"\b(?:recent|latest|last|newest)\s+(?:leads?|clients?|entries)\b", re.I),
+     "tset_recent"),
 ]
 _SETTINGS_BACK_RE = re.compile(r"^\s*(?:back|menu|main|home|up|return)\b", re.I)
 _SETTINGS_CLOSE_RE = re.compile(r"^\s*(?:close|exit|quit|dismiss|finished|done)\b", re.I)
@@ -19133,6 +19275,7 @@ _SETTINGS_HINT = (
     "• *client sources*\n"
     "• *supervisors*\n"
     "• *follow-ups*\n"
+    "• *recent leads*\n"
     "…or *back* / *close*."
 )
 
@@ -19156,10 +19299,11 @@ async def _show_settings_view(target: str, *, query=None, message=None) -> None:
         text, kb = _SETTINGS_MENU_TEXT, _settings_main_kb()
     else:
         text, kb = await view()
+    pm = _SETTINGS_VIEW_PARSE.get(target, "Markdown")
     if query is not None:
-        await query.edit_message_text(text, parse_mode="Markdown", reply_markup=kb)
+        await query.edit_message_text(text, parse_mode=pm, reply_markup=kb)
     elif message is not None:
-        await message.reply_text(text, parse_mode="Markdown", reply_markup=kb)
+        await message.reply_text(text, parse_mode=pm, reply_markup=kb)
 
 
 async def handle_settings_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -19209,6 +19353,11 @@ async def handle_settings_cb(update: Update, context: ContextTypes.DEFAULT_TYPE)
         await _show_settings_view("tset_plates", query=query); return SET_MENU
     if data == "tset_groups":
         await _show_settings_view("tset_groups", query=query); return SET_MENU
+    if data == "tset_recent":
+        # Page turns and strikes are the top-level ^rlv_ handler's, so they
+        # survive a redeploy; this only opens page 0.
+        await _show_settings_view("tset_recent", query=query)
+        return SET_MENU
     if data == "tset_close":
         context.user_data.pop("tset_await", None)
         await query.edit_message_text("⚙️ Settings closed."); return ConversationHandler.END
@@ -20086,6 +20235,11 @@ def main():
         CallbackQueryHandler(handle_insurance_email_to_client, pattern=r"^ins_email_")
     )
     application.add_handler(CommandHandler("setclientemail", cmd_set_client_email))
+    # Recent Leads browser (page/strike/restore). Top-level: the strike button
+    # must survive a redeploy — supervisor-gated inside the handler.
+    application.add_handler(
+        CallbackQueryHandler(handle_recent_leads_cb, pattern=r"^rlv_")
+    )
 
     # Supervisor receipts navigation (drivers list <-> driver's refs).
     # Top-level so the back/forward buttons work even while inside another
