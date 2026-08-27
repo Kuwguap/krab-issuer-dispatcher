@@ -56,6 +56,10 @@ class Config:
     DRIVER_PAYMENT_ZELLE = (os.getenv("DRIVER_PAYMENT_ZELLE") or "OrganizeDataOnline@gmail.com").strip()
     DRIVER_PAYMENT_PAYPAL = (os.getenv("DRIVER_PAYMENT_PAYPAL") or "privatedealership@gmail.com").strip()
     DRIVER_PAYMENT_PAGE_URL = (os.getenv("DRIVER_PAYMENT_PAGE_URL") or "www.TriStateTags.com/Payments").strip()
+    # The job-ticket lines of the accepted-lead DM. Neither is stored per lead,
+    # so these are the fleet-wide defaults the message prints.
+    DRIVER_PAYMENT_METHOD = (os.getenv("DRIVER_PAYMENT_METHOD") or "Cash").strip()
+    DRIVER_DELIVERY_TIME = (os.getenv("DRIVER_DELIVERY_TIME") or "ASAP").strip()
 
     # Renewal cycle
     RENEWAL_DAYS = int(os.getenv("RENEWAL_DAYS", "28"))

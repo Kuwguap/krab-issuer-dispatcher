@@ -986,6 +986,7 @@ async def _deliver_skip_dispatch(context, lead: dict, driver: dict, *,
                 html_prefix="<b>⚡ This one skipped dispatch — it is yours.</b>\n\n",
                 mirror_supervisory=False,
                 accepted_by=label,
+                driver_dm=True,
             )
             driver_ok = True
         except Exception as e:
@@ -9632,16 +9633,25 @@ async def _send_full_group_lead_to_chat(
     mirror_supervisory: bool = False,
     renewal: bool = False,
     accepted_by: str | None = None,
+    driver_dm: bool = False,
 ) -> None:
-    """Post the same detailed HTML lead as the issuer flow; optionally mirror to supervisory chat(s)."""
+    """Post the same detailed HTML lead as the issuer flow; optionally mirror to supervisory chat(s).
+
+    ``driver_dm`` swaps the body for the driver's LEAD ACCEPTED job ticket —
+    Skip Dispatch and paid Instant Tags send a DRIVER the exact message a
+    normal accept sends, not the group card — while keeping everything else
+    this helper does (prefix, accept line, tag PDFs, insurance ride-along)."""
     reference_id = (lead.get("reference_id") or "N/A").strip()
     phase1 = _phase1_from_stored_lead(lead)
     link = (lead.get("encrypted_link") or "").strip()
     issuer_note = _lead_issuer_note(lead)
     issue_dt, exp_dt = _issue_and_expiration_for_group_display(lead)
-    body = _format_group_lead_message_html(
-        reference_id, phase1, link, issue_dt, exp_dt, issuer_note, header_text=header_text,
-    )
+    if driver_dm:
+        body = _build_driver_lead_accepted_message_html(lead)
+    else:
+        body = _format_group_lead_message_html(
+            reference_id, phase1, link, issue_dt, exp_dt, issuer_note, header_text=header_text,
+        )
     accept_line = (
         f"✅ <b>Accepted by {html.escape(accepted_by, quote=False)}</b>\n\n"
         if accepted_by else ""
@@ -10330,13 +10340,17 @@ def _delivery_block_plain(lead: dict) -> str:
 
 
 def _build_driver_lead_accepted_message_html(lead: dict) -> str:
-    """Full post-accept DM for drivers (HTML): tap-to-copy reference in <code>, safe escapes."""
+    """Full post-accept DM for drivers (HTML): the job ticket first and BOLD —
+    phone, address, name, price, payment method, time — then the notes, the
+    payment rails, and a tap-to-copy reference. This is THE driver format:
+    normal accepts, paid Instant Tags and Skip Dispatch all send it."""
     def esc(s: str) -> str:
         return html.escape(str(s or ""), quote=False)
 
     client_name = esc(_client_display_name_from_lead(lead))
     link_raw = _driver_phone_display(lead)
-    if link_raw.startswith("http://") or link_raw.startswith("https://"):
+    phone_is_link = link_raw.startswith("http://") or link_raw.startswith("https://")
+    if phone_is_link:
         link_line = f"📞Phone open link ({esc(link_raw)})"
     else:
         link_line = f"📞Phone {esc(link_raw)}"
@@ -10344,27 +10358,36 @@ def _build_driver_lead_accepted_message_html(lead: dict) -> str:
     ref = esc((lead.get("reference_id") or "").strip() or "N/A")
     extra = esc(_sanitize_phones_for_send(lead.get("extra_info") or "") or "—")
     delivery = esc(_delivery_block_plain(lead))
+    pay_method = esc((getattr(Config, "DRIVER_PAYMENT_METHOD", None) or "Cash").strip() or "Cash")
+    when = esc((getattr(Config, "DRIVER_DELIVERY_TIME", None) or "ASAP").strip() or "ASAP")
     spec_d = _lead_driver_note(lead)
-    lines = [
+
+    ticket = [
         "✅ LEAD ACCEPTED — 🕊LET'S FLY 💸",
-        "",
-        f"Client name: {client_name}",
-        *_multi_tag_notice_lines(lead),
+        link_line,
+    ]
+    if phone_is_link:
+        # Only when the phone actually IS the one-time link (/driverblock on).
+        ticket.append("📞 Click link 🔗 enter password “ callclient “ to view")
+    ticket.extend([
         "📍 Delivery Address",
         delivery,
-        "",
-        f"📝Extra info: {extra}",
-        "📞 Call Client Now Confirm: 💰 Price • ⏱️ Time • 📍 Location • 🏷 Tag",
-        link_line,
-        "📞 Click link 🔗 enter password “ callclient “ to view",
+        f"👤 Name: {client_name}",
+        *_multi_tag_notice_lines(lead),
         f"💰 Price: {price}",
-        f"🆔 Reference ID: <code>{ref}</code>",
+        f"💵Payment Method: {pay_method}",
+        f"⏱️Time: {when}",
+    ])
+
+    lines = [
+        "<b>" + "\n".join(ticket) + "</b>",
+        "",
+        f"📝Extra Notes: {extra}",
     ]
     if spec_d:
-        lines.extend(["", f"📝 Special request (driver): {esc(_sanitize_phones_for_send(spec_d))}"])
+        lines.append(f"📝 Special request (driver): {esc(_sanitize_phones_for_send(spec_d))}")
     lines.extend([
-        "",
-        "🚨Client must pay dealership directly🚨",
+        "🚨Clients E-Payments to dealership directly🚨",
         "💳 We Accept all electronic payment methods:",
         f"CashApp: {esc(Config.DRIVER_PAYMENT_CASHAPP)}",
         f"Venmo: {esc(Config.DRIVER_PAYMENT_VENMO)}",
@@ -10372,16 +10395,8 @@ def _build_driver_lead_accepted_message_html(lead: dict) -> str:
         f"PayPal: {esc(Config.DRIVER_PAYMENT_PAYPAL)}",
         "🌐 Payment Page",
         esc(Config.DRIVER_PAYMENT_PAGE_URL or ""),
-        "🏦ask client to pay⚡️ electronically🏦",
-        "",
-        "⚠️ Important Message ‼️",
-        "• DO NOT HAND TAG TO CLIENT WITHOUT PAYMENT FIRST✋❌🏷️🧾1️⃣",
-        "• Be fast, polite, professional🤵",
-        "• Double-check all info ℹ️",
-        "• Drive safely 🚘",
-        "• Upload receipt 🧾 within 1 hour ⚡️",
-        "",
-        "👇 Upload Payment Receipt Below 📸",
+        "🏦CLIENT MUST PAY⚡️DIRECT TO US🏦",
+        f"🆔 Reference ID: <code>{ref}</code>",
     ])
     return "\n".join(lines)
 
