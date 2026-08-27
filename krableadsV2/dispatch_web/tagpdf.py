@@ -14,17 +14,16 @@ happens only when a value is missing — a lead created outside the bot's
 submit path — and is persisted into those same columns so the NEXT web
 download reuses it.
 
-KNOWN BOT DIVERGENCE (intentional — do NOT "fix" it by re-copying the bot):
-the CURRENT bot re-mints car 1's plate on every non-renewal build. Its
-``_phase1_from_stored_lead`` produces only the 11 blob fields — no ``plate``
-key — so ``phase1.get("plate")`` is always empty for vehicle <= 1 and
-bot.py mints fresh and overwrites the row (cars 2+ DO reuse, their phase1
-carries the stored plate). This mirror's explicit injection of the lead
-row's columns inside ``_tag_fields_from_lead`` implements the reuse
-semantics the bot's own "reuse the assigned values so re-sends are
-identical" comment promises; a future copy-the-bot pass must KEEP that
-injection (and the guarded persistence below) until bot.py itself falls
-back to the lead row for car 1.
+PLATE REUSE — now identical to the bot. Both surfaces reuse car 1's assigned
+plate off the lead row: this mirror injects the row's ``plate``/
+``tag_control_number`` inside ``_tag_fields_from_lead``, and bot.py does the
+same (``_assigned_plate = phase1.get("plate") or (lead.get("plate") if
+vehicle <= 1 else "")``). So a web download and the Telegram tag carry the
+SAME plate for the same car. (Before a72f539 the bot re-minted car 1 on every
+send — its ``_phase1_from_stored_lead`` blob has no ``plate`` key — and this
+mirror's injection was the only side honouring the "reuse the assigned values
+so re-sends are identical" promise; that gap is closed on both sides now.)
+Keep this injection: it is what keeps the two surfaces agreeing.
 
 No Telegram calls, no renewal path: a renewal mints a fresh plate and that
 decision stays with the bot.

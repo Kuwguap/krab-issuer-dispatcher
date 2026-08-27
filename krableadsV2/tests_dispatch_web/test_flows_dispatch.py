@@ -1000,20 +1000,19 @@ class _RecordingQuery(_FakeQuery):
         return _chain
 
 
-def test_tagpdf_docstring_documents_bot_car1_remint_divergence():
-    """Finding pin: the module docstring used to claim the bot reuses car 1's
-    stored plate — it does not (bot._phase1_from_stored_lead carries no plate
-    key, so every non-renewal bot build re-mints). The corrected docstring must
-    flag the divergence so the next "copy the bot's code here again" pass does
-    not mechanically delete the mirror's lead-row injection and import the
-    bot's re-mint bug."""
+def test_tagpdf_docstring_documents_car1_plate_reuse_parity():
+    """The bot's car-1 re-mint bug was fixed (a72f539: bot._tag_fields_from_lead
+    now reads the lead row for vehicle <= 1), so both surfaces reuse the stored
+    plate and a web tag matches the Telegram tag. The docstring must describe
+    that PARITY — and still tell the next 'copy the bot again' pass to keep the
+    mirror's lead-row injection, which is what holds the agreement."""
     from dispatch_web import tagpdf
 
     doc = tagpdf.__doc__ or ""
-    assert "KNOWN BOT DIVERGENCE" in doc
-    assert "re-mints car 1's plate" in doc
-    # The old false claim — that the bot itself reuses these columns — is gone.
-    assert "(and the bot itself)" not in doc
+    assert "PLATE REUSE" in doc and "identical to the bot" in doc
+    assert "Keep this injection" in doc
+    # The stale claim that the current bot re-mints car 1 is gone.
+    assert "the CURRENT bot re-mints" not in doc
 
 
 def test_tag_pdf_mint_claims_car1_columns_with_null_guard(authed, db, monkeypatch):
