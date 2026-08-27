@@ -32,7 +32,6 @@ import os
 import re
 import time
 
-import requests as _requests
 from flask import Response, jsonify, request
 
 logger = logging.getLogger(__name__)
@@ -893,8 +892,10 @@ def register(app, db_provider):
     @app.route("/receipts/receipt/<lead_id>", methods=["GET"])
     def receipts_receipt_image(lead_id):
         """The receipt for the board's thumbnails — database first (never
-        expires), else the lead's external URL fetched server-side (a redirect
-        would be dropped by the Vercel rewrite)."""
+        expires). Anything still external is resolved by the canonical
+        /api/receipts/image view (Telegram re-signing included), and the bytes
+        it finds are mirrored INTO receipt_files — so every receipt makes the
+        slow external trip at most once, then serves from the row forever."""
         got = None
         try:
             got = _resolve().get_receipt_file(lead_id)
@@ -907,26 +908,18 @@ def register(app, db_provider):
                 "X-Content-Type-Options": "nosniff",
                 "Content-Security-Policy": "default-src 'none'",
             })
-        url = ""
+        resolver = app.view_functions.get("api_receipt_image")
+        if resolver is None:
+            return jsonify({"error": "no receipt stored for this lead"}), 404
+        resp = resolver(lead_id)
         try:
-            r = (_resolve().client.table("leads").select("receipt_image_url")
-                 .eq("id", str(lead_id)).limit(1).execute())
-            url = ((r.data or [{}])[0].get("receipt_image_url") or "").strip()
-        except Exception:
-            url = ""
-        # "/receipt/" URLs point back at this very service — nothing external
-        # to fetch, and no reason to call ourselves.
-        if url.startswith("http") and "/receipt/" not in url:
-            try:
-                resp = _requests.get(url.split("#", 1)[0], timeout=25)
-                ct = (resp.headers.get("content-type") or "").split(";")[0].strip().lower()
-                if resp.ok and resp.content and ct in RECEIPT_MIME:
-                    return Response(resp.content, mimetype=RECEIPT_MIME[ct], headers={
-                        "Cache-Control": "private, max-age=300",
-                        "X-Content-Type-Options": "nosniff",
-                        "Content-Security-Policy": "default-src 'none'",
-                    })
-            except Exception as e:
-                logger.warning("receipts board: external receipt fetch failed for %s: %s",
-                               lead_id, e)
-        return jsonify({"error": "no receipt stored for this lead"}), 404
+            mime = (getattr(resp, "mimetype", "") or "").lower()
+            if getattr(resp, "status_code", 0) == 200 and mime in RECEIPT_MIME:
+                data = resp.get_data()
+                if data and len(data) <= 8_000_000:
+                    _resolve().save_receipt_file(
+                        lead_id, data=data, content_type=RECEIPT_MIME[mime],
+                        source="board")
+        except Exception as e:
+            logger.warning("receipts board: could not mirror receipt %s: %s", lead_id, e)
+        return resp
