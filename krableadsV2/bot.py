@@ -107,7 +107,53 @@ _PHASE1_STATE_EXCLUDE = frozenset({
     "pending_phone_number", "pending_price",
     "special_request_note", "special_request_issuers", "special_request_drivers", "username",
     "reassign_lead_id", "approval_files_forwarded",
+    "telegram_name", "instant_tag", "driver_amount",
 })
+
+
+# 🤖 Instant Tag: the DRIVER pays this by card and the tag sends itself.
+# AMOUNT is price minus this, refreshed on every price write; an explicit
+# ✏️ Edit → 💵 Amount holds only until the price changes again (the spec).
+# Deliberately NEVER text-parsed — no label, no AI field: the number the bot
+# charges a card must not be settable by a stray sentence.
+INSTANT_AMOUNT_DISCOUNT_USD = 50
+
+
+def _sync_driver_amount_from_price(state_data: dict) -> None:
+    """price $200 → driver_amount $150. Called at every price WRITE, so a
+    manual Amount edit survives exactly until the price moves."""
+    amount = _price_amount_str(
+        (state_data.get("pending_price") or state_data.get("price") or ""))
+    if not amount:
+        return
+    try:
+        val = max(0, int(float(amount)) - INSTANT_AMOUNT_DISCOUNT_USD)
+    except ValueError:
+        return
+    state_data["driver_amount"] = f"${val}"
+
+
+def _instant_all_drivers_enabled() -> bool:
+    """Supervisory switch: allow the All-Drivers broadcast for Instant Tag
+    leads (every driver gets their own payment link; first card to clear
+    wins the tag). OFF by default — instant means ONE driver."""
+    try:
+        return str(db.get_setting("instant_all_drivers") or "").strip().lower() in (
+            "1", "true", "on", "yes")
+    except Exception:
+        return False
+
+
+def _driver_amount_cents(source: dict) -> Optional[int]:
+    """The Stripe amount for an Instant Tag lead, in cents, or None."""
+    amount = _price_amount_str((source or {}).get("driver_amount") or "")
+    if not amount:
+        return None
+    try:
+        cents = int(round(float(amount) * 100))
+    except ValueError:
+        return None
+    return cents if cents > 0 else None
 
 # Receipt submission states
 STATE_WAITING_REFERENCE_ID = 4  # Waiting for reference ID input
@@ -643,17 +689,25 @@ def _dashboard_base() -> str:
             or "https://tristatetags.com/backend").strip().rstrip("/")
 
 
-async def request_instant_pdf_link(lead_id, driver_id, reference_id="") -> tuple:
-    """(url, error). Asks the dashboard to open a Stripe Checkout session."""
+async def request_instant_pdf_link(lead_id, driver_id, reference_id="",
+                                   amount_cents: Optional[int] = None) -> tuple:
+    """(url, error). Asks the dashboard to open a Stripe Checkout session.
+
+    amount_cents is the Instant Tag AMOUNT (driver_amount = price - $50); None
+    keeps the dashboard's flat price, exactly as before the field existed."""
     key = (getattr(Config, "INTEGRATIONS_API_KEY", None) or "").strip()
     if not key:
         return None, "INTEGRATIONS_API_KEY is not set on the bot."
 
+    payload = {"lead_id": str(lead_id), "driver_id": str(driver_id),
+               "reference_id": str(reference_id or "")}
+    if amount_cents:
+        payload["amount_cents"] = int(amount_cents)
+
     def _post():
         return requests.post(
             f"{_dashboard_base()}/api/instant/checkout",
-            json={"lead_id": str(lead_id), "driver_id": str(driver_id),
-                  "reference_id": str(reference_id or "")},
+            json=payload,
             headers={"Authorization": f"Bearer {key}"},
             timeout=20,
         )
@@ -826,8 +880,11 @@ async def handle_skip_dispatch_driver_pick(update: Update, context: ContextTypes
 
     ref = html.escape(str(lead.get("reference_id") or "N/A"), quote=False)
     dname = html.escape(str(driver.get("driver_name") or "driver"), quote=False)
+    _cents = _driver_amount_cents(lead)
+    _amt_label = f"${_cents // 100}" if _cents else "$100"
     url, err = await request_instant_pdf_link(
-        lead_id.strip(), driver_id.strip(), lead.get("reference_id") or "")
+        lead_id.strip(), driver_id.strip(), lead.get("reference_id") or "",
+        amount_cents=_cents)
 
     body = [
         f"⚡ <b>Skip Dispatch — {dname}</b>",
@@ -837,7 +894,7 @@ async def handle_skip_dispatch_driver_pick(update: Update, context: ContextTypes
         "",
     ]
     if url:
-        body.append("💳 <b>Pay $100</b> with the button below,")
+        body.append(f"💳 <b>Pay {_amt_label}</b> with the button below,")
         body.append("🔑 <b>or reply here with the password.</b>")
     else:
         # No checkout is not a dead end when a password can still release it.
@@ -846,7 +903,8 @@ async def handle_skip_dispatch_driver_pick(update: Update, context: ContextTypes
     await query.message.reply_text(
         NL.join(body),
         parse_mode="HTML",
-        reply_markup=(InlineKeyboardMarkup([[InlineKeyboardButton("💳 Pay $100 and send", url=url)]])
+        reply_markup=(InlineKeyboardMarkup([[InlineKeyboardButton(
+                          f"💳 Pay {_amt_label} and send", url=url)]])
                       if url else None),
     )
 
@@ -889,7 +947,7 @@ async def handle_skip_dispatch_password(update: Update, context: ContextTypes.DE
 
 
 async def _deliver_skip_dispatch(context, lead: dict, driver: dict, *,
-                                 notify_chat_id=None, how: str = "password") -> None:
+                                 notify_chat_id=None, how: str = "password") -> bool:
     """The send itself: the driver first, then every group and supervisory chat.
 
     The driver is treated as a delivery target of the same shape as a group, so
@@ -901,6 +959,21 @@ async def _deliver_skip_dispatch(context, lead: dict, driver: dict, *,
     ref = str(lead.get("reference_id") or "N/A")
     dname = str(driver.get("driver_name") or "driver")
     label = f"SKIP DISPATCH — {dname}" + ("" if how == "password" else " (PAID)")
+
+    # Like the main accept path: no insurer detected means TriState covers it —
+    # arm the ride-along so the card + portal go out with the tag below. The
+    # client email stays HELD behind the dispatcher's payment button as always.
+    try:
+        fresh = await asyncio.to_thread(db.get_lead_by_id, lead.get("id")) or lead
+        if (not _lead_already_insured(fresh)
+                and not (str(fresh.get("insurance_card_sent_at") or "")).strip()
+                and not fresh.get("wants_insurance")):
+            await asyncio.to_thread(db.update_lead, fresh["id"], {"wants_insurance": True})
+            lead = await asyncio.to_thread(db.get_lead_by_id, fresh["id"]) or fresh
+        else:
+            lead = fresh
+    except Exception as e:
+        logger.warning("skip dispatch: could not arm auto-insurance: %s", e)
 
     driver_cid = _parse_chat_id(driver.get("driver_telegram_id"))
     driver_ok = False
@@ -959,6 +1032,66 @@ async def _deliver_skip_dispatch(context, lead: dict, driver: dict, *,
                                            parse_mode="HTML")
         except Exception as e:
             logger.warning("skip dispatch: could not confirm to the operator: %s", e)
+    return driver_ok
+
+
+async def _dispatch_instant_tag_lead(context, lead: dict, selected_drivers: list,
+                                     *, notify_chat_id=None, user_data=None) -> None:
+    """🤖 Instant Tag dispatch: no Accept/Decline round. Every chosen driver
+    gets a payment link for the AMOUNT (all-drivers only when supervisors
+    switched it on); the first card to clear releases the tag automatically
+    (webhook stamps the payer, the sweep delivers like Skip Dispatch). The
+    issuer can also release it with the Skip Dispatch password, armed here."""
+    ref = str(lead.get("reference_id") or "N/A")
+    cents = _driver_amount_cents(lead)
+    amt_label = f"${cents // 100}" if cents else "$100"
+    sent, failed = [], []
+    for d in (selected_drivers or []):
+        cid = _parse_chat_id((d or {}).get("driver_telegram_id"))
+        if cid is None:
+            failed.append(str(d.get("driver_name") or "driver") + " (no chat id)")
+            continue
+        url, err = await request_instant_pdf_link(
+            str(lead.get("id")), str(d.get("id")), ref, amount_cents=cents)
+        body = [
+            "🤖 <b>Instant Tag 🏷️</b>",
+            f"📋 Reference: <code>{html.escape(ref, quote=False)}</code>",
+            "",
+            f"Pay <b>{amt_label}</b> and this tag sends itself here — no dispatch, no wait.",
+        ]
+        kb = None
+        if url:
+            kb = InlineKeyboardMarkup([[InlineKeyboardButton(
+                f"💳 Pay {amt_label} and get the tag", url=url)]])
+        else:
+            body.append(f"<i>Payment page unavailable: {html.escape(str(err or ''), quote=False)}</i>")
+        try:
+            await context.bot.send_message(chat_id=cid, text=NL.join(body),
+                                           parse_mode="HTML", reply_markup=kb)
+            sent.append(str(d.get("driver_name") or "driver"))
+        except Exception as e:
+            logger.warning("instant tag: could not reach driver %s: %s", d.get("driver_name"), e)
+            failed.append(str(d.get("driver_name") or "driver"))
+    if user_data is not None and len(selected_drivers or []) == 1 and sent:
+        user_data[SKIP_DISPATCH_PENDING_KEY] = {
+            "lead_id": str(lead.get("id")),
+            "driver_id": str((selected_drivers or [{}])[0].get("id") or ""),
+            "at": time.time(),
+        }
+    if notify_chat_id:
+        lines = [f"🤖 <b>Instant Tag — {html.escape(ref, quote=False)}</b>",
+                 f"💵 Amount: {amt_label}"]
+        if sent:
+            lines.append("📨 Payment link sent to: " + html.escape(", ".join(sent), quote=False))
+        if failed:
+            lines.append("⚠️ Could not reach: " + html.escape(", ".join(failed), quote=False))
+        if user_data is not None and len(selected_drivers or []) == 1 and sent:
+            lines.append("🔑 Or reply here with the password to release it without payment.")
+        try:
+            await context.bot.send_message(chat_id=notify_chat_id, text=NL.join(lines),
+                                           parse_mode="HTML")
+        except Exception as e:
+            logger.warning("instant tag: could not confirm to issuer: %s", e)
 
 
 async def deliver_paid_instant_pdfs(context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -978,6 +1111,17 @@ async def deliver_paid_instant_pdfs(context: ContextTypes.DEFAULT_TYPE) -> None:
         if not lead_id or not driver_id:
             continue
         driver = await asyncio.to_thread(_driver_row_by_id, driver_id)
+        if driver and lead.get("instant_tag"):
+            # 🤖 Instant Tag: the payment replaces the whole dispatch round, so
+            # delivery is the FULL Skip Dispatch send — driver, groups,
+            # supervisory, tag + auto-insurance ride-along — not just a DM.
+            try:
+                ok = await _deliver_skip_dispatch(context, lead, driver, how="paid")
+                if ok:
+                    await asyncio.to_thread(db.mark_instant_pdf_delivered, lead_id)
+            except Exception as e:
+                logger.error("instant tag delivery failed for %s: %s", lead_id, e)
+            continue
         chat_id = _parse_chat_id((driver or {}).get("driver_telegram_id"))
         if not driver or chat_id is None:
             logger.error("instant pdf: lead %s is paid but driver %s has no chat id",
@@ -2956,6 +3100,7 @@ PH1_EDIT_TO_STATE_KEY = {
     "driver": "special_request_drivers",
     "email": "email",
     "dl": "driver_license_id",
+    "amt": "driver_amount",
 }
 # ── Colour picker for the review card's Color field ─────────────────────────
 # Tapping a colour is far faster (and far less error-prone) than typing one, and the
@@ -3115,7 +3260,7 @@ def _fresh_price_picker(context, state_data) -> InlineKeyboardMarkup:
 # answer it (see _adopt_review_message).
 PH1_REVIEW_CB_PATTERN = (
     r"^(ph1_accept|ph1_edit|ph1_vin_check|ph1_add_image|ph1_adjust|ph1_attach|"
-    r"ph1_ins_toggle|adjust_cancel|ph1_back|ph1_pick_group|ph1_pick_driver|"
+    r"ph1_ins_toggle|ph1_itag_toggle|adjust_cancel|ph1_back|ph1_pick_group|ph1_pick_driver|"
     r"ph1_pick_source|selgrp_|seldrv_|selsrc_|ph1_sel_back|driver_suspended_|"
     r"edit_cancel|ph1edit_|ph1_add_car|ph1car_|ph1carrm_)"
 )
@@ -3575,14 +3720,17 @@ def _format_phase1_field_lines(state_data: dict) -> str:
         f"🕒Delivery Date/Time & Notes: {state_data.get('extra_info') or '-'}",
         f"📞Phone: {state_data.get('pending_phone_number') or '-'}",
         f"💲Price: {state_data.get('pending_price') or '-'}",
+        (f"🤖 Amount (driver pays): {state_data.get('driver_amount') or '-'}"
+         if state_data.get("instant_tag") else None),
         f"📝Issuer note: {state_data.get('special_request_issuers') or '-'}",
         f"📝Driver note: {state_data.get('special_request_drivers') or '-'}",
         f"📧Email (required for insurance): {state_data.get('email') or '-'}",
         f"🪪Driver license (required for insurance): {state_data.get('driver_license_id') or '-'}",
     ]
     # Extra cars append their own block. With none, this adds "" and the card is
-    # byte-identical to before the feature existed.
-    return "\n".join(lines) + _format_all_extra_vehicle_lines(state_data)
+    # byte-identical to before the feature existed. The None filter is the
+    # Amount line, which exists only while Instant Tag is toggled on.
+    return "\n".join(l for l in lines if l is not None) + _format_all_extra_vehicle_lines(state_data)
 
 
 def _format_phase1_ai_review_text(state_data: dict) -> str:
@@ -3708,7 +3856,15 @@ def _build_review_keyboard_with_selections(state_data):
             callback_data="ph1_ins_toggle",
         )],
         [InlineKeyboardButton("🖼 Add image (title / license)", callback_data="ph1_add_image")],
-    ] + _add_car_button_rows(state_data))
+    ] + _add_car_button_rows(state_data) + [
+        [InlineKeyboardButton(
+            (f"🤖 Instant Tag 🏷️: ON ({(state_data.get('driver_amount') or '').strip()})"
+             if (state_data.get("driver_amount") or "").strip()
+             else "🤖 Instant Tag 🏷️: ON")
+            if state_data.get("instant_tag") else "🤖 Instant Tag 🏷️",
+            callback_data="ph1_itag_toggle",
+        )],
+    ])
 
 async def _edit_message_keyboard(context, chat_id, message_id, keyboard):
     try:
@@ -3956,6 +4112,7 @@ def _phase1_edit_fields_keyboard(state_data: dict) -> InlineKeyboardMarkup:
         [
             InlineKeyboardButton(f"Phone: {_truncate_btn_val(state_data.get('pending_phone_number') or '-', 18)}", callback_data="ph1edit_phone"),
             InlineKeyboardButton(f"Price: {_truncate_btn_val(state_data.get('pending_price') or '-', 12)}", callback_data="ph1edit_price"),
+            InlineKeyboardButton(f"💵 Amount: {_truncate_btn_val(state_data.get('driver_amount') or '-', 10)}", callback_data="ph1edit_amt"),
         ],
         [
             InlineKeyboardButton(f"Issuer note: {_truncate_btn_val(state_data.get('special_request_issuers') or '-')}", callback_data="ph1edit_issuer"),
@@ -4364,9 +4521,16 @@ def _apply_single_phase1_edit(state_data: dict, edit_key: str, new_text: str) ->
             return
         state_data["driver_license_id"] = ai_vision.normalize_driver_license_id(new_text)
         return
+    if edit_key == "amt":
+        # Normalized HERE so every path stores "$175" — this number goes to
+        # Stripe, and a stray suffix must never reach a charge.
+        state_data["driver_amount"] = _clean_inline_value("amt", new_text) or ""
+        return
     sk = PH1_EDIT_TO_STATE_KEY.get(edit_key)
     if sk:
         state_data[sk] = new_text if new_text else "-"
+        if edit_key == "price":
+            _sync_driver_amount_from_price(state_data)
 
 
 def _clean_vin_and_car(state_data: dict) -> None:
@@ -4458,6 +4622,7 @@ def _apply_caption_to_lead(state_data: dict, caption: str) -> list:
         changed.append("phone")
     if price and _empty("pending_price"):
         state_data["pending_price"] = price
+        _sync_driver_amount_from_price(state_data)
         changed.append("price")
     email, dl = _extract_email_and_dl_from_text(text)
     if email and _empty("email"):
@@ -4542,6 +4707,7 @@ def _merge_phase1_adjust(state_data: dict, structured_text: str, only_empty: boo
         elif low.startswith("price"):
             if not _blocked("pending_price"):
                 state_data["pending_price"] = v
+                _sync_driver_amount_from_price(state_data)
                 updated.append("price")
         elif low.startswith("email"):
             em = ai_vision.normalize_email(v)
@@ -5056,6 +5222,12 @@ def _clean_inline_value(edit_key: str, value: str) -> str:
         amount = "$" + m.group(0).replace(",", "")
         # "150 + toll" / "150 plus tolls" quotes the same job with the toll on top.
         return amount + _PH1_TOLL_SUFFIX if _price_has_toll(value) else amount
+    if edit_key == "amt":
+        # The Instant Tag amount: digits only, no toll games. Reached ONLY via
+        # its edit button — never parsed out of free text (money charged to a
+        # card is not settable by a stray sentence).
+        m = re.search(r"\d[\d,]*(?:\.\d+)?", value)
+        return ("$" + m.group(0).replace(",", "")) if m else ""
     if edit_key in ("name", "fn", "ln"):
         # "name of the insurance company State Farm" left "of the" behind.
         if all(w.strip(".,'").lower() in _FILLER_NOT_A_NAME for w in value.split()):
@@ -6557,7 +6729,7 @@ async def _open_group_picker(context: ContextTypes.DEFAULT_TYPE) -> None:
     await _edit_message_keyboard(context, chat_id, mid, InlineKeyboardMarkup(buttons))
 
 
-async def _open_driver_picker(context: ContextTypes.DEFAULT_TYPE) -> None:
+async def _open_driver_picker(context: ContextTypes.DEFAULT_TYPE, state_data: dict | None = None) -> None:
     chat_id = context.user_data.get("review_chat_id"); mid = context.user_data.get("review_message_id")
     if not chat_id or not mid:
         return
@@ -6570,7 +6742,11 @@ async def _open_driver_picker(context: ContextTypes.DEFAULT_TYPE) -> None:
             buttons.append([InlineKeyboardButton(f"🚫 {name} (PENALTY)", callback_data=f"driver_suspended_{did}")])
         else:
             buttons.append([InlineKeyboardButton(f"🚗 {name}", callback_data=f"seldrv_{did}")])
-    if [d for d in active if str(d.get("id")) not in suspended]:
+    if ([d for d in active if str(d.get("id")) not in suspended]
+            and not ((state_data or {}).get("instant_tag")
+                     and not _instant_all_drivers_enabled())):
+        # Instant Tag = ONE driver pays ONE link, unless supervisors switched
+        # the broadcast on in /settings.
         buttons.append([InlineKeyboardButton("📢 Send to All Drivers", callback_data="seldrv_all")])
     buttons.append([InlineKeyboardButton("⬅️ Back", callback_data="ph1_sel_back")])
     await _edit_message_keyboard(context, chat_id, mid, InlineKeyboardMarkup(buttons))
@@ -6933,7 +7109,7 @@ async def _interpret_review_command(update, context, user_id, state_data, text):
             # from being fixed rather than needing the whole line retyped.
             joined = " ".join(failed).lower()
             if "driver" in joined:
-                await _open_driver_picker(context)
+                await _open_driver_picker(context, state_data)
             elif "dispatcher" in joined:
                 await _open_group_picker(context)
             elif "source" in joined:
@@ -6962,6 +7138,10 @@ async def _interpret_review_command(update, context, user_id, state_data, text):
         if _ALL_SELECT_RE.match(payload or ""):
             _select_driver(state_data, user_id, "all")
             await _update_review_message_text(context, state_data)
+            if state_data.get("instant_tag") and not _instant_all_drivers_enabled():
+                await _finish("🤖 Instant Tag needs ONE driver — say a driver's name "
+                              "(All Drivers is off for this lead).")
+                return STATE_AI_REVIEW
             await _finish("✅ Driver → All Drivers")
             return STATE_AI_REVIEW
         active = [d for d in _get_all_drivers_cached() if record_is_active(d)]
@@ -6975,7 +7155,7 @@ async def _interpret_review_command(update, context, user_id, state_data, text):
                 return STATE_AI_REVIEW
             if _payload_is_prose(payload):
                 return None               # a note, not a pick — let it be written
-            await _open_driver_picker(context)
+            await _open_driver_picker(context, state_data)
             await update.message.reply_text(f"🤔 No driver matched “{payload}”. Pick one above.")
             return STATE_AI_REVIEW
         _select_driver(state_data, user_id, d)
@@ -9631,7 +9811,14 @@ async def _build_and_send_tag_pdf(
     caption = f"🧾 NJ 30-Day Temp Tag — {plate}{which}\nReference: {reference_id}"
     if accepted_by:
         caption += f"\n✅ Accepted by {accepted_by}"
-    filename = f"tag_{re.sub(r'[^A-Za-z0-9]+', '', plate) or 'tag'}.pdf"
+    # "all generated tags come as tag_H268132 — change so it comes as the
+    # client's name": Arturo_Torne.pdf (car index appended on a multi-car lead
+    # so two files never collide in the same chat). Plate stays the fallback.
+    _client_file = re.sub(r"[^A-Za-z0-9]+", "_",
+                          f"{fields.get('first') or ''} {fields.get('last') or ''}".strip()).strip("_")
+    _sfx = f"_{vehicle}" if total > 1 else ""
+    filename = ((f"{_client_file}{_sfx}.pdf") if _client_file
+                else f"tag_{re.sub(r'[^A-Za-z0-9]+', '', plate) or 'tag'}{_sfx}.pdf")
     seen: set = set()
     sent = 0
     for cid in target_chat_ids:
@@ -10213,6 +10400,7 @@ async def _phase1_finish_vision_extraction(
             state_data["pending_phone_number"] = norm_phone
         if norm_price:
             state_data["pending_price"] = norm_price
+            _sync_driver_amount_from_price(state_data)
         if issuer_note:
             state_data["special_request_issuers"] = issuer_note
         if driver_note:
@@ -10231,6 +10419,7 @@ async def _phase1_finish_vision_extraction(
                 state_data["pending_phone_number"] = phone_fb
             if not state_data.get("pending_price") and price_fb:
                 state_data["pending_price"] = price_fb
+                _sync_driver_amount_from_price(state_data)
         if not (state_data.get("email") or "").strip() or not (state_data.get("driver_license_id") or "").strip():
             raw_email, raw_dl = _extract_email_and_dl_from_text(typed_text)
             if raw_email and not (state_data.get("email") or "").strip():
@@ -10657,6 +10846,7 @@ async def handle_phase1(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
                 state_data["pending_phone_number"] = l.split(":", 1)[1].strip()
             elif low.startswith("price:"):
                 state_data["pending_price"] = l.split(":", 1)[1].strip()
+                _sync_driver_amount_from_price(state_data)
             elif low.startswith("issuer note:"):
                 note = l.split(":", 1)[1].strip()
                 if note.lower() not in ("-", "none", "n/a", "na"):
@@ -10686,6 +10876,7 @@ async def handle_phase1(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
                 state_data["pending_phone_number"] = phone
             if not state_data.get("pending_price") and price:
                 state_data["pending_price"] = price
+                _sync_driver_amount_from_price(state_data)
 
         # Fallback for email + driver-license id from the user's raw message
         if not (state_data.get("email") or "").strip() or not (state_data.get("driver_license_id") or "").strip():
@@ -11519,6 +11710,30 @@ async def handle_phase1_ai_review_callback(update, context):
         context.user_data.pop("adjust_prompt_msg_id", None)
         return STATE_AI_REVIEW
 
+    elif data == "ph1_itag_toggle":
+        state_data["instant_tag"] = not state_data.get("instant_tag")
+        if state_data["instant_tag"]:
+            if not (state_data.get("driver_amount") or "").strip():
+                _sync_driver_amount_from_price(state_data)
+            # Instant is ONE driver by definition; a card already set to the
+            # broadcast resets to auto so the picker asks again.
+            if str(state_data.get("selected_driver_names") or "").strip().lower().startswith("all"):
+                state_data["selected_driver_names"] = "auto"
+        db.set_user_state(user_id, "phase1", state_data)
+        await _update_review_message_text(context, state_data)
+        if state_data.get("instant_tag"):
+            amt = (state_data.get("driver_amount") or "").strip()
+            note = (
+                f"🤖 Instant Tag: the driver pays {amt or '…'} by card (or you release it "
+                "with the password) and the tag sends itself. Pick ONE driver — "
+                "All Drivers is off for this lead."
+            )
+            if not amt:
+                note += ("\n⚠️ No amount yet — set the price (amount = price − $50) "
+                         "or ✏️ Edit → 💵 Amount.")
+            await _send_vanishing(context, query.message.chat_id, note, delay=10.0)
+        return STATE_AI_REVIEW
+
     elif data == "ph1_ins_toggle":
         state_data["wants_insurance"] = not state_data.get("wants_insurance")
         db.set_user_state(user_id, "phase1", state_data)
@@ -11609,7 +11824,7 @@ async def handle_phase1_ai_review_callback(update, context):
             else:
                 buttons.append([InlineKeyboardButton(f"🚗 {name}", callback_data=f"seldrv_{did}")])
         elig = [d for d in active if str(d.get("id")) not in suspended]
-        if elig:
+        if elig and not (state_data.get("instant_tag") and not _instant_all_drivers_enabled()):
             buttons.append([InlineKeyboardButton("📢 Send to All Drivers", callback_data="seldrv_all")])
         buttons.append([InlineKeyboardButton("⬅️ Back", callback_data="ph1_sel_back")])
         await _edit_message_keyboard(context, chat_id, mid, InlineKeyboardMarkup(buttons))
@@ -11664,6 +11879,12 @@ async def handle_phase1_ai_review_callback(update, context):
         active = [d for d in drivers if record_is_active(d)]
         suspended = _get_suspended_driver_ids()
         if data == "seldrv_all":
+            if state_data.get("instant_tag") and not _instant_all_drivers_enabled():
+                await _send_vanishing(
+                    context, query.message.chat_id,
+                    "🤖 Instant Tag needs ONE driver — All Drivers is off for this "
+                    "lead (a supervisor can allow it in /settings → ⚡ Instant Tag).")
+                return STATE_AI_REVIEW
             selected = [d for d in active if str(d["id"]) not in suspended]
             names = "All Drivers"
             ids = [d["id"] for d in selected]
@@ -12369,6 +12590,7 @@ async def _finalize_lead_after_notes(
     # pending_price and would fold a second $100 into it on the retry.
     state_data["price"] = _price_with_insurance_addon(
         price, bool(state_data.get("wants_insurance")))
+    _sync_driver_amount_from_price(state_data)
     state_data["encrypted_data"] = encrypted_data
     state_data["reference_id"] = reference_id
     state_data["username"] = username
@@ -12614,6 +12836,10 @@ async def _submit_lead_from_review(message, context, user_id, data):
     if not attached_for_dispatch:
         attached_for_dispatch = data.get("attached_files") or []
     lead_payload = await _attach_extra_vehicles_for_create({}, data)
+    # Fold BEFORE the payload so the amount tracks the price the client
+    # actually pays (insurance add-on included).
+    data["price"] = _price_with_insurance_addon(price, bool(data.get("wants_insurance")))
+    _sync_driver_amount_from_price(data)
     lead = db.create_lead({
         **lead_payload,
         "user_id": user_id, "telegram_username": username,
@@ -12622,7 +12848,7 @@ async def _submit_lead_from_review(message, context, user_id, data):
         "vehicle_details": vd,
         "delivery_details": data.get("delivery_details", ""),
         "phone_number": phone,
-        "price": _price_with_insurance_addon(price, bool(data.get("wants_insurance"))),
+        "price": data["price"],
         "encrypted_link": enc.get("link"),
         "onetimesecret_token": enc.get("secret_key"),
         "onetimesecret_secret_key": enc.get("metadata_key"),
@@ -13412,6 +13638,14 @@ async def _background_dispatch_lead_after_driver_pick(
 ) -> None:
     """Monday (non-blocking), driver DMs, group post, supervisory/ST, usage — runs after issuer continues."""
     lead_id = lead["id"]
+    if lead_data.get("instant_tag") or lead.get("instant_tag"):
+        # 🤖 Instant Tag: the payment IS the dispatch. No Accept/Decline round,
+        # no group offer — the tag goes out the moment a card clears (or the
+        # issuer types the password), delivered exactly like Skip Dispatch.
+        await _dispatch_instant_tag_lead(
+            context, lead, selected_drivers,
+            notify_chat_id=issuer_notify_chat_id, user_data=context.user_data)
+        return
     monday_result = None
     if monday:
         monday_lead_data = {
@@ -18176,11 +18410,23 @@ async def _on_lead_created(context: ContextTypes.DEFAULT_TYPE, lead: dict | None
     # wants_insurance column exists (the feature stays dormant until the migration runs).
     try:
         st = db.get_user_state(lead.get("user_id"))
-        if st and (st.get("data") or {}).get("wants_insurance"):
+        st_data = (st.get("data") or {}) if st else {}
+        if st_data.get("wants_insurance"):
             try:
                 await asyncio.to_thread(db.update_lead, lead["id"], {"wants_insurance": True})
             except Exception as e:
                 logger.info("wants_insurance not persisted (column missing yet?): %s", e)
+        # Instant Tag rides the same deploy-safe channel: flag + the amount the
+        # driver pays. Optional write keys, so a DB behind the migration
+        # degrades to a normal lead instead of failing.
+        if st_data.get("instant_tag"):
+            try:
+                await asyncio.to_thread(db.update_lead, lead["id"], {
+                    "instant_tag": True,
+                    "driver_amount": (st_data.get("driver_amount") or "").strip() or None,
+                })
+            except Exception as e:
+                logger.info("instant_tag not persisted (column missing yet?): %s", e)
     except Exception as e:
         logger.debug("wants_insurance persist check failed: %s", e)
     try:
@@ -18850,6 +19096,7 @@ def _settings_main_kb() -> InlineKeyboardMarkup:
         [InlineKeyboardButton("👑 Supervisors", callback_data="tset_sups")],
         [InlineKeyboardButton("🔁 Follow-ups", callback_data="tset_fu")],
         [InlineKeyboardButton("🧾 Recent Leads", callback_data="tset_recent")],
+        [InlineKeyboardButton("⚡ Instant Tag", callback_data="tset_instant")],
         [InlineKeyboardButton("✖️ Close", callback_data="tset_close")],
     ])
 
@@ -19237,6 +19484,27 @@ async def _settings_view_recent():
     return await _recent_leads_text_kb(0)
 
 
+async def _settings_view_instant():
+    """⚡ Instant Tag: the supervisory switch for the all-drivers broadcast."""
+    on = _instant_all_drivers_enabled()
+    text = (
+        "⚡ *Instant Tag*\n\n"
+        "🤖 A lead with Instant Tag ON sends the chosen driver a Stripe link for "
+        "the *Amount* (price − $50, editable); paying releases the tag "
+        "automatically, and the issuer's password still works.\n\n"
+        f"📢 Send to All Drivers for instant leads: *{'ON' if on else 'OFF'}*\n"
+        "_ON means every driver gets their own payment link — the first card to "
+        "clear wins the tag; later links refuse with “already paid”._"
+    )
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton(
+            ("🔴 Turn all-drivers OFF" if on else "🟢 Allow Send to All Drivers"),
+            callback_data="tset_itag_all")],
+        [InlineKeyboardButton("⬅️ Back", callback_data="tset_menu")],
+    ])
+    return text, kb
+
+
 _SETTINGS_VIEWS = {
     "tset_plates": _settings_view_plates,
     "tset_groups": _settings_view_groups,
@@ -19246,6 +19514,7 @@ _SETTINGS_VIEWS = {
     "tset_sups": _settings_view_supervisors,
     "tset_fu": _settings_view_followups,
     "tset_recent": _settings_view_recent,
+    "tset_instant": _settings_view_instant,
 }
 # Refs and client names carry characters Markdown v1 chokes on, so the Recent
 # Leads screen renders as HTML while every other view keeps Markdown.
@@ -19263,6 +19532,7 @@ _SETTINGS_NAV = [
     (re.compile(r"\b(?:follow[\s-]*ups?|renewals?|reminders?)\b", re.I), "tset_fu"),
     (re.compile(r"\b(?:recent|latest|last|newest)\s+(?:leads?|clients?|entries)\b", re.I),
      "tset_recent"),
+    (re.compile(r"\binstant\s*(?:tags?|pdf)?\b", re.I), "tset_instant"),
 ]
 _SETTINGS_BACK_RE = re.compile(r"^\s*(?:back|menu|main|home|up|return)\b", re.I)
 _SETTINGS_CLOSE_RE = re.compile(r"^\s*(?:close|exit|quit|dismiss|finished|done)\b", re.I)
@@ -19276,6 +19546,7 @@ _SETTINGS_HINT = (
     "• *supervisors*\n"
     "• *follow-ups*\n"
     "• *recent leads*\n"
+    "• *instant tag*\n"
     "…or *back* / *close*."
 )
 
@@ -19357,6 +19628,17 @@ async def handle_settings_cb(update: Update, context: ContextTypes.DEFAULT_TYPE)
         # Page turns and strikes are the top-level ^rlv_ handler's, so they
         # survive a redeploy; this only opens page 0.
         await _show_settings_view("tset_recent", query=query)
+        return SET_MENU
+    if data == "tset_instant":
+        await _show_settings_view("tset_instant", query=query)
+        return SET_MENU
+    if data == "tset_itag_all":
+        want = not _instant_all_drivers_enabled()
+        ok = await asyncio.to_thread(db.set_setting, "instant_all_drivers",
+                                     "1" if want else "0")
+        if not ok:
+            await query.message.reply_text("⚠️ Could not save the setting. Try again.")
+        await _show_settings_view("tset_instant", query=query)
         return SET_MENU
     if data == "tset_close":
         context.user_data.pop("tset_await", None)

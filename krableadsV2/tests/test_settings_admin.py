@@ -239,6 +239,7 @@ class VoiceAndTextNavigationTest(unittest.TestCase):
         "i want to suspend a driver": "tset_susp",
         "recent leads": "tset_recent", "latest clients": "tset_recent",
         "show the last leads": "tset_recent",
+        "instant tag": "tset_instant", "instant pdf": "tset_instant",
     }
 
     def test_phrases_resolve_to_the_right_screen(self):
@@ -256,7 +257,7 @@ class VoiceAndTextNavigationTest(unittest.TestCase):
         spoken = {bot._settings_nav_target(w) for w in
                   ("plate numbers", "dispatchers", "drivers", "suspensions",
                    "client sources", "supervisors", "follow-ups",
-                   "recent leads")}
+                   "recent leads", "instant tag")}
         self.assertEqual(spoken, set(bot._SETTINGS_VIEWS))
 
     def test_spoken_navigation_opens_the_screen(self):

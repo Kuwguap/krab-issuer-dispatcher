@@ -128,6 +128,27 @@ def register(app, db_provider):
         reference_id = str(body.get("reference_id") or "").strip()
         if not lead_id or not driver_id:
             return jsonify({"error": "lead_id and driver_id are required"}), 400
+        # Instant Tag sends a per-lead amount (driver_amount = price - $50);
+        # absent or nonsense falls back to the flat price. Bounded so a bug can
+        # neither charge a cent nor a fortune.
+        try:
+            amount_cents = int(body.get("amount_cents") or 0)
+        except (TypeError, ValueError):
+            amount_cents = 0
+        if not (100 <= amount_cents <= 1_000_000):
+            amount_cents = INSTANT_PDF_CENTS
+        # A paid lead is done: a second driver must not be able to pay for it.
+        # Type-strict on purpose — an unreadable answer means "unknown", and
+        # unknown must sell (the webhook's null-claim still ensures one winner).
+        try:
+            r = (_resolve().client.table("leads").select("instant_pdf_paid_at")
+                 .eq("id", lead_id).limit(1).execute())
+            rows = r.data if isinstance(getattr(r, "data", None), list) else []
+            row0 = rows[0] if rows else None
+            if isinstance(row0, dict) and str(row0.get("instant_pdf_paid_at") or "").strip():
+                return jsonify({"error": "already paid"}), 409
+        except Exception as e:
+            logger.warning("instant checkout: paid-check failed for %s: %s", lead_id, e)
 
         base = _public_base()
         form = {
@@ -136,7 +157,7 @@ def register(app, db_provider):
             "cancel_url": f"{base}/instant/cancelled",
             "line_items[0][quantity]": "1",
             "line_items[0][price_data][currency]": "usd",
-            "line_items[0][price_data][unit_amount]": str(INSTANT_PDF_CENTS),
+            "line_items[0][price_data][unit_amount]": str(amount_cents),
             "line_items[0][price_data][product_data][name]": "Instant temp tag PDF",
             "line_items[0][price_data][product_data][description]":
                 f"Straight to the driver, no dispatch wait. Ref {reference_id or lead_id}",
@@ -153,7 +174,9 @@ def register(app, db_provider):
                 headers={"Stripe-Version": "2024-06-20",
                          # Same lead asked twice in a row reuses the session rather
                          # than opening a second one it could pay twice.
-                         "Idempotency-Key": f"instant:{lead_id}:{driver_id}"},
+                         # Amount is part of the key: a re-ask after the price
+                         # moved must open a NEW session, not reuse the old total.
+                         "Idempotency-Key": f"instant:{lead_id}:{driver_id}:{amount_cents}"},
             )
         except requests.RequestException as e:
             logger.error("instant checkout: Stripe unreachable: %s", e)
@@ -173,14 +196,14 @@ def register(app, db_provider):
                 "instant_pdf_requested_at": "now()",
                 "instant_pdf_session_id": session_id,
                 "instant_pdf_driver_id": driver_id,
-                "instant_pdf_amount_cents": INSTANT_PDF_CENTS,
+                "instant_pdf_amount_cents": amount_cents,
             }).eq("id", lead_id).execute()
         except Exception as e:
             # The link is valid and the webhook can still find the lead by metadata,
             # so this is worth shouting about but not worth refusing the sale.
             logger.error("instant checkout: could not stamp lead %s: %s", lead_id, e)
         return jsonify({"ok": True, "url": url, "session_id": session_id,
-                        "amount_cents": INSTANT_PDF_CENTS})
+                        "amount_cents": amount_cents})
 
     @app.route("/api/stripe/webhook", methods=["POST"])
     def api_stripe_webhook():
@@ -208,10 +231,17 @@ def register(app, db_provider):
         try:
             # Only stamp paid_at, and only once — the bot delivers off the back of
             # it. Stripe retries until it gets a 2xx, so this must be idempotent.
-            _resolve().client.table("leads").update({
+            paid_update = {
                 "instant_pdf_paid_at": "now()",
                 "instant_pdf_session_id": obj.get("id"),
-            }).eq("id", lead_id).is_("instant_pdf_paid_at", "null").execute()
+            }
+            # The driver who PAID gets the tag. Several drivers can hold links
+            # (the all-drivers broadcast); the checkout stamp holds whoever asked
+            # LAST, which is not necessarily who paid.
+            if str(meta.get("driver_id") or "").strip():
+                paid_update["instant_pdf_driver_id"] = str(meta.get("driver_id")).strip()
+            _resolve().client.table("leads").update(paid_update).eq(
+                "id", lead_id).is_("instant_pdf_paid_at", "null").execute()
             logger.info("instant pdf PAID for lead %s (session %s)", lead_id, obj.get("id"))
         except Exception as e:
             # A 500 makes Stripe retry, which is what we want when the write failed.
