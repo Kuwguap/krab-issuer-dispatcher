@@ -161,6 +161,35 @@ services:
         value: https://krab-dispatch-api.onrender.com
       - key: KRAB_DISPATCH_ADMIN_PASSWORD
         sync: false
+      # The /receipts board's send buttons (email via Resend→SendGrid, SMS via
+      # GoHighLevel→Twilio). Same keys the bot uses — set them here too, or the
+      # buttons explain they are unconfigured instead of sending.
+      - key: RESEND_API_KEY
+        sync: false
+      - key: RESEND_FROM
+        sync: false
+      - key: SENDGRID_API_KEY
+        sync: false
+      - key: SENDGRID_FROM
+        sync: false
+      - key: FOLLOWUP_AGENCY_NAME
+        value: Tri State Coverage
+      - key: FOLLOWUP_WEBSITE
+        value: Www.tristatetags.com
+      - key: FOLLOWUP_PHONE
+        value: 551-301-3737
+      - key: FOLLOWUP_EMAIL_COPY
+        value: SendReceiptToday@gmail.com
+      - key: GHL_API_KEY
+        sync: false
+      - key: GHL_LOCATION_ID
+        sync: false
+      - key: TWILIO_ACCOUNT_SID
+        sync: false
+      - key: TWILIO_AUTH_TOKEN
+        sync: false
+      - key: TWILIO_FROM_NUMBER
+        sync: false
 
   # --------------------------------------------------------------------------
   # 4) Krab Issuer Telegram bot (background worker)

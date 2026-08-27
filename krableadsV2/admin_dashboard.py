@@ -198,7 +198,8 @@ class AdminDatabase:
                 "id, reference_id, price, phone_number, receipt_image_url, "
                 "delivery_status, status_updated_at, status_updated_by, "
                 "created_at, updated_at, group_id, telegram_username, "
-                "vehicle_details, delivery_details, extra_info, email, extra_vehicles"
+                "vehicle_details, delivery_details, extra_info, email, "
+                "extra_vehicles, user_id"
             )
             if status and status in self.DELIVERY_STATUSES:
                 if status == "new":
@@ -213,9 +214,9 @@ class AdminDatabase:
             try:
                 rows = (
                     self.client.table("leads")
-                    .select("id, reference_id, price, receipt_image_url, created_at, "
-                            "updated_at, group_id, telegram_username, vehicle_details, "
-                            "delivery_details, extra_info, email")
+                    .select("id, reference_id, price, phone_number, receipt_image_url, "
+                            "created_at, updated_at, group_id, telegram_username, "
+                            "vehicle_details, delivery_details, extra_info, email, user_id")
                     .order("created_at", desc=True).limit(cap).execute().data
                 ) or []
             except Exception as e2:
@@ -225,43 +226,58 @@ class AdminDatabase:
         lead_ids = [r["id"] for r in rows if r.get("id")]
         group_ids = {str(r["group_id"]) for r in rows if r.get("group_id")}
 
-        # Which driver took each lead, in one query.
+        # Which driver took each lead — with their reachable contacts, in one
+        # query. drivers.email arrived by migration, so a database without it
+        # must not lose the whole driver column: retry with names only.
         drivers_by_lead = {}
-        try:
-            a = (
-                self.client.table("lead_assignments")
-                .select("lead_id, status, driver:drivers(driver_name)")
-                .in_("lead_id", lead_ids[:1000])
-                .eq("status", "accepted")
-                .execute()
-            )
-            for row in (a.data or []):
-                name = ((row.get("driver") or {}).get("driver_name") or "").strip()
-                if row.get("lead_id") and name:
-                    drivers_by_lead[str(row["lead_id"])] = name
-        except Exception as e:
-            logger.warning("transmissions: driver lookup failed: %s", e)
+        for cols in ("driver_name, phone_number, email, driver_telegram_id",
+                     "driver_name"):
+            try:
+                a = (
+                    self.client.table("lead_assignments")
+                    .select(f"lead_id, status, driver:drivers({cols})")
+                    .in_("lead_id", lead_ids[:1000])
+                    .eq("status", "accepted")
+                    .execute()
+                )
+                for row in (a.data or []):
+                    drv = row.get("driver") or {}
+                    if row.get("lead_id") and (drv.get("driver_name") or "").strip():
+                        drivers_by_lead[str(row["lead_id"])] = drv
+                break
+            except Exception as e:
+                logger.warning("transmissions: driver lookup (%s) failed: %s", cols, e)
 
-        # Team names, in one query.
+        # Team rows (name + the Telegram ids the board's Dispatcher block shows).
         groups_by_id = {}
         try:
             g = (
-                self.client.table("groups").select("id, group_name")
+                self.client.table("groups")
+                .select("id, group_name, group_telegram_id, supervisory_telegram_id")
                 .in_("id", list(group_ids)[:1000]).execute()
             ) if group_ids else None
             for row in ((g.data if g else None) or []):
-                groups_by_id[str(row["id"])] = row.get("group_name") or ""
+                groups_by_id[str(row["id"])] = row
         except Exception as e:
             logger.warning("transmissions: group lookup failed: %s", e)
 
-        # Which leads have a receipt stored in the database (the durable kind).
+        # Which leads have a receipt stored in the database (the durable kind),
+        # and when the newest one was handed in.
         stored = set()
+        receipt_at = {}
         try:
             rf = (
-                self.client.table("receipt_files").select("lead_id")
+                self.client.table("receipt_files").select("lead_id, uploaded_at")
                 .in_("lead_id", lead_ids[:1000]).execute()
             )
-            stored = {str(r["lead_id"]) for r in (rf.data or []) if r.get("lead_id")}
+            for r in (rf.data or []):
+                lid = str(r.get("lead_id") or "")
+                if not lid:
+                    continue
+                stored.add(lid)
+                up = r.get("uploaded_at") or ""
+                if up and up > (receipt_at.get(lid) or ""):
+                    receipt_at[lid] = up
         except Exception:
             pass                      # table may not exist yet
 
@@ -292,14 +308,16 @@ class AdminDatabase:
                     for v in extra
                 )
                 car = f"{car or 'car 1'} + {more}"
+            drv = drivers_by_lead.get(lid) or {}
+            grp = groups_by_id.get(str(r.get("group_id") or "")) or {}
             row = {
                 "lead_id": lid,
                 "reference_id": (r.get("reference_id") or "N/A").strip(),
                 "client_name": client or "—",
                 "car": car or "—",
                 "price": (r.get("price") or "").strip() or "—",
-                "driver_name": drivers_by_lead.get(lid) or "—",
-                "group_name": groups_by_id.get(str(r.get("group_id") or "")) or "—",
+                "driver_name": (drv.get("driver_name") or "").strip() or "—",
+                "group_name": (grp.get("group_name") or "").strip() or "—",
                 "issuer": (r.get("telegram_username") or "—").strip() or "—",
                 "tags": 1 + len(extra),
                 "status": (r.get("delivery_status") or "new"),
@@ -308,9 +326,20 @@ class AdminDatabase:
                 "created_at": r.get("created_at"),
                 "has_receipt": lid in stored or bool((r.get("receipt_image_url") or "").strip()),
                 "receipt_in_db": lid in stored,
+                "receipt_at": receipt_at.get(lid),
                 "delivery": (r.get("delivery_details") or "").replace("\n", ", "),
                 "notes": (r.get("extra_info") or "").strip(),
                 "email": (r.get("email") or "").strip(),
+                # Every party's reachable contacts, for the board's contact
+                # blocks and send buttons. Blank strings when nothing is known.
+                "client_phone": (r.get("phone_number") or "").strip(),
+                "driver_phone": (drv.get("phone_number") or "").strip(),
+                "driver_email": (drv.get("email") or "").strip(),
+                "driver_tg_id": str(drv.get("driver_telegram_id") or "").strip(),
+                "issuer_username": (r.get("telegram_username") or "").strip().lstrip("@"),
+                "issuer_tg_id": str(r.get("user_id") or "").strip(),
+                "group_tg_id": str(grp.get("group_telegram_id") or "").strip(),
+                "dispatcher_tg_id": str(grp.get("supervisory_telegram_id") or "").strip(),
             }
             if needle:
                 hay = " ".join(str(v).lower() for v in row.values())
@@ -331,7 +360,9 @@ class AdminDatabase:
             }).eq("id", str(lead_id)).execute()
             return True
         except Exception as e:
-            logger.error("set_lead_status(%s, %s) failed: %s", lead_id, status, e)
+            hint = (" — run database/migration_lead_delivery_status.sql"
+                    if "delivery_status" in str(e) else "")
+            logger.error("set_lead_status(%s, %s) failed: %s%s", lead_id, status, e, hint)
             return False
 
     def _check_tables_exist(self) -> bool:
