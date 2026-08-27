@@ -1035,6 +1035,42 @@ async def _deliver_skip_dispatch(context, lead: dict, driver: dict, *,
     return driver_ok
 
 
+_CITY_STATE_ZIP_RE = re.compile(
+    r"([A-Za-z][A-Za-z .'\-]*?)\s*,*\s+([A-Z]{2})\s+(\d{5}(?:-\d{4})?)")
+
+
+def _instant_tag_city_line(lead: dict) -> str:
+    """City, ST ZIP from the delivery address — enough to judge the trip.
+
+    The street and unit stay behind the payment on purpose: the full address
+    (and the client's phone, as the usual one-time link) arrives with the paid
+    delivery, exactly like every accepted lead."""
+    text = str(lead.get("delivery_details") or "")
+    match = None
+    for match in _CITY_STATE_ZIP_RE.finditer(text):
+        pass                        # the LAST match — addresses end in city/state
+    if match:
+        return f"{match.group(1).strip(' ,')}, {match.group(2)} {match.group(3)}"
+    # No zip written down — settle for the trailing pieces that carry no digits
+    # (digits mean a street number, which is exactly what must not leak here).
+    parts = [p.strip() for p in re.split(r"[,\n]+", text) if p.strip()]
+    tail = [p for p in parts[-2:] if not re.search(r"\d", p)]
+    return ", ".join(tail)
+
+
+def _instant_tag_when_line(lead: dict) -> str:
+    """When this job came in, New York time — '%b D, H:MM AM/PM' by hand,
+    because %-d/%-I only exist on Linux and the tests run on Windows too."""
+    ny = pytz.timezone("America/New_York")
+    raw = str(lead.get("created_at") or "").strip()
+    try:
+        dt = datetime.fromisoformat(raw.replace("Z", "+00:00")).astimezone(ny)
+    except Exception:
+        dt = datetime.now(ny)
+    clock = dt.strftime("%I:%M %p").lstrip("0")
+    return f"{dt.strftime('%b')} {dt.day}, {clock}"
+
+
 async def _dispatch_instant_tag_lead(context, lead: dict, selected_drivers: list,
                                      *, notify_chat_id=None, user_data=None) -> None:
     """🤖 Instant Tag dispatch: no Accept/Decline round. Every chosen driver
@@ -1056,9 +1092,18 @@ async def _dispatch_instant_tag_lead(context, lead: dict, selected_drivers: list
         body = [
             "🤖 <b>Instant Tag 🏷️</b>",
             f"📋 Reference: <code>{html.escape(ref, quote=False)}</code>",
-            "",
-            f"Pay <b>{amt_label}</b> and this tag sends itself here — no dispatch, no wait.",
         ]
+        place = _instant_tag_city_line(lead)
+        if place:
+            body.append(f"📍 {html.escape(place, quote=False)}")
+        body.append(f"🕒 {html.escape(_instant_tag_when_line(lead), quote=False)}")
+        body.append("💵 Payment in cash")
+        body.append("")
+        body.append(
+            f"Pay <b>{amt_label}</b> and this tag sends itself here — no dispatch, "
+            "no wait. You collect cash-in-hand from the client. Full delivery "
+            "details (address + client phone) arrive after payment."
+        )
         kb = None
         if url:
             kb = InlineKeyboardMarkup([[InlineKeyboardButton(
