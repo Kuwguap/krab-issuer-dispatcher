@@ -17767,41 +17767,146 @@ async def _escalate_renewal_driver(
     )
 
 
-async def _escalate_renewal_driver_all(
+def _renewal_creator_chat(renewal: dict):
+    """The chat of the person who created the lead this renewal belongs to."""
+    lead = (renewal or {}).get("lead") or {}
+    return _parse_chat_id(lead.get("user_id"))
+
+
+async def _renewal_hand_back_to_creator(
     context: ContextTypes.DEFAULT_TYPE,
     renewal_id: str,
     *,
-    exclude_driver_id: str | None = None,
+    declined_by: str | None = None,
 ) -> None:
-    """Fallback: the original driver couldn't take the renewal — offer it to ALL active drivers everywhere (FCFS)."""
-    # Atomic claim: never overwrite a concurrent Accept (reopening a completed
-    # renewal), never re-broadcast when timer + Reassign both fire.
+    """A renewal its driver will not take goes BACK to the person who created
+    the lead — it is never broadcast to every driver on the board.
+
+    The claim is the same atomic one the old fan-out used, so a concurrent
+    Accept still wins and the hand-back cannot fire twice for one refusal."""
     if not db.claim_renewal_driver_escalation(renewal_id):
-        logger.info(
-            "Renewal %s: all-drivers escalation skipped (already accepted or escalated)",
-            renewal_id,
-        )
+        logger.info("Renewal %s: hand-back skipped (already accepted or handed back)",
+                    renewal_id)
         return
-    logger.info("Renewal %s: escalating to all drivers", renewal_id)
-    refreshed = db.get_renewal_by_id(renewal_id)
-    if not refreshed:
+    renewal = db.get_renewal_by_id(renewal_id)
+    if not renewal:
+        return
+    lead = renewal.get("lead") or {}
+    ref = lead.get("reference_id") or "N/A"
+    chat = _renewal_creator_chat(renewal)
+    if not chat:
+        logger.warning("Renewal %s: no creator chat to hand back to (lead user_id missing)",
+                       renewal_id)
+        return
+    who = _telegram_md1_escape(declined_by or "The driver")
+    try:
+        await context.bot.send_message(
+            chat_id=chat,
+            text=(
+                f"🔄 **{who} is not taking this renewal**\n\n"
+                f"Reference ID: `{ref}`\n\n"
+                "Nobody else has been offered it — choose a new driver."
+            ),
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(
+                "🚗 Choose a driver", callback_data=f"rpk_{_short_uuid(renewal_id)}")]]),
+        )
+        logger.info("Renewal %s: handed back to its creator for reassignment", renewal_id)
+    except Exception as e:
+        logger.warning("Renewal %s: could not reach the creator: %s", renewal_id, e)
+
+
+async def handle_renewal_pick_open(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Creator tapped 'Choose a driver' on a handed-back renewal."""
+    query = update.callback_query
+    await query.answer()
+    short_r = (query.data or "").replace("rpk_", "").strip()
+    try:
+        renewal_id = _long_uuid(short_r)
+    except Exception:
+        await query.message.reply_text("❌ Invalid request.")
+        return
+    renewal = db.get_renewal_by_id(renewal_id)
+    if not renewal:
+        await query.message.reply_text("❌ That renewal no longer exists.")
+        return
+    if renewal.get("driver_status") == "accepted":
+        await query.message.reply_text("✅ A driver already took this renewal.")
         return
     suspended = _get_suspended_driver_ids()
-    sent_any = False
-    for d in _get_all_drivers_cached() or []:
+    rows, row = [], []
+    for d in (_get_all_drivers_cached() or []):
         did = str(d.get("id") or "")
-        if not did:
+        if not did or not record_is_active(d) or did in suspended:
             continue
-        if not record_is_active(d):
-            continue
-        if exclude_driver_id and did == str(exclude_driver_id):
-            continue
-        if did in suspended:
-            continue
-        if await _send_renewal_to_driver(context, refreshed, d):
-            sent_any = True
-    if not sent_any:
-        logger.warning("Renewal %s: no drivers available for all-driver escalation", renewal_id)
+        row.append(InlineKeyboardButton(
+            (d.get("driver_name") or "driver")[:24],
+            callback_data=f"rpd_{_short_uuid(renewal_id)}{_short_uuid(did)}"))
+        if len(row) == 2:
+            rows.append(row)
+            row = []
+    if row:
+        rows.append(row)
+    if not rows:
+        await query.message.reply_text("❌ No active drivers available. Contact admin.")
+        return
+    ref = (renewal.get("lead") or {}).get("reference_id") or "N/A"
+    await query.message.reply_text(
+        f"🚗 **Pick the driver for renewal** `{ref}`",
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup(rows),
+    )
+
+
+async def handle_renewal_pick_driver(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Creator chose the driver a handed-back renewal goes to."""
+    query = update.callback_query
+    await query.answer()
+    pair = _parse_paired_short_uuids(query.data, "rpd_")
+    if not pair:
+        await query.message.reply_text("❌ Invalid request.")
+        return
+    short_r, short_d = pair
+    try:
+        renewal_id = _long_uuid(short_r)
+        driver_id = _long_uuid(short_d)
+    except Exception:
+        await query.message.reply_text("❌ Invalid request.")
+        return
+    renewal = db.get_renewal_by_id(renewal_id)
+    if not renewal:
+        await query.message.reply_text("❌ That renewal no longer exists.")
+        return
+    if renewal.get("driver_status") == "accepted":
+        await query.message.reply_text("✅ A driver already took this renewal.")
+        return
+    driver = next((d for d in (_get_all_drivers_cached() or [])
+                   if str(d.get("id")) == str(driver_id)), None)
+    if not driver:
+        await query.message.reply_text("❌ That driver is no longer available.")
+        return
+    # Back to 'sent' BEFORE the offer goes out: the hand-back claim only fires
+    # on a renewal that is not already escalated, so without this reset the
+    # next driver's Reassign would be swallowed and nobody would be told.
+    db.update_renewal(renewal_id, {
+        "driver_status": "sent",
+        "driver_sent_at": datetime.utcnow().isoformat(),
+    })
+    refreshed = db.get_renewal_by_id(renewal_id) or renewal
+    ok = await _send_renewal_to_driver(context, refreshed, driver)
+    dname = _telegram_md1_escape(driver.get("driver_name") or "driver")
+    ref = (refreshed.get("lead") or {}).get("reference_id") or "N/A"
+    try:
+        await query.message.edit_text(
+            (f"✅ Renewal `{ref}` sent to {dname}." if ok
+             else f"❌ Could not reach {dname} — pick someone else."),
+            parse_mode="Markdown",
+        )
+    except Exception:
+        pass
+    if not ok:
+        # Undo the reset so the renewal can still be handed back cleanly.
+        db.update_renewal(renewal_id, {"driver_status": "escalated"})
 
 
 async def handle_renewal_group_accept(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -18075,14 +18180,19 @@ async def handle_renewal_driver_reassign(update: Update, context: ContextTypes.D
         return
 
     ref = (renewal.get("lead") or {}).get("reference_id", "N/A")
+    driver = next((d for d in (_get_all_drivers_cached() or [])
+                   if str(d.get("id")) == str(driver_id)), None)
     try:
         await query.message.edit_text(
-            f"🔄 **Reassigned** — this renewal delivery (`{ref}`) is now open to ALL drivers. First accept wins.",
+            f"🔄 **Passed back** — renewal `{ref}` has gone back to whoever "
+            "created the lead, to be given to another driver.",
             parse_mode="Markdown",
         )
     except Exception:
         pass
-    await _escalate_renewal_driver_all(context, renewal_id, exclude_driver_id=driver_id)
+    await _renewal_hand_back_to_creator(
+        context, renewal_id,
+        declined_by=(driver or {}).get("driver_name") or "The driver")
 
 
 # ── Client follow-ups ──────────────────────────────────────────────────────
@@ -20723,6 +20833,9 @@ def main():
     application.add_handler(CallbackQueryHandler(handle_renewal_group_reassign, pattern="^rgr_"))
     application.add_handler(CallbackQueryHandler(handle_renewal_driver_accept, pattern="^rda_"))
     application.add_handler(CallbackQueryHandler(handle_renewal_driver_reassign, pattern="^rdr_"))
+    # Handing a renewal back to its creator: open the picker, then pick.
+    application.add_handler(CallbackQueryHandler(handle_renewal_pick_open, pattern="^rpk_"))
+    application.add_handler(CallbackQueryHandler(handle_renewal_pick_driver, pattern="^rpd_"))
 
     # Client follow-up reminder actions + list commands
     application.add_handler(CommandHandler(["followups", "myclients"], cmd_my_followups))
@@ -20916,7 +21029,7 @@ def main():
                                 chat_id=gchat27,
                                 text=(
                                     f"🔔 Renewal reminder — `{ref27}` is due tomorrow.\n"
-                                    f"The offer goes to {dname27} first, then opens to all drivers."
+                                    f"It goes to {dname27}; if they pass, you pick the next driver."
                                 ),
                                 parse_mode="Markdown",
                             )
@@ -20929,7 +21042,7 @@ def main():
                             chat_id=drv_chat27,
                             text=(
                                 f"🔔 Heads up — renewal `{ref27}` is due tomorrow.\n"
-                                "You'll get the offer first when it drops."
+                                "It comes to you — accept it, or pass it back."
                             ),
                             parse_mode="Markdown",
                         )
@@ -20973,15 +21086,9 @@ def main():
                 ref = lead.get("reference_id", "?")
 
                 if sent:
-                    esc_seconds = Config.RENEWAL_ESCALATION_MINUTES * 60
-                    if context.application.job_queue:
-                        async def _driver_esc_job(ctx, _rid=renewal_id, _did=original_did):
-                            await _escalate_renewal_driver_all(ctx, _rid, exclude_driver_id=_did)
-                        context.application.job_queue.run_once(
-                            _driver_esc_job,
-                            when=esc_seconds,
-                            name=f"renewal_driver_esc_{renewal_id}",
-                        )
+                    # NO timed fan-out. A renewal the driver simply has not
+                    # answered yet stays theirs; it moves only when somebody
+                    # reassigns it, and then only back to the lead's creator.
                     # Same-issuer-group notice (informational — the claim already
                     # auto-accepted this group; no buttons needed).
                     if original_gid:
@@ -20996,26 +21103,49 @@ def main():
                                     chat_id=gchat,
                                     text=(
                                         f"🔄 Renewal `{ref}` sent to {dname}.\n"
-                                        f"If they don't respond in {Config.RENEWAL_ESCALATION_MINUTES} min, "
-                                        "it opens to ALL drivers — first accept wins."
+                                        "If they pass it back, whoever created the "
+                                        "lead picks the next driver."
                                     ),
                                     parse_mode="Markdown",
                                 )
                         except Exception as e:
                             logger.warning("Renewal %s: could not notify original group: %s", renewal_id, e)
+                    # The person who created the lead decides where it goes if
+                    # the driver will not take it, so they hear about it directly
+                    # rather than only in a team chat they may not sit in.
+                    creator_chat = _renewal_creator_chat(renewal)
+                    if creator_chat:
+                        try:
+                            dname_c = _telegram_md1_escape(
+                                (original_driver or {}).get("driver_name") or "the driver")
+                            await context.bot.send_message(
+                                chat_id=creator_chat,
+                                text=(
+                                    f"🔄 **Renewal due** — `{ref}`\n\n"
+                                    f"Sent to {dname_c}. If they pass it back, "
+                                    "you choose who gets it next."
+                                ),
+                                parse_mode="Markdown",
+                                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(
+                                    "🚗 Give it to someone else",
+                                    callback_data=f"rpk_{_short_uuid(renewal_id)}")]]),
+                            )
+                        except Exception as e:
+                            logger.warning(
+                                "Renewal %s: could not tell the creator: %s", renewal_id, e)
                     logger.info(
-                        "Renewal %s (ref %s) sent to original driver, all-drivers escalation in %d min",
-                        renewal_id, ref, Config.RENEWAL_ESCALATION_MINUTES,
+                        "Renewal %s (ref %s) sent to its original driver; it moves "
+                        "only if somebody reassigns it", renewal_id, ref,
                     )
                 else:
-                    # No original driver reachable — open to ALL drivers right away.
+                    # No original driver reachable — ask the creator to choose,
+                    # rather than waking every driver on the board.
                     logger.info(
-                        "Renewal %s: no reachable original driver — escalating to ALL drivers",
-                        renewal_id,
+                        "Renewal %s: original driver unreachable — asking the creator "
+                        "to pick", renewal_id,
                     )
-                    await _escalate_renewal_driver_all(
-                        context, renewal_id, exclude_driver_id=original_did
-                    )
+                    await _renewal_hand_back_to_creator(
+                        context, renewal_id, declined_by="The original driver")
         except Exception as e:
             logger.error("Renewal checker job failed: %s", e)
 
