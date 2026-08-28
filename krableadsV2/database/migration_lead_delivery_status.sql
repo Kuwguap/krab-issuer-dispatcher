@@ -17,7 +17,9 @@ alter table leads
 alter table leads drop constraint if exists leads_delivery_status_check;
 alter table leads add constraint leads_delivery_status_check
     check (delivery_status is null
-           or delivery_status in ('new', 'on_the_way', 'delivered', 'paid'));
+           or delivery_status in ('new', 'followup', 'tag_issued', 'tag_emailed',
+                                  'tag_printed', 'on_the_way', 'delivered',
+                                  'paid', 'receipt_uploaded'));
 
 -- The board sorts by most recently touched.
 create index if not exists leads_status_updated_idx

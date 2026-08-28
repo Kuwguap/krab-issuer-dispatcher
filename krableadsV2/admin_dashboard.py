@@ -185,7 +185,11 @@ class AdminDatabase:
     # handful of batched queries rather than the two-per-lead the older receipt
     # gallery used, because this page shows hundreds of rows at once.
 
-    DELIVERY_STATUSES = ("new", "on_the_way", "delivered", "paid")
+    # The full journey (v2) — 'delivered' and 'paid' stay legal for old rows
+    # ('paid' displays as Receipt uploaded). Requires migration_lead_status_v2.sql.
+    DELIVERY_STATUSES = ("new", "followup", "tag_issued", "tag_emailed",
+                         "tag_printed", "on_the_way", "delivered", "paid",
+                         "receipt_uploaded")
 
     def get_transmissions(self, limit: int = 300, status: str = "", search: str = "") -> list:
         """Leads as the board shows them: newest first, with driver, team, receipt
@@ -199,7 +203,7 @@ class AdminDatabase:
                 "delivery_status, status_updated_at, status_updated_by, "
                 "created_at, updated_at, group_id, telegram_username, "
                 "vehicle_details, delivery_details, extra_info, email, "
-                "extra_vehicles, user_id"
+                "extra_vehicles, user_id, issue_date"
             )
             if status and status in self.DELIVERY_STATUSES:
                 if status == "new":
@@ -216,7 +220,8 @@ class AdminDatabase:
                     self.client.table("leads")
                     .select("id, reference_id, price, phone_number, receipt_image_url, "
                             "created_at, updated_at, group_id, telegram_username, "
-                            "vehicle_details, delivery_details, extra_info, email, user_id")
+                            "vehicle_details, delivery_details, extra_info, email, "
+                            "user_id, issue_date")
                     .order("created_at", desc=True).limit(cap).execute().data
                 ) or []
             except Exception as e2:
@@ -281,6 +286,25 @@ class AdminDatabase:
         except Exception:
             pass                      # table may not exist yet
 
+        # Active renewal clocks — when the bot holds a real due date, the
+        # board's Renewal countdown uses it instead of issue_date arithmetic.
+        renewal_due = {}
+        try:
+            rr = (
+                self.client.table("lead_renewals")
+                .select("lead_id, renewal_due_at, status")
+                .in_("lead_id", lead_ids[:1000])
+                .in_("status", ["pending", "group_phase", "driver_phase"])
+                .execute()
+            )
+            for row in (rr.data or []):
+                lid = str(row.get("lead_id") or "")
+                due = row.get("renewal_due_at") or ""
+                if lid and due and due > (renewal_due.get(lid) or ""):
+                    renewal_due[lid] = due
+        except Exception:
+            pass                      # table may not exist yet
+
         needle = (search or "").strip().lower()
         out = []
         for r in rows:
@@ -324,6 +348,8 @@ class AdminDatabase:
                 "status_updated_at": r.get("status_updated_at"),
                 "status_updated_by": r.get("status_updated_by") or "",
                 "created_at": r.get("created_at"),
+                "issue_date": r.get("issue_date"),
+                "renewal_due_at": renewal_due.get(lid),
                 "has_receipt": lid in stored or bool((r.get("receipt_image_url") or "").strip()),
                 "receipt_in_db": lid in stored,
                 "receipt_at": receipt_at.get(lid),
@@ -353,11 +379,17 @@ class AdminDatabase:
         if status not in self.DELIVERY_STATUSES:
             return False
         try:
-            self.client.table("leads").update({
+            resp = self.client.table("leads").update({
                 "delivery_status": status,
                 "status_updated_at": "now()",
                 "status_updated_by": (who or "board")[:64],
             }).eq("id", str(lead_id)).execute()
+            if not resp.data:
+                # RLS (anon key) or a vanished row swallows the write silently —
+                # zero affected rows must not read as success.
+                logger.warning("set_lead_status(%s, %s): update affected no rows",
+                               lead_id, status)
+                return False
             return True
         except Exception as e:
             hint = (" — run database/migration_lead_delivery_status.sql"
@@ -2207,6 +2239,11 @@ def receipt_portal(token):
         ).eq("id", lead_id).execute()
     except Exception as e:
         logger.error("receipt portal: could not point the lead at the upload: %s", e)
+    # The board's ladder ends here: a receipt handed in is Receipt uploaded.
+    try:
+        db.set_lead_status(lead_id, "receipt_uploaded", "portal")
+    except Exception as e:
+        logger.warning("receipt portal: status advance failed for %s: %s", lead_id, e)
     logger.info("Receipt stored from portal for lead %s (%s bytes)", lead_id, len(data))
     return render_template_string(
         _PORTAL_PAGE, heading="Receipt received", reference_id=reference_id,

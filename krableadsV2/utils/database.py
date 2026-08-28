@@ -219,6 +219,152 @@ class Database:
                 return None
         return None
 
+    # Where a transmission has got to, in journey order. The bot only ever moves
+    # a lead FORWARD along this ladder — a delayed "driver on the way" tick must
+    # never un-ring "receipt uploaded". Humans on /receipts can set anything.
+    DELIVERY_STATUS_RANK = {
+        "new": 0, "followup": 1, "tag_issued": 2, "tag_emailed": 3,
+        "tag_printed": 4, "on_the_way": 5, "delivered": 6,
+        "paid": 7, "receipt_uploaded": 7,
+    }
+
+    def advance_delivery_status(self, lead_id: str, status: str,
+                                *, respect_human: bool = False) -> bool:
+        """Move a lead forward on the board — never backward, never loudly.
+
+        ONE conditional UPDATE, no read-then-write: the status filter rides in
+        the request, so a racing receipt upload can never be demoted by a
+        slower timed transition landing after it. ``respect_human=True`` (the
+        timed sweep) additionally refuses to touch a row a person has set by
+        hand — the bot must not fight the operator every two minutes.
+
+        Returns True only when the row actually moved. A database missing the
+        column (delivery-status migrations not run) latches off after one
+        warning — status is a courtesy on top of dispatch, not a reason to
+        break it or to spam the log every sweep tick."""
+        rank = self.DELIVERY_STATUS_RANK.get(status)
+        if rank is None or not self._check_tables_exist():
+            return False
+        import time as _time
+        latched = getattr(self, "_delivery_status_missing_at", 0)
+        if latched and _time.time() - latched < 600:
+            return False                # re-probe every 10 min — the operator
+                                        # may run the migration at any moment
+        lower = ",".join(sorted(
+            s for s, r in self.DELIVERY_STATUS_RANK.items() if r < rank))
+        try:
+            q = (self.client.table("leads").update({
+                    "delivery_status": status,
+                    "status_updated_at": "now()",
+                    "status_updated_by": "bot",
+                })
+                .eq("id", str(lead_id))
+                .or_(f"delivery_status.is.null,delivery_status.in.({lower})"))
+            if respect_human:
+                q = q.or_("status_updated_by.is.null,status_updated_by.eq.bot")
+            resp = q.execute()
+            self._delivery_status_missing_at = 0
+            return bool(resp.data)
+        except Exception as e:
+            if "delivery_status" in str(e) or "42703" in str(e):
+                self._delivery_status_missing_at = _time.time()
+                logger.warning(
+                    "advance_delivery_status: delivery_status not writable — run "
+                    "database/migration_lead_delivery_status.sql and "
+                    "migration_lead_status_v2.sql (disabling status advances): %s", e)
+            else:
+                logger.warning("advance_delivery_status(%s, %s) failed: %s",
+                               lead_id, status, e)
+            return False
+
+    def find_recent_lead_id_by_contact(self, phone: Optional[str],
+                                       email: Optional[str],
+                                       user_id=None) -> Optional[str]:
+        """Newest lead whose phone digits or email match — how a follow-up
+        (which stores no lead_id) finds the lead it is chasing.
+
+        Phone matching demands a FULL ten digits (a short free-text fragment
+        must not tag someone else's lead), and when ``user_id`` is given the
+        saving agent's own leads win over anyone else's."""
+        import re as _re
+        want_digits = _re.sub(r"\D", "", phone or "")[-10:]
+        if len(want_digits) < 10:
+            want_digits = ""
+        want_email = (email or "").strip().lower()
+        if not want_digits and not want_email:
+            return None
+        try:
+            r = (self.client.table("leads").select("id, phone_number, email, user_id")
+                 .order("created_at", desc=True).limit(300).execute())
+        except Exception as e:
+            logger.warning("find_recent_lead_id_by_contact: %s", e)
+            return None
+        rows = r.data or []
+
+        def _match(row):
+            if want_digits and _re.sub(r"\D", "", row.get("phone_number") or "")[-10:] == want_digits:
+                return True
+            return bool(want_email
+                        and (row.get("email") or "").strip().lower() == want_email)
+
+        if user_id is not None:
+            for row in rows:
+                if str(row.get("user_id")) == str(user_id) and _match(row):
+                    return str(row.get("id"))
+        for row in rows:
+            if _match(row):
+                return str(row.get("id"))
+        return None
+
+    def get_recently_accepted_leads(self, hours: int = 48) -> list:
+        """[{lead_id, accepted_at}] for assignments accepted in the window —
+        what the timed status sweep (tag printed → driver on the way) reads."""
+        from datetime import datetime, timedelta, timezone
+        since = (datetime.now(timezone.utc) - timedelta(hours=hours)).isoformat()
+        try:
+            r = (self.client.table("lead_assignments")
+                 .select("lead_id, accepted_at")
+                 .eq("status", "accepted").gte("accepted_at", since)
+                 .limit(500).execute())
+            return [row for row in (r.data or [])
+                    if row.get("lead_id") and row.get("accepted_at")]
+        except Exception as e:
+            logger.warning("get_recently_accepted_leads: %s", e)
+            return []
+
+    def get_recently_group_accepted_leads(self, hours: int = 48) -> list:
+        """[{lead_id, accepted_at}] for GROUP (ag_) accepts in the window —
+        the team's tap stores its timestamp on group_lead_offers, not on
+        lead_assignments, and the timed sweep must see both accept paths."""
+        from datetime import datetime, timedelta, timezone
+        since = (datetime.now(timezone.utc) - timedelta(hours=hours)).isoformat()
+        try:
+            r = (self.client.table("group_lead_offers")
+                 .select("lead_id, accepted_at")
+                 .eq("status", "accepted").gte("accepted_at", since)
+                 .limit(500).execute())
+            return [row for row in (r.data or [])
+                    if row.get("lead_id") and row.get("accepted_at")]
+        except Exception as e:
+            logger.warning("get_recently_group_accepted_leads: %s", e)
+            return []
+
+    def get_recently_paid_instant_leads(self, hours: int = 48) -> list:
+        """[{id, instant_pdf_paid_at}] paid in the window — an instant payment
+        counts as the accept for the timed status sweep."""
+        from datetime import datetime, timedelta, timezone
+        since = (datetime.now(timezone.utc) - timedelta(hours=hours)).isoformat()
+        try:
+            r = (self.client.table("leads")
+                 .select("id, instant_pdf_paid_at")
+                 .gte("instant_pdf_paid_at", since)
+                 .limit(500).execute())
+            return [row for row in (r.data or [])
+                    if row.get("id") and row.get("instant_pdf_paid_at")]
+        except Exception as e:
+            logger.warning("get_recently_paid_instant_leads: %s", e)
+            return []
+
     def update_lead(self, lead_id: str, updates: Dict[str, Any]) -> bool:
         """Update a lead record."""
         if not self._check_tables_exist():

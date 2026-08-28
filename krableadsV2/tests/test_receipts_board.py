@@ -54,9 +54,11 @@ class ThePageLoadsTest(unittest.TestCase):
         self.assertEqual(200, r.status_code)
         self.assertIn("text/html", r.content_type)
 
-    def test_it_names_all_four_statuses(self):
+    def test_it_names_every_status_on_the_ladder(self):
         body = self.client.get("/receipts").get_data(as_text=True)
-        for label in ("New", "On the way", "Delivered", "Paid"):
+        for label in ("New Lead", "Followup", "Tag issued", "Tag emailed",
+                      "Tag printed", "Driver on the way", "Delivered",
+                      "Receipt uploaded"):
             self.assertIn(label, body, label)
 
     def test_it_has_the_expand_control(self):
@@ -74,9 +76,12 @@ class ThePageLoadsTest(unittest.TestCase):
 
     def test_the_status_list_is_injected_as_real_json(self):
         body = self.client.get("/receipts").get_data(as_text=True)
-        self.assertIn('const STATUSES = ["new", "on_the_way", "delivered", "paid"]', body)
+        self.assertIn('const STATUSES = ["new", "followup", "tag_issued", '
+                      '"tag_emailed", "tag_printed", "on_the_way", "delivered", '
+                      '"receipt_uploaded"]', body)
         self.assertNotIn("__STATUSES__", body)
         self.assertNotIn("__LABELS__", body)
+        self.assertNotIn("__AGENCY__", body)
 
 
 class TheDataEndpointTest(unittest.TestCase):
@@ -137,7 +142,8 @@ class AnyoneCanMoveTheStatusTest(unittest.TestCase):
         return r, db
 
     def test_each_status_can_be_set(self):
-        for s in ("on_the_way", "delivered", "paid", "new"):
+        for s in ("followup", "tag_issued", "tag_emailed", "tag_printed",
+                  "on_the_way", "delivered", "receipt_uploaded", "paid", "new"):
             with self.subTest(status=s):
                 r, db = self._post(s)
                 self.assertEqual(200, r.status_code)
@@ -166,7 +172,9 @@ class TheQueryIsBatchedTest(unittest.TestCase):
     """Hundreds of rows at once — the old gallery did two queries per lead."""
 
     def test_only_the_statuses_the_board_offers_are_accepted(self):
-        self.assertEqual(("new", "on_the_way", "delivered", "paid"),
+        self.assertEqual(("new", "followup", "tag_issued", "tag_emailed",
+                          "tag_printed", "on_the_way", "delivered", "paid",
+                          "receipt_uploaded"),
                          ad.AdminDatabase.DELIVERY_STATUSES)
 
     def test_set_lead_status_refuses_anything_else(self):

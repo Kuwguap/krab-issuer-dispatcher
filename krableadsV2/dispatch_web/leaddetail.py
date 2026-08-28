@@ -37,10 +37,15 @@ _PHASE1_FIELDS = (
 )
 
 _DELIVERY_STATUS_LABELS = {
-    "new": "New",
-    "on_the_way": "On the way",
+    "new": "New Lead",
+    "followup": "Followup",
+    "tag_issued": "Tag issued",
+    "tag_emailed": "Tag emailed",
+    "tag_printed": "Tag printed",
+    "on_the_way": "Driver on the way",
     "delivered": "Delivered",
-    "paid": "Paid",
+    "paid": "Receipt uploaded",
+    "receipt_uploaded": "Receipt uploaded",
 }
 
 

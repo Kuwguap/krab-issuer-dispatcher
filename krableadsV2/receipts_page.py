@@ -1,12 +1,15 @@
 """The /receipts board — every transmission, its receipt, every party's contacts,
 and where it has got to.
 
-This is the full back-office page: the "krab issuer" transmissions list with the
-things that list could not do — a status column the whole team can move (New, On
-the way, Delivered, Paid), the receipt shown from the database rather than a
-Telegram link that has expired, a contact block per party (Client, Driver,
-Issuer, Dispatcher), and Send email / Send SMS buttons on every party that has
-that contact.
+This is the full back-office page: month-grouped, numbered rows under sticky
+headers; a status ladder that walks the whole journey (New Lead → Followup →
+Tag issued → Tag emailed → Tag printed → Driver on the way → Receipt uploaded)
+and is advanced automatically by the bot; per-party contact blocks with Send
+email / Send SMS buttons; a Renewal countdown (29 days from tag issue); a
+month-end money strip (all $, with-receipt $, and the gap); CSV export; and
+five views — Table, Cards, Sheet (spreadsheet), Charts, CRM (kanban) — plus a
+voice command mic (OpenAI-backed intent + answers) and an optional ambient
+"game mode" sprite layer.
 
 Senders are REUSED, not reinvented:
   * email — ``utils/client_outreach.send_client_email`` (Resend first, SendGrid
@@ -18,10 +21,15 @@ Senders are REUSED, not reinvented:
 Exposure: tristatetags.com is the speedy-tags Vercel project, whose catch-all
 rewrite sends unknown paths to the storefront — and whose ``/api/*`` already
 belongs to the quicktags checkout proxy. That is why EVERY route this board
-needs also exists under ``/receipts/*`` (page, data, status, notify, image):
-one Vercel rewrite pair ``/receipts(/:path*)`` → this Flask service exposes the
-whole board without touching the checkout proxy. The original ``/api/…`` routes
-stay put for anything already pointed at them.
+needs also exists under ``/receipts/*`` (page, data, status, notify, image,
+voice, assets): one Vercel rewrite pair ``/receipts(/:path*)`` → this Flask
+service exposes the whole board without touching the checkout proxy. The
+original ``/api/…`` routes stay put for anything already pointed at them.
+
+The heavier view modules (sheet, charts, CRM, themes, voice UI) are served
+from ``receipts_assets.py`` and the sprite layer from ``receipts_game.py`` —
+both OPTIONAL: delete either file and the board still runs; every integration
+point is behind a ``typeof`` guard in the page and a try/except here.
 
 Kept in its own module because admin_dashboard.py is already long, and because
 the board is self-contained: it needs ``db`` and ``app`` and nothing else.
@@ -36,13 +44,23 @@ from flask import Response, jsonify, request
 
 logger = logging.getLogger(__name__)
 
+# The journey, in the order the select offers it. 'delivered' is legacy but
+# still real; rows stamped 'paid' by the old board DISPLAY as Receipt uploaded
+# (see STATUS_ALIAS) and the endpoint still accepts 'paid' for old callers.
 STATUS_LABELS = {
-    "new": "New",
-    "on_the_way": "On the way",
+    "new": "New Lead",
+    "followup": "Followup",
+    "tag_issued": "Tag issued",
+    "tag_emailed": "Tag emailed",
+    "tag_printed": "Tag printed",
+    "on_the_way": "Driver on the way",
     "delivered": "Delivered",
-    "paid": "Paid",
+    "receipt_uploaded": "Receipt uploaded",
 }
-STATUS_ORDER = ("new", "on_the_way", "delivered", "paid")
+STATUS_ORDER = ("new", "followup", "tag_issued", "tag_emailed",
+                "tag_printed", "on_the_way", "delivered", "receipt_uploaded")
+STATUS_ALIAS = {"paid": "receipt_uploaded"}
+ACCEPTED_STATUSES = STATUS_ORDER + ("paid",)
 PARTIES = ("client", "driver", "issuer", "dispatcher")
 
 # Receipt bytes are served straight back from this origin — an allowlist, never
@@ -61,6 +79,15 @@ RECEIPT_MIME = {
 # text a client twice. Per (lead, party, channel), in-process.
 _MIN_SECONDS_BETWEEN_SENDS = 15
 _recent_sends = {}
+
+# The voice endpoint costs a database sweep and (when configured) an OpenAI
+# call per utterance — throttled per client and globally, with the aggregates
+# cached, so a hammering script burns neither budget nor pool.
+_VOICE_MIN_GAP_SEC = 2.0
+_VOICE_GLOBAL_PER_MIN = 30
+_voice_last_by_ip = {}
+_voice_window = []
+_voice_summary_cache = {"at": 0.0, "value": None}
 
 
 def _agency() -> dict:
@@ -182,67 +209,274 @@ def _party_contact(db, lead_id: str, party: str):
     }
 
 
+# ── Voice: intent + answers ─────────────────────────────────────────────────
+# Actions the page knows how to perform; anything else is answer-only.
+VOICE_ACTIONS = (
+    "set_view",       # args: {view: table|cards|sheet|chart|crm}
+    "toggle_view",    # flips table <-> cards
+    "set_theme",      # args: {theme: light|dark|midnight|matrix|sunset|ocean|monday|mono|bubblegum|auto}
+    "game_mode",      # args: {mode: off|subtle|full}
+    "celebrate",      # fires the goal.hit reaction
+    "download_csv",
+    "search",         # args: {query}
+    "filter_status",  # args: {status}
+    "filter_month",   # args: {month: "2026-05"}
+    "refresh",
+    "none",
+)
+
+
+def _money(price) -> float:
+    try:
+        return float(re.sub(r"[^0-9.]", "", str(price or "")) or 0)
+    except Exception:
+        return 0.0
+
+
+def _voice_summary(rows: list) -> dict:
+    """Compact aggregates the voice model (and the local fallback) answer from."""
+    months, statuses, issuers, drivers = {}, {}, {}, {}
+    total = total_rec = 0.0
+    year_total = 0.0
+    from datetime import datetime, timezone
+    now = datetime.now(timezone.utc)
+    for r in rows or []:
+        amt = _money(r.get("price"))
+        total += amt
+        mk = str(r.get("created_at") or "")[:7] or "unknown"
+        m = months.setdefault(mk, {"count": 0, "sum": 0.0, "receipt_sum": 0.0, "receipts": 0})
+        m["count"] += 1
+        m["sum"] += amt
+        if r.get("has_receipt"):
+            total_rec += amt
+            m["receipt_sum"] += amt
+            m["receipts"] += 1
+        s = r.get("status") or "new"
+        statuses[s] = statuses.get(s, 0) + 1
+        iss = (r.get("issuer") or "").strip()
+        if iss and iss != "—":
+            issuers[iss] = issuers.get(iss, 0) + 1
+        drv = (r.get("driver_name") or "").strip()
+        if drv and drv != "—":
+            drivers[drv] = drivers.get(drv, 0) + 1
+        try:
+            created = datetime.fromisoformat(str(r.get("created_at")).replace("Z", "+00:00"))
+            if (now - created).days <= 365:
+                year_total += amt
+        except Exception:
+            pass
+    latest = (rows or [{}])[0]
+    return {
+        "total_leads": len(rows or []),
+        "total_dollars": round(total, 2),
+        "with_receipt_dollars": round(total_rec, 2),
+        "missing_dollars": round(total - total_rec, 2),
+        "last_365_days_dollars": round(year_total, 2),
+        "by_month": {k: {kk: (round(vv, 2) if isinstance(vv, float) else vv)
+                         for kk, vv in v.items()}
+                     for k, v in sorted(months.items(), reverse=True)[:14]},
+        "by_status": statuses,
+        "top_issuers": sorted(issuers.items(), key=lambda x: -x[1])[:5],
+        "top_drivers": sorted(drivers.items(), key=lambda x: -x[1])[:5],
+        "latest_lead": {
+            "client": latest.get("client_name"), "issuer": latest.get("issuer"),
+            "price": latest.get("price"), "created_at": latest.get("created_at"),
+            "status": latest.get("status"), "reference": latest.get("reference_id"),
+        },
+    }
+
+
+def _voice_openai(text: str, ctx: dict, summary: dict):
+    """Ask OpenAI for {say, action, args}. None when unavailable — the local
+    fallback answers instead, so the mic never goes dead with the API down."""
+    key = (os.getenv("OPENAI_API_KEY") or "").strip()
+    if not key:
+        return None
+    try:
+        from openai import OpenAI
+        # max_retries=0 + a hard timeout, like utils/nl_router.py — a Flask
+        # request must answer or fall back, never hang on retries.
+        client = OpenAI(api_key=key, timeout=15, max_retries=0)
+        model = ((os.getenv("OPENAI_ADMIN_MODEL") or "").strip()
+                 or (os.getenv("OPENAI_MODEL") or "").strip()
+                 or "gpt-4o-mini")
+        system = (
+            "You are the voice assistant for a temporary-tag back-office board "
+            "(transmissions, receipts, drivers, issuers, dispatchers). Respond "
+            "with ONE JSON object: {\"say\": string, \"action\": string, "
+            "\"args\": object}. 'say' is a short spoken reply (1-2 sentences, "
+            "conversational, no markdown). 'action' must be one of: "
+            + ", ".join(VOICE_ACTIONS) + ". Use 'none' for pure questions. "
+            "View names: table (row by column), cards, sheet (excel/spreadsheet), "
+            "chart (diagram), crm (pipeline/kanban). Themes: light, dark, "
+            "midnight, matrix, sunset, ocean, monday, mono, bubblegum, auto. "
+            "game_mode modes: off, subtle, full — 'game mode'/'video game view' "
+            "means {mode:'full'} unless they ask for subtle or off. Answer money "
+            "and count questions from the DATA truthfully; amounts are USD."
+        )
+        user = json.dumps({"command": text, "ui": ctx, "data": summary})
+        resp = client.chat.completions.create(
+            model=model,
+            messages=[{"role": "system", "content": system},
+                      {"role": "user", "content": user}],
+            response_format={"type": "json_object"},
+            max_tokens=300,
+            temperature=0,
+        )
+        out = json.loads(resp.choices[0].message.content or "{}")
+        action = out.get("action") if out.get("action") in VOICE_ACTIONS else "none"
+        return {"say": str(out.get("say") or "")[:600], "action": action,
+                "args": out.get("args") or {}}
+    except Exception as e:
+        logger.warning("voice: OpenAI intent failed: %s", e)
+        return None
+
+
+def _voice_local(text: str, summary: dict) -> dict:
+    """No-API fallback: enough regex to keep every command working offline."""
+    t = text.lower()
+
+    def say(msg, action="none", args=None):
+        return {"say": msg, "action": action, "args": args or {}}
+
+    # Specific views first — "excel sheet list view" must never read as "table".
+    if re.search(r"\b(excel|sheet|spread)\b", t):
+        return say("Here is the spreadsheet view.", "set_view", {"view": "sheet"})
+    if re.search(r"\b(chart|diagram|graph)\b", t):
+        return say("Here are the numbers as charts.", "set_view", {"view": "chart"})
+    if re.search(r"\bcrm\b|pipeline|kanban", t):
+        return say("CRM mode it is.", "set_view", {"view": "crm"})
+    if re.search(r"\b(card|cards)\b", t):
+        return say("Switching to card view.", "set_view", {"view": "cards"})
+    if re.search(r"\btable\b|row by column|column view|\blist view\b", t):
+        return say("Switching to table view.", "set_view", {"view": "table"})
+    if "game" in t or "sprite" in t:
+        mode = "off" if re.search(r"\boff\b|kill|stop", t) else (
+            "subtle" if "subtle" in t or "calm" in t else "full")
+        return say(f"Game mode {mode}.", "game_mode", {"mode": mode})
+    if "celebrat" in t or "confetti" in t:
+        return say("Let's go! 🎉", "celebrate")
+    if "toggle" in t and "view" in t:
+        return say("Toggling the view.", "toggle_view")
+    if "theme" in t:
+        m = re.search(r"\b(light|dark|midnight|matrix|sunset|ocean|monday|mono|"
+                      r"bubblegum|auto)\b", t)
+        if m:
+            return say(f"Trying the {m.group(1)} theme.", "set_theme",
+                       {"theme": m.group(1)})
+    if "csv" in t or "download" in t or "export" in t:
+        return say("Downloading the CSV.", "download_csv")
+    if "refresh" in t or "reload" in t:
+        return say("Refreshing.", "refresh")
+    if re.search(r"(how much|revenue|made|total).*(year|365)", t):
+        return say(f"About ${summary.get('last_365_days_dollars', 0):,.0f} in the "
+                   "last twelve months, across "
+                   f"{summary.get('total_leads', 0)} transmissions on the board.")
+    if re.search(r"(how much|revenue|made|total)", t):
+        return say(f"${summary.get('total_dollars', 0):,.0f} across the board — "
+                   f"${summary.get('with_receipt_dollars', 0):,.0f} of it has a "
+                   "receipt uploaded.")
+    if "recent" in t or "latest" in t or "last lead" in t:
+        latest = summary.get("latest_lead") or {}
+        return say(f"The most recent lead is {latest.get('client') or 'unknown'} "
+                   f"for {latest.get('price') or 'an unknown amount'}, entered by "
+                   f"{latest.get('issuer') or 'an unknown issuer'}.")
+    return say("I didn't catch a command. Try: card view, sheet view, charts, "
+               "CRM mode, game mode, a theme, download CSV — or ask about the numbers.")
+
+
 BOARD_HTML = r"""<!doctype html>
 <html><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Receipts &amp; Transmissions</title>
+<link rel="stylesheet" href="/receipts/asset/themes.css">
 <style>
  :root {
    --bg:#f4f5f7; --card:#fff; --ink:#172b4d; --muted:#6b778c; --line:#dfe1e6;
    --soft:#f8f9fb; --accent:#0065ff;
-   --new:#8993a4; --otw:#0065ff; --del:#00875a; --paid:#6554c0;
+   --new:#8993a4; --followup:#ff991f; --issued:#00b8d9; --emailed:#36b37e;
+   --printed:#8777d9; --otw:#0065ff; --del:#00875a; --paid:#00ca72;
    --ok-bg:#e3fcef; --ok-ink:#006644; --bad-bg:#ffebe6; --bad-ink:#bf2600;
+   --z-sprites:20;
  }
  @media (prefers-color-scheme: dark) {
-   :root { --bg:#1d2125; --card:#22272b; --ink:#e6edf3; --muted:#9fadbc;
+   :root:not([data-theme]) { --bg:#1d2125; --card:#22272b; --ink:#e6edf3; --muted:#9fadbc;
            --line:#2c333a; --soft:#1a1e22;
            --ok-bg:#133527; --ok-ink:#7ee2b8; --bad-bg:#42221f; --bad-ink:#ff9c8f; }
  }
  * { box-sizing:border-box; }
+ html, body { height:100%; }
  body { margin:0; font:14px/1.45 -apple-system,system-ui,"Segoe UI",sans-serif;
-        background:var(--bg); color:var(--ink); }
+        background:var(--bg); color:var(--ink);
+        transition:background-color .25s, color .25s; }
  header { background:var(--card); border-bottom:1px solid var(--line);
-          padding:14px 20px 12px; display:flex; gap:14px; align-items:center;
+          padding:12px 18px 10px; display:flex; gap:12px; align-items:center;
           flex-wrap:wrap; }
- h1 { font-size:18px; margin:0; font-weight:700; }
+ h1 { font-size:18px; margin:0; font-weight:700; white-space:nowrap; }
  .sub { color:var(--muted); font-size:12px; }
  .grow { flex:1; }
  input[type=search] { padding:8px 12px; border:1px solid var(--line); border-radius:8px;
-                      background:var(--bg); color:inherit; min-width:230px; }
+                      background:var(--bg); color:inherit; min-width:200px; }
  .tabs { display:flex; gap:6px; flex-wrap:wrap; }
  .tab { padding:6px 12px; border:1px solid var(--line); border-radius:20px;
         background:transparent; color:var(--muted); cursor:pointer; font-weight:600;
-        font-size:13px; }
+        font-size:12.5px; }
  .tab.on { background:var(--ink); color:var(--card); border-color:var(--ink); }
  .counts { color:var(--muted); font-size:12px; }
- .who { border:1px dashed var(--line); border-radius:20px; padding:6px 12px;
-        background:transparent; color:var(--muted); cursor:pointer; font-size:13px; }
- #cfg { margin:10px 20px 0; padding:9px 14px; border-radius:8px; font-size:13px;
+ .who, .hbtn { border:1px dashed var(--line); border-radius:20px; padding:6px 12px;
+        background:transparent; color:var(--muted); cursor:pointer; font-size:13px;
+        white-space:nowrap; }
+ .hbtn { border-style:solid; }
+ .hbtn:hover { color:var(--accent); border-color:var(--accent); }
+ .seg { display:flex; border:1px solid var(--line); border-radius:9px; overflow:hidden; }
+ .seg button { border:0; background:transparent; color:var(--muted); padding:7px 11px;
+               cursor:pointer; font-weight:650; font-size:12.5px; border-right:1px solid var(--line); }
+ .seg button:last-child { border-right:0; }
+ .seg button.on { background:var(--accent); color:#fff; }
+ #stats { display:flex; gap:10px; flex-wrap:wrap; padding:10px 18px 0; }
+ .stat { background:var(--card); border:1px solid var(--line); border-radius:10px;
+         padding:8px 14px; font-size:13px; color:var(--muted); }
+ .stat b { color:var(--ink); font-size:15px; margin-left:6px; }
+ .stat.warn b { color:var(--bad-ink); }
+ #cfg { margin:10px 18px 0; padding:9px 14px; border-radius:8px; font-size:13px;
         background:var(--soft); border:1px solid var(--line); color:var(--muted);
         display:none; }
  .err { background:var(--bad-bg); color:var(--bad-ink); padding:10px 14px;
-        border-radius:8px; margin:10px 20px; }
- main { padding:12px 20px 70px; }
- .wrap { overflow-x:auto; background:var(--card); border:1px solid var(--line);
-         border-radius:10px; }
- table { width:100%; min-width:1340px; border-collapse:collapse; }
+        border-radius:8px; margin:10px 18px; }
+ main { padding:12px 18px 80px; }
+ .view { display:none; }
+ .view.on { display:block; }
+ .wrap { overflow:auto; background:var(--card); border:1px solid var(--line);
+         border-radius:10px; max-height:calc(100vh - 230px); }
+ table { width:100%; min-width:1420px; border-collapse:collapse; }
  th { position:sticky; top:0; z-index:3; background:var(--card);
       text-align:left; font-size:11px; letter-spacing:.06em; text-transform:uppercase;
       color:var(--muted); padding:10px 12px; border-bottom:1px solid var(--line);
-      white-space:nowrap; }
+      white-space:nowrap; box-shadow:0 1px 0 var(--line); }
  td { padding:11px 12px; border-bottom:1px solid var(--line); vertical-align:top; }
  tr.row:hover { background:rgba(0,101,255,.05); }
+ tr.mrow td { background:var(--soft); font-weight:750; cursor:pointer; padding:9px 12px;
+              font-size:13px; letter-spacing:.02em; user-select:none; }
+ tr.mrow .msum { color:var(--muted); font-weight:600; font-size:12px; margin-left:10px; }
+ .idx { color:var(--muted); font-size:12px; font-weight:650; }
  .ref { font-family:ui-monospace,monospace; font-size:12px; color:var(--muted); }
  .cname { font-weight:650; }
  .carline { color:var(--muted); font-size:12px; }
  .exp { cursor:pointer; user-select:none; color:var(--muted); width:26px; }
- .pill { display:inline-block; padding:3px 10px; border-radius:20px; font-size:12px;
+ .pill { display:inline-block; padding:3px 10px; border-radius:20px; font-size:11.5px;
          font-weight:650; color:#fff; white-space:nowrap; }
- .s-new{background:var(--new)} .s-on_the_way{background:var(--otw)}
- .s-delivered{background:var(--del)} .s-paid{background:var(--paid)}
+ .s-new{background:var(--new)} .s-followup{background:var(--followup)}
+ .s-tag_issued{background:var(--issued)} .s-tag_emailed{background:var(--emailed)}
+ .s-tag_printed{background:var(--printed)} .s-on_the_way{background:var(--otw)}
+ .s-delivered{background:var(--del)} .s-receipt_uploaded{background:var(--paid)}
  select.status { margin-top:5px; padding:5px 8px; border-radius:8px;
                  border:1px solid var(--line); background:var(--bg); color:inherit;
-                 font-weight:600; }
+                 font-weight:600; max-width:150px; }
+ .renew { display:inline-block; padding:3px 9px; border-radius:8px; font-size:12px;
+          font-weight:700; border:1px solid var(--line); white-space:nowrap; }
+ .renew.ok { color:var(--ok-ink); background:var(--ok-bg); border-color:transparent; }
+ .renew.soon { color:#8a5b00; background:rgba(255,153,31,.18); border-color:transparent; }
+ .renew.due { color:var(--bad-ink); background:var(--bad-bg); border-color:transparent; }
  .thumb { width:72px; height:52px; object-fit:cover; border-radius:8px;
           border:1px solid var(--line); cursor:zoom-in; display:block; background:var(--soft); }
  .nothumb { width:72px; height:52px; border:1px dashed var(--line); border-radius:8px;
@@ -266,6 +500,7 @@ BOARD_HTML = r"""<!doctype html>
  .detail { background:var(--soft); }
  .detail dl { display:grid; grid-template-columns:max-content 1fr; gap:6px 16px; margin:0; }
  .detail dt { color:var(--muted); font-size:12px; }
+ .detail dd { margin:0; min-width:0; overflow-wrap:anywhere; }
  .detail img { max-width:min(460px,100%); border-radius:8px; margin-top:10px;
                border:1px solid var(--line); cursor:zoom-in; }
  a { color:var(--otw); text-decoration:none; }
@@ -275,15 +510,16 @@ BOARD_HTML = r"""<!doctype html>
  .overlay { position:fixed; inset:0; background:rgba(9,30,66,.55); z-index:50;
             display:flex; align-items:center; justify-content:center; padding:20px; }
  .overlay[hidden] { display:none; }
- .sheet { background:var(--card); color:var(--ink); border-radius:12px;
+ .sheet-modal { background:var(--card); color:var(--ink); border-radius:12px;
           width:min(560px,100%); max-height:92vh; overflow:auto; padding:20px 22px;
           box-shadow:0 18px 50px rgba(0,0,0,.35); }
- .sheet h2 { margin:0 0 4px; font-size:16px; }
+ .sheet-modal h2 { margin:0 0 4px; font-size:16px; }
  .c-to { color:var(--muted); font-size:13px; margin-bottom:12px; }
- .sheet label { display:block; font-size:12px; color:var(--muted); margin:10px 0 4px; }
- .sheet input, .sheet textarea { width:100%; padding:9px 11px; border:1px solid var(--line);
+ .sheet-modal label { display:block; font-size:12px; color:var(--muted); margin:10px 0 4px; }
+ .sheet-modal input, .sheet-modal textarea { width:100%; padding:9px 11px;
+        border:1px solid var(--line);
         border-radius:8px; background:var(--bg); color:inherit; font:inherit; }
- .sheet textarea { resize:vertical; }
+ .sheet-modal textarea { resize:vertical; }
  .c-actions { display:flex; gap:8px; align-items:center; margin-top:14px; }
  .c-actions .spacer { flex:1; }
  .btn { border-radius:8px; padding:8px 16px; font-weight:650; cursor:pointer;
@@ -295,17 +531,15 @@ BOARD_HTML = r"""<!doctype html>
  #c-result.bad { color:var(--bad-ink); }
  #lightbox img { max-width:94vw; max-height:92vh; border-radius:10px; cursor:zoom-out;
                  background:#fff; }
- #toasts { position:fixed; right:16px; bottom:16px; z-index:60; display:flex;
+ #toasts { position:fixed; right:16px; bottom:84px; z-index:60; display:flex;
            flex-direction:column; gap:8px; }
  .toast { padding:10px 14px; border-radius:8px; font-size:13px; font-weight:600;
           box-shadow:0 6px 18px rgba(0,0,0,.25); }
  .toast.ok { background:var(--ok-bg); color:var(--ok-ink); }
  .toast.bad { background:var(--bad-bg); color:var(--bad-ink); }
- footer { position:fixed; left:0; right:0; bottom:0; padding:6px 20px;
-          font-size:11px; color:var(--muted); background:var(--bg); text-align:right;
-          pointer-events:none; }
- /* ── Phone layout: the same transmissions as cards, thumb-first ─────────── */
- #cards { display:none; }
+ /* ── Phone cards ────────────────────────────────────────────────────────── */
+ .mdivider { font-weight:750; color:var(--muted); padding:8px 4px 2px; cursor:pointer;
+             user-select:none; font-size:13px; }
  .card { background:var(--card); border:1px solid var(--line); border-radius:12px;
          padding:12px 14px; }
  .c-top { display:flex; gap:10px; align-items:flex-start; justify-content:space-between; }
@@ -328,25 +562,28 @@ BOARD_HTML = r"""<!doctype html>
            padding:6px 0; text-align:left; }
  .c-detail { border-top:1px dashed var(--line); padding-top:10px; margin-top:2px;
              font-size:13px; }
- .detail dd { margin:0; min-width:0; overflow-wrap:anywhere; }
  .c-detail img { max-width:100%; }
  .empty { padding:30px 10px; text-align:center; }
+ #vw-sheet, #vw-chart, #vw-crm { min-height:300px; }
+ footer { position:fixed; left:0; right:0; bottom:0; padding:6px 18px;
+          font-size:11px; color:var(--muted); background:var(--bg); text-align:right;
+          pointer-events:none; z-index:5; }
  @media (max-width:860px) {
-   header { padding:12px 14px 10px; gap:10px; }
+   header { padding:12px 12px 10px; gap:8px; }
    h1 { font-size:16px; }
    .sub { display:none; }
-   main { padding:10px 10px 24px; }
-   .wrap { display:none; }
-   #cards { display:flex; flex-direction:column; gap:10px; }
+   main { padding:10px 8px 90px; }
+   #stats { padding:8px 8px 0; }
+   .wrap { max-height:none; }
    .tabs { width:100%; order:3; overflow-x:auto; flex-wrap:nowrap;
            scrollbar-width:none; padding-bottom:2px; }
    .tab { flex:0 0 auto; }
-   input[type=search] { flex:1; min-width:120px; font-size:16px; }
-   select.status, .sheet input, .sheet textarea { font-size:16px; }
+   input[type=search] { flex:1; min-width:110px; font-size:16px; }
+   select.status, .sheet-modal input, .sheet-modal textarea { font-size:16px; }
    .act { padding:8px 12px; }
    .overlay { padding:0; align-items:flex-end; }
-   .sheet { width:100%; max-height:88vh; border-radius:14px 14px 0 0; padding:16px; }
-   #toasts { left:12px; right:12px; bottom:10px; }
+   .sheet-modal { width:100%; max-height:88vh; border-radius:14px 14px 0 0; padding:16px; }
+   #toasts { left:12px; right:12px; bottom:84px; }
    footer { display:none; }
  }
  @media (max-width:760px) { .hide-sm { display:none; } }
@@ -359,16 +596,29 @@ BOARD_HTML = r"""<!doctype html>
   <div class="tabs" id="tabs"></div>
   <span class="grow"></span>
   <input type="search" id="q" placeholder="Search ref, client, driver, phone…">
+  <div class="seg" id="seg">
+    <button data-view="table" title="Row by column">📋 Table</button>
+    <button data-view="cards" title="Card view">🗂 Cards</button>
+    <button data-view="sheet" title="Spreadsheet">📑 Sheet</button>
+    <button data-view="chart" title="Charts">📊 Charts</button>
+    <button data-view="crm" title="Pipeline">📌 CRM</button>
+  </div>
+  <button class="hbtn" id="csv" title="Download everything as a CSV file">⬇ CSV</button>
+  <span id="themeMount"></span>
+  <button class="hbtn" id="gamechip" title="Ambient game mode">🎮 off</button>
   <button class="who" id="who" title="Shown next to everything you change or send">👤 …</button>
   <span class="counts" id="counts"></span>
 </header>
+<div id="stats"></div>
 <div id="cfg"></div>
 <div id="err"></div>
 <main>
+  <div class="view" id="vw-table">
   <div class="wrap">
   <table>
     <thead><tr>
       <th class="exp"></th>
+      <th>#</th>
       <th>Client</th>
       <th>Receipt</th>
       <th>Client phone</th>
@@ -377,17 +627,22 @@ BOARD_HTML = r"""<!doctype html>
       <th>Driver</th>
       <th>Issuer</th>
       <th>Dispatcher</th>
+      <th>Renewal</th>
       <th>Status</th>
       <th class="hide-sm">Updated</th>
     </tr></thead>
-    <tbody id="rows"><tr><td colspan="11" class="none">Loading…</td></tr></tbody>
+    <tbody id="rows"><tr><td colspan="13" class="none">Loading…</td></tr></tbody>
   </table>
   </div>
-  <div id="cards"><div class="none empty">Loading…</div></div>
+  </div>
+  <div class="view" id="vw-cards"><div id="cards"><div class="none empty">Loading…</div></div></div>
+  <div class="view" id="vw-sheet"></div>
+  <div class="view" id="vw-chart"></div>
+  <div class="view" id="vw-crm"></div>
 </main>
 
 <div class="overlay" id="compose" hidden>
-  <div class="sheet">
+  <div class="sheet-modal">
     <h2 id="c-title">Send</h2>
     <div class="c-to" id="c-to"></div>
     <label id="c-sublabel">Subject
@@ -408,6 +663,11 @@ BOARD_HTML = r"""<!doctype html>
 <div id="toasts"></div>
 <footer>refreshes every 30s</footer>
 
+<script src="/receipts/asset/themes.js"></script>
+<script src="/receipts/asset/sheet.js"></script>
+<script src="/receipts/asset/charts.js"></script>
+<script src="/receipts/asset/crm.js"></script>
+<script src="/receipts/asset/voice.js"></script>
 <script>
 const STATUSES = __STATUSES__;
 const LABELS = __LABELS__;
@@ -417,17 +677,13 @@ const IMG = "/receipts/receipt/";
 let ALL = [], filter = "", q = "";
 let CFG = {email: true, sms: "unknown"};   // refreshed from /receipts/api/sendconfig
 let COMPOSE = null;                        // {row, party, channel}
+let VIEW = localStorage.getItem("krab_view") || "table";
+if (!["table","cards","sheet","chart","crm"].includes(VIEW)) VIEW = "table";
+let COLLAPSED = {};
+try { COLLAPSED = JSON.parse(localStorage.getItem("krab_mcollapse") || "{}") || {}; } catch (e) {}
+let PREV_STATUS = null;                    // lead_id -> status, for bus diffing
 const PARTY_KEYS = ["client", "driver", "issuer", "dispatcher"];
-// Below this width the table becomes cards — same data, thumb-first.
 const MQ = window.matchMedia("(max-width: 860px)");
-let LAST_LAYOUT = null;                    // what draw() last rendered for
-if (MQ.addEventListener) MQ.addEventListener("change", () => draw());
-else if (MQ.addListener) MQ.addListener(() => draw());
-// Some embedded/emulated viewports resize without firing the media-query
-// listener — the resize event redraws only when the layout actually flips.
-window.addEventListener("resize", () => {
-  if (MQ.matches !== LAST_LAYOUT) draw();
-});
 
 const esc = s => String(s == null ? "" : s).replace(/[&<>"']/g,
   c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
@@ -441,6 +697,66 @@ function when(iso) {
 const digits = s => String(s || "").replace(/\D/g, "");
 const telHref = p => { const d = digits(p); return d.length >= 10 ? "tel:+1" + d.slice(-10) : ""; };
 const firstName = n => (String(n || "").trim().split(/\s+/)[0]) || "there";
+const moneyNum = p => { const n = parseFloat(String(p || "").replace(/[^0-9.]/g, "")); return isNaN(n) ? 0 : n; };
+const fmtMoney = n => "$" + Math.round(n).toLocaleString();
+const monthKey = iso => (iso || "").slice(0, 7) || "unknown";
+function monthLabel(key) {
+  if (key === "unknown") return "UNDATED";
+  const d = new Date(key + "-15T12:00:00Z");
+  return isNaN(d) ? key : d.toLocaleString([], {month:"long", year:"numeric"}).toUpperCase();
+}
+const normStatus = s => (s === "paid" ? "receipt_uploaded" : (s || "new"));
+const statusLabel = s => LABELS[normStatus(s)] || s;
+// The view modules bridge through window.* — top-level const does not create
+// window properties, so export the shared helpers explicitly.
+window.esc = esc; window.when = when; window.moneyNum = moneyNum;
+window.monthKey = monthKey; window.monthLabel = monthLabel; window.LABELS = LABELS;
+
+// Renewal countdown. When the bot holds a real renewal clock for the lead
+// (lead_renewals.renewal_due_at) that IS the number; otherwise 29 days from
+// the day the tag was issued (created date when a tag was never dated).
+function renewalDays(r) {
+  if (r.renewal_due_at) {
+    const due = new Date(r.renewal_due_at);
+    if (!isNaN(due)) return Math.max(-99, Math.ceil((due.getTime() - Date.now()) / 86400000));
+  }
+  const base = r.issue_date || r.created_at;
+  if (!base) return null;
+  const d = new Date(base);
+  if (isNaN(d)) return null;
+  return 29 - Math.floor((Date.now() - d.getTime()) / 86400000);
+}
+function renewalChip(r) {
+  const d = renewalDays(r);
+  if (d == null) return '<span class="none">—</span>';
+  if (d > 7) return `<span class="renew ok">${d} d</span>`;
+  if (d > 0) return `<span class="renew soon">${d} d</span>`;
+  return `<span class="renew due">${d === 0 ? "due" : Math.abs(d) + "d over"}</span>`;
+}
+
+// ── Event bus: the page narrates, optional layers (game mode) listen. ──────
+function bus(type, payload) {
+  try { window.dispatchEvent(new CustomEvent("krab", {detail: {type, payload: payload || {}}})); }
+  catch (e) {}
+}
+const FORWARD_RANK = {new:0, followup:1, tag_issued:2, tag_emailed:3,
+                      tag_printed:4, on_the_way:5, delivered:6, receipt_uploaded:7};
+function emitDiffs(rows) {
+  const next = {};
+  rows.forEach(r => { next[r.lead_id] = normStatus(r.status); });
+  if (PREV_STATUS) {
+    rows.forEach(r => {
+      const was = PREV_STATUS[r.lead_id], now = next[r.lead_id];
+      if (was === undefined) { bus("lead.created", {id: r.lead_id}); return; }
+      if (was === now) return;
+      if (now === "receipt_uploaded") bus("deal.won", {id: r.lead_id, value: moneyNum(r.price)});
+      else if (now === "on_the_way") bus("driver.on_the_way", {id: r.lead_id});
+      else if ((FORWARD_RANK[now] || 0) > (FORWARD_RANK[was] || 0))
+        bus("stage.advanced", {id: r.lead_id, label: statusLabel(now)});
+    });
+  }
+  PREV_STATUS = next;
+}
 
 function whoAmI(ask) {
   let w = localStorage.getItem("krab_who") || "";
@@ -469,10 +785,11 @@ function toast(text, ok) {
 function tabs() {
   const el = document.getElementById("tabs");
   const counts = {};
-  ALL.forEach(r => { counts[r.status] = (counts[r.status] || 0) + 1; });
+  ALL.forEach(r => { const s = normStatus(r.status); counts[s] = (counts[s] || 0) + 1; });
   el.innerHTML = [["", "All"]].concat(STATUSES.map(s => [s, LABELS[s]]))
     .map(([v, label]) => {
       const n = v ? (counts[v] || 0) : ALL.length;
+      if (v && !n && v !== "new") return "";     // quiet empty stops, keep the strip short
       return `<button class="tab ${filter === v ? "on" : ""}" data-f="${v}">`
            + `${esc(label)} <span class="counts">${n}</span></button>`;
     }).join("");
@@ -483,8 +800,42 @@ function tabs() {
 
 function visible() {
   const needle = q.trim().toLowerCase();
-  return ALL.filter(r => (!filter || r.status === filter)
+  return ALL.filter(r => (!filter || normStatus(r.status) === filter)
     && (!needle || JSON.stringify(r).toLowerCase().includes(needle)));
+}
+
+// Month folders — Monday-style: the month, then its rows, first to last day.
+function monthGroups(rows) {
+  const out = [];
+  let cur = null;
+  rows.forEach(r => {
+    const key = monthKey(r.created_at);
+    if (!cur || cur.key !== key) {
+      cur = {key, label: monthLabel(key), rows: [], sumAll: 0, sumRec: 0, nRec: 0};
+      out.push(cur);
+    }
+    cur.rows.push(r);
+    const amt = moneyNum(r.price);
+    cur.sumAll += amt;
+    if (r.has_receipt) { cur.sumRec += amt; cur.nRec += 1; }
+  });
+  return out;
+}
+
+function renderStats(rows) {
+  let sumAll = 0, sumRec = 0, nRec = 0;
+  rows.forEach(r => { const a = moneyNum(r.price); sumAll += a;
+                      if (r.has_receipt) { sumRec += a; nRec += 1; } });
+  const nowKey = monthKey(new Date().toISOString());
+  let mAll = 0, mRec = 0, mN = 0;
+  rows.forEach(r => { if (monthKey(r.created_at) === nowKey) {
+    const a = moneyNum(r.price); mAll += a; mN += 1; if (r.has_receipt) mRec += a; } });
+  document.getElementById("stats").innerHTML = [
+    `<span class="stat">🧾 With receipts<b>${fmtMoney(sumRec)}</b> <span class="counts">(${nRec})</span></span>`,
+    `<span class="stat">💰 All<b>${fmtMoney(sumAll)}</b> <span class="counts">(${rows.length})</span></span>`,
+    `<span class="stat warn">⚠ Missing<b>${fmtMoney(sumAll - sumRec)}</b> <span class="counts">(${rows.length - nRec})</span></span>`,
+    `<span class="stat">📅 ${esc(monthLabel(nowKey))}<b>${fmtMoney(mAll)}</b> <span class="counts">(${mN} leads · ${fmtMoney(mRec)} receipted)</span></span>`,
+  ].join("");
 }
 
 // Every party's contacts, in the one consistent shape the blocks render.
@@ -553,15 +904,16 @@ function receiptCell(r) {
          onerror="this.outerHTML='<div class=nothumb>no image</div>'">`
     : `<div class="nothumb">no receipt</div>`;
   const date = r.receipt_at ? when(r.receipt_at) : (r.has_receipt ? "on file" : "—");
-  return `${img}<div class="rinfo"><b>${esc(r.price)}</b> · ${esc(date)}<br>${esc(LABELS[r.status] || r.status)}</div>`;
+  return `${img}<div class="rinfo"><b>${esc(r.price)}</b> · ${esc(date)}<br>${esc(statusLabel(r.status))}</div>`;
 }
 
 function statusBits(r) {
+  const now = normStatus(r.status);
   const opts = STATUSES.map(s =>
-    `<option value="${s}" ${r.status === s ? "selected" : ""}>${esc(LABELS[s])}</option>`
+    `<option value="${s}" ${now === s ? "selected" : ""}>${esc(LABELS[s])}</option>`
   ).join("");
   return {
-    pill: `<span class="pill s-${esc(r.status)}">${esc(LABELS[r.status] || r.status)}</span>`,
+    pill: `<span class="pill s-${esc(now)}">${esc(statusLabel(r.status))}</span>`,
     select: `<select class="status" data-id="${esc(r.lead_id)}">${opts}</select>`,
   };
 }
@@ -581,6 +933,7 @@ function detailBody(r) {
       <dt>Notes</dt><dd>${esc(r.notes) || "—"}</dd>
       <dt>Entered by</dt><dd>${esc(r.issuer)}</dd>
       <dt>Created</dt><dd>${esc(when(r.created_at))}</dd>
+      <dt>Tag issued</dt><dd>${esc(when(r.issue_date))}</dd>
       <dt>Receipt</dt><dd>${r.receipt_in_db ? "stored here (never expires)"
                             : (r.has_receipt ? "external link" : "not handed in")}</dd>
       ${partyLines}
@@ -589,13 +942,14 @@ function detailBody(r) {
                          data-full="${IMG + encodeURIComponent(r.lead_id)}" alt="receipt">` : ""}`;
 }
 
-function rowHtml(r) {
+function rowHtml(r, idx) {
   const s = statusBits(r);
   const phone = r.client_phone
     ? `<a href="${esc(telHref(r.client_phone) || "#")}">${esc(r.client_phone)}</a>`
     : '<span class="none">—</span>';
   return `<tr class="row" data-id="${esc(r.lead_id)}">
     <td class="exp" data-x="${esc(r.lead_id)}">▸</td>
+    <td class="idx">${idx}</td>
     <td><div class="cname">${esc(r.client_name)}</div>
         <div class="ref">${esc(r.reference_id)}</div>
         <div class="carline">${esc(r.car)}</div></td>
@@ -606,15 +960,27 @@ function rowHtml(r) {
     <td>${block(r, "driver")}</td>
     <td>${block(r, "issuer")}</td>
     <td>${block(r, "dispatcher")}</td>
+    <td>${renewalChip(r)}</td>
     <td>${s.pill}<br>${s.select}</td>
     <td class="hide-sm">${esc(when(r.status_updated_at))}<br>
         <span class="counts">${esc(r.status_updated_by || "")}</span></td>
   </tr>
-  <tr class="detail" id="d-${esc(r.lead_id)}" hidden><td colspan="11">${detailBody(r)}</td></tr>`;
+  <tr class="detail" id="d-${esc(r.lead_id)}" hidden><td colspan="13">${detailBody(r)}</td></tr>`;
+}
+
+function monthRowHtml(g) {
+  const closed = !!COLLAPSED[g.key];
+  return `<tr class="mrow" data-mk="${esc(g.key)}"><td colspan="13">
+    ${closed ? "📁" : "📂"} ${esc(g.label)}
+    <span class="msum">${g.rows.length} lead${g.rows.length === 1 ? "" : "s"}
+      · ${fmtMoney(g.sumAll)} total · ${fmtMoney(g.sumRec)} with receipts (${g.nRec})
+      · ${fmtMoney(g.sumAll - g.sumRec)} missing</span>
+    <span class="msum" style="float:right">${closed ? "▸" : "▾"}</span>
+  </td></tr>`;
 }
 
 // One card per transmission on a phone — the same data, thumb-first.
-function cardHtml(r) {
+function cardHtml(r, idx) {
   const c = contacts(r);
   const s = statusBits(r);
   const partyRow = p => {
@@ -640,10 +1006,10 @@ function cardHtml(r) {
   return `<div class="card" data-id="${esc(r.lead_id)}">
     <div class="c-top">
       <div class="c-id">
-        <div class="cname">${esc(r.client_name)}</div>
+        <div class="cname"><span class="idx">#${idx}</span> ${esc(r.client_name)}</div>
         <div class="ref">${esc(r.reference_id)} · ${esc(r.car)}${(r.tags || 1) > 1 ? ` · <b>${esc(r.tags)}× tags</b>` : ""}</div>
       </div>
-      ${s.pill}
+      <div style="text-align:right">${s.pill}<div style="margin-top:5px">${renewalChip(r)}</div></div>
     </div>
     <div class="c-mid">
       ${img}
@@ -659,27 +1025,134 @@ function cardHtml(r) {
   </div>`;
 }
 
+function setView(v) {
+  VIEW = v;
+  localStorage.setItem("krab_view", v);
+  document.querySelectorAll("#seg button").forEach(b =>
+    b.classList.toggle("on", b.dataset.view === v));
+  draw();
+}
+
 function draw() {
   tabs();
-  LAST_LAYOUT = MQ.matches;
+  renderStats(ALL);
   const rows = visible();
   document.getElementById("counts").textContent = `${rows.length} of ${ALL.length}`;
+  document.querySelectorAll(".view").forEach(el =>
+    el.classList.toggle("on", el.id === "vw-" + VIEW));
   const tb = document.getElementById("rows");
   const cards = document.getElementById("cards");
-  if (MQ.matches) {
-    tb.innerHTML = "";
-    cards.innerHTML = rows.length ? rows.map(cardHtml).join("")
-      : '<div class="none empty">Nothing here yet.</div>';
-  } else {
-    cards.innerHTML = "";
-    tb.innerHTML = rows.length ? rows.map(rowHtml).join("")
-      : '<tr><td colspan="11" class="none">Nothing here yet.</td></tr>';
+  tb.innerHTML = ""; cards.innerHTML = "";
+  // Leaving a view tears down its document-level hooks and observers — the
+  // CRM's outside-click closers and the charts' ResizeObserver must not keep
+  // running against a hidden container forever.
+  if (VIEW !== "crm") {
+    const crmEl = document.getElementById("vw-crm");
+    if (crmEl.__crmDocClose) {
+      ["click", "scroll", "keydown"].forEach(t =>
+        document.removeEventListener(t, crmEl.__crmDocClose, true));
+      crmEl.__crmDocClose = null;
+    }
+    crmEl.innerHTML = "";
+  }
+  if (VIEW !== "chart") {
+    const chEl = document.getElementById("vw-chart");
+    if (chEl.__kcRO) { chEl.__kcRO.disconnect(); chEl.__kcRO = null; }
+    chEl.__kcRows = null;
+    chEl.innerHTML = "";
+  }
+  if (VIEW !== "sheet") document.getElementById("vw-sheet").innerHTML = "";
+
+  if (VIEW === "table") {
+    if (!rows.length) {
+      tb.innerHTML = '<tr><td colspan="13" class="none">Nothing here yet.</td></tr>';
+      return;
+    }
+    let idx = 0;
+    const parts = [];
+    monthGroups(rows).forEach(g => {
+      parts.push(monthRowHtml(g));
+      g.rows.forEach(r => {
+        idx += 1;
+        if (!COLLAPSED[g.key]) parts.push(rowHtml(r, idx));
+      });
+    });
+    tb.innerHTML = parts.join("");
+  } else if (VIEW === "cards") {
+    if (!rows.length) {
+      cards.innerHTML = '<div class="none empty">Nothing here yet.</div>';
+      return;
+    }
+    let idx = 0;
+    const parts = [];
+    monthGroups(rows).forEach(g => {
+      const closed = !!COLLAPSED[g.key];
+      parts.push(`<div class="mdivider" data-mk="${esc(g.key)}">${closed ? "📁" : "📂"} ${esc(g.label)}
+        · ${g.rows.length} · ${fmtMoney(g.sumAll)} (${fmtMoney(g.sumRec)} receipted) ${closed ? "▸" : "▾"}</div>`);
+      g.rows.forEach(r => { idx += 1; if (!closed) parts.push(cardHtml(r, idx)); });
+    });
+    cards.innerHTML = parts.join("");
+  } else if (VIEW === "sheet") {
+    const el = document.getElementById("vw-sheet");
+    if (typeof renderSheetView === "function") renderSheetView(rows, el);
+    else el.innerHTML = '<div class="none empty">Sheet module not installed.</div>';
+  } else if (VIEW === "chart") {
+    const el = document.getElementById("vw-chart");
+    if (typeof renderChartView === "function") renderChartView(rows, el);
+    else el.innerHTML = '<div class="none empty">Charts module not installed.</div>';
+  } else if (VIEW === "crm") {
+    const el = document.getElementById("vw-crm");
+    if (typeof renderCrmView === "function")
+      renderCrmView(rows, el, {LABELS, STATUSES,
+        onStatusChange: (id, next) => saveStatus(id, next, null),
+        onOpen: id => { setView("table"); requestAnimationFrame(() => {
+          const d = document.getElementById("d-" + id);
+          if (d) { d.hidden = false; d.scrollIntoView({block: "center"}); } }); }});
+    else el.innerHTML = '<div class="none empty">CRM module not installed.</div>';
   }
 }
 
-// One set of listeners for both layouts — rows and cards come and go, the
-// container stays.
+async function saveStatus(id, next, holder) {
+  if (holder) holder.classList.add("saving");
+  try {
+    const res = await fetch(`${API}/transmissions/${encodeURIComponent(id)}/status`, {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({status: next, by: whoAmI(true)}),
+    });
+    if (!res.ok) throw new Error(await res.text());
+    const row = ALL.find(r => r.lead_id === id);
+    if (row) {
+      const was = normStatus(row.status);
+      row.status = next;
+      row.status_updated_at = new Date().toISOString();
+      row.status_updated_by = localStorage.getItem("krab_who") || "";
+      if (next === "receipt_uploaded") bus("deal.won", {id, value: moneyNum(row.price)});
+      else if (next === "on_the_way") bus("driver.on_the_way", {id});
+      else if ((FORWARD_RANK[next] || 0) > (FORWARD_RANK[was] || 0))
+        bus("stage.advanced", {id, label: statusLabel(next)});
+      if (PREV_STATUS) PREV_STATUS[id] = normStatus(next);
+    }
+    draw();
+  } catch (e) {
+    document.getElementById("err").innerHTML =
+      `<div class="err">Could not save that status: ${esc(e.message)}</div>`;
+    if (holder) holder.classList.remove("saving");
+    draw();          // the select must never keep showing a status that did not save
+  }
+}
+
+// One set of listeners for every layout — rows, cards and month folders come
+// and go, the container stays.
 document.querySelector("main").addEventListener("click", e => {
+  const mh = e.target.closest(".mrow, .mdivider");
+  if (mh) {
+    const k = mh.dataset.mk;
+    COLLAPSED[k] = !COLLAPSED[k];
+    try { localStorage.setItem("krab_mcollapse", JSON.stringify(COLLAPSED)); } catch (e2) {}
+    draw();
+    return;
+  }
   const exp = e.target.closest(".exp");
   if (exp && exp.dataset.x) {
     const d = document.getElementById("d-" + exp.dataset.x);
@@ -703,41 +1176,24 @@ document.querySelector("main").addEventListener("click", e => {
     document.getElementById("lightbox").hidden = false;
   }
 });
-document.querySelector("main").addEventListener("change", async e => {
+document.querySelector("main").addEventListener("change", e => {
   const sel = e.target.closest("select.status");
   if (!sel) return;
-  const id = sel.dataset.id, next = sel.value;
-  const holder = sel.closest("tr") || sel.closest(".card");
-  if (holder) holder.classList.add("saving");
-  try {
-    const res = await fetch(`${API}/transmissions/${encodeURIComponent(id)}/status`, {
-      method: "POST",
-      headers: {"Content-Type": "application/json"},
-      body: JSON.stringify({status: next, by: whoAmI(true)}),
-    });
-    if (!res.ok) throw new Error(await res.text());
-    const row = ALL.find(r => r.lead_id === id);
-    if (row) {
-      row.status = next;
-      row.status_updated_at = new Date().toISOString();
-      row.status_updated_by = localStorage.getItem("krab_who") || "";
-    }
-    draw();
-  } catch (err) {
-    document.getElementById("err").innerHTML =
-      `<div class="err">Could not save that status: ${esc(err.message)}</div>`;
-    if (holder) holder.classList.remove("saving");
-  }
+  saveStatus(sel.dataset.id, sel.value, sel.closest("tr") || sel.closest(".card"));
 });
 
 // ── Compose ────────────────────────────────────────────────────────────────
 function statusLine(r) {
   return {
     new: "We have received your order and are getting it ready.",
+    followup: "We are following up on your order — some details are still needed.",
+    tag_issued: "Your temporary tag has been issued.",
+    tag_emailed: "Your temporary tag has been emailed to you.",
+    tag_printed: "Your temporary tag is printed and ready.",
     on_the_way: "Your temporary tag is on the way to you now.",
     delivered: "Your temporary tag has been delivered.",
-    paid: "Payment received — thank you! Your transaction is complete.",
-  }[r.status] || "Here is an update on your temporary tag.";
+    receipt_uploaded: "Payment received — thank you! Your transaction is complete.",
+  }[normStatus(r.status)] || "Here is an update on your temporary tag.";
 }
 
 function prefill(r, party, channel) {
@@ -763,11 +1219,11 @@ ${AGENCY.website}`,
     };
   }
   const who = localStorage.getItem("krab_who") || AGENCY.name;
-  const line = `${r.reference_id} — ${r.client_name}, ${r.car}: status "${LABELS[r.status] || r.status}".`;
+  const line = `${r.reference_id} — ${r.client_name}, ${r.car}: status "${statusLabel(r.status)}".`;
   if (channel === "sms")
     return {subject: "", message: `From the receipts board (${who}): ${line}`};
   return {
-    subject: `Transmission ${r.reference_id} — ${LABELS[r.status] || r.status}`,
+    subject: `Transmission ${r.reference_id} — ${statusLabel(r.status)}`,
     message: `Hi,
 
 ${line}
@@ -825,6 +1281,7 @@ document.getElementById("c-send").onclick = async () => {
     res.textContent = `Sent ✓ via ${body.provider || channel} to ${body.to || "recipient"}`;
     res.className = "ok";
     toast(`${channel === "email" ? "Email" : "SMS"} sent to the ${party} (${row.reference_id})`, true);
+    bus("task.completed", {id: row.lead_id});
     setTimeout(() => { document.getElementById("compose").hidden = true; COMPOSE = null; }, 1400);
   } catch (e) {
     res.textContent = e.message; res.className = "bad";
@@ -845,6 +1302,78 @@ document.addEventListener("keydown", e => {
   }
 });
 
+// ── CSV ────────────────────────────────────────────────────────────────────
+function fallbackCsv(rows) {
+  const cols = ["reference_id","client_name","client_phone","email","car","tags","price",
+                "has_receipt","receipt_at","status","driver_name","group_name","issuer",
+                "created_at","issue_date","delivery","notes","status_updated_by"];
+  const cell = v => { v = String(v == null ? "" : v);
+    // A leading = + - @ (or tab/CR) executes as a formula in Excel — neutralize.
+    if (/^[=+\-@\t\r]/.test(v)) v = "'" + v;
+    return /[",\n]/.test(v) ? '"' + v.replace(/"/g, '""') + '"' : v; };
+  return "﻿" + [cols.join(",")].concat(
+    rows.map(r => cols.map(c => cell(r[c])).join(","))).join("\r\n");
+}
+function downloadCsv() {
+  const csv = (typeof buildCsv === "function") ? buildCsv(ALL) : fallbackCsv(ALL);
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(new Blob([csv], {type: "text/csv;charset=utf-8"}));
+  a.download = "receipts-" + new Date().toISOString().slice(0, 10) + ".csv";
+  document.body.appendChild(a); a.click();
+  setTimeout(() => { URL.revokeObjectURL(a.href); a.remove(); }, 500);
+  toast("CSV downloaded.", true);
+}
+document.getElementById("csv").onclick = downloadCsv;
+
+// ── Voice actions — everything the mic (or a typed command) can do. ────────
+window.krabVoiceAction = function (action, args) {
+  args = args || {};
+  switch (action) {
+    case "set_view": if (["table","cards","sheet","chart","crm"].includes(args.view)) setView(args.view); break;
+    case "toggle_view": setView(VIEW === "table" ? "cards" : "table"); break;
+    case "set_theme":
+      if (typeof applyTheme === "function") applyTheme(String(args.theme || "auto"));
+      break;
+    case "game_mode": {
+      const m = ["off","subtle","full"].includes(args.mode) ? args.mode : "full";
+      if (window.krabGame) window.krabGame.setMode(m);
+      else localStorage.setItem("krab_game", m);
+      updateGameChip();
+      break;
+    }
+    case "celebrate": bus("goal.hit", {}); break;
+    case "download_csv": downloadCsv(); break;
+    case "search": q = String(args.query || ""); document.getElementById("q").value = q; draw(); break;
+    case "filter_status": filter = STATUSES.includes(args.status) ? args.status : ""; draw(); break;
+    case "filter_month": {
+      const k = String(args.month || "");
+      const groups = monthGroups(ALL);
+      if (!groups.some(g => g.key === k)) break;   // unknown month = no-op, not a blank board
+      Object.keys(COLLAPSED).forEach(x => delete COLLAPSED[x]);
+      groups.forEach(g => { if (g.key !== k) COLLAPSED[g.key] = true; });
+      draw();
+      break;
+    }
+    case "refresh": load(); break;
+  }
+};
+
+function updateGameChip() {
+  const m = (window.krabGame && window.krabGame.mode && window.krabGame.mode())
+            || localStorage.getItem("krab_game") || "off";
+  document.getElementById("gamechip").textContent = "🎮 " + m;
+}
+document.getElementById("gamechip").onclick = () => {
+  const order = ["off", "subtle", "full"];
+  const cur = (window.krabGame && window.krabGame.mode && window.krabGame.mode())
+              || localStorage.getItem("krab_game") || "off";
+  const next = order[(order.indexOf(cur) + 1) % order.length];
+  window.krabVoiceAction("game_mode", {mode: next});
+};
+
+document.querySelectorAll("#seg button").forEach(b =>
+  b.onclick = () => setView(b.dataset.view));
+
 // ── Data ───────────────────────────────────────────────────────────────────
 async function loadConfig() {
   try {
@@ -859,7 +1388,7 @@ async function loadConfig() {
       : "";
     if (CFG.status_column === false)
       text += (text ? "   " : "") + "⚠ Statuses cannot be saved yet — run "
-            + "database/migration_lead_delivery_status.sql in the Supabase SQL editor once.";
+            + "database/migration_lead_delivery_status.sql (and migration_lead_status_v2.sql) once.";
     const cfg = document.getElementById("cfg");
     cfg.textContent = text;
     cfg.style.display = text ? "block" : "none";
@@ -871,6 +1400,8 @@ async function load() {
     const res = await fetch(`${API}/transmissions?limit=500`);
     if (!res.ok) throw new Error(await res.text());
     ALL = await res.json();
+    emitDiffs(ALL);
+    bus("data.refreshed", {count: ALL.length});
     document.getElementById("err").innerHTML = "";
   } catch (e) {
     document.getElementById("err").innerHTML =
@@ -881,7 +1412,20 @@ async function load() {
 }
 
 document.getElementById("q").oninput = e => { q = e.target.value; draw(); };
+// Canvas views (charts) and inline-styled views resolve their colors at render
+// time — redraw whenever the theme attribute flips, however it was flipped.
+new MutationObserver(() => draw()).observe(document.documentElement,
+  {attributes: true, attributeFilter: ["data-theme"]});
 whoAmI(false);
+if (typeof initThemes === "function") initThemes(document.getElementById("themeMount"));
+if (typeof applyTheme === "function") applyTheme(localStorage.getItem("krab_theme") || "auto");
+if (typeof initVoice === "function") initVoice({
+  endpoint: API + "/voice",
+  getContext: () => ({view: VIEW, theme: localStorage.getItem("krab_theme") || "auto"}),
+  onAction: (a, g) => window.krabVoiceAction(a, g),
+});
+updateGameChip();
+setView(VIEW);
 loadConfig();
 load();
 setInterval(() => {                     // the board is shared — keep it fresh,
@@ -889,6 +1433,7 @@ setInterval(() => {                     // the board is shared — keep it fresh
   load();
 }, 30000);
 </script>
+<script defer src="/receipts/game.js"></script>
 </body></html>"""
 
 
@@ -913,6 +1458,34 @@ def register(app, db_provider):
                 .replace("__AGENCY__", json.dumps(_agency())))
         return Response(html, mimetype="text/html")
 
+    @app.route("/receipts/asset/<name>", methods=["GET"])
+    def receipts_asset(name):
+        """View modules (sheet, charts, CRM, themes, voice) — optional: with
+        receipts_assets.py absent, the board's core still works."""
+        body = None
+        try:
+            import receipts_assets
+            body = receipts_assets.ASSETS.get(name)
+        except Exception:
+            body = None
+        if body is None:
+            return jsonify({"error": "no such asset"}), 404
+        mime = "text/css" if name.endswith(".css") else "application/javascript"
+        return Response(body, mimetype=mime,
+                        headers={"Cache-Control": "public, max-age=300"})
+
+    @app.route("/receipts/game.js", methods=["GET"])
+    def receipts_game_js():
+        """The ambient sprite layer — deliberately removable: delete
+        receipts_game.py and this serves an empty stub, nothing else changes."""
+        try:
+            import receipts_game
+            return Response(receipts_game.GAME_JS, mimetype="application/javascript",
+                            headers={"Cache-Control": "public, max-age=300"})
+        except Exception:
+            return Response("/* game layer not installed */",
+                            mimetype="application/javascript")
+
     @app.route("/receipts/api/transmissions", methods=["GET"])
     @app.route("/api/transmissions", methods=["GET"])
     def api_transmissions():
@@ -932,13 +1505,14 @@ def register(app, db_provider):
     def api_set_transmission_status(lead_id):
         body = request.get_json(silent=True) or {}
         status = (body.get("status") or request.args.get("status") or "").strip()
-        if status not in STATUS_ORDER:
+        if status not in ACCEPTED_STATUSES:
             return jsonify({"error": f"status must be one of {list(STATUS_ORDER)}"}), 400
         who = (body.get("by") or "").strip()
         if not _resolve().set_lead_status(lead_id, status, who):
             return jsonify({"error": (
                 "could not save — if this keeps happening, check that "
-                "database/migration_lead_delivery_status.sql has been run"
+                "database/migration_lead_delivery_status.sql and "
+                "migration_lead_status_v2.sql have been run"
             )}), 500
         return jsonify({"ok": True, "lead_id": lead_id, "status": status})
 
@@ -1007,6 +1581,42 @@ def register(app, db_provider):
         _recent_sends[key] = now
         return jsonify({"ok": True, "party": party, "channel": channel,
                         "provider": provider, "to": shown})
+
+    @app.route("/receipts/api/voice", methods=["POST"])
+    def receipts_voice():
+        """The mic's brain: one short command in, {say, action, args} out.
+
+        OpenAI when configured (it can both answer questions from the board's
+        aggregates and pick a UI action); a deterministic local parser when not,
+        so the mic never goes dead."""
+        body = request.get_json(silent=True) or {}
+        text = (body.get("text") or "").strip()[:500]
+        if not text:
+            return jsonify({"error": "text is required"}), 400
+        now = time.time()
+        ip = (request.headers.get("X-Forwarded-For") or
+              request.remote_addr or "?").split(",")[0].strip()
+        if now - _voice_last_by_ip.get(ip, 0) < _VOICE_MIN_GAP_SEC:
+            return jsonify({"error": "one command at a time"}), 429
+        while _voice_window and now - _voice_window[0] > 60:
+            _voice_window.pop(0)
+        if len(_voice_window) >= _VOICE_GLOBAL_PER_MIN:
+            return jsonify({"error": "the voice line is busy — try again shortly"}), 429
+        _voice_last_by_ip[ip] = now
+        _voice_window.append(now)
+        ctx = {"view": str(body.get("view") or "")[:20],
+               "theme": str(body.get("theme") or "")[:20]}
+        summary = _voice_summary_cache["value"]
+        if summary is None or now - _voice_summary_cache["at"] > 30:
+            try:
+                rows = _resolve().get_transmissions(limit=1000)
+            except Exception as e:
+                logger.warning("voice: could not load rows: %s", e)
+                rows = []
+            summary = _voice_summary(rows)
+            _voice_summary_cache.update(at=now, value=summary)
+        result = _voice_openai(text, ctx, summary) or _voice_local(text, summary)
+        return jsonify(result)
 
     @app.route("/receipts/api/sendconfig", methods=["GET"])
     def receipts_send_config():

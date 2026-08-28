@@ -1226,6 +1226,62 @@ async def _send_instant_tag_to_driver(context, lead, driver, chat_id) -> bool:
     return True
 
 
+# Minutes after an accept (or an instant payment) before the board reads
+# "Tag printed", then "Driver on the way".
+_STATUS_PRINTED_AFTER_MIN = 3
+_STATUS_ON_THE_WAY_AFTER_MIN = 8
+
+
+async def advance_timed_statuses(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Walk accepted leads along the /receipts board: accept + 3 min → Tag
+    printed, accept + 8 min → Driver on the way.
+
+    The clock is the STORED accepted_at / instant_pdf_paid_at, not an
+    in-process timer, so a restart between accept and transition delays
+    nothing. advance_delivery_status is forward-only, so an early receipt
+    upload is never demoted, and the two-accepts race is harmless — both
+    paths land on the same stored timestamps."""
+    from datetime import datetime, timezone
+
+    def _when(iso):
+        try:
+            return datetime.fromisoformat(str(iso).replace("Z", "+00:00"))
+        except Exception:
+            return None
+
+    pairs = []
+    try:
+        # BOTH accept paths (the two-accepts race stores its timestamp in two
+        # different tables) plus instant payments.
+        for row in await asyncio.to_thread(db.get_recently_accepted_leads):
+            pairs.append((str(row.get("lead_id") or ""), _when(row.get("accepted_at"))))
+        for row in await asyncio.to_thread(db.get_recently_group_accepted_leads):
+            pairs.append((str(row.get("lead_id") or ""), _when(row.get("accepted_at"))))
+        for row in await asyncio.to_thread(db.get_recently_paid_instant_leads):
+            pairs.append((str(row.get("id") or ""), _when(row.get("instant_pdf_paid_at"))))
+    except Exception as e:
+        logger.warning("status sweep: could not read accepts: %s", e)
+        return
+    now = datetime.now(timezone.utc)
+
+    def _advance(lid, st):
+        # respect_human: these transitions are cosmetic timers — the moment a
+        # person sets a status by hand, the sweep keeps its hands off that row.
+        return db.advance_delivery_status(lid, st, respect_human=True)
+
+    for lead_id, at in pairs:
+        if not lead_id or at is None:
+            continue
+        minutes = (now - at).total_seconds() / 60.0
+        try:
+            if minutes >= _STATUS_ON_THE_WAY_AFTER_MIN:
+                await asyncio.to_thread(_advance, lead_id, "on_the_way")
+            elif minutes >= _STATUS_PRINTED_AFTER_MIN:
+                await asyncio.to_thread(_advance, lead_id, "tag_printed")
+        except Exception as e:
+            logger.warning("status sweep advance failed for %s: %s", lead_id, e)
+
+
 def _after_send_keyboard(lead_id: str) -> InlineKeyboardMarkup:
     """Buttons on the "lead sent" confirmation.
 
@@ -9948,6 +10004,16 @@ async def _send_all_tag_pdfs(
             logger.error("Tag PDF for car %s of lead %s failed: %s",
                          n, lead.get("id"), e)
             counts.append(0)
+    # The board's ladder: a tag that actually reached a chat means Tag issued.
+    # advance_delivery_status only ever moves FORWARD, so renewals and repeat
+    # sends against a further-along lead are harmless no-ops.
+    if any(counts):
+        try:
+            await asyncio.to_thread(
+                db.advance_delivery_status, str(lead.get("id") or ""), "tag_issued")
+        except Exception as e:
+            logger.warning("tag_issued status advance failed for %s: %s",
+                           lead.get("id"), e)
     return counts
 
 
@@ -12609,11 +12675,29 @@ async def _finalize_lead_after_notes(
     Reusable so notes flows can skip prompts when the AI already extracted them.
     """
     msg_user = getattr(message, "from_user", None) if message else None
+    if msg_user is not None and getattr(msg_user, "is_bot", False):
+        # Callback finalizes (review-card Submit, the price picker) hand us the
+        # BOT's own message as `message`; its author must never become the
+        # lead's entrant — that is how "KrabDispatchBot" rows reached the board.
+        msg_user = None
     username = (
         (state_data.get("username") if state_data.get("username") not in (None, "", "Unknown") else None)
         or (msg_user.username if msg_user and msg_user.username else None)
         or "Unknown"
     )
+    if username == "Unknown":
+        try:
+            # The issuer is DMing the bot right now, so getChat resolves them.
+            _entrant = await context.bot.get_chat(user_id)
+            username = (getattr(_entrant, "username", None) or "").strip() or "Unknown"
+            if not (state_data.get("telegram_name") or "").strip():
+                _nm = " ".join(p for p in (
+                    (getattr(_entrant, "first_name", None) or ""),
+                    (getattr(_entrant, "last_name", None) or "")) if p).strip()
+                if _nm:
+                    state_data["telegram_name"] = _nm
+        except Exception as e:
+            logger.info("finalize: could not resolve entrant %s: %s", user_id, e)
 
     if not _phase1_has_phone_and_price(state_data):
         db.set_user_state(user_id, "phase1", state_data)
@@ -12885,7 +12969,21 @@ async def _submit_lead_from_review(message, context, user_id, data):
         return ConversationHandler.END
 
     ref_id = generate_reference_id()
-    username = data.get("username", "Unknown")
+    username = data.get("username") or "Unknown"
+    if username == "Unknown":
+        try:
+            # This path arrives from inline buttons, whose `message` is the
+            # bot's own — resolve the human who is actually submitting.
+            _entrant = await context.bot.get_chat(user_id)
+            username = (getattr(_entrant, "username", None) or "").strip() or "Unknown"
+            if not (data.get("telegram_name") or "").strip():
+                _nm = " ".join(p for p in (
+                    (getattr(_entrant, "first_name", None) or ""),
+                    (getattr(_entrant, "last_name", None) or "")) if p).strip()
+                if _nm:
+                    data["telegram_name"] = _nm
+        except Exception as e:
+            logger.info("submit: could not resolve entrant %s: %s", user_id, e)
 
     # Build vehicle_details as 11 lines
     vd = "\n".join([
@@ -17242,6 +17340,11 @@ async def handle_receipt_image(update: Update, context: ContextTypes.DEFAULT_TYP
         logger.error("update_lead_receipt failed lead_id=%s ref=%s", lead_id, reference_id)
 
     if success:
+        # The board's ladder ends here: a receipt in hand is Receipt uploaded.
+        try:
+            db.advance_delivery_status(str(lead_id), "receipt_uploaded")
+        except Exception as e:
+            logger.warning("receipt_uploaded status advance failed for %s: %s", lead_id, e)
         # Paper Investigator shared tables: idempotent catch-up if subtract-at-accept missed the row
         # (UUID formatting, API errors, or race with PI job). Receipt proves the delivery is real.
         try:
@@ -18349,6 +18452,21 @@ async def handle_fu_menu_callback(update: Update, context: ContextTypes.DEFAULT_
     return STATE_FU_MENU
 
 
+def _fu_mark_lead_followup(fu: dict, user_id=None) -> None:
+    """A saved follow-up moves its lead to Followup on the /receipts board.
+
+    Follow-ups store no lead_id, so the lead is found by contact matching —
+    the saving agent's own leads preferred, full-10-digit phone matches only.
+    Forward-only: a lead already further along the ladder stays put."""
+    try:
+        lead_id = db.find_recent_lead_id_by_contact(
+            fu.get("phone_number"), fu.get("email"), user_id=user_id)
+        if lead_id:
+            db.advance_delivery_status(lead_id, "followup")
+    except Exception as e:
+        logger.warning("followup status advance failed: %s", e)
+
+
 async def _fu_finish_save(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """Persist the follow-up (with schedule when set) and confirm to the agent."""
     query = update.callback_query
@@ -18373,6 +18491,7 @@ async def _fu_finish_save(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                 "Run database/migration_client_followups.sql (+ _v2) on Supabase, then try again."
             )
             return STATE_FU_MENU
+        await asyncio.to_thread(_fu_mark_lead_followup, fu, update.effective_user.id)
         await query.message.edit_text(
             f"💾 Saved {name}. No reminders set (no frequency chosen)."
         )
@@ -18417,6 +18536,7 @@ async def _fu_finish_save(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             "Run database/migration_client_followups.sql (+ _v2) on Supabase, then try again."
         )
         return STATE_FU_MENU
+    await asyncio.to_thread(_fu_mark_lead_followup, fu, update.effective_user.id)
     chase_line = (
         "🤖 The bot will text/email the client on this schedule — they'll chase YOU."
         if chase else "You'll get a DM until you close or stop it."
@@ -20681,6 +20801,11 @@ def main():
         # webhook's own request — a payment that lands mid-restart still arrives.
         application.job_queue.run_repeating(
             deliver_paid_instant_pdfs, interval=20, first=30)
+        # The /receipts board's timed transitions (Tag printed, Driver on the
+        # way) — derived from stored accept timestamps, restart-proof.
+        application.job_queue.run_repeating(
+            advance_timed_statuses, interval=120, first=90,
+            name="board_status_sweep")
         logger.info("Driver timeout job scheduled (every 60s, first in 120s)")
 
     if application.job_queue:
