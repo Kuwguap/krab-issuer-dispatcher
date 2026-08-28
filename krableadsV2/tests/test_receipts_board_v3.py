@@ -135,7 +135,7 @@ class TheVoiceEndpointTest(unittest.TestCase):
         receipts_page._voice_window.clear()
         receipts_page._voice_summary_cache.update(at=0.0, value=None)
 
-    def _post(self, text):
+    def _post(self, text, theme="dark", view="table"):
         receipts_page._voice_last_by_ip.clear()
         receipts_page._voice_window.clear()
         receipts_page._voice_summary_cache.update(at=0.0, value=None)
@@ -148,7 +148,8 @@ class TheVoiceEndpointTest(unittest.TestCase):
         with mock.patch.object(ad, "db", db), \
                 mock.patch.object(receipts_page, "_voice_openai", return_value=None):
             return self.client.post("/receipts/api/voice",
-                                    data=json.dumps({"text": text}),
+                                    data=json.dumps({"text": text, "theme": theme,
+                                                     "view": view}),
                                     content_type="application/json")
 
     def test_empty_text_is_refused(self):
@@ -183,6 +184,47 @@ class TheVoiceEndpointTest(unittest.TestCase):
     def test_the_most_recent_lead_question(self):
         got = self._post("which issuer sent the most recent lead").get_json()
         self.assertIn("tester", got["say"])
+
+    def test_the_phrasings_that_used_to_fail(self):
+        """Reported broken in production: bare plurals and a theme request with
+        no theme named. The parser is what answers when OPENAI_API_KEY is unset,
+        which is the normal state of this service."""
+        for text, action in (("charts", "set_view"),
+                             ("chart", "set_view"),
+                             ("change to chart view", "set_view"),
+                             ("change theme", "set_theme"),
+                             ("a theme", "set_theme"),
+                             ("download csv", "download_csv"),
+                             ("i dont like this theme", "set_theme")):
+            got = self._post(text).get_json()
+            self.assertEqual(action, got["action"], f"{text!r} -> {got}")
+
+    def test_a_theme_change_never_repeats_the_current_one(self):
+        for _ in range(12):
+            got = self._post("change the theme").get_json()
+            self.assertEqual("set_theme", got["action"])
+            self.assertNotEqual("dark", got["args"]["theme"],
+                                "must pick a theme other than the current one")
+
+    def test_one_utterance_can_answer_and_act(self):
+        """The headline: 'tell me X and change the theme' must do BOTH."""
+        got = self._post(
+            "tell me the name of last client and change theme i dont like this one"
+        ).get_json()
+        self.assertIn("John", got["say"])                  # the answer
+        names = [a["action"] for a in got["actions"]]
+        self.assertIn("set_theme", names, got)             # and the deed
+
+    def test_two_commands_both_run_in_order(self):
+        got = self._post("switch to charts and download the csv").get_json()
+        self.assertEqual(["set_view", "download_csv"],
+                         [a["action"] for a in got["actions"]], got)
+        self.assertEqual("chart", got["actions"][0]["args"]["view"])
+
+    def test_the_single_intent_shape_still_works_for_old_clients(self):
+        got = self._post("give me the charts").get_json()
+        self.assertEqual("set_view", got["action"])
+        self.assertEqual({"view": "chart"}, got["args"])
 
 
 class TheLadderNeverWalksBackwardsTest(unittest.TestCase):

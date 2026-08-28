@@ -287,9 +287,350 @@ def _voice_summary(rows: list) -> dict:
     }
 
 
+VOICE_THEMES = ("light", "dark", "midnight", "matrix", "sunset", "ocean",
+                "monday", "mono", "bubblegum")
+
+# Every view and the many ways a person actually asks for it. ORDER MATTERS —
+# the most specific pattern wins, so "excel sheet list" is never read as the
+# plain table. Plurals and -ing forms are all matched: "charts", "charting"
+# and "chart me" must behave identically to "chart".
+_VIEW_PATTERNS = (
+    ("sheet", r"excel|spread\s*sheet|\bsheets?\b|\bspreadsheets?\b"),
+    ("chart", r"\bchart\w*|\bgraph\w*|diagram\w*|\bplots?\b|visuali[sz]\w*|"
+              r"\bbars?\b|\bpie\b|\banalytics?\b|\bstats?\b|\bnumbers?\b|"
+              r"\bfigures?\b|\btotals?\b"),
+    ("crm",   r"\bcrm\b|pipeline\w*|kanban|deal ?board|\bdrag\b|\bstages?\b"),
+    ("cards", r"\bcards?\b|\btiles?\b"),
+    ("table", r"\btables?\b|row by column|column view|\bgrid\b|\brows?\b|"
+              r"\blist\b|\bspreadsheet-less\b|normal view|default view"),
+)
+
+# Clause splitter for multi-intent utterances: "tell me the last client AND
+# change the theme". Deliberately generous — a wrongly split clause simply
+# fails to match and is dropped, while a missed split loses a whole command.
+_CLAUSE_SPLIT = re.compile(
+    r"\s+(?:and then|and also|and|then|also|plus|as well as|&)\s+|[,;]+")
+
+# Small rotating pools so the assistant never sounds like a recording.
+_SAY = {
+    "sheet": ("Here's the spreadsheet.", "Spreadsheet view, coming up.",
+              "Switching to the sheet."),
+    "chart": ("Here are the numbers as charts.", "Charts it is.",
+              "Pulling up the graphs."),
+    "crm": ("CRM mode.", "Here's the pipeline.", "Switching to the deal board."),
+    "cards": ("Card view.", "Here are the cards.", "Switching to cards."),
+    "table": ("Back to the table.", "Row by column, coming up.",
+              "Here's the table view."),
+    "csv": ("Downloading the CSV.", "Exporting it now.", "CSV on its way."),
+    "refresh": ("Refreshing.", "Pulling the latest.", "Reloading the board."),
+    "toggle": ("Toggling the view.", "Flipping it over."),
+    "celebrate": ("Let's go! 🎉", "Confetti incoming!", "Celebrating!"),
+    "huh": ("I didn't catch that. You can ask for a view — table, cards, sheet, "
+            "charts or CRM — a different theme, the CSV, or anything about the "
+            "numbers.",
+            "Not sure what you meant. Try \"charts\", \"another theme\", "
+            "\"download the CSV\", or ask how much we made this month."),
+}
+
+
+def _pick(key: str) -> str:
+    import random
+    return random.choice(_SAY[key])
+
+
+def _pick_other_theme(current: str) -> str:
+    """A theme that is NOT the one they are looking at — what "I don't like
+    this one" and "change the theme" both mean."""
+    import random
+    cur = (current or "").strip().lower()
+    pool = [t for t in VOICE_THEMES if t != cur] or list(VOICE_THEMES)
+    return random.choice(pool)
+
+
+def _voice_answer(t: str, summary: dict):
+    """A spoken answer for a question about the board, or None."""
+    money = lambda v: f"${(v or 0):,.0f}"                                # noqa: E731
+    latest = summary.get("latest_lead") or {}
+
+    if re.search(r"(name|who).*(last|latest|recent|newest).*(client|customer)"
+                 r"|(last|latest|recent|newest) (client|customer)", t):
+        who = latest.get("client") or "unknown"
+        return (f"The last client is {who}"
+                + (f", {latest.get('price')}" if latest.get("price") else "")
+                + (f", entered by {latest.get('issuer')}." if latest.get("issuer")
+                   else "."))
+    if re.search(r"(who|which).*(issuer|sent|entered).*(last|latest|recent)"
+                 r"|(last|latest|recent).*(lead|transmission)", t):
+        return (f"The most recent lead is {latest.get('client') or 'unknown'} "
+                f"for {latest.get('price') or 'an unknown amount'}, entered by "
+                f"{latest.get('issuer') or 'an unknown issuer'}.")
+    if re.search(r"(top|best|most).*(driver)", t):
+        top = (summary.get("top_drivers") or [])
+        return (f"{top[0][0]} is top with {top[0][1]} leads." if top
+                else "No driver has taken a lead yet.")
+    if re.search(r"(top|best|most).*(issuer|agent|sender)", t):
+        top = (summary.get("top_issuers") or [])
+        return (f"{top[0][0]} leads with {top[0][1]} entries." if top
+                else "No issuer activity yet.")
+    # Small talk gets a small answer rather than a wall of instructions — but
+    # ONLY when the greeting is the whole utterance. "hi, how much did we make"
+    # is a question wearing a hello.
+    if re.fullmatch(r"\s*(?:hi|hey|hello|yo|sup|good (?:morning|afternoon|evening))"
+                    r"[\s,!.]*(?:there|everyone|team)?[\s,!.?]*", t):
+        import random
+        return random.choice(("Hey — what do you need?", "Hi. What can I do?",
+                              "Hey there. Ask me for a view or a number."))
+    if re.search(r"\bthank|\bthanks\b|\bcheers\b|\bnice one\b|\bappreciate", t):
+        import random
+        return random.choice(("Anytime.", "You got it.", "No problem."))
+    if re.search(r"never ?mind|forget it|nothing|cancel that", t):
+        return "No worries."
+    if re.search(r"what can you do|help me|what do you do|your commands|"
+                 r"how do (?:i|you) (?:use|work)", t):
+        return ("I can switch views — table, cards, sheet, charts or CRM — change "
+                "the theme, filter by month or status, download the CSV, start "
+                "tetris, and answer questions about the money, the receipts, the "
+                "drivers and the issuers. Say two things at once and I'll do both.")
+    if re.search(r"how are we doing|how'?s business|how'?s it going|"
+                 r"the summary|summar(?:y|ise|ize)|overview|how'?s the board", t):
+        by = summary.get("by_status") or {}
+        done = by.get("receipt_uploaded", 0) + by.get("paid", 0)
+        return (f"{summary.get('total_leads', 0)} transmissions, "
+                f"{money(summary.get('total_dollars'))} all in — "
+                f"{done} receipted, {money(summary.get('missing_dollars'))} "
+                "still owed.")
+    # "how many are MISSING receipts" must not answer with the receipted count.
+    if re.search(r"(how many|count|number of).*(missing|owed|outstanding|"
+                 r"no receipt|without)", t):
+        by = summary.get("by_status") or {}
+        done = by.get("receipt_uploaded", 0) + by.get("paid", 0)
+        return (f"{max(0, summary.get('total_leads', 0) - done)} transmissions "
+                f"have no receipt yet, worth "
+                f"{money(summary.get('missing_dollars'))}.")
+    if re.search(r"(how many|count|number of).*(receipt)", t):
+        by = summary.get("by_status") or {}
+        return (f"{by.get('receipt_uploaded', 0) + by.get('paid', 0)} "
+                "transmissions have a receipt uploaded.")
+    if re.search(r"how many|count of|number of", t):
+        return f"{summary.get('total_leads', 0)} transmissions on the board."
+    if re.search(r"missing|owed|outstanding|no receipt|without.*receipt", t):
+        return (f"{money(summary.get('missing_dollars'))} has no receipt "
+                "against it yet.")
+    if re.search(r"(this|current) month|month so far", t):
+        mk = sorted((summary.get("by_month") or {}).keys(), reverse=True)
+        if mk:
+            m = summary["by_month"][mk[0]]
+            return (f"{money(m.get('sum'))} this month across "
+                    f"{m.get('count', 0)} transmissions, "
+                    f"{money(m.get('receipt_sum'))} of it receipted.")
+    if re.search(r"(year|365|twelve month|12 month)", t) and \
+            re.search(r"how much|revenue|made|total|earn|sales", t):
+        return (f"About {money(summary.get('last_365_days_dollars'))} in the last "
+                f"twelve months, across {summary.get('total_leads', 0)} "
+                "transmissions on the board.")
+    if re.search(r"how much|revenue|made|total|earn|sales|money", t):
+        return (f"{money(summary.get('total_dollars'))} across the board — "
+                f"{money(summary.get('with_receipt_dollars'))} of it has a "
+                "receipt uploaded.")
+    return None
+
+
+# Spoken names for the board's statuses, for "show me only the paid ones".
+_STATUS_WORDS = (
+    ("receipt_uploaded", r"paid|receipts? uploaded|receipted"),
+    ("on_the_way", r"on the way|out for delivery|en route"),
+    ("tag_printed", r"printed"),
+    ("tag_emailed", r"emailed"),
+    ("tag_issued", r"issued"),
+    ("followup", r"follow ?up"),
+    ("delivered", r"delivered"),
+    ("new", r"new leads?|brand new|unassigned"),
+)
+_MONTHS = ("january", "february", "march", "april", "may", "june", "july",
+           "august", "september", "october", "november", "december")
+
+# A question wants an ANSWER even when it names something actionable:
+# "how much did we make" must never open the charts.
+_QUESTION = re.compile(
+    r"\bhow (?:much|many|are|is|'?s)\b|\bwhat'?s?\b|\bwho'?s?\b|\bwhich\b|"
+    r"\bwhen\b|\btell me\b|\bname of\b|\?\s*$")
+
+# An explicit "give me the file" beats every view that shares a word with it —
+# "export to excel" is a download, not the spreadsheet view.
+_DOWNLOAD = re.compile(
+    r"(?:download|export|save|send me|email me)\b[^.]{0,40}?"
+    r"\b(?:csv|excel|spread\s*sheet|spreadsheet|file|report|data)\b"
+    # …and the words the other way round: "excel export", "spreadsheet download"
+    r"|\b(?:csv|excel|spread\s*sheet|spreadsheet)\s+(?:export|download|file|dump)\b"
+    r"|\bcsv\b|\bcee ess vee\b")
+
+
+def _voice_clause(t: str, ctx: dict, summary: dict):
+    """One clause -> (action, args, say) or None. `t` is already lowercased."""
+    themed = bool(re.search(r"\btheme\b|\bcolou?rs?\b|\bskin\b|\bpalette\b", t))
+    named = re.search(r"\b(" + "|".join(VOICE_THEMES) + r"|auto|default|system)\b", t)
+    wants_other = bool(re.search(
+        r"\b(?:change|switch|different|another|other|next|new|random|surprise|"
+        r"anything else|something else)\b", t)) or bool(re.search(
+        r"\b(?:don'?t|do not|dont) (?:like|want)\b|\bhate\b|\bugly\b|"
+        r"\bnot? a fan\b|\btoo (?:bright|dark)\b", t))
+
+    def theme_named(name):
+        if name in ("default", "system", "auto"):
+            return ("set_theme", {"theme": "auto"}, "Back to the system theme.")
+        return ("set_theme", {"theme": name}, "Switching to " + name + ".")
+
+    # ── A file request, FIRST: it shares its nouns with the sheet view ────
+    if _DOWNLOAD.search(t):
+        return ("download_csv", {}, _pick("csv"))
+
+    # ── Themes, by name or by feeling ────────────────────────────────────
+    if themed:
+        if named:
+            return theme_named(named.group(1))
+        pick = _pick_other_theme(ctx.get("theme"))
+        reason = ("Not a fan? Here's " if re.search(
+            r"don'?t|dont|hate|ugly|bright|dark", t) else "Here's ")
+        return ("set_theme", {"theme": pick}, reason + pick + " instead.")
+    # "dark mode", "night mode", "light mode" — the word "theme" never appears.
+    if not named:
+        mode_word = re.search(r"\b(night|dark|day|light)\b\s*mode\b|"
+                              r"\bgo (dark|light)\b|\bmake it (dark|light)\b", t)
+        if mode_word:
+            hit = next(g for g in mode_word.groups() if g)
+            return theme_named("dark" if hit in ("night", "dark") else "light")
+
+    # ── Views ────────────────────────────────────────────────────────────
+    mentions_view = bool(re.search(r"\bviews?\b|\blayouts?\b|\bdisplays?\b", t))
+    if (re.search(r"\btoggle\b|\bflip\b|\bswap\b", t)
+            or (wants_other and mentions_view)) and \
+            not re.search("|".join(p for _, p in _VIEW_PATTERNS), t):
+        return ("toggle_view", {}, _pick("toggle"))
+    for view, pattern in _VIEW_PATTERNS:
+        if re.search(pattern, t):
+            return ("set_view", {"view": view}, _pick(view))
+
+    # ── Everything else ──────────────────────────────────────────────────
+    if "tetris" in t or re.search(r"play (?:a |the )?game|mini ?game", t):
+        return ("play_tetris", {},
+                "Let's play! Arrow keys, or drag and tap on a phone.")
+    if re.search(r"\bgame mode\b|\bsprites?\b|\bcharacters?\b|video game", t):
+        mode = ("off" if re.search(r"\boff\b|kill|stop|quiet|hide", t)
+                else "subtle" if re.search(r"subtle|calm|less|fewer", t) else "full")
+        return ("game_mode", {"mode": mode},
+                "Turning the characters off." if mode == "off"
+                else "Game mode " + mode + ".")
+    if re.search(r"celebrat|confetti|party|hooray", t):
+        return ("celebrate", {}, _pick("celebrate"))
+    if re.search(r"refresh|reload|update the board|latest data", t):
+        return ("refresh", {}, _pick("refresh"))
+
+    # Filters — "show me only the paid ones", "just august"
+    if re.search(r"\bonly\b|\bjust\b|\bfilter\b", t):
+        for status, pattern in _STATUS_WORDS:
+            if re.search(pattern, t):
+                return ("filter_status", {"status": status},
+                        "Filtering to " + STATUS_LABELS.get(status, status) + ".")
+    for i, month in enumerate(_MONTHS, start=1):
+        if re.search(r"\b" + month + r"\b", t):
+            from datetime import datetime, timezone
+            ym = re.search(r"\b(20\d\d)\b", t)
+            year = int(ym.group(1)) if ym else datetime.now(timezone.utc).year
+            return ("filter_month", {"month": "%d-%02d" % (year, i)},
+                    "Showing " + month.capitalize() + " " + str(year) + ".")
+
+    m = re.search(r"(?:search|find|look ?for|filter)\s+"
+                  r"(?:for\s+|by\s+|on\s+|to\s+)?(.+)", t)
+    if m and len(m.group(1).strip()) > 1:
+        q = m.group(1).strip().strip("\"'")
+        return ("search", {"query": q}, "Searching for " + q + ".")
+
+    # A theme named on its own ("matrix", "put it on mono") — LAST, so any view
+    # or command sharing that word always wins first.
+    if named:
+        return theme_named(named.group(1))
+    return None
+
+
+def _voice_local(text: str, ctx: dict, summary: dict) -> dict:
+    """The offline brain — and, since OPENAI_API_KEY is often unset on this
+    service, the one that actually answers most of the time.
+
+    Multi-intent by design: an utterance is split into clauses so "tell me the
+    last client and change the theme" both answers AND acts."""
+    whole = (text or "").lower().strip()
+    clauses = [c.strip() for c in _CLAUSE_SPLIT.split(whole) if c and c.strip()]
+    if not clauses:
+        clauses = [whole]
+
+    # Only one of these can be true of the board at a time, so a later one
+    # REPLACES an earlier one ("cards then the sheet" ends on the sheet)
+    # instead of being dropped as a duplicate.
+    exclusive = ("set_view", "set_theme", "game_mode", "filter_status",
+                 "filter_month")
+    actions, says, seen = [], [], set()
+
+    def add(action, args, line):
+        if action in exclusive:
+            for i, existing in enumerate(actions):
+                if existing["action"] == action:
+                    actions.pop(i)                  # keep the LAST word on it
+                    break
+        elif (action, json.dumps(args, sort_keys=True)) in seen:
+            return                                  # the same deed twice: once is enough
+        seen.add((action, json.dumps(args, sort_keys=True)))
+        actions.append({"action": action, "args": args})
+        says.append(line)
+
+    for clause in clauses:
+        # A question is answered even when it names something actionable
+        # ("how much did we make" must not open the charts); anything else
+        # prefers the command ("chart the revenue" charts).
+        asked = bool(_QUESTION.search(clause))
+        hit = None if asked else _voice_clause(clause, ctx, summary)
+        if hit:
+            add(*hit)
+            continue
+        answer = _voice_answer(clause, summary)
+        if answer:
+            says.append(answer)
+            continue
+        hit = hit or _voice_clause(clause, ctx, summary)
+        if hit:
+            add(*hit)
+
+    # Nothing landed clause by clause — try the whole utterance once, since a
+    # clumsy split can strand a command ("switch me over to, uh, charts").
+    if not actions and not says:
+        answer = _voice_answer(whole, summary)
+        if answer:
+            says.append(answer)
+        else:
+            hit = _voice_clause(whole, ctx, summary)
+            if hit:
+                add(*hit)
+
+    # Only now, and only for the WHOLE utterance: a bare opinion ("I don't like
+    # this one", "change it") is about the look. Per-clause this fired on
+    # fragments a speech-to-text comma had stranded — "switch me over to, uh,
+    # charts" flipped the palette on its way to the charts.
+    if not actions and not says:
+        if re.search(r"\b(?:change|different|another|other|next|new|random|"
+                     r"surprise|something else)\b", whole) or re.search(
+                     r"\b(?:don'?t|dont) (?:like|want)\b|\bhate\b|\bugly\b", whole):
+            if not re.search(r"\bclient|driver|lead|receipt|issuer|dispatcher|"
+                             r"status|price|tag\b", whole):
+                pick = _pick_other_theme(ctx.get("theme"))
+                add("set_theme", {"theme": pick},
+                    f"No problem — trying {pick} instead.")
+    if not says:
+        says.append(_pick("huh"))
+    return {"say": " ".join(says)[:600], "actions": actions}
+
+
 def _voice_openai(text: str, ctx: dict, summary: dict):
-    """Ask OpenAI for {say, action, args}. None when unavailable — the local
-    fallback answers instead, so the mic never goes dead with the API down."""
+    """Ask OpenAI for {say, actions[]}. None when unavailable — the local brain
+    answers instead, so the mic never goes dead with the API down."""
     key = (os.getenv("OPENAI_API_KEY") or "").strip()
     if not key:
         return None
@@ -303,18 +644,24 @@ def _voice_openai(text: str, ctx: dict, summary: dict):
                  or "gpt-4o-mini")
         system = (
             "You are the voice assistant for a temporary-tag back-office board "
-            "(transmissions, receipts, drivers, issuers, dispatchers). Respond "
-            "with ONE JSON object: {\"say\": string, \"action\": string, "
-            "\"args\": object}. 'say' is a short spoken reply (1-2 sentences, "
-            "conversational, no markdown). 'action' must be one of: "
-            + ", ".join(VOICE_ACTIONS) + ". Use 'none' for pure questions. "
-            "View names: table (row by column), cards, sheet (excel/spreadsheet), "
-            "chart (diagram), crm (pipeline/kanban). Themes: light, dark, "
-            "midnight, matrix, sunset, ocean, monday, mono, bubblegum, auto. "
-            "game_mode modes: off, subtle, full — 'game mode'/'video game view' "
-            "means {mode:'full'} unless they ask for subtle or off. 'tetris' or "
-            "'let's play a game' means action play_tetris. Answer money "
-            "and count questions from the DATA truthfully; amounts are USD."
+            "(transmissions, receipts, drivers, issuers, dispatchers). Reply "
+            "with ONE JSON object: {\"say\": string, \"actions\": "
+            "[{\"action\": string, \"args\": object}]}. "
+            "'say' is a short, natural spoken reply (1-2 sentences, no markdown) "
+            "— vary your wording, never sound canned. "
+            "An utterance may contain SEVERAL requests: put one entry in "
+            "'actions' for EACH thing to do, in order, and answer any question "
+            "in 'say'. Use an empty actions list for pure questions. "
+            "Valid actions: " + ", ".join(a for a in VOICE_ACTIONS if a != "none")
+            + ". View names: table (row by column), cards, sheet (excel/"
+            "spreadsheet), chart (diagram/graphs), crm (pipeline/kanban). "
+            "Themes: " + ", ".join(VOICE_THEMES) + ", auto. If they ask to "
+            "change the theme, dislike the current one, or want 'another', pick "
+            "a specific theme that is NOT the current one (given in ui.theme) "
+            "and name your pick in 'say'. game_mode modes: off, subtle, full — "
+            "'game mode'/'video game view' means full unless they say subtle or "
+            "off. 'tetris' or 'play a game' means play_tetris. Answer money and "
+            "count questions from DATA truthfully; amounts are USD."
         )
         user = json.dumps({"command": text, "ui": ctx, "data": summary})
         resp = client.chat.completions.create(
@@ -322,71 +669,26 @@ def _voice_openai(text: str, ctx: dict, summary: dict):
             messages=[{"role": "system", "content": system},
                       {"role": "user", "content": user}],
             response_format={"type": "json_object"},
-            max_tokens=300,
-            temperature=0,
+            max_tokens=400,
+            temperature=0.4,             # a little warmth; the schema keeps it honest
         )
         out = json.loads(resp.choices[0].message.content or "{}")
-        action = out.get("action") if out.get("action") in VOICE_ACTIONS else "none"
-        return {"say": str(out.get("say") or "")[:600], "action": action,
-                "args": out.get("args") or {}}
+        actions = []
+        raw = out.get("actions")
+        if not isinstance(raw, list):                # tolerate the old single shape
+            raw = [{"action": out.get("action"), "args": out.get("args")}]
+        for item in raw[:4]:
+            if not isinstance(item, dict):
+                continue
+            name = item.get("action")
+            if name in VOICE_ACTIONS and name != "none":
+                args = item.get("args")
+                actions.append({"action": name,
+                                "args": args if isinstance(args, dict) else {}})
+        return {"say": str(out.get("say") or "")[:600], "actions": actions}
     except Exception as e:
         logger.warning("voice: OpenAI intent failed: %s", e)
         return None
-
-
-def _voice_local(text: str, summary: dict) -> dict:
-    """No-API fallback: enough regex to keep every command working offline."""
-    t = text.lower()
-
-    def say(msg, action="none", args=None):
-        return {"say": msg, "action": action, "args": args or {}}
-
-    # Specific views first — "excel sheet list view" must never read as "table".
-    if re.search(r"\b(excel|sheet|spread)\b", t):
-        return say("Here is the spreadsheet view.", "set_view", {"view": "sheet"})
-    if re.search(r"\b(chart|diagram|graph)\b", t):
-        return say("Here are the numbers as charts.", "set_view", {"view": "chart"})
-    if re.search(r"\bcrm\b|pipeline|kanban", t):
-        return say("CRM mode it is.", "set_view", {"view": "crm"})
-    if re.search(r"\b(card|cards)\b", t):
-        return say("Switching to card view.", "set_view", {"view": "cards"})
-    if re.search(r"\btable\b|row by column|column view|\blist view\b", t):
-        return say("Switching to table view.", "set_view", {"view": "table"})
-    if "tetris" in t or re.search(r"play (a )?game", t):
-        return say("Let's play! Arrow keys, or drag and tap on a phone.", "play_tetris")
-    if "game" in t or "sprite" in t:
-        mode = "off" if re.search(r"\boff\b|kill|stop", t) else (
-            "subtle" if "subtle" in t or "calm" in t else "full")
-        return say(f"Game mode {mode}.", "game_mode", {"mode": mode})
-    if "celebrat" in t or "confetti" in t:
-        return say("Let's go! 🎉", "celebrate")
-    if "toggle" in t and "view" in t:
-        return say("Toggling the view.", "toggle_view")
-    if "theme" in t:
-        m = re.search(r"\b(light|dark|midnight|matrix|sunset|ocean|monday|mono|"
-                      r"bubblegum|auto)\b", t)
-        if m:
-            return say(f"Trying the {m.group(1)} theme.", "set_theme",
-                       {"theme": m.group(1)})
-    if "csv" in t or "download" in t or "export" in t:
-        return say("Downloading the CSV.", "download_csv")
-    if "refresh" in t or "reload" in t:
-        return say("Refreshing.", "refresh")
-    if re.search(r"(how much|revenue|made|total).*(year|365)", t):
-        return say(f"About ${summary.get('last_365_days_dollars', 0):,.0f} in the "
-                   "last twelve months, across "
-                   f"{summary.get('total_leads', 0)} transmissions on the board.")
-    if re.search(r"(how much|revenue|made|total)", t):
-        return say(f"${summary.get('total_dollars', 0):,.0f} across the board — "
-                   f"${summary.get('with_receipt_dollars', 0):,.0f} of it has a "
-                   "receipt uploaded.")
-    if "recent" in t or "latest" in t or "last lead" in t:
-        latest = summary.get("latest_lead") or {}
-        return say(f"The most recent lead is {latest.get('client') or 'unknown'} "
-                   f"for {latest.get('price') or 'an unknown amount'}, entered by "
-                   f"{latest.get('issuer') or 'an unknown issuer'}.")
-    return say("I didn't catch a command. Try: card view, sheet view, charts, "
-               "CRM mode, game mode, a theme, download CSV — or ask about the numbers.")
 
 
 BOARD_HTML = r"""<!doctype html>
@@ -1368,9 +1670,22 @@ window.krabVoiceAction = function (action, args) {
   switch (action) {
     case "set_view": if (["table","cards","sheet","chart","crm"].includes(args.view)) setView(args.view); break;
     case "toggle_view": setView(VIEW === "table" ? "cards" : "table"); break;
-    case "set_theme":
-      if (typeof applyTheme === "function") applyTheme(String(args.theme || "auto"));
+    case "set_theme": {
+      if (typeof applyTheme !== "function") break;
+      const known = (typeof THEMES !== "undefined" && Array.isArray(THEMES))
+        ? THEMES.map(t => t.id) : [];
+      let want = String(args.theme || "").trim().toLowerCase();
+      // The server normally names a concrete theme; these relative words are
+      // honoured too so a model answering "next" is never a no-op.
+      if (!want || /^(next|other|another|different|random|surprise|change)$/.test(want)) {
+        const cur = localStorage.getItem("krab_theme") || "auto";
+        const pool = (known.length ? known : ["light","dark","midnight","matrix",
+          "sunset","ocean","monday","mono","bubblegum"]).filter(t => t !== cur);
+        want = pool.length ? pool[Math.floor(Math.random() * pool.length)] : "dark";
+      }
+      applyTheme(want);
       break;
+    }
     case "game_mode": {
       const m = ["off","subtle","full"].includes(args.mode) ? args.mode : "full";
       if (window.krabGame) window.krabGame.setMode(m);
@@ -1665,8 +1980,27 @@ def register(app, db_provider):
                 rows = []
             summary = _voice_summary(rows)
             _voice_summary_cache.update(at=now, value=summary)
-        result = _voice_openai(text, ctx, summary) or _voice_local(text, summary)
-        return jsonify(result)
+
+        local = _voice_local(text, ctx, summary)
+        result = _voice_openai(text, ctx, summary)
+        if result is None:
+            result = local
+        elif not result.get("actions") and local.get("actions"):
+            # The model answered but did not act on a command the deterministic
+            # parser is sure about ("download the csv") — do the thing anyway.
+            result["actions"] = local["actions"]
+        if not (result.get("say") or "").strip():
+            result["say"] = local.get("say") or ""
+
+        actions = result.get("actions") or []
+        # `action`/`args` stay in the payload for anything still reading the
+        # single-intent shape; `actions` is what the page executes.
+        return jsonify({
+            "say": result.get("say") or "",
+            "action": actions[0]["action"] if actions else "none",
+            "args": actions[0]["args"] if actions else {},
+            "actions": actions,
+        })
 
     @app.route("/receipts/api/sendconfig", methods=["GET"])
     def receipts_send_config():

@@ -1837,9 +1837,19 @@ function initVoice(opts) {
       inFlight = null;
       inFlightCtrl = null;
       data = data || {};
-      if (data.action) {
+      // One utterance can carry SEVERAL requests ("tell me the last client and
+      // change the theme") — run every one, in order. `actions` is the current
+      // shape; `action` is the older single-intent one, still honoured.
+      var list = Array.isArray(data.actions) && data.actions.length
+        ? data.actions
+        : (data.action && data.action !== "none"
+            ? [{ action: data.action, args: data.args }] : []);
+      for (var ai = 0; ai < list.length; ai++) {
+        var step = list[ai] || {};
+        if (!step.action || step.action === "none") continue;
         // the board reacts NOW — speech is commentary, not a gate
-        try { onAction(data.action, data.args); } catch (e) { /* board's problem, not ours */ }
+        try { onAction(step.action, step.args || {}); }
+        catch (e) { /* board's problem, not ours */ }
       }
       if (data.say) {
         showBubble(data.say, "say");
