@@ -216,6 +216,7 @@ VOICE_ACTIONS = (
     "toggle_view",    # flips table <-> cards
     "set_theme",      # args: {theme: light|dark|midnight|matrix|sunset|ocean|monday|mono|bubblegum|auto}
     "game_mode",      # args: {mode: off|subtle|full}
+    "play_tetris",    # opens the sprite layer's tetris minigame
     "celebrate",      # fires the goal.hit reaction
     "download_csv",
     "search",         # args: {query}
@@ -311,7 +312,8 @@ def _voice_openai(text: str, ctx: dict, summary: dict):
             "chart (diagram), crm (pipeline/kanban). Themes: light, dark, "
             "midnight, matrix, sunset, ocean, monday, mono, bubblegum, auto. "
             "game_mode modes: off, subtle, full — 'game mode'/'video game view' "
-            "means {mode:'full'} unless they ask for subtle or off. Answer money "
+            "means {mode:'full'} unless they ask for subtle or off. 'tetris' or "
+            "'let's play a game' means action play_tetris. Answer money "
             "and count questions from the DATA truthfully; amounts are USD."
         )
         user = json.dumps({"command": text, "ui": ctx, "data": summary})
@@ -350,6 +352,8 @@ def _voice_local(text: str, summary: dict) -> dict:
         return say("Switching to card view.", "set_view", {"view": "cards"})
     if re.search(r"\btable\b|row by column|column view|\blist view\b", t):
         return say("Switching to table view.", "set_view", {"view": "table"})
+    if "tetris" in t or re.search(r"play (a )?game", t):
+        return say("Let's play! Arrow keys, or drag and tap on a phone.", "play_tetris")
     if "game" in t or "sprite" in t:
         mode = "off" if re.search(r"\boff\b|kill|stop", t) else (
             "subtle" if "subtle" in t or "calm" in t else "full")
@@ -534,7 +538,15 @@ BOARD_HTML = r"""<!doctype html>
  #toasts { position:fixed; right:16px; bottom:84px; z-index:60; display:flex;
            flex-direction:column; gap:8px; }
  .toast { padding:10px 14px; border-radius:8px; font-size:13px; font-weight:600;
-          box-shadow:0 6px 18px rgba(0,0,0,.25); }
+          box-shadow:0 6px 18px rgba(0,0,0,.25); pointer-events:none; }
+ /* While a tetris game is up, toasts move to the top so the touch controls
+    underneath stay tappable. The sprite layer toggles the class. */
+ body.krab-tetris-on #toasts { top:70px; bottom:auto; }
+ /* The floating mic must never sit on top of an open modal sheet. The body
+    class is set in JS (bulletproof); :has() is the belt-and-braces path. */
+ body.krab-modal-open .vc-root, body.krab-modal-open #vc-root,
+ body:has(.overlay:not([hidden])) .vc-root,
+ body:has(.overlay:not([hidden])) #vc-root { display:none !important; }
  .toast.ok { background:var(--ok-bg); color:var(--ok-ink); }
  .toast.bad { background:var(--bad-bg); color:var(--bad-ink); }
  /* ── Phone cards ────────────────────────────────────────────────────────── */
@@ -580,6 +592,7 @@ BOARD_HTML = r"""<!doctype html>
    .tab { flex:0 0 auto; }
    input[type=search] { flex:1; min-width:110px; font-size:16px; }
    select.status, .sheet-modal input, .sheet-modal textarea { font-size:16px; }
+   .vc-input { font-size:16px !important; }   /* iOS zooms sub-16px inputs */
    .act { padding:8px 12px; }
    .overlay { padding:0; align-items:flex-end; }
    .sheet-modal { width:100%; max-height:88vh; border-radius:14px 14px 0 0; padding:16px; }
@@ -1234,6 +1247,30 @@ ${AGENCY.name}`,
   };
 }
 
+function pauseTetrisForModal() {
+  // Arrow keys must never steer a hidden game behind an open sheet.
+  try {
+    if (window.krabTetris && window.krabTetris.active && window.krabTetris.active()
+        && window.krabTetris.pause) window.krabTetris.pause(true);
+  } catch (e) {}
+}
+
+// One watcher owns "is a modal up?": it hides the floating mic (which sits
+// above the sheets) and pauses any game behind them. Attribute-driven, so it
+// is correct no matter which code path opened or closed the overlay.
+(function watchModals() {
+  const overlays = ["compose", "lightbox"].map(id => document.getElementById(id))
+                                          .filter(Boolean);
+  const sync = () => {
+    const open = overlays.some(o => !o.hidden);
+    document.body.classList.toggle("krab-modal-open", open);
+    if (open) pauseTetrisForModal();
+  };
+  const mo = new MutationObserver(sync);
+  overlays.forEach(o => mo.observe(o, {attributes: true, attributeFilter: ["hidden"]}));
+  sync();
+})();
+
 function openCompose(row, party, channel) {
   COMPOSE = {row, party, channel};
   const c = contacts(row)[party];
@@ -1341,6 +1378,18 @@ window.krabVoiceAction = function (action, args) {
       updateGameChip();
       break;
     }
+    case "play_tetris":
+      if (window.krabGame && window.krabGame.playTetris) {
+        if (window.krabGame.mode && window.krabGame.mode() === "off")
+          window.krabGame.setMode("subtle");     // the game needs the layer awake
+        window.krabGame.playTetris();
+        updateGameChip();
+      } else if (window.krabTetris && window.krabTetris.start) {
+        window.krabTetris.start({});
+      } else {
+        toast("Tetris is not installed on this deployment.", false);
+      }
+      break;
     case "celebrate": bus("goal.hit", {}); break;
     case "download_csv": downloadCsv(); break;
     case "search": q = String(args.query || ""); document.getElementById("q").value = q; draw(); break;
@@ -1433,6 +1482,7 @@ setInterval(() => {                     // the board is shared — keep it fresh
   load();
 }, 30000);
 </script>
+<script defer src="/receipts/asset/tetris.js"></script>
 <script defer src="/receipts/game.js"></script>
 </body></html>"""
 

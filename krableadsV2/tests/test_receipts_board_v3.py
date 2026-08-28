@@ -68,6 +68,26 @@ class TheBoardStructureTest(unittest.TestCase):
                        'id="themeMount"', 'id="gamechip"', "krabVoiceAction"):
             self.assertIn(needle, self.body, needle)
 
+    def test_the_minigame_is_wired_but_optional(self):
+        self.assertIn("/receipts/asset/tetris.js", self.body)
+        self.assertIn('case "play_tetris"', self.body)
+        self.assertIn("window.krabTetris", self.body)
+
+    def test_a_modal_hides_the_mic_and_pauses_the_game(self):
+        """The floating mic sits above the sheets, and arrow keys must never
+        steer a game hidden behind one."""
+        self.assertIn("krab-modal-open", self.body)
+        self.assertIn("pauseTetrisForModal", self.body)
+        self.assertIn('attributeFilter: ["hidden"]', self.body)
+
+    def test_toasts_move_out_of_the_way_of_a_game(self):
+        self.assertIn("body.krab-tetris-on #toasts", self.body)
+        self.assertIn("pointer-events:none", self.body)
+
+    def test_the_phone_keeps_sixteen_pixel_inputs(self):
+        """Anything smaller and iOS zooms the whole page on focus."""
+        self.assertIn(".vc-input { font-size:16px", self.body)
+
     def test_the_page_narrates_on_the_event_bus(self):
         for needle in ("deal.won", "driver.on_the_way", "stage.advanced",
                        "goal.hit", "CustomEvent"):
@@ -150,6 +170,10 @@ class TheVoiceEndpointTest(unittest.TestCase):
     def test_game_mode_and_celebrate(self):
         self.assertEqual("game_mode", self._post("game mode view").get_json()["action"])
         self.assertEqual("celebrate", self._post("celebrate!").get_json()["action"])
+
+    def test_tetris_is_a_voice_command(self):
+        self.assertEqual("play_tetris", self._post("let's play tetris").get_json()["action"])
+        self.assertEqual("play_tetris", self._post("wanna play a game?").get_json()["action"])
 
     def test_money_questions_answer_from_the_data(self):
         got = self._post("how much did we make this year").get_json()

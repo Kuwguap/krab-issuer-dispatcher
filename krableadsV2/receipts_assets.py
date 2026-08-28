@@ -2038,4 +2038,1065 @@ function initVoice(opts) {
 }
 
 ''',
+    'tetris.js': r'''
+/* tetris.js — pixel Tetris minigame for the /receipts board ("Video Game Mode").
+ * Served alongside game_layer.js; the ambient sprite layer drives the
+ * sprite-interference API (geometry / blast / nudge) while a human plays.
+ *
+ * CONTRACT:
+ *   - defines exactly ONE global:
+ *       window.krabTetris = { start(opts), stop(), pause(on), active(),
+ *                            geometry(), blast(cx, cy), nudge(dir), state() }
+ *     opts = { onClose?, onEvent?(type, payload) };  nothing else leaks;
+ *   - ONE overlay wrapper (#kt-root), position:fixed, centered horizontally;
+ *     vertically centered on viewports >= 700px tall, otherwise anchored
+ *     96px above the bottom edge (the voice mic button lives bottom-center
+ *     and must NEVER be overlapped);  z-index 22 (below the page's modals
+ *     at z 50);  pointer-events:auto on the wrapper only — no backdrop;
+ *   - SHORT viewports (innerHeight < 480 — phone landscape): the panel drops
+ *     the centering entirely and anchors LEFT (left:12px, vertically
+ *     centered) so the bottom-center mic stays clear;  the stats row is
+ *     hidden and the touch controls become a vertical column to the RIGHT of
+ *     the board inside the card, so the whole card fits vh - 16 with the
+ *     header on-screen;  re-decided on every resize / orientationchange;
+ *   - board 10x18 ALWAYS; cell size fits total width <= min(92vw, 340px) and
+ *     total height <= 78vh (short: the vh-16 budget above), floor 8px;
+ *     DPR-correct canvas, crisp integer-scaled pixels;
+ *   - all colors come from the page theme at render time (--card --line
+ *     --ink --muted --accent; blocks from --new --issued --followup
+ *     --printed --del --paid --otw; clear/blast flash from --emailed) so
+ *     every theme reskins the game;
+ *   - fixed-timestep simulation (same accumulator discipline as
+ *     game_layer.js); zero per-frame allocations in the render loop;
+ *   - stop() is a FULL teardown: RAF, every listener (keyboard, pointer,
+ *     resize, visibility, matchMedia coarse/reduced/dppx), timers, DOM —
+ *     repeated start/stop leaks nothing;
+ *   - prefers-reduced-motion: the 150ms line-clear flash is skipped
+ *     (instant collapse) and blast/clear particles are not spawned;
+ *   - events emitted via opts.onEvent: 'start' {}, 'lock' {colHeights},
+ *     'clear' {lines}, 'over' {score}, 'blast' {cleared}, 'nudge' {dir}.
+ *     Payload objects (and geometry()'s return) are REUSED between calls —
+ *     read them synchronously, copy if you must keep them.
+ */
+(function () {
+  'use strict';
+  if (window.krabTetris) return;                 // double-include guard
+
+  /* ── tuning constants (timing in ms, distances in CSS px) ─────────────── */
+  const COLS = 10, ROWS = 18;
+  const STEP = 1000 / 60;        // fixed simulation timestep
+  const MAX_DT = 50;             // clamp a janky frame; never fast-forward
+  const MAX_STEPS = 4;           // spiral-of-death guard
+  const GRAV0 = 800;             // ms per row at level 1…
+  const GRAV_DEC = 60;           // …minus this per level…
+  const GRAV_MIN = 120;          // …floored here
+  const SOFT_MS = 40;            // soft-drop gravity while held
+  const LOCK_MS = 400;           // lock delay, refreshed by movement…
+  const LOCK_CAP = 2000;         // …but total grounded time caps here
+  const FLASH_MS = 150;          // line-clear flash before collapse
+  const BLAST_MS = 220;          // blast cell flash
+  const CLEAR_SCORE = [0, 100, 300, 500, 800];   // x level
+  const KICKS = [0, -1, 1, -2, 2];               // simple wall-kick ladder
+  const HS_KEY = 'krab_tetris_hs';
+  const P_MAX = 48;              // particle pool hard cap
+  const MIC_CLEAR = 96;          // bottom clearance for the voice mic button
+  const NEXT_M = 9;              // next-preview mini-cell (CSS px)
+  const Z_PANEL = 22;            // below the page's modals at z 50
+  const CHROME_FINE = 108;       // panel chrome height minus board (est.)
+  const CHROME_COARSE = 168;     // …with the touch control row
+  const CHROME_SHORT = 66;       // landscape: padding 20 + border 2 + header 44
+  const SIDE_COL = 52;           // landscape: 44px touch column + 8px gap
+  const SHORT_VH = 480;          // below this the panel goes landscape mode
+
+  function rand(a, b) { return a + Math.random() * (b - a); }
+
+  /* ── theme — colors from the page's CSS variables, refreshed at most every
+   * 500ms OUTSIDE the hot loops (getPropertyValue allocates strings).  The
+   * block-tile atlas is rebuilt only when a color actually changed. ──────── */
+  const THEME = { card: '#ffffff', line: '#dfe1e6', ink: '#172b4d',
+                  muted: '#6b778c', accent: '#0065ff', flash: '#00b8d9' };
+  // piece order: I J L O S T Z — one status color each, distinct fallbacks
+  const PIECE_VARS = ['--new', '--issued', '--followup', '--printed', '--del', '--paid', '--otw'];
+  const COLORS = ['#0065ff', '#8993a4', '#e2a33b', '#6554c0', '#00875a', '#e2447d', '#ff7452'];
+  let themeAt = -1, tilesDirty = true;
+  function cssVar(cs, n, fb) { const s = cs.getPropertyValue(n); const t = s && s.trim(); return t || fb; }
+  function refreshTheme(now) {
+    if (now - themeAt < 500) return;
+    themeAt = now;
+    let cs;
+    try { cs = getComputedStyle(document.documentElement); } catch (e) { return; }
+    const pl = THEME.line, pf = THEME.flash;
+    THEME.card = cssVar(cs, '--card', THEME.card);
+    THEME.line = cssVar(cs, '--line', THEME.line);
+    THEME.ink = cssVar(cs, '--ink', THEME.ink);
+    THEME.muted = cssVar(cs, '--muted', THEME.muted);
+    THEME.accent = cssVar(cs, '--accent', THEME.accent);
+    THEME.flash = cssVar(cs, '--emailed', THEME.flash);
+    for (let i = 0; i < 7; i++) {
+      const v = cssVar(cs, PIECE_VARS[i], COLORS[i]);
+      if (v !== COLORS[i]) { COLORS[i] = v; tilesDirty = true; }
+    }
+    if (THEME.line !== pl || THEME.flash !== pf) tilesDirty = true;
+  }
+
+  /* ── the 7 tetrominoes — base cells in box coords, 4 rotations generated
+   * once at boot ((x,y) -> (box-1-y, x), clockwise).  Flat Int8Arrays. ───── */
+  const BASE = [
+    { box: 4, cells: [0, 1, 1, 1, 2, 1, 3, 1] },   // I
+    { box: 3, cells: [0, 0, 0, 1, 1, 1, 2, 1] },   // J
+    { box: 3, cells: [2, 0, 0, 1, 1, 1, 2, 1] },   // L
+    { box: 2, cells: [0, 0, 1, 0, 0, 1, 1, 1] },   // O
+    { box: 3, cells: [1, 0, 2, 0, 0, 1, 1, 1] },   // S
+    { box: 3, cells: [1, 0, 0, 1, 1, 1, 2, 1] },   // T
+    { box: 3, cells: [0, 0, 1, 0, 1, 1, 2, 1] },   // Z
+  ];
+  const ROTS = [];                                 // ROTS[p][r] = Int8Array(8)
+  const SPAWN_X = new Int8Array(7), SPAWN_Y = new Int8Array(7);
+  (function buildRots() {
+    for (let p = 0; p < 7; p++) {
+      const box = BASE[p].box, rots = [];
+      let c = Int8Array.from(BASE[p].cells);
+      for (let r = 0; r < 4; r++) {
+        rots.push(c);
+        const nx = new Int8Array(8);
+        for (let k = 0; k < 8; k += 2) { nx[k] = box - 1 - c[k + 1]; nx[k + 1] = c[k]; }
+        c = nx;
+      }
+      ROTS.push(rots);
+      let minY = 9;
+      for (let k = 1; k < 8; k += 2) if (rots[0][k] < minY) minY = rots[0][k];
+      SPAWN_Y[p] = -minY;                          // topmost cell spawns on row 0
+      SPAWN_X[p] = ((COLS - box) / 2) | 0;
+    }
+  })();
+
+  /* ── board state — everything preallocated at boot ──────────────────────── */
+  const board = new Int8Array(COLS * ROWS);        // 0 empty, 1..7 = piece+1
+  const blastF = new Float32Array(COLS * ROWS);    // per-cell blast flash timers
+  const clearRows = new Int8Array(ROWS);           // rows marked for collapse
+  const colHeights = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0]; // settled stack height/col
+  const cur = { p: 0, r: 0, x: 0, y: 0 };          // the falling piece
+  let nextP = 0;
+  const bag = new Int8Array(7);                    // 7-bag randomizer
+  let bagIx = 7;
+  function draw7() {
+    if (bagIx >= 7) {
+      for (let i = 0; i < 7; i++) bag[i] = i;
+      for (let i = 6; i > 0; i--) {
+        const j = (Math.random() * (i + 1)) | 0;
+        const t = bag[i]; bag[i] = bag[j]; bag[j] = t;
+      }
+      bagIx = 0;
+    }
+    return bag[bagIx++];
+  }
+
+  /* ── runtime state ──────────────────────────────────────────────────────── */
+  let activeFlag = false;
+  let score = 0, lines = 0, level = 1, hi = 0;
+  let over = false, paused = false;
+  let phase = 0;                                   // 0 playing, 1 clearing, 2 over
+  let gravIv = GRAV0, gravT = 0, lockT = 0, groundT = 0, clearT = 0, clearCount = 0;
+  let kbSoft = false, btnSoft = false;
+  function softOn() { return kbSoft || btnSoft; }
+  let hudDirty = true, nextDirty = true;
+  let REDUCED = false;
+  let cbClose = null, cbEvent = null;
+
+  // reused event payloads — read synchronously, copy to keep (see contract)
+  const evStart = {};
+  const evLock = { colHeights: colHeights };
+  const evClear = { lines: 0 };
+  const evOver = { score: 0 };
+  const evBlast = { cleared: 0 };
+  const evNudge = { dir: 0 };
+  function emitEv(type, payload) {
+    if (!cbEvent) return;
+    try { cbEvent(type, payload); } catch (e) {}
+  }
+
+  /* ── DOM refs (created in start, destroyed in stop) ─────────────────────── */
+  let root = null, boardCv = null, bctx = null, nextCv = null, nctx = null;
+  let scoreEl = null, linesEl = null, levelEl = null, hiEl = null;
+  let pauseBtn = null, ctrlRow = null, overWrap = null, finalEl = null;
+  let statsRow = null, midWrap = null;             // for the landscape re-flow
+  let cell = 20, cssW = COLS * 20, cssH = ROWS * 20, DPR = 1;
+  let tileCv = null, tileCtx = null, tileD = 0;    // block atlas (kept across restarts)
+  let baseCv = null, baseCtx = null;               // board bg + grid, prerendered
+  let mqCoarse = null, mqReduced = null, mqDpr = null, armedDpr = 0;
+  let raf = 0, lastTs = 0, acc = 0;
+  let repTimer = 0;                                // touch-button hold-repeat
+
+  /* ── high score (localStorage can throw; the game shrugs) ───────────────── */
+  function readHi() {
+    try { const v = parseInt(localStorage.getItem(HS_KEY), 10); return isFinite(v) && v > 0 ? v : 0; }
+    catch (e) { return 0; }
+  }
+  function persistHi() {
+    if (score > hi) { hi = score; try { localStorage.setItem(HS_KEY, String(hi)); } catch (e) {} }
+  }
+
+  /* ── core mechanics ─────────────────────────────────────────────────────── */
+  function fits(p, r, x, y) {
+    const t = ROTS[p][r];
+    for (let k = 0; k < 8; k += 2) {
+      const bx = x + t[k], by = y + t[k + 1];
+      if (bx < 0 || bx >= COLS || by >= ROWS) return false;
+      if (by >= 0 && board[by * COLS + bx]) return false;   // above the top is air
+    }
+    return true;
+  }
+  function recomputeHeights() {
+    for (let c = 0; c < COLS; c++) {
+      let h = 0;
+      for (let r = 0; r < ROWS; r++) if (board[r * COLS + c]) { h = ROWS - r; break; }
+      colHeights[c] = h;
+    }
+  }
+  function tryMove(dx) {
+    if (!activeFlag || over || paused || phase !== 0) return false;
+    if (!fits(cur.p, cur.r, cur.x + dx, cur.y)) return false;
+    cur.x += dx;
+    if (!fits(cur.p, cur.r, cur.x, cur.y + 1)) lockT = 0;   // movement refreshes lock delay
+    return true;
+  }
+  function tryRotate() {
+    if (!activeFlag || over || paused || phase !== 0) return false;
+    const nr = (cur.r + 1) & 3;
+    for (let i = 0; i < 5; i++) {                  // simple wall kicks: 0 -1 +1 -2 +2
+      const nx = cur.x + KICKS[i];
+      if (fits(cur.p, nr, nx, cur.y)) {
+        cur.r = nr; cur.x = nx;
+        if (!fits(cur.p, cur.r, cur.x, cur.y + 1)) lockT = 0;
+        return true;
+      }
+    }
+    return false;
+  }
+  function hardDrop() {
+    if (!activeFlag || over || paused || phase !== 0) return;
+    let d = 0;
+    while (fits(cur.p, cur.r, cur.x, cur.y + 1)) { cur.y++; d++; }
+    if (d > 0) { score += 2 * d; hudDirty = true; }         // 2 points per cell
+    lockNow();
+  }
+  function spawnPiece() {
+    cur.p = nextP; nextP = draw7(); nextDirty = true;
+    cur.r = 0; cur.x = SPAWN_X[cur.p]; cur.y = SPAWN_Y[cur.p];
+    gravT = 0; lockT = 0; groundT = 0;
+    ptrId = -1;                                    // a held drag never steers a NEW piece
+    if (!fits(cur.p, cur.r, cur.x, cur.y)) doGameOver();    // spawn collides -> over
+  }
+  function lockNow() {
+    const t = ROTS[cur.p][cur.r];
+    let topOut = false;
+    for (let k = 0; k < 8; k += 2) {
+      const bx = cur.x + t[k], by = cur.y + t[k + 1];
+      if (by < 0) { topOut = true; continue; }
+      board[by * COLS + bx] = cur.p + 1;
+    }
+    recomputeHeights();
+    clearCount = 0;                                // scan full rows BEFORE 'lock' fires so
+    for (let r = 0; r < ROWS; r++) {               // a handler's synchronous blast() can
+      let full = 1;                                // never void an earned line clear
+      for (let c = 0; c < COLS; c++) if (!board[r * COLS + c]) { full = 0; break; }
+      clearRows[r] = full;
+      if (full) clearCount++;
+    }
+    emitEv('lock', evLock);                        // evLock.colHeights === colHeights
+    if (topOut) { doGameOver(); return; }
+    if (clearCount > 0) {
+      if (REDUCED) { collapseRows(); afterClear(); spawnPiece(); }  // no flash
+      else { phase = 1; clearT = 0; }
+    } else spawnPiece();
+  }
+  function collapseRows() {                        // in-place, no allocation
+    let w = ROWS - 1;
+    for (let r = ROWS - 1; r >= 0; r--) {
+      if (clearRows[r]) continue;
+      if (w !== r) {
+        for (let c = 0; c < COLS; c++) {
+          board[w * COLS + c] = board[r * COLS + c];
+          blastF[w * COLS + c] = blastF[r * COLS + c];
+        }
+      }
+      w--;
+    }
+    for (; w >= 0; w--)
+      for (let c = 0; c < COLS; c++) { board[w * COLS + c] = 0; blastF[w * COLS + c] = 0; }
+    for (let r = 0; r < ROWS; r++) clearRows[r] = 0;
+    recomputeHeights();
+  }
+  function afterClear() {
+    score += CLEAR_SCORE[clearCount] * level;      // 100/300/500/800 x level
+    lines += clearCount;
+    const lv = 1 + ((lines / 10) | 0);
+    if (lv !== level) { level = lv; gravIv = Math.max(GRAV_MIN, GRAV0 - GRAV_DEC * (level - 1)); }
+    hudDirty = true;
+    evClear.lines = clearCount;
+    emitEv('clear', evClear);
+    clearCount = 0;
+  }
+  function doGameOver() {
+    over = true; phase = 2;
+    persistHi(); hudDirty = true;
+    if (finalEl) finalEl.textContent = 'SCORE ' + score;
+    if (overWrap) overWrap.style.display = 'flex';
+    evOver.score = score;
+    emitEv('over', evOver);
+  }
+  function resetGame() {
+    board.fill(0); blastF.fill(0);
+    for (let r = 0; r < ROWS; r++) clearRows[r] = 0;
+    for (let c = 0; c < COLS; c++) colHeights[c] = 0;
+    resetParticles();
+    score = 0; lines = 0; level = 1; gravIv = GRAV0;
+    over = false; paused = false; phase = 0; clearCount = 0;
+    gravT = 0; lockT = 0; groundT = 0; clearT = 0;
+    kbSoft = false; btnSoft = false;
+    bagIx = 7; nextP = draw7();
+    spawnPiece();
+    if (overWrap) overWrap.style.display = 'none';
+    if (pauseBtn) pauseBtn.textContent = '⏸';
+    hudDirty = true;
+    emitEv('start', evStart);
+  }
+
+  /* ── particle pool — P_MAX objects preallocated; board-canvas space ────── */
+  const pool = new Array(P_MAX);
+  const free = new Int16Array(P_MAX);
+  let freeTop = 0, liveParts = 0;
+  (function () {
+    for (let i = 0; i < P_MAX; i++) {
+      pool[i] = { on: false, x: 0, y: 0, px: 0, py: 0, vx: 0, vy: 0, life: 0, ttl: 1, ci: 0, sz: 2 };
+      free[i] = i;
+    }
+    freeTop = P_MAX;
+  })();
+  function resetParticles() {
+    for (let i = 0; i < P_MAX; i++) { pool[i].on = false; free[i] = i; }
+    freeTop = P_MAX; liveParts = 0;
+  }
+  function emitPart(x, y, vx, vy, ttl, ci, sz) {
+    if (freeTop <= 0) return;
+    const p = pool[free[--freeTop]];
+    p.on = true; p.x = x; p.y = y; p.px = x; p.py = y; p.vx = vx; p.vy = vy;
+    p.life = 0; p.ttl = ttl; p.ci = ci; p.sz = sz;
+    liveParts++;
+  }
+  function spawnBurst(c, r, ci) {                  // pixel explosion on one cell
+    const bx = (c + 0.5) * cell, by = (r + 0.5) * cell;
+    const sz = Math.max(2, (cell / 6) | 0);
+    for (let i = 0; i < 4; i++)
+      emitPart(bx + rand(-3, 3), by + rand(-3, 3), rand(-90, 90), rand(-170, -20),
+               rand(320, 620), ci, sz);
+  }
+  function updateParticles(dt) {
+    const dts = dt / 1000;
+    for (let i = 0; i < P_MAX; i++) {
+      const p = pool[i];
+      if (!p.on) continue;
+      p.px = p.x; p.py = p.y;
+      p.life += dt;
+      if (p.life >= p.ttl) { p.on = false; free[freeTop++] = i; liveParts--; continue; }
+      p.vy += 520 * dts;
+      p.x += p.vx * dts; p.y += p.vy * dts;
+    }
+  }
+  function renderParticles(g, alpha) {
+    if (liveParts <= 0) return;
+    for (let i = 0; i < P_MAX; i++) {
+      const p = pool[i];
+      if (!p.on) continue;
+      const t = p.life / p.ttl;
+      g.globalAlpha = t > 0.6 ? (1 - t) / 0.4 : 1;
+      g.fillStyle = COLORS[p.ci];
+      g.fillRect((p.px + (p.x - p.px) * alpha) | 0, (p.py + (p.y - p.py) * alpha) | 0, p.sz, p.sz);
+    }
+    g.globalAlpha = 1;
+  }
+
+  /* ── block tile atlas — each piece color drawn ONCE per theme/resize as a
+   * 2-tone pixel block: 1u darker outline, light top bevel, left light,
+   * bottom/right inner shade, one specular pixel.  Overlay-alpha shading
+   * means no color parsing is ever needed. ───────────────────────────────── */
+  function drawTile(g, ox, c, col) {
+    const u = Math.max(1, (c / 8) | 0);            // the pixel unit
+    g.fillStyle = col; g.fillRect(ox, 0, c, c);
+    g.fillStyle = 'rgba(10,12,26,0.55)';           // outline ring
+    g.fillRect(ox, 0, c, u); g.fillRect(ox, c - u, c, u);
+    g.fillRect(ox, 0, u, c); g.fillRect(ox + c - u, 0, u, c);
+    g.fillStyle = 'rgba(255,255,255,0.45)';        // top bevel light
+    g.fillRect(ox + u, u, c - 2 * u, u);
+    g.fillStyle = 'rgba(255,255,255,0.18)';        // left light
+    g.fillRect(ox + u, 2 * u, u, c - 3 * u);
+    g.fillStyle = 'rgba(0,0,0,0.30)';              // bottom inner shade
+    g.fillRect(ox + u, c - 2 * u, c - 2 * u, u);
+    g.fillStyle = 'rgba(0,0,0,0.18)';              // right inner shade
+    g.fillRect(ox + c - 2 * u, 2 * u, u, c - 4 * u);
+    g.fillStyle = 'rgba(255,255,255,0.6)';         // specular pixel
+    g.fillRect(ox + 2 * u, 2 * u, u, u);
+  }
+  function buildTiles() {
+    if (!tileCv) { tileCv = document.createElement('canvas'); tileCtx = tileCv.getContext('2d'); }
+    tileD = Math.max(2, Math.round(cell * DPR));
+    tileCv.width = 7 * tileD; tileCv.height = tileD;
+    const g = tileCtx;
+    g.setTransform(1, 0, 0, 1, 0, 0);
+    for (let i = 0; i < 7; i++) drawTile(g, i * tileD, tileD, COLORS[i]);
+  }
+  function buildBase() {                           // board well + grid, prerendered
+    if (!baseCv) { baseCv = document.createElement('canvas'); baseCtx = baseCv.getContext('2d'); }
+    const w = Math.max(1, Math.round(cssW * DPR)), h = Math.max(1, Math.round(cssH * DPR));
+    baseCv.width = w; baseCv.height = h;
+    const g = baseCtx;
+    g.setTransform(1, 0, 0, 1, 0, 0);
+    g.fillStyle = 'rgba(127,134,168,0.10)';        // neutral well tint, both themes
+    g.fillRect(0, 0, w, h);
+    g.globalAlpha = 0.45;
+    g.fillStyle = THEME.line;
+    for (let c = 1; c < COLS; c++) g.fillRect(Math.round(c * cell * DPR), 0, 1, h);
+    for (let r = 1; r < ROWS; r++) g.fillRect(0, Math.round(r * cell * DPR), w, 1);
+    g.globalAlpha = 1;
+  }
+
+  /* ── panel DOM ──────────────────────────────────────────────────────────── */
+  function el(tag, css) {
+    const e = document.createElement(tag);
+    if (css) e.style.cssText = css;
+    return e;
+  }
+  function mkIconBtn(txt, label) {                 // 44px touch target
+    const b = el('button',
+      'width:44px;height:44px;flex:0 0 auto;display:inline-flex;align-items:center;' +
+      'justify-content:center;background:transparent;border:1px solid var(--line,#dfe1e6);' +
+      'border-radius:10px;color:var(--ink,#172b4d);font:600 15px ui-monospace,SFMono-Regular,' +
+      'Menlo,Consolas,monospace;cursor:pointer;padding:0;-webkit-tap-highlight-color:transparent;');
+    b.type = 'button'; b.textContent = txt;
+    b.setAttribute('aria-label', label);
+    return b;
+  }
+  function mkWideBtn(txt, primary) {
+    const b = el('button',
+      'min-width:120px;min-height:44px;border-radius:10px;cursor:pointer;padding:0 16px;' +
+      '-webkit-tap-highlight-color:transparent;' +
+      'font:700 12px ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;letter-spacing:.12em;' +
+      (primary
+        ? 'background:var(--accent,#0065ff);border:1px solid var(--accent,#0065ff);color:#fff;'
+        : 'background:transparent;border:1px solid rgba(255,255,255,.75);color:#fff;'));
+    b.type = 'button'; b.textContent = txt;
+    return b;
+  }
+  function buildPanel() {
+    root = el('div',
+      'position:fixed;left:50%;z-index:' + Z_PANEL + ';pointer-events:auto;box-sizing:content-box;' +
+      'background:var(--card,#ffffff);border:1px solid var(--line,#dfe1e6);border-radius:12px;' +
+      'box-shadow:0 14px 36px rgba(9,30,66,.28);padding:10px;touch-action:none;' +
+      'user-select:none;-webkit-user-select:none;-webkit-touch-callout:none;' +
+      '-webkit-tap-highlight-color:transparent;' +
+      'color:var(--ink,#172b4d);' +
+      'font:12px/1.3 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;');
+    root.id = 'kt-root';
+    root.setAttribute('role', 'dialog');
+    root.setAttribute('aria-label', 'Tetris');
+
+    const head = el('div', 'display:flex;align-items:center;gap:6px;height:44px;');
+    const title = el('div', 'flex:1;font-weight:800;font-size:13px;letter-spacing:.22em;');
+    title.textContent = 'TETRIS';
+    pauseBtn = mkIconBtn('⏸', 'Pause');
+    const closeB = mkIconBtn('✕', 'Close');
+    head.appendChild(title); head.appendChild(pauseBtn); head.appendChild(closeB);
+
+    const stats = el('div', 'display:flex;align-items:flex-end;justify-content:space-between;' +
+      'gap:8px;margin:2px 0 8px;');
+    function statCol(label) {
+      const w = el('div', 'min-width:0;');
+      const l = el('div', 'font-size:9px;letter-spacing:.14em;color:var(--muted,#6b778c);');
+      l.textContent = label;
+      const v = el('div', 'font-size:13px;font-weight:800;');
+      v.textContent = '0';
+      w.appendChild(l); w.appendChild(v);
+      stats.appendChild(w);
+      return v;
+    }
+    statsRow = stats;
+    scoreEl = statCol('SCORE');
+    linesEl = statCol('LINES');
+    levelEl = statCol('LVL');
+    hiEl = statCol('HI');
+    const nw = el('div', 'flex:0 0 auto;');
+    const nl = el('div', 'font-size:9px;letter-spacing:.14em;color:var(--muted,#6b778c);text-align:right;');
+    nl.textContent = 'NEXT';
+    nextCv = document.createElement('canvas');
+    nextCv.style.cssText = 'display:block;image-rendering:pixelated;';
+    nw.appendChild(nl); nw.appendChild(nextCv);
+    stats.appendChild(nw);
+
+    const bw = el('div', 'position:relative;line-height:0;flex:0 0 auto;');
+    boardCv = document.createElement('canvas');
+    boardCv.style.cssText = 'display:block;image-rendering:pixelated;border-radius:4px;';
+    bw.appendChild(boardCv);
+    overWrap = el('div', 'position:absolute;inset:0;display:none;flex-direction:column;' +
+      'align-items:center;justify-content:center;gap:10px;background:rgba(10,14,30,0.66);' +
+      'border-radius:4px;text-align:center;line-height:1.3;');
+    const goT = el('div', 'color:#fff;font-weight:800;font-size:16px;letter-spacing:.18em;');
+    goT.textContent = 'GAME OVER';
+    finalEl = el('div', 'color:#fff;font-size:12px;letter-spacing:.08em;');
+    const restartB = mkWideBtn('RESTART', true);
+    const closeB2 = mkWideBtn('CLOSE', false);
+    overWrap.appendChild(goT); overWrap.appendChild(finalEl);
+    overWrap.appendChild(restartB); overWrap.appendChild(closeB2);
+    bw.appendChild(overWrap);
+
+    ctrlRow = el('div', 'display:none;flex:0 0 auto;justify-content:center;align-items:center;' +
+      'gap:10px;margin-top:8px;');
+    function mkCtl(txt, label) {
+      const b = el('button',
+        'width:52px;height:44px;display:inline-flex;align-items:center;justify-content:center;' +
+        'background:transparent;border:1px solid var(--line,#dfe1e6);border-radius:10px;' +
+        'color:var(--ink,#172b4d);font:600 16px ui-monospace,monospace;cursor:pointer;padding:0;' +
+        '-webkit-tap-highlight-color:transparent;');
+      b.type = 'button'; b.textContent = txt;
+      b.setAttribute('aria-label', label);
+      ctrlRow.appendChild(b);
+      return b;
+    }
+    const leftB = mkCtl('◀', 'Move left');
+    const rightB = mkCtl('▶', 'Move right');
+    const rotB = mkCtl('⟳', 'Rotate');
+    const downB = mkCtl('⬇', 'Soft drop');
+
+    // board + touch controls share one flex box: a column in portrait (controls
+    // under the board), a row in landscape (controls beside it) — see layout()
+    midWrap = el('div', 'display:flex;flex-direction:column;');
+    midWrap.appendChild(bw);
+    midWrap.appendChild(ctrlRow);
+
+    root.appendChild(head);
+    root.appendChild(stats);
+    root.appendChild(midWrap);
+    document.body.appendChild(root);
+
+    // panel-local listeners (die with the DOM on stop(); no manual removal)
+    root.addEventListener('contextmenu', preventEv);
+    root.addEventListener('wheel', preventEv, { passive: false });
+    boardCv.addEventListener('pointerdown', onPtrDown);
+    boardCv.addEventListener('pointermove', onPtrMove);
+    boardCv.addEventListener('pointerup', onPtrUp);
+    boardCv.addEventListener('pointercancel', onPtrCancel);
+    pauseBtn.addEventListener('click', togglePause);
+    closeB.addEventListener('click', userClose);
+    restartB.addEventListener('click', resetGame);
+    closeB2.addEventListener('click', userClose);
+    leftB.addEventListener('pointerdown', function (e) { e.preventDefault(); startRepeat(moveL); });
+    rightB.addEventListener('pointerdown', function (e) { e.preventDefault(); startRepeat(moveR); });
+    leftB.addEventListener('pointerup', stopRepeat);
+    rightB.addEventListener('pointerup', stopRepeat);
+    leftB.addEventListener('pointercancel', stopRepeat);
+    rightB.addEventListener('pointercancel', stopRepeat);
+    leftB.addEventListener('pointerleave', stopRepeat);
+    rightB.addEventListener('pointerleave', stopRepeat);
+    rotB.addEventListener('pointerdown', function (e) { e.preventDefault(); tryRotate(); });
+    downB.addEventListener('pointerdown', function (e) { e.preventDefault(); btnSoft = true; });
+    downB.addEventListener('pointerup', softOff);
+    downB.addEventListener('pointercancel', softOff);
+    downB.addEventListener('pointerleave', softOff);
+  }
+  function preventEv(e) { e.preventDefault(); }    // ONLY inside the panel
+  function softOff() { btnSoft = false; }
+  function moveL() { tryMove(-1); }
+  function moveR() { tryMove(1); }
+  function startRepeat(fn) {                       // touch hold-repeat: 260ms, then 110ms
+    stopRepeat();
+    fn();
+    repTimer = setTimeout(function again() { fn(); repTimer = setTimeout(again, 110); }, 260);
+  }
+  function stopRepeat() { if (repTimer) { clearTimeout(repTimer); repTimer = 0; } }
+
+  /* ── layout — cell size from min(92vw, 340px) x 78vh, DPR-exact canvases,
+   * vertical anchoring (centered >= 700px tall, else 96px above the bottom
+   * so the voice mic button is never overlapped).
+   *
+   * SHORT viewports (vh < 480 — a phone in landscape) get a different panel
+   * entirely: portrait's math there yields a card taller than the screen and
+   * shoves the header off the top (-20px at 812x375).  Instead the stats row
+   * is hidden, the touch controls move to a vertical column RIGHT of the
+   * board, and the card anchors to the LEFT edge (vertically centered) so the
+   * bottom-center voice mic is never covered.  Only the 44px header sits
+   * above the board there, so the whole card fits in vh - 16.  This runs on
+   * every resize / orientationchange, so the two modes swap live. ────────── */
+  function layout() {
+    if (!root) return;
+    DPR = window.devicePixelRatio || 1;
+    const vw = window.innerWidth, vh = window.innerHeight;
+    const coarse = !!(mqCoarse && mqCoarse.matches);
+    const short = vh < SHORT_VH;                   // landscape / short viewport
+    ctrlRow.style.display = coarse ? 'flex' : 'none';
+    statsRow.style.display = short ? 'none' : 'flex';
+    let maxW, availH;
+    if (short) {
+      // controls ride beside the board, so the ONLY chrome over the board is
+      // the header: the height budget is vh - 16 minus padding+border+header
+      const sideW = coarse ? SIDE_COL : 0;
+      maxW = vw - 24 - 22 - sideW;                 // 12px gutters, padding + border
+      availH = vh - 16 - CHROME_SHORT;
+    } else {
+      maxW = Math.min(vw * 0.92, 340) - 22;        // minus padding + border
+      availH = Math.min(vh * 0.78, vh - MIC_CLEAR - 12) - (coarse ? CHROME_COARSE : CHROME_FINE);
+    }
+    cell = Math.max(8, Math.min(30, (maxW / COLS) | 0, (availH / ROWS) | 0));
+    cssW = cell * COLS; cssH = cell * ROWS;        // 10 x 18, always
+    root.style.width = (cssW + (short && coarse ? SIDE_COL : 0)) + 'px';
+    boardCv.style.width = cssW + 'px'; boardCv.style.height = cssH + 'px';
+    boardCv.width = Math.max(1, Math.round(cssW * DPR));
+    boardCv.height = Math.max(1, Math.round(cssH * DPR));
+    bctx = boardCv.getContext('2d');
+    bctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+    bctx.imageSmoothingEnabled = false;            // crisp pixels, always
+    nextCv.style.width = (4 * NEXT_M) + 'px'; nextCv.style.height = (2 * NEXT_M) + 'px';
+    nextCv.width = Math.max(1, Math.round(4 * NEXT_M * DPR));
+    nextCv.height = Math.max(1, Math.round(2 * NEXT_M * DPR));
+    nctx = nextCv.getContext('2d');
+    nctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+    nctx.imageSmoothingEnabled = false;
+    // ── control re-flow: a row under the board, or a column beside it ──────
+    const ctls = ctrlRow.children;
+    if (short) {
+      midWrap.style.flexDirection = 'row';
+      midWrap.style.alignItems = 'center';
+      midWrap.style.gap = '8px';
+      ctrlRow.style.flexDirection = 'column';
+      ctrlRow.style.gap = '6px';
+      ctrlRow.style.marginTop = '0';
+      ctrlRow.style.width = '44px';
+      // 4 buttons + 3 gaps never taller than the board itself
+      const bh = Math.max(30, Math.min(44, ((cssH - 18) / 4) | 0));
+      for (let i = 0; i < ctls.length; i++) {
+        ctls[i].style.width = '44px'; ctls[i].style.height = bh + 'px';
+      }
+    } else {
+      midWrap.style.flexDirection = 'column';
+      midWrap.style.alignItems = '';
+      midWrap.style.gap = '';
+      ctrlRow.style.flexDirection = 'row';
+      ctrlRow.style.gap = '10px';
+      ctrlRow.style.marginTop = '8px';
+      ctrlRow.style.width = '';
+      for (let i = 0; i < ctls.length; i++) {
+        ctls[i].style.width = '52px'; ctls[i].style.height = '44px';
+      }
+    }
+    // ── anchoring ─────────────────────────────────────────────────────────
+    if (short) {                                   // LEFT edge, vertically centered:
+      root.style.left = '12px';                    // the mic owns bottom-center
+      root.style.top = '50%'; root.style.bottom = 'auto';
+      root.style.transform = 'translateY(-50%)';
+    } else if (vh >= 700) {
+      root.style.left = '50%';
+      root.style.top = '50%'; root.style.bottom = 'auto';
+      root.style.transform = 'translate(-50%,-50%)';
+    } else {
+      root.style.left = '50%';
+      root.style.top = 'auto'; root.style.bottom = MIC_CLEAR + 'px';
+      root.style.transform = 'translateX(-50%)';
+    }
+    buildTiles(); buildBase();
+    tilesDirty = false; nextDirty = true; rectAt = -1;
+  }
+
+  /* ── DPR watcher (zoom / monitor moves) — same pattern as game_layer ───── */
+  function armDprWatch() {
+    if (mqDpr) { try { mqDpr.removeEventListener('change', onDprChange); } catch (e) {} }
+    try {
+      armedDpr = window.devicePixelRatio || 1;
+      mqDpr = window.matchMedia('(resolution: ' + armedDpr + 'dppx)');
+      mqDpr.addEventListener('change', onDprChange);
+    } catch (e) { mqDpr = null; }
+  }
+  function onDprChange() { layout(); armDprWatch(); }
+
+  /* ── sprite-interference API ────────────────────────────────────────────── */
+  const geomRect = { left: 0, top: 0, width: 0, height: 0, right: 0, bottom: 0 };
+  const geom = {
+    rect: geomRect, cell: 20, cols: COLS, rows: ROWS, colHeights: colHeights,
+    topY: function (c) { return geomRect.top + (ROWS - (colHeights[c] || 0)) * geom.cell; },
+  };
+  let rectAt = -1;
+  function geometry() {
+    if (!activeFlag || !boardCv) return null;
+    const now = performance.now();
+    if (now - rectAt > 250) {                      // panel is fixed; refresh at most 4/s
+      rectAt = now;
+      const r = boardCv.getBoundingClientRect();
+      geomRect.left = r.left; geomRect.top = r.top;
+      geomRect.width = r.width; geomRect.height = r.height;
+      geomRect.right = r.right; geomRect.bottom = r.bottom;
+    }
+    geom.cell = cell;
+    return geom;
+  }
+  function blast(cx, cy) {                         // settled cells only, 3x3
+    // phase 1 is the clear flash: those cells are already scored — never double-score
+    if (!activeFlag || over || paused || phase !== 0) return 0;
+    cx |= 0; cy |= 0;
+    let cleared = 0;
+    for (let r = cy - 1; r <= cy + 1; r++) {
+      if (r < 0 || r >= ROWS) continue;
+      for (let c = cx - 1; c <= cx + 1; c++) {
+        if (c < 0 || c >= COLS) continue;
+        const ix = r * COLS + c;
+        if (!board[ix]) continue;                  // the falling piece never lives here
+        if (!REDUCED) spawnBurst(c, r, board[ix] - 1);
+        board[ix] = 0;
+        blastF[ix] = BLAST_MS;
+        cleared++;
+      }
+    }
+    if (cleared > 0) {
+      score += 40 * cleared; hudDirty = true;
+      recomputeHeights();
+      evBlast.cleared = cleared;
+      emitEv('blast', evBlast);
+    }
+    return cleared;
+  }
+  function nudge(dir) {                            // shift the FALLING piece
+    // Coerce FIRST: isFinite('') / isFinite(null) / isFinite([]) are all true,
+    // so a strict `dir === 0` alone let those through and silently shifted
+    // the piece right. One numeric conversion closes the whole family.
+    const n = +dir;
+    if (!n || !isFinite(n)) return false;
+    const d = n < 0 ? -1 : 1;
+    const ok = tryMove(d);
+    if (ok) { evNudge.dir = d; emitEv('nudge', evNudge); }
+    return ok;
+  }
+  const stateObj = { score: 0, lines: 0, level: 1, over: false, paused: false };
+  function apiState() {
+    stateObj.score = score; stateObj.lines = lines; stateObj.level = level;
+    stateObj.over = over; stateObj.paused = paused;
+    return stateObj;
+  }
+
+  /* ── input: keyboard (only while active; never over form fields, never
+   * while a page overlay is open, never stealing keys from focused page
+   * controls outside #kt-root) ───────────────────────────────────────────── */
+  function onKey(e) {
+    if (!activeFlag) return;
+    const t = e.target;
+    if (t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' ||
+              t.tagName === 'SELECT' || t.isContentEditable)) return;
+    // a page overlay owns the keyboard (incl. Escape) — one cheap check
+    if (document.querySelector('.overlay:not([hidden])')) return;
+    // a focused page control (button/link/tabindex) outside the panel keeps
+    // its keys — Space/Enter must activate it normally, no preventDefault
+    if (t && t.nodeType === 1 &&
+        (t.tagName === 'BUTTON' || t.tagName === 'A' || t.hasAttribute('tabindex')) &&
+        !(t.closest && t.closest('#kt-root'))) return;
+    switch (e.code) {
+      case 'Escape':     e.preventDefault(); if (!e.repeat) userClose(); break;
+      case 'KeyP':       e.preventDefault(); if (!e.repeat) togglePause(); break;
+      case 'ArrowLeft':  e.preventDefault(); tryMove(-1); break;
+      case 'ArrowRight': e.preventDefault(); tryMove(1); break;
+      case 'ArrowDown':  e.preventDefault(); kbSoft = true; break;
+      case 'ArrowUp':
+      case 'KeyZ':       e.preventDefault(); if (!e.repeat) tryRotate(); break;
+      case 'Space':      e.preventDefault(); if (!e.repeat) hardDrop(); break;
+    }
+  }
+  function onKeyUp(e) {
+    if (!activeFlag) return;
+    if (e.code === 'ArrowDown') kbSoft = false;
+  }
+
+  /* ── input: pointer on the board canvas — drag steers to the pointer's
+   * column (grab-relative), tap rotates, quick downward swipe hard-drops. ── */
+  let ptrId = -1, ptrX0 = 0, ptrY0 = 0, ptrT0 = 0, ptrMovedX = false, grabOff = 0;
+  function colAtX(clientX) {
+    geometry();                                    // keeps geomRect fresh
+    return Math.floor((clientX - geomRect.left) / cell);   // symmetric at the left edge
+  }
+  function onPtrDown(e) {
+    if (!activeFlag) return;
+    e.preventDefault();
+    if (over) return;                              // the overlay owns game-over input
+    if (paused || phase !== 0) return;             // no grabbing mid-flash or paused
+    try { boardCv.setPointerCapture(e.pointerId); } catch (err) {}
+    ptrId = e.pointerId;
+    ptrX0 = e.clientX; ptrY0 = e.clientY; ptrT0 = performance.now();
+    ptrMovedX = false;
+    rectAt = -1;                                   // force one fresh rect read
+    grabOff = cur.x - colAtX(e.clientX);
+  }
+  function onPtrMove(e) {
+    if (ptrId !== e.pointerId || !activeFlag || over || paused || phase !== 0) return;
+    e.preventDefault();
+    if (Math.abs(e.clientX - ptrX0) > cell * 0.6) ptrMovedX = true;
+    const want = colAtX(e.clientX) + grabOff;
+    let guard = COLS;
+    while (cur.x < want && guard-- > 0) { if (!tryMove(1)) break; }
+    guard = COLS;
+    while (cur.x > want && guard-- > 0) { if (!tryMove(-1)) break; }
+  }
+  function onPtrUp(e) {
+    if (ptrId !== e.pointerId) return;
+    ptrId = -1;
+    if (!activeFlag || over) return;
+    const dt = Math.max(1, performance.now() - ptrT0);
+    const dx = e.clientX - ptrX0, dy = e.clientY - ptrY0;
+    if (dy > 40 && dy / dt > 0.4 && dy > Math.abs(dx)) { hardDrop(); return; }  // swipe
+    if (!ptrMovedX && Math.abs(dy) < 12 && dt < 350) tryRotate();               // tap
+  }
+  function onPtrCancel(e) { if (ptrId === e.pointerId) ptrId = -1; }
+
+  /* ── pause / close ──────────────────────────────────────────────────────── */
+  function togglePause() {
+    if (!activeFlag || over) return;
+    paused = !paused;
+    if (pauseBtn) pauseBtn.textContent = paused ? '▶' : '⏸';
+  }
+  function apiPause(on) {                          // public: idempotent P-key twin
+    if (!activeFlag || over) return;
+    if (!!on === paused) return;
+    togglePause();
+  }
+  function userClose() {
+    const cb = cbClose;
+    apiStop();
+    if (cb) { try { cb(); } catch (e) {} }
+  }
+
+  /* ── fixed-timestep simulation ──────────────────────────────────────────── */
+  function update(dt) {
+    if (paused) return;                            // pause freezes everything
+    updateParticles(dt);
+    for (let i = 0; i < blastF.length; i++) {      // blast flash decay
+      if (blastF[i] > 0) { blastF[i] -= dt; if (blastF[i] < 0) blastF[i] = 0; }
+    }
+    if (over) return;                              // the last explosion still settles
+    if (phase === 1) {                             // line-clear flash, then collapse
+      clearT += dt;
+      if (clearT >= FLASH_MS) {
+        if (!REDUCED) {
+          for (let r = 0; r < ROWS; r++) {
+            if (!clearRows[r]) continue;
+            for (let c = 0; c < COLS; c += 2) {
+              const v = board[r * COLS + c];
+              if (v) spawnBurst(c, r, v - 1);
+            }
+          }
+        }
+        collapseRows(); afterClear(); phase = 0; spawnPiece();
+      }
+      return;
+    }
+    // gravity + lock delay
+    const grounded = !fits(cur.p, cur.r, cur.x, cur.y + 1);
+    if (grounded) {
+      gravT = 0;
+      lockT += dt; groundT += dt;                  // movement resets lockT, never groundT
+      if (lockT >= LOCK_MS || groundT >= LOCK_CAP) lockNow();
+    } else {
+      lockT = 0;
+      const iv = softOn() ? Math.min(SOFT_MS, gravIv) : gravIv;
+      gravT += dt;
+      while (gravT >= iv) {
+        gravT -= iv;
+        if (fits(cur.p, cur.r, cur.x, cur.y + 1)) {
+          cur.y++;
+          groundT = 0;                             // descending re-arms the lock cap
+          if (softOn()) { score += 1; hudDirty = true; }   // 1 point per soft cell
+        } else break;
+      }
+    }
+  }
+
+  /* ── render — no allocations: prerendered base, tile atlas drawImage,
+   * overlay flashes, pooled particles.  alpha only interpolates particles
+   * (piece motion is deliberately stepped — 8-bit law). ──────────────────── */
+  function drawNext() {
+    nextDirty = false;
+    const g = nctx;
+    if (!g || !tileCv) return;
+    g.clearRect(0, 0, 4 * NEXT_M, 2 * NEXT_M);
+    const t = ROTS[nextP][0];
+    let minX = 9, minY = 9, maxX = -9, maxY = -9;
+    for (let k = 0; k < 8; k += 2) {
+      if (t[k] < minX) minX = t[k];
+      if (t[k] > maxX) maxX = t[k];
+      if (t[k + 1] < minY) minY = t[k + 1];
+      if (t[k + 1] > maxY) maxY = t[k + 1];
+    }
+    const ox = (((4 - (maxX - minX + 1)) * NEXT_M) / 2) | 0;
+    const oy = (((2 - (maxY - minY + 1)) * NEXT_M) / 2) | 0;
+    for (let k = 0; k < 8; k += 2)
+      g.drawImage(tileCv, nextP * tileD, 0, tileD, tileD,
+        ox + (t[k] - minX) * NEXT_M, oy + (t[k + 1] - minY) * NEXT_M, NEXT_M, NEXT_M);
+  }
+  function render(alpha) {
+    const g = bctx;
+    if (!g) return;
+    if (tilesDirty) { buildTiles(); buildBase(); tilesDirty = false; nextDirty = true; }
+    if (nextDirty) drawNext();
+    g.save();                                      // fractional DPR (1.25 etc): clear the
+    g.setTransform(1, 0, 0, 1, 0, 0);              // FULL bitmap so no particle flecks
+    g.clearRect(0, 0, boardCv.width, boardCv.height);   // survive at the right/bottom edge
+    g.restore();
+    g.drawImage(baseCv, 0, 0, baseCv.width, baseCv.height, 0, 0, cssW, cssH);
+    for (let r = 0; r < ROWS; r++) {               // settled cells
+      const ro = r * COLS;
+      for (let c = 0; c < COLS; c++) {
+        const v = board[ro + c];
+        if (v) g.drawImage(tileCv, (v - 1) * tileD, 0, tileD, tileD,
+                           c * cell, r * cell, cell, cell);
+      }
+    }
+    if (phase === 1) {                             // line-clear flicker
+      g.globalAlpha = (((clearT / 50) | 0) % 2 === 0) ? 0.85 : 0.35;
+      g.fillStyle = THEME.flash;
+      for (let r = 0; r < ROWS; r++) if (clearRows[r]) g.fillRect(0, r * cell, cssW, cell);
+      g.globalAlpha = 1;
+    }
+    for (let i = 0; i < blastF.length; i++) {      // blast cell flashes
+      const f = blastF[i];
+      if (f <= 0) continue;
+      g.globalAlpha = f / BLAST_MS;
+      g.fillStyle = THEME.flash;
+      g.fillRect((i % COLS) * cell, ((i / COLS) | 0) * cell, cell, cell);
+    }
+    g.globalAlpha = 1;
+    if (phase === 0 && !over) {                    // the falling piece
+      const t = ROTS[cur.p][cur.r], sx = cur.p * tileD;
+      for (let k = 0; k < 8; k += 2) {
+        const by = cur.y + t[k + 1];
+        if (by < 0) continue;
+        g.drawImage(tileCv, sx, 0, tileD, tileD,
+                    (cur.x + t[k]) * cell, by * cell, cell, cell);
+      }
+    }
+    renderParticles(g, alpha);
+    if (paused && !over) {
+      g.fillStyle = 'rgba(10,14,30,0.55)';
+      g.fillRect(0, 0, cssW, cssH);
+      g.fillStyle = '#ffffff';
+      g.font = '700 16px ui-monospace,SFMono-Regular,Menlo,Consolas,monospace';
+      g.textAlign = 'center';
+      g.fillText('PAUSED', cssW / 2, cssH / 2);
+    }
+  }
+  function updateHud() {                           // DOM touched only on change
+    hudDirty = false;
+    if (!scoreEl) return;
+    scoreEl.textContent = String(score);
+    linesEl.textContent = String(lines);
+    levelEl.textContent = String(level);
+    hiEl.textContent = String(score > hi ? score : hi);
+  }
+
+  /* ── the loop — STEP accumulator, dt clamped, spiral guard; a hidden tab
+   * freezes the clock (and auto-pauses so nobody dies off-screen). ───────── */
+  function tick(ts) {
+    if (!activeFlag) return;
+    raf = requestAnimationFrame(tick);
+    let dt = ts - lastTs; lastTs = ts;
+    if (dt < 0) dt = 0;
+    if (dt > MAX_DT) dt = MAX_DT;
+    acc += dt;
+    let n = 0;
+    while (acc >= STEP && n < MAX_STEPS) { update(STEP); acc -= STEP; n++; }
+    if (n === MAX_STEPS) acc = 0;                  // spiral guard: drop the debt
+    refreshTheme(performance.now());
+    render(acc / STEP);
+    if (hudDirty) updateHud();
+  }
+
+  /* ── window-level listeners ─────────────────────────────────────────────── */
+  function onResize() { layout(); }
+  function onVis() {
+    if (!activeFlag) return;
+    if (document.hidden) {
+      if (raf) { cancelAnimationFrame(raf); raf = 0; }
+      if (!over && !paused) togglePause();         // don't die in a hidden tab
+    } else if (!raf) {
+      lastTs = performance.now(); acc = 0;
+      raf = requestAnimationFrame(tick);
+    }
+  }
+  function onCoarse() { layout(); }
+  function onPrm() { REDUCED = !!(mqReduced && mqReduced.matches); }
+  function onBlur() { kbSoft = false; btnSoft = false; }   // never a stuck soft-drop
+
+  /* ── lifecycle ──────────────────────────────────────────────────────────── */
+  function apiStart(opts) {
+    if (activeFlag) return;
+    if (!document.body) return;                    // included too early: no-op
+    cbClose = (opts && typeof opts.onClose === 'function') ? opts.onClose : null;
+    cbEvent = (opts && typeof opts.onEvent === 'function') ? opts.onEvent : null;
+    try {
+      mqCoarse = window.matchMedia('(pointer: coarse)');
+      mqCoarse.addEventListener('change', onCoarse);
+    } catch (e) { mqCoarse = null; }
+    try {
+      mqReduced = window.matchMedia('(prefers-reduced-motion: reduce)');
+      mqReduced.addEventListener('change', onPrm);
+      REDUCED = mqReduced.matches;
+    } catch (e) { mqReduced = null; REDUCED = false; }
+    hi = readHi();
+    buildPanel();
+    layout();
+    armDprWatch();
+    window.addEventListener('keydown', onKey);
+    window.addEventListener('keyup', onKeyUp);
+    window.addEventListener('resize', onResize);
+    window.addEventListener('orientationchange', onResize);
+    window.addEventListener('blur', onBlur);
+    document.addEventListener('visibilitychange', onVis);
+    activeFlag = true;
+    themeAt = -1;                                  // force an immediate theme read
+    resetGame();                                   // emits 'start'
+    updateHud();
+    lastTs = performance.now(); acc = 0;
+    if (!document.hidden) raf = requestAnimationFrame(tick);
+  }
+  function apiStop() {
+    if (!activeFlag) return;
+    activeFlag = false;
+    persistHi();
+    if (raf) { cancelAnimationFrame(raf); raf = 0; }
+    stopRepeat();
+    window.removeEventListener('keydown', onKey);
+    window.removeEventListener('keyup', onKeyUp);
+    window.removeEventListener('resize', onResize);
+    window.removeEventListener('orientationchange', onResize);
+    window.removeEventListener('blur', onBlur);
+    document.removeEventListener('visibilitychange', onVis);
+    if (mqCoarse) { try { mqCoarse.removeEventListener('change', onCoarse); } catch (e) {} mqCoarse = null; }
+    if (mqReduced) { try { mqReduced.removeEventListener('change', onPrm); } catch (e) {} mqReduced = null; }
+    if (mqDpr) { try { mqDpr.removeEventListener('change', onDprChange); } catch (e) {} mqDpr = null; }
+    if (root && root.parentNode) root.parentNode.removeChild(root);
+    // element-attached listeners die with the removed subtree; drop the refs
+    root = null; boardCv = null; bctx = null; nextCv = null; nctx = null;
+    overWrap = null; finalEl = null; pauseBtn = null; ctrlRow = null;
+    statsRow = null; midWrap = null;
+    scoreEl = null; linesEl = null; levelEl = null; hiEl = null;
+    kbSoft = false; btnSoft = false; ptrId = -1; rectAt = -1;
+    resetParticles();
+    cbClose = null; cbEvent = null;
+  }
+
+  /* ── the ONE global ─────────────────────────────────────────────────────── */
+  window.krabTetris = {
+    get element() { return root; },   // the panel card — the sprite layer's shake target
+    start: apiStart,
+    stop: apiStop,
+    pause: apiPause,
+    active: function () { return activeFlag; },
+    geometry: geometry,
+    blast: blast,
+    nudge: nudge,
+    state: apiState,
+  };
+})();
+
+''',
 }

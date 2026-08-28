@@ -17,20 +17,36 @@ GAME_JS = r'''
  * /receipts board.  Served as /receipts/game.js, included with <script defer>.
  *
  * CONTRACT (the page must run identically if this file is deleted):
- *   - talks to the page ONLY via the window 'krab' CustomEvent bus and its own
- *     localStorage key 'krab_game';
- *   - defines exactly ONE global: window.krabGame = {setMode, mode, celebrate};
+ *   - talks to the page ONLY via the window 'krab' CustomEvent bus, its own
+ *     localStorage key 'krab_game', and ONE body class — 'krab-tetris-on',
+ *     set while a tetris game is up so the page can style its toasts out of
+ *     the panel's way, and always removed again on game over / close /
+ *     teardown (the page needs no CSS for it; nothing here reads it back);
+ *   - defines exactly ONE global: window.krabGame =
+ *     {setMode, mode, celebrate, playTetris, say};
  *   - sprites live ONLY in the side gutter rails mirrored around <main>'s
- *     content box (or the 64px bottom strip fallback) — a canvas clip path
- *     enforces this structurally, so a sprite can never be drawn over content;
- *   - rail < 120px hides that rail; both too narrow -> bottom strip; viewport
- *     < 1100px (or a touch/hover-none device) -> the layer is fully off;
+ *     content box (or the bottom strip) — a canvas clip path enforces this
+ *     structurally, so a sprite can never be drawn over content.  Two spec'd
+ *     exceptions: chat bubbles (viewport-clamped, never inside the mic dead
+ *     zone or over the tetris HUD band — the panel-card top down to the board
+ *     top) and, while the OPTIONAL
+ *     window.krabTetris panel is open, the panel's own rect — sprites
+ *     deliberately play ON the panel (canvas z raised 22 -> 23 for the game,
+ *     restored on stop; pointer-events stays none so play is unaffected);
+ *   - rail < 120px hides that rail; both too narrow, viewport < 1100px, OR a
+ *     coarse-pointer device -> the BOTTOM STRIP (64px; 72px coarse pointers),
+ *     sprites at their normal x3 scale.  A mic dead zone (centerX ±90px, the
+ *     page's floating voice button) excludes waypoints, the car, and bubbles;
  *   - ONE fixed, full-viewport canvas: pointer-events none, aria-hidden,
  *     role=presentation, tabindex -1, z-index var(--z-sprites, 20) (kept below
  *     the page's .overlay z:50 / #toasts z:60); the element itself never moves
- *     or resizes per frame (zero CLS) — only draw commands animate;
- *   - default mode 'off' on first load; 'subtle' = 2 sprites, major reactions
- *     only; 'full' = up to 6 sprites (frame-budget tiers may lower that);
+ *     or resizes per frame (zero CLS) — only draw commands animate.  The one
+ *     interactive DOM this layer may own is the tiny tetris-invite chip
+ *     (44px targets, auto-dismissed, removed on teardown);
+ *   - window pointerdown/pointermove listeners are PASSIVE and never call
+ *     preventDefault — taps and swipes always reach the page untouched;
+ *   - default mode 'off' on first load; 'subtle' = 2 sprites (1 on mobile),
+ *     major reactions only; 'full' = up to 6 (frame-budget tiers may lower);
  *   - prefers-reduced-motion: static poses with slow cross-fades only.
  */
 (function () {
@@ -44,8 +60,18 @@ GAME_JS = r'''
   const SCALE = 3;               // integer sprite scale only — pixel art law
   const CW = 24, CH = 24;        // atlas cell size (characters are 12-16px tall)
   const RAIL_MIN = 120;          // a rail narrower than this hides
-  const STRIP_H = 64;            // bottom-strip fallback height
-  const VIEW_MIN = 1100;         // below this the layer is fully off
+  const STRIP_H = 64;            // bottom-strip height (fine pointers)
+  const STRIP_H_COARSE = 72;     // …taller on coarse pointers (thumb room)
+  const VIEW_MIN = 1100;         // below this: bottom-strip mode, always
+  const DEAD_HALF = 90;          // mic dead zone: centerX ± this — waypoints,
+                                 //   the car path and bubbles NEVER enter it
+  const TAP_CD = 2000;           // per-sprite tap-reaction cooldown
+  const DODGE_CD = 3000;         // per-sprite dodge cooldown
+  const DODGE_SPEED = 0.6;       // px/ms pointer speed that reads as a lunge
+  const IDLE_QUIP_MIN = 45000, IDLE_QUIP_MAX = 120000;  // per-sprite quips
+  const INVITE_IDLE = 90000;     // idle since boot/last game before an invite
+  const INVITE_TTL = 8000;       // invite chip auto-dismiss
+  const INVITE_DECLINE = 300000; // NO -> 5min cooldown
   const CONTENT_GAP = 10;        // breathing room between a rail and content
   const WALK_SPEED = 26;         // px/s base; personality scales ±15%
   const GRAV = 760;              // px/s² for procedural jumps
@@ -101,7 +127,7 @@ GAME_JS = r'''
    * refresh runs OUTSIDE the per-particle hot loops). ─────────────────────── */
   const THEME = {
     ink: '#172b4d', muted: '#6b778c', line: '#dfe1e6', accent: '#0065ff',
-    ok: '#00875a', glow: '#0065ff',
+    ok: '#00875a', glow: '#0065ff', bub: '#ffffff',
   };
   const CONF = ['#0065ff', '#6554c0', '#00875a', '#e2a33b', '#0065ff', '#8993a4', '#00875a'];
   let themeAt = -1;
@@ -118,6 +144,7 @@ GAME_JS = r'''
     THEME.accent = cssVar(cs, '--accent', THEME.accent);
     THEME.ok = cssVar(cs, '--del', THEME.ok);
     THEME.glow = cssVar(cs, '--accent', THEME.glow);
+    THEME.bub = cssVar(cs, '--card', THEME.bub);   // bubble fill tracks the page's card bg
     // confetti draws from the page's own status palette (new colors included)
     CONF[0] = cssVar(cs, '--accent', CONF[0]);
     CONF[1] = cssVar(cs, '--paid', CONF[1]);
@@ -165,7 +192,8 @@ GAME_JS = r'''
   const HEADCOL = 32;           // 4 head variants: open, blink, happy, side
   const ATLAS_COLS = 36;
   const PROPS = { car0: 0, car1: 1, flag0: 2, flag1: 3, scroll0: 4, scroll1: 5,
-                  scroll2: 6, check: 7, zz: 8, bang: 9, note: 10, pebble: 11 };
+                  scroll2: 6, check: 7, zz: 8, bang: 9, note: 10, pebble: 11,
+                  heart: 12 };
   // playback speeds; celebrate/turn/notice are driven frame-by-frame by state code
   const ANIMS = {
     walk: { ms: 83, loop: true }, idle: { ms: 500, loop: true },
@@ -339,6 +367,11 @@ GAME_JS = r'''
     P(12, 8, 1, 6, '#e2a33b'); P(13, 8, 2, 1, '#e2a33b'); P(10, 13, 3, 2, '#e2a33b');
     P = painterAt(g, PROPS.pebble, 3);
     P(11, 19, 2, 2, '#8a8f98'); P(11, 19, 1, 1, '#b3b8c2');
+    P = painterAt(g, PROPS.heart, 3);            // pixel heart (tap-reaction pop)
+    P(9, 10, 3, 2, '#e2543b'); P(13, 10, 3, 2, '#e2543b');
+    P(8, 12, 9, 2, '#e2543b'); P(9, 14, 7, 1, '#e2543b');
+    P(10, 15, 5, 1, '#e2543b'); P(11, 16, 3, 1, '#e2543b');
+    P(12, 17, 1, 1, '#a92735'); P(9, 11, 2, 1, '#f0867a');
   }
 
   let ATLAS = null;
@@ -378,9 +411,13 @@ GAME_JS = r'''
     a: { x: 0, y: 0, w: 0, h: 0 },
     b: { x: 0, y: 0, w: 0, h: 0 },
     railW: 0,
+    mobile: false,                               // narrow viewport OR coarse pointer
   };
+  // the floating voice-mic dead zone (bottom-center): waypoints, the car and
+  // bubbles never enter this rect.  Inert until evalBands computes it.
+  const dead = { x0: -1e9, x1: -1e9, y0: 1e9 };
   let layoutDirty = true;
-  let COARSE = false;                            // hover-none device -> nothing
+  let COARSE = false;                            // hover-none device -> strip + no hover
   const WP_FY = [0.2, 0.4, 0.6, 0.8, 0.92];      // weighted pause points…
   const WP_W = [1, 2, 3, 3, 2];                  // …favouring the lower half
   const WP_CUM = [];
@@ -390,8 +427,11 @@ GAME_JS = r'''
     layoutDirty = false;
     glowGradsDirty = true;                          // band geometry feeds the glow gradients
     const vw = window.innerWidth, vh = window.innerHeight;
-    if (vw < VIEW_MIN || COARSE) { bands.mode = 'none'; bands.n = 0; return; }
-    const main = document.querySelector('main');
+    const sh = COARSE ? STRIP_H_COARSE : STRIP_H;
+    dead.x0 = vw / 2 - DEAD_HALF; dead.x1 = vw / 2 + DEAD_HALF;
+    dead.y0 = vh - sh - 64;                         // the mic floats just above the strip
+    bands.mobile = (vw < VIEW_MIN || COARSE);
+    const main = bands.mobile ? null : document.querySelector('main');
     const r = main ? main.getBoundingClientRect() : null;
     const lw = r ? Math.max(0, r.left) : 0;
     const rw = r ? Math.max(0, vw - r.right) : 0;
@@ -411,19 +451,35 @@ GAME_JS = r'''
       bands.a.x = (lRail >= RAIL_MIN) ? 0 : vw - w;
       bands.a.y = top; bands.a.w = w; bands.a.h = vh - top;
     } else {
-      // both rails too narrow (or no <main>): the 64px bottom strip fallback
+      // mobile / coarse pointer / both rails too narrow / no <main>: the
+      // bottom strip — the very bottom of the viewport, where the page only
+      // has padding.  (This replaces the old <1100px hard-off.)
       bands.mode = 'strip'; bands.n = 1; bands.railW = 0;
-      bands.a.x = 0; bands.a.y = vh - STRIP_H; bands.a.w = vw; bands.a.h = STRIP_H;
+      bands.a.x = 0; bands.a.y = vh - sh; bands.a.w = vw; bands.a.h = sh;
     }
+  }
+  function stripX(fromX) {                          // strip waypoint OUTSIDE the mic dead zone
+    const b = bands.a;
+    const lo = b.x + 24, hi = b.x + b.w - 24;
+    const lw = Math.max(0, (dead.x0 - 18) - lo);    // 18 ≈ sprite half-width margin
+    const rw = Math.max(0, hi - (dead.x1 + 18));
+    if (lw <= 0 && rw <= 0) return lo;              // absurdly narrow: hug the left edge
+    let nx = (Math.random() * (lw + rw) < lw)
+      ? lo + Math.random() * lw
+      : (dead.x1 + 18) + Math.random() * rw;
+    if (Math.abs(nx - fromX) < 60) {                // one re-roll away from the same spot
+      nx = (Math.random() * (lw + rw) < lw)
+        ? lo + Math.random() * lw
+        : (dead.x1 + 18) + Math.random() * rw;
+    }
+    return nx;
   }
   function bandOf(s) { return (bands.n > 1 && s.bandIx === 1) ? bands.b : bands.a; }
   function pickWaypoint(s) {                      // weighted, never the same spot
     const b = bandOf(s);
     if (bands.mode === 'strip') {
       s.ty = b.y + b.h - 10;
-      let nx = b.x + 40 + Math.random() * (b.w - 80);
-      if (Math.abs(nx - s.x) < 60) nx = b.x + 40 + Math.random() * (b.w - 80);
-      s.tx = nx;
+      s.tx = stripX(s.x);                          // never parks in the mic dead zone
       return;
     }
     const roll = Math.random() * WP_CUM[WP_CUM.length - 1];
@@ -469,8 +525,12 @@ GAME_JS = r'''
     cv.setAttribute('aria-hidden', 'true');       // contract (4): invisible to a11y
     cv.setAttribute('role', 'presentation');
     cv.setAttribute('tabindex', '-1');
-    cv.style.cssText = 'position:fixed;inset:0;width:100vw;height:100vh;' +
+    // NO 100vw/100vh here — the element is sized in px by sizeCanvas from the
+    // same innerWidth/innerHeight as the buffer (iOS Safari's collapsing
+    // toolbar makes 100vh drift from innerHeight and the strip would smear)
+    cv.style.cssText = 'position:fixed;left:0;top:0;' +
       'pointer-events:none;z-index:var(--z-sprites,20);display:block;';
+    if (tetris.active) cv.style.zIndex = '23';    // canvas rebuilt mid-game: stay over the panel
     document.body.appendChild(cv);
     ctx = cv.getContext('2d');
     sizeCanvas();
@@ -480,8 +540,11 @@ GAME_JS = r'''
     if (!cv) return;
     DPR = window.devicePixelRatio || 1;
     if (dprMq && DPR !== armedDpr) armDprWatch();  // DPR moved without a change event: re-arm
-    cv.width = Math.max(1, Math.round(window.innerWidth * DPR));
-    cv.height = Math.max(1, Math.round(window.innerHeight * DPR));
+    const w = window.innerWidth, h = window.innerHeight;
+    cv.style.width = w + 'px';                     // element px == buffer px source —
+    cv.style.height = h + 'px';                    //   never drifts under Safari's toolbar
+    cv.width = Math.max(1, Math.round(w * DPR));
+    cv.height = Math.max(1, Math.round(h * DPR));
     ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
     ctx.imageSmoothingEnabled = false;            // crisp pixels, always
   }
@@ -498,7 +561,9 @@ GAME_JS = r'''
 
   /* ── particle pool — P_MAX objects preallocated at boot; update()/render()
    * never allocate (no literals, no closures — index loops only). ─────────── */
-  const K_CONF = 0, K_ZZ = 1, K_CHECK = 2, K_NOTE = 3, K_PEBBLE = 4;
+  const K_CONF = 0, K_ZZ = 1, K_CHECK = 2, K_NOTE = 3, K_PEBBLE = 4,
+        K_HEART = 5, K_BOOM = 6;
+  const BOOMC = ['#ffd964', '#ff9b3d', '#e2543b', '#8a8f98', '#4a4f5d'];
   const pool = new Array(P_MAX);
   const freeList = new Int16Array(P_MAX);
   let freeTop = 0, liveParts = 0;
@@ -523,6 +588,14 @@ GAME_JS = r'''
       emit(K_CONF, x + rand(-8, 8), y + rand(-6, 6), rand(-95, 95), rand(-270, -110),
            rand(900, 1600), 2 + randi(2), randi(7), rand(4, 10));
   }
+  function emitBoom(x, y) {                        // chunky 💥-style radial pixel burst
+    const n = Math.min((22 * TIERS[tier].pmul) | 0, freeTop);
+    for (let i = 0; i < n; i++) {
+      const a = rand(0, 6.28), v = rand(60, 240);
+      emit(K_BOOM, x, y, Math.cos(a) * v, Math.sin(a) * v - 40,
+           rand(350, 750), 3 + randi(3), randi(5), 0);
+    }
+  }
   function updateParticles(dt) {
     const dts = dt / 1000;
     for (let i = 0; i < P_MAX; i++) {
@@ -533,6 +606,10 @@ GAME_JS = r'''
       if (p.life >= p.ttl) { p.on = false; freeList[freeTop++] = i; liveParts--; continue; }
       if (p.kind === K_CONF || p.kind === K_PEBBLE) {
         p.vy += 340 * dts; p.vx *= (1 - 0.85 * dts);
+      } else if (p.kind === K_BOOM) {
+        p.vy += 210 * dts; p.vx *= (1 - 1.6 * dts);
+      } else if (p.kind === K_HEART) {
+        p.vy = -34; p.vx = Math.sin((p.life + p.ang * 300) / 200) * 10;
       } else if (p.kind === K_ZZ) {
         p.vy = -22; p.vx = Math.sin((p.life + p.ang * 300) / 260) * 14;
       } else if (p.kind === K_NOTE) {
@@ -556,12 +633,16 @@ GAME_JS = r'''
         g.fillStyle = CONF[p.ci];
         const w = 1 + ((p.size * Math.abs(Math.cos(p.ang + p.life * p.spin / 1000))) | 0);
         g.fillRect(snap(ix), snap(iy), w, p.size);
+      } else if (p.kind === K_BOOM) {              // chunky explosion pixels
+        g.fillStyle = BOOMC[p.ci];
+        g.fillRect(snap(ix), snap(iy), p.size, p.size);
       } else {
         // bitmap particles reuse the props row — no shapes built per frame
         let col = PROPS.zz;
         if (p.kind === K_CHECK) col = PROPS.check;
         else if (p.kind === K_NOTE) col = PROPS.note;
         else if (p.kind === K_PEBBLE) col = PROPS.pebble;
+        else if (p.kind === K_HEART) col = PROPS.heart;
         const sc = p.kind === K_CHECK ? 3 : 2;    // integer scales only
         g.drawImage(ATLAS, col * CW, 3 * CH, CW, CH,
           snap(ix) - 12 * sc, snap(iy) - 12 * sc, CW * sc, CH * sc);
@@ -578,12 +659,239 @@ GAME_JS = r'''
     sp.x += sp.vx * dts; sp.y += sp.vy * dts;
   }
 
-  /* ── cursor awareness — position + how long it has been still ───────────── */
-  const mouse = { x: -9999, y: -9999, movedAt: 0 };
+  /* ── chat bubbles — canvas-drawn pixel speech bubbles.  A pool of TWO
+   * (manager rule: max 2 on screen); spawn allocates nothing but one
+   * measureText, update/draw allocate nothing.  Text is drawn via fillText so
+   * markup is inert; say() additionally strips control chars.  Bubbles are a
+   * sanctioned overlay: they render OUTSIDE the band clip but are clamped
+   * fully on-viewport, never inside the mic dead zone (widened while the voice
+   * UI is up), and never over the tetris HUD band — the panel CARD's top down
+   * to the board top, measured, not guessed. ─────────────────────────────── */
+  const LINES = Object.assign(Object.create(null), {   // data, easy to extend
+    'lead.created':      ['ouu new lead ✨', 'fresh one!', "who's taking it?"],
+    'deal.won':          ['cha-ching!', 'receipt secured 🧾', 'money in!'],
+    'driver.on_the_way': ['drive safe!', 'vroom vroom'],
+    'stage.advanced':    ['moving up!', 'nice progress'],
+    'goal.hit':          ['BEST JOB EVER', 'LEGENDS!'],
+    'task.completed':    ['sent ✉', 'done and dusted'],
+    idle:  ['this is the best job ever', 'best job ever, no cap', '☕ break soon?',
+            "taggin' and braggin'", 'nice board today'],
+    dodge: ['whoa!', 'hey, watch it'],
+    tap:   ['hey!', ':D', 'careful!'],
+    invite:   ['wanna play tetris? 🎮'],
+    clear:    ['nice!'],
+    over:     ['gg... rematch?'],
+    boom:     ['boom 💥'],
+    mischief: ['hehe >:)'],
+  });
+  const lastLineIx = Object.create(null);
+  function pickLine(cat) {                         // random, never the same twice running
+    const arr = LINES[cat];
+    if (!arr || !arr.length) return '';
+    if (arr.length === 1) return arr[0];
+    let i = randi(arr.length);
+    if (i === lastLineIx[cat]) i = (i + 1) % arr.length;
+    lastLineIx[cat] = i;
+    return arr[i];
+  }
+  const BUB_FONT = '600 20px ui-monospace,SFMono-Regular,Menlo,monospace'; // 10px ×2 = crisp
+  const BUB_H = 34, BUB_TAIL = 8, BUB_PAD = 10;
+  const bubbles = [
+    { on: false, s: null, text: '', w: 0, life: 0, ttl: 0, ax: 0, ay: 0 },
+    { on: false, s: null, text: '', w: 0, life: 0, ttl: 0, ax: 0, ay: 0 },
+  ];
+  function rectsHit(x, y, w, h, rx0, ry0, rx1, ry1) {
+    return x < rx1 && x + w > rx0 && y < ry1 && y + h > ry0;
+  }
+  function bubbleAnchor(b) {                       // follows its sprite while it lives
+    const s = b.s;
+    if (s && !s.dead) { b.ax = s.x; b.ay = s.y + s.jumpY - 52; }
+  }
+  // voice-UI courtesy: while the page's floating voice control is listening /
+  // thinking / speaking it grows, so BUBBLES (only) treat a wider mic dead
+  // zone — centerX ± min(170, innerWidth/2 - 16).  Sprite waypoints, the car
+  // and the invite chip keep the plain DEAD_HALF zone.  Sampled at spawn time.
+  let bubDeadPad = 0;                              // extra half-width, 0 when idle
+  function refreshBubbleDead() {
+    bubDeadPad = 0;
+    try {
+      const vc = document.querySelector('.vc-root');
+      if (vc && vc.classList &&
+          (vc.classList.contains('listening') || vc.classList.contains('thinking') ||
+           vc.classList.contains('speaking'))) {
+        const half = Math.min(170, window.innerWidth / 2 - 16);
+        bubDeadPad = Math.max(0, half - DEAD_HALF);
+      }
+    } catch (e) { bubDeadPad = 0; }
+  }
+  // WHERE A BUBBLE ACTUALLY LANDS: viewport clamp, then the mic-dead-zone and
+  // tetris-HUD displacements.  ONE helper, used by both the spawn-time overlap
+  // test and drawBubbles — measuring the pre-displacement rect in one place and
+  // the post-displacement rect in the other is how two bubbles ended up
+  // overlapping.  Returns a REUSED object: read it before calling again.
+  const bubPos = { x: 0, y: 0 };
+  function bubbleRect(ax, ay, w) {
+    const vw = window.innerWidth, vh = window.innerHeight;
+    const h = BUB_H + BUB_TAIL;
+    let x = clamp(ax - w / 2, 4, Math.max(4, vw - w - 4));
+    let y = clamp(ay - BUB_TAIL - BUB_H, 4, Math.max(4, vh - h - 4));
+    const dx0 = dead.x0 - bubDeadPad, dx1 = dead.x1 + bubDeadPad;
+    if (rectsHit(x, y, w, h, dx0, dead.y0, dx1, 1e9)) {     // never over the mic
+      x = (ax < (dx0 + dx1) / 2) ? dx0 - w - 4 : dx1 + 4;
+      x = clamp(x, 4, Math.max(4, vw - w - 4));
+    }
+    // never over the tetris HUD band: the panel card's top down to the board
+    // top (score / lines / level / NEXT live in there, and their height is set
+    // by the theme's fonts — it was never a fixed 34px header)
+    if (tetris.active && tetris.pw > 0 && tetris.py > tetris.panelTop &&
+        rectsHit(x, y, w, h, tetris.px, tetris.panelTop, tetris.px + tetris.pw, tetris.py))
+      y = tetris.py + 2;                           // drop onto the board itself
+    bubPos.x = x; bubPos.y = y;
+    return bubPos;
+  }
+  function bubbleSay(s, text) {
+    if (!live || !ctx || !s || s.dead || !text) return false;
+    let slot = -1;
+    for (let i = 0; i < 2; i++) {
+      if (bubbles[i].on && bubbles[i].s === s) return false;   // one per sprite
+      if (!bubbles[i].on && slot < 0) slot = i;
+    }
+    if (slot < 0) return false;                    // manager rule: max 2 — skip
+    const b = bubbles[slot];
+    ctx.font = BUB_FONT;
+    const w = Math.min(Math.ceil(ctx.measureText(text).width) + BUB_PAD * 2,
+                       window.innerWidth - 8);
+    b.s = s; bubbleAnchor(b);
+    refreshBubbleDead();                           // one DOM read per spawn, not per frame
+    // overlap rule: would it intersect the other live bubble WHERE EACH ONE
+    // ACTUALLY DRAWS (after dead-zone / HUD displacement)?  then skip
+    const o = bubbles[1 - slot];
+    if (o.on) {
+      const mine = bubbleRect(b.ax, b.ay, w);
+      const nx = mine.x, ny = mine.y;               // copy: bubbleRect reuses its object
+      bubbleAnchor(o);
+      const theirs = bubbleRect(o.ax, o.ay, o.w);
+      if (rectsHit(nx, ny, w, BUB_H + BUB_TAIL,
+                   theirs.x, theirs.y, theirs.x + o.w, theirs.y + BUB_H + BUB_TAIL)) {
+        b.s = null; return false;
+      }
+    }
+    b.on = true; b.text = text; b.w = w;
+    b.life = 0;
+    b.ttl = clamp(2200 + text.length * 40, 2200, 3500);   // life scales with length
+    return true;
+  }
+  function bubbleUpdate(dt) {
+    for (let i = 0; i < 2; i++) {
+      const b = bubbles[i];
+      if (!b.on) continue;
+      b.life += dt;
+      if (b.s && b.s.dead) b.life = Math.max(b.life, b.ttl - 260);  // owner left: fade now
+      if (b.life >= b.ttl) { b.on = false; b.s = null; }
+    }
+  }
+  function clearBubbles() {
+    for (let i = 0; i < 2; i++) { bubbles[i].on = false; bubbles[i].s = null; }
+  }
+  function drawPixelBubble(g, x, y, w, h, tailX) { // rounded pixel rect + pixel tail
+    g.fillStyle = THEME.ink;                       // 2px outline, notched corners
+    g.fillRect(x + 2, y, w - 4, h);
+    g.fillRect(x, y + 2, w, h - 4);
+    g.fillRect(x + 1, y + 1, 1, 1); g.fillRect(x + w - 2, y + 1, 1, 1);
+    g.fillRect(x + 1, y + h - 2, 1, 1); g.fillRect(x + w - 2, y + h - 2, 1, 1);
+    g.fillRect(tailX - 4, y + h, 8, 2);            // 4px-scale stepped tail
+    g.fillRect(tailX - 2, y + h + 2, 4, 2);
+    g.fillStyle = THEME.bub;
+    g.fillRect(x + 2, y + 2, w - 4, h - 4);
+    g.fillRect(tailX - 3, y + h - 2, 6, 2);
+    g.fillRect(tailX - 1, y + h, 2, 2);
+  }
+  function drawBubbles(g) {
+    if (!bubbles[0].on && !bubbles[1].on) return;
+    g.font = BUB_FONT; g.textAlign = 'center'; g.textBaseline = 'middle';
+    for (let i = 0; i < 2; i++) {
+      const b = bubbles[i];
+      if (!b.on) continue;
+      bubbleAnchor(b);
+      // the SAME placement the spawn-time overlap test used: viewport clamp,
+      // mic dead zone, tetris HUD band
+      const r = bubbleRect(b.ax, b.ay, b.w);
+      const x = r.x, y = r.y;
+      const tailX = clamp(Math.round(b.ax), x + 8, x + b.w - 8);
+      const sc = REDUCED ? 1 : easePop(Math.min(1, b.life / 160));   // pop-in overshoot
+      const a = b.life > b.ttl - 260 ? (b.ttl - b.life) / 260 : Math.min(1, b.life / 120);
+      const cx2 = Math.round(x + b.w / 2), cy2 = Math.round(y + BUB_H / 2);
+      g.save();
+      g.globalAlpha = clamp(a, 0, 1);
+      g.translate(cx2, cy2); g.scale(sc, sc); g.translate(-cx2, -cy2);
+      drawPixelBubble(g, Math.round(x), Math.round(y), b.w, BUB_H, tailX);
+      g.fillStyle = THEME.ink;
+      g.fillText(b.text, cx2, cy2 + 1);
+      g.restore();
+    }
+    g.globalAlpha = 1;
+  }
+
+  /* ── cursor awareness — position, stillness, and smoothed speed (px/ms;
+   * pointermove covers mouse AND touch drags, so swipes can trigger dodges) ── */
+  const mouse = { x: -9999, y: -9999, movedAt: 0, speed: 0, dirX: 0, dirY: 0, at: 0 };
   function onMouse(e) {
+    const now = performance.now();
     const dx = e.clientX - mouse.x, dy = e.clientY - mouse.y;
-    if (dx * dx + dy * dy > 9) mouse.movedAt = performance.now();
+    if (dx * dx + dy * dy > 9) mouse.movedAt = now;
+    const dtm = now - mouse.at;
+    if (dtm > 0 && dtm < 120) {
+      const sp = Math.sqrt(dx * dx + dy * dy) / dtm;
+      mouse.speed += (sp - mouse.speed) * 0.5;     // light smoothing
+      if (sp > 0.02) { mouse.dirX = dx; mouse.dirY = dy; }
+    } else mouse.speed = 0;                        // stale gap: not a lunge
+    mouse.at = now;
     mouse.x = e.clientX; mouse.y = e.clientY;
+  }
+
+  /* ── tap / click play — a PASSIVE window pointerdown hit-tests sprite
+   * bboxes (+10px pad).  NEVER preventDefault: the canvas is pointer-events
+   * none and this listener is passive, so the event reaches the page
+   * untouched either way. ────────────────────────────────────────────────── */
+  function onPointerDown(e) {
+    if (!live) return;
+    const px = e.clientX, py = e.clientY;
+    for (let i = 0; i < sprites.length; i++) {
+      const s = sprites[i];
+      if (s.dead || s.retiring || s.alpha < 0.5) continue;
+      const sy = s.y + s.jumpY;
+      // char box is ~±21 × 45 tall at ×3 — pad by 10 on every side
+      if (px >= s.x - 31 && px <= s.x + 31 && py >= sy - 55 && py <= sy + 10) {
+        tapSprite(s, px);
+        break;
+      }
+    }
+  }
+  function tapSprite(s, px) {
+    if (simNow < s.tapCd) return;                  // 2s per-sprite cooldown
+    const k = s.perf.kind;
+    if (s.state === 'celebrate' ||
+        (s.state === 'react' && (k === 'dyn' || k === 'dynplant' || k === 'scurry' || k === 'invite')))
+      return;                                      // don't derail set pieces
+    s.tapCd = simNow + TAP_CD;
+    const talk = Math.random() < 0.45;             // MAY answer with a bubble
+    if (REDUCED) { if (talk) bubbleSay(s, pickLine('tap')); return; }
+    const r = randi(4);
+    if (r === 0) {                                 // startled hop, squash first
+      s.extraSY = 0.8;
+      beginPerf(s, 'cheer', s.x, '', 0);
+      s.jumpV = -200; s.landed = false;
+    } else if (r === 1) {                          // quick spin
+      beginPerf(s, 'spin', s.x, '', 0);
+    } else if (r === 2) {                          // wave at the finger
+      const want = px >= s.x ? 1 : -1;
+      if (want !== s.facing) beginTurn(s, want, 'wave'); else beginState(s, 'wave');
+    } else {                                       // heart pop
+      emit(K_HEART, s.x, s.y + s.jumpY - 62, 0, -34, 1400, 2, 0, 0);
+      s.happyUntil = simNow + 1200;
+      s.extraSY = 1.12;
+    }
+    if (talk) bubbleSay(s, pickLine('tap'));
   }
 
   /* ── shared runtime state ───────────────────────────────────────────────── */
@@ -604,7 +912,7 @@ GAME_JS = r'''
   const flags = [ { on: false, x: 0, y: 0, t0: 0, label: '' },
                   { on: false, x: 0, y: 0, t0: 0, label: '' } ];
   const car = { on: false, x: 0, y: 0, px: 0, py: 0, vx: 0, dir: 1, phase: 0, t: 0,
-                bandIx: 0, honked: false, wheelT: 0, bounce: 0 };
+                bandIx: 0, honked: false, wheelT: 0, bounce: 0, stopX: 0 };
 
   function tryAttention(dur) {
     if (simNow < attUntil) return false;
@@ -641,6 +949,9 @@ GAME_JS = r'''
       springInit: false,
       retiring: false, dead: false,
       fadeMix: 0, poseSwapAt: 0,                  // reduced-motion cross-fades
+      tapCd: 0, dodgeCd: 0, dodgeDir: 1,          // pointer-play cooldowns
+      quipAt: rand(IDLE_QUIP_MIN, IDLE_QUIP_MAX), // idle chat-bubble timer
+      duty: 0, col: 0, colH: -1, colAt: 0,        // tetris rooftop duty
     };
   }
   function setAnim(s, name, rate, frame) {
@@ -664,7 +975,7 @@ GAME_JS = r'''
     }
     if (REDUCED) { s.x = s.tx; s.y = s.ty; }      // reduced motion: no offscreen enter-walk
     s.px = s.x; s.py = s.y;
-    s.blinkAt += simNow; s.breakAt += simNow; s.sleepAt += simNow;
+    s.blinkAt += simNow; s.breakAt += simNow; s.sleepAt += simNow; s.quipAt += simNow;
     beginState(s, 'enter');
     if (withScroll) { s.prop = 'scroll'; s.propT = 0; }
     sprites.push(s);
@@ -674,7 +985,7 @@ GAME_JS = r'''
     let best = null;
     for (let i = 0; i < sprites.length; i++) {
       const s = sprites[i];
-      if (s.retiring || s.dead) continue;
+      if (s.retiring || s.dead || s.duty) continue;   // rooftop crew is busy
       if (s.state === 'idle' || s.state === 'walk' || s.state === 'idleBreak' || s.state === 'sleep') return s;
       if (!best) best = s;
     }
@@ -710,6 +1021,7 @@ GAME_JS = r'''
         break;
       }
       case 'slump': setAnim(s, 'slump', 1, 0); break;
+      case 'tetris': setAnim(s, 'idle', 1, 0); s.colH = -1; break;
     }
   }
   function beginTurn(s, dir, after) {
@@ -730,6 +1042,10 @@ GAME_JS = r'''
     else if (kind === 'cheer') { setAnim(s, 'celebrate', 0, 2); s.jumpV = -130; s.landed = false; }
     else if (kind === 'hop') { setAnim(s, 'celebrate', 0, 1); s.jumpV = -180; s.landed = false; s.prop = 'check'; s.propT = 0; }
     else if (kind === 'delayjump') { setAnim(s, 'idle', 1, 0); }
+    else if (kind === 'dodge') { setAnim(s, 'idle', 0, 0); s.perf.delay = 0; }
+    else if (kind === 'spin') { setAnim(s, 'idle', 0, 0); }
+    else if (kind === 'invite') { setAnim(s, 'turn', 0, 1); }   // face the viewer
+    else if (kind === 'dyn') { setAnim(s, 'walk', 1.6, 0); s.walkRamp = 0; }
   }
   function endPerf(s) {
     s.perf.kind = ''; s.prop = ''; s.animRate = 1;
@@ -784,6 +1100,18 @@ GAME_JS = r'''
     const dx = mouse.x - hx, dy = mouse.y - hy;
     const d2 = dx * dx + dy * dy;
     const engaged = (s.state === 'idle' || s.state === 'walk' || s.state === 'idleBreak');
+    // FAST approach (flick or swipe) toward the sprite -> DODGE: anticipation
+    // lean, then a sidestep hop away from the pointer vector.  3s cooldown.
+    if (engaged && mouse.speed > DODGE_SPEED && simNow >= s.dodgeCd &&
+        performance.now() - mouse.movedAt < 90 && d2 < 70 * 70 &&
+        (mouse.dirX * -dx + mouse.dirY * -dy) > 0) {   // pointer motion points AT the sprite
+      s.dodgeCd = simNow + DODGE_CD;
+      s.dodgeDir = (hx - mouse.x) >= 0 ? 1 : -1;       // hop away from the pointer
+      beginPerf(s, 'dodge', s.x, '', 0);
+      if (Math.random() < 0.4) bubbleSay(s, pickLine('dodge'));
+      return;
+    }
+    if (COARSE) return;   // touch devices have no hover — tap covers interaction
     if (d2 < ATT_R2 && engaged) {
       // head tracks the cursor while the body keeps doing what it was doing
       const k = Math.min(1, dt / 140);
@@ -839,6 +1167,13 @@ GAME_JS = r'''
       }
     }
     cursorLogic(s, dt);
+    // idle chat quips: every 45-120s per sprite, gated so they stay rare
+    if (simNow >= s.quipAt) {
+      s.quipAt = simNow + rand(IDLE_QUIP_MIN, IDLE_QUIP_MAX);
+      if ((s.state === 'idle' || s.state === 'walk' || s.state === 'idleBreak') &&
+          Math.random() < 0.65)
+        bubbleSay(s, pickLine('idle'));
+    }
     s.stateT += dt;
 
     switch (s.state) {
@@ -852,6 +1187,7 @@ GAME_JS = r'''
         break;
       }
       case 'idle': {
+        if (s.duty) { beginState(s, 'tetris'); break; }   // rooftop crew bounce back
         if (simNow >= s.breakAt) {
           pickBreak(s);
           s.breakAt = simNow + rand(6000, 14000) / s.pers.breakBias;
@@ -883,9 +1219,12 @@ GAME_JS = r'''
           if (after === 'walk') beginState(s, 'walk');
           else if (after === 'notice') beginState(s, 'notice');
           else if (after === 'wave') beginState(s, 'wave');
-          else if (after === 'react' && s.perf.kind) {   // flag carrier mid-turn
+          else if (after === 'react' && s.perf.kind) {   // performer mid-turn
             beginState(s, 'react');
             if (s.perf.kind === 'flagrun') { setAnim(s, 'walk', 1.5, 0); s.walkRamp = 0; }
+            else if (s.perf.kind === 'dyn' || s.perf.kind === 'scurry') {
+              setAnim(s, 'walk', 1.7, 0); s.walkRamp = 0.3;
+            }
           }
           else beginState(s, 'idle');
         }
@@ -986,7 +1325,67 @@ GAME_JS = r'''
           if (p.t >= 950) endPerf(s);
         } else if (p.kind === 'delayjump') {
           if (p.t >= p.delay) beginCelebrate(s, p.reps, p.intensity);
+        } else if (p.kind === 'dodge') {
+          if (p.delay === 0) {                     // 90ms anticipation lean INTO the threat
+            s.lean = -0.14 * s.dodgeDir * Math.min(1, p.t / 90);
+            if (p.t >= 90) {
+              p.delay = 1;
+              s.jumpV = -150; s.landed = false;
+              s.extraSY = 0.86;                    // push-off squash
+            }
+          } else {                                 // airborne sidestep away
+            const b = bandOf(s);
+            s.x = clamp(s.x + s.dodgeDir * 170 * (dt / 1000), b.x + 16, b.x + b.w - 16);
+            if (s.landed || p.t > 600) endPerf(s);
+          }
+        } else if (p.kind === 'spin') {
+          const t = Math.min(1, p.t / 340);        // one full flat-sprite spin
+          s.sx = s.facing * Math.cos(t * Math.PI * 2);
+          if (Math.abs(s.sx) < 0.15) s.sx = s.sx < 0 ? -0.15 : 0.15;
+          if (t >= 1) { s.sx = s.facing; endPerf(s); }
+        } else if (p.kind === 'invite') {
+          s.sx = s.facing;                         // held front pose; the chip drives exit
+          if (!tetris.inviteOn || tetris.inviteSprite !== s) endPerf(s);
+        } else if (p.kind === 'dyn') {             // approach the tall column
+          s.ty = s.y;
+          s.tx = p.tx;
+          if (moveToward(s, dt, 1.7)) {
+            p.kind = 'dynplant'; p.t = 0;
+            setAnim(s, 'celebrate', 0, 0);         // crouch to plant
+          }
+        } else if (p.kind === 'dynplant') {
+          if (p.t >= 350) {
+            dynArm(s);                             // fuse lit — scurry target set inside
+            p.kind = 'scurry'; p.t = 0;
+            setAnim(s, 'walk', 1.8, 0); s.walkRamp = 0.4;
+          }
+        } else if (p.kind === 'scurry') {
+          s.ty = s.y;
+          if (moveToward(s, dt, 2) || p.t > 1400) endPerf(s);
         }
+        break;
+      }
+      case 'tetris': {                             // rooftop duty on the krabTetris stack
+        if (!tetris.active || !tetris.geo) { releaseDuty(s); break; }
+        if (simNow >= s.colAt) {                   // wander to another column now and then
+          s.colAt = simNow + rand(4000, 9000);
+          s.col = randi(tetris.cols);
+        }
+        const h = tColH(s.col);
+        if (h !== s.colH) {                        // the stack moved under them: small hop
+          if (s.colH >= 0 && s.jumpY === 0) { s.jumpV = -120; s.landed = false; }
+          s.colH = h;
+        }
+        const gx = clamp(tColX(s.col), tetris.px + 8, tetris.px + tetris.pw - 8);
+        const gy = tStackY(s.col) - 1;
+        s.y += clamp(gy - s.y, -260 * dts, 260 * dts);   // ride the stack top
+        const ddx = gx - s.x, add = Math.abs(ddx);
+        if (add > 3) {
+          const dir = ddx < 0 ? -1 : 1;
+          s.facing = s.sx = dir;
+          s.x += dir * Math.min(add, 52 * dts);
+          if (s.anim !== 'walk') setAnim(s, 'walk', 1.2, 0);
+        } else if (s.anim !== 'idle') setAnim(s, 'idle', 1, randi(2));   // sit between moves
         break;
       }
       case 'exit': {
@@ -1132,9 +1531,15 @@ GAME_JS = r'''
   function carStart() {
     car.on = true; car.t = 0; car.honked = false; car.wheelT = 0; carHonkT = 0;
     if (bands.mode === 'strip') {
+      // the car path NEVER enters the mic dead zone: drive in from an edge,
+      // brake short of it, honk, U-turn, leave — same choreography as a rail
       const b = bands.a;
-      car.bandIx = 0; car.phase = 0;
+      car.bandIx = 0; car.phase = 1;
       car.dir = Math.random() < 0.5 ? 1 : -1;
+      car.stopX = car.dir > 0 ? dead.x0 - 48 : dead.x1 + 48;
+      if (car.dir > 0 ? car.stopX < b.x + 60 : car.stopX > b.x + b.w - 60) {
+        car.on = false; return;                    // no room on this viewport: skip
+      }
       car.x = car.dir > 0 ? b.x - 40 : b.x + b.w + 40;
       car.y = b.y + b.h - 6;
       car.px = car.x; car.py = car.y;
@@ -1144,6 +1549,7 @@ GAME_JS = r'''
       const b = car.bandIx ? bands.b : bands.a;
       const left = (b.x === 0);                    // band side, not band index (single-rail safe)
       car.dir = left ? 1 : -1;                     // enter from the screen edge
+      car.stopX = left ? b.x + b.w - 36 : b.x + 36;   // brake toward the inner edge
       car.x = left ? b.x - 40 : b.x + b.w + 40;
       car.y = b.y + b.h - 6;
       car.px = car.x; car.py = car.y;
@@ -1163,17 +1569,12 @@ GAME_JS = r'''
     car.wheelT += dt * Math.min(1, Math.abs(car.vx) / 60);
     car.bounce = Math.sin(car.t / 70) * (Math.abs(car.vx) > 20 ? 1 : 0.3);   // slight bounce
     const b = (car.bandIx && bands.n > 1) ? bands.b : bands.a;
-    if (car.phase === 0) {                         // strip: straight across
+    if (car.phase === 1) {                         // brake toward the stop mark
       car.x += car.vx * dts;
-      if (!car.honked && Math.abs(car.x - (b.x + b.w / 2)) < 90) honk();
-      if (car.dir > 0 ? car.x > b.x + b.w + 50 : car.x < b.x - 50) car.on = false;
-    } else if (car.phase === 1) {                  // rail: brake toward inner edge
-      const stopX = (b.x === 0) ? b.x + b.w - 36 : b.x + 36;
-      car.x += car.vx * dts;
-      const d = Math.abs(stopX - car.x);
+      const d = Math.abs(car.stopX - car.x);
       if (d < 70) car.vx = car.dir * Math.max(26, 150 * (d / 70));
-      if ((car.dir > 0 && car.x >= stopX) || (car.dir < 0 && car.x <= stopX)) {
-        car.x = stopX; car.vx = 0; car.phase = 2; car.t = 0; honk();
+      if ((car.dir > 0 && car.x >= car.stopX) || (car.dir < 0 && car.x <= car.stopX)) {
+        car.x = car.stopX; car.vx = 0; car.phase = 2; car.t = 0; honk();
       }
     } else if (car.phase === 2) {                  // held honk beat
       if (car.t > 800) { car.phase = 3; car.t = 0; }
@@ -1187,7 +1588,7 @@ GAME_JS = r'''
     // nearby idle sprites cheer at the car (small action — no attention slot)
     for (let i = 0; i < sprites.length; i++) {
       const s = sprites[i];
-      if (s.retiring || s.dead || s.cheerAt > simNow - 4000) continue;
+      if (s.retiring || s.dead || s.duty || s.cheerAt > simNow - 4000) continue;
       if ((s.state === 'idle' || s.state === 'walk') && Math.abs(s.x - car.x) < 240 &&
           Math.abs(s.y - car.y) < 200) {
         s.cheerAt = simNow;
@@ -1296,9 +1697,10 @@ GAME_JS = r'''
     if (cfg.big) lastBigAt = simNow;
     attUntil = Math.max(attUntil, reactUntil);      // a reaction owns the attention budget
     const pmul = TIERS[tier].pmul;
+    let voice = null;                               // ONE event bubble per coalesced reaction
     if (type === 'deal.won') {
       const s = pickPerformer();
-      if (s) { beginCelebrate(s, 1 + inten, inten); s.happyUntil = simNow + 2500; }
+      if (s) { beginCelebrate(s, 1 + inten, inten); s.happyUntil = simNow + 2500; voice = s; }
       if (pmul > 0) {
         const n = (26 * inten * pmul) | 0;
         if (bands.mode === 'rails') {
@@ -1313,27 +1715,34 @@ GAME_JS = r'''
         const b = bandOf(s);
         const tx = s.x < b.x + b.w / 2 ? b.x + b.w - 28 : b.x + 28;
         beginPerf(s, 'flagrun', tx, label, 0);
+        voice = s;
       }
     } else if (type === 'lead.created') {
-      if (sprites.length < desiredSprites()) spawnSprite(true);
-      else { const s = pickPerformer(); if (s) beginPerf(s, 'scroll', s.x, '', 0); }
+      if (sprites.length < desiredSprites()) voice = spawnSprite(true);
+      else { const s = pickPerformer(); if (s) { beginPerf(s, 'scroll', s.x, '', 0); voice = s; } }
     } else if (type === 'driver.on_the_way') {
       carStart();
+      voice = pickPerformer();
     } else if (type === 'task.completed') {
       const s = pickPerformer();
-      if (s) { beginPerf(s, 'hop', s.x, '', 0); s.happyUntil = simNow + 1000; }
+      if (s) { beginPerf(s, 'hop', s.x, '', 0); s.happyUntil = simNow + 1000; voice = s; }
     } else if (type === 'goal.hit') {              // the biggest moment
       goal.phase = 1; goal.at = simNow + 2400; goal.inten = inten;
       for (let i = 0; i < sprites.length; i++) {
         const s = sprites[i];
-        if (s.retiring || s.dead) continue;
+        if (s.retiring || s.dead || s.duty) continue;   // rooftop crew stays put
         const b = bandOf(s);
         s.tx = b.x + b.w / 2;
-        s.ty = bands.mode === 'strip' ? b.y + b.h - 10 : b.y + b.h * 0.78;
+        if (bands.mode === 'strip') {
+          s.tx = stripX(s.x);                      // gather, but outside the mic dead zone
+          s.ty = b.y + b.h - 10;
+        } else s.ty = b.y + b.h * 0.78;
         if (s.state !== 'walk') beginState(s, 'walk');   // reactions interrupt idle
+        if (!voice) voice = s;
       }
       glowScreen = 1;
     }
+    if (voice) bubbleSay(voice, pickLine(type));
   }
   function goalUpdate(dt) {
     if (goal.phase === 0) return;
@@ -1342,7 +1751,7 @@ GAME_JS = r'''
       let k = 0;
       for (let i = 0; i < sprites.length; i++) {
         const s = sprites[i];
-        if (s.retiring || s.dead) continue;
+        if (s.retiring || s.dead || s.duty) continue;
         beginPerf(s, 'delayjump', s.x, '', k * 130);    // staggered, never lockstep
         s.perf.reps = 2 + (goal.inten | 0);
         s.perf.intensity = goal.inten || 1;
@@ -1418,12 +1827,419 @@ GAME_JS = r'''
     }
   }
 
+  /* ── tetris integration — window.krabTetris is OPTIONAL and typeof-guarded
+   * at every touch point.  Expected surface (all reads are defensive):
+   *   krabTetris.start({onEvent, onClose})   krabTetris.stop()
+   *   krabTetris.geometry() ->
+   *     { rect:{left,top,width,height},  BOARD rect in viewport px
+   *       cell, cols, rows,    cell size + grid dimensions
+   *       colHeights }         settled-stack height per column, in cells
+   *   krabTetris.blast(col, rowNearTop)      krabTetris.nudge(±1)
+   *   krabTetris.pause(on)                   krabTetris.active()
+   *   krabTetris.element?                    panel CARD node — the shake target,
+   *                                          and the top of the HUD band that
+   *                                          bubbles must clear (its rect top
+   *                                          down to the board top; the old
+   *                                          fixed headerH was a wrong guess)
+   * The USER CLOSING the panel arrives as the onClose CALLBACK, never as an
+   * event; RESTART after game over arrives as a fresh 'start' event on a panel
+   * that is still live, which we re-adopt.
+   * While a game runs the sprite canvas z-index is raised to 23 (panel: 22)
+   * so sprites draw OVER the panel; pointer-events stays none, so play is
+   * unaffected.  geometry() is polled at LOGIC rate, ONLY while active. */
+  const tetris = {
+    active: false, starting: false, geo: null,
+    px: 0, py: 0, pw: 0, ph: 0, headerH: 34, cell: 8, cols: 10, rows: 20,
+    panelTop: 0, panelTopAt: -1e9,               // measured card top (HUD band)
+    inviteOn: false, inviteEl: null, inviteAt: 0, inviteSprite: null,
+    declineUntil: 0, lastGameAt: 0,
+    blasts: 0, lastBlastAt: -1e9, nudgeAt: -1e9, nudgePendAt: 0, nudgeDir: 1,
+    shakeT: 0, shakeArmed: false,
+    panelEl: null, prevTransform: '', shakeA: '', shakeB: '',
+  };
+  const dyn = { on: false, t: 0, x: 0, y: 0, col: 0 };   // one dynamite at a time
+  function KT() {
+    return (typeof window.krabTetris !== 'undefined' && window.krabTetris)
+      ? window.krabTetris : null;
+  }
+  function tPollGeo() {
+    const kt = KT();
+    if (!kt || typeof kt.geometry !== 'function') { tetris.geo = null; return; }
+    let g = null;
+    try { g = kt.geometry(); } catch (e) { g = null; }
+    tetris.geo = (g && typeof g === 'object') ? g : null;
+    if (!tetris.geo) return;
+    // The real module reports rect:{left,top,width,height}; older shapes
+    // used bare x/y/w/h — accept both so the interface cannot drift apart.
+    const _r = tetris.geo.rect;
+    tetris.px = (+tetris.geo.x || 0) || (_r ? (+_r.left || 0) : 0);
+    tetris.py = (+tetris.geo.y || 0) || (_r ? (+_r.top || 0) : 0);
+    tetris.pw = (+tetris.geo.w || 0) || (_r ? (+_r.width || 0) : 0);
+    tetris.ph = (+tetris.geo.h || 0) || (_r ? (+_r.height || 0) : 0);
+    tetris.headerH = (+tetris.geo.headerH > 0) ? +tetris.geo.headerH : 34;
+    tetris.cols = (tetris.geo.colHeights && tetris.geo.colHeights.length) ||
+                  ((+tetris.geo.cols > 0) ? (+tetris.geo.cols | 0) : 10);
+    tetris.rows = (+tetris.geo.rows > 0) ? (+tetris.geo.rows | 0) : 20;
+    tetris.cell = (+tetris.geo.cell > 0) ? +tetris.geo.cell
+                : (tetris.pw > 0 ? tetris.pw / tetris.cols : 8);
+    // the HUD band bubbles must clear runs from the panel CARD's top down to
+    // the board top — MEASURED off the card, because the header + stats rows
+    // are as tall as the theme's fonts make them.  At most 4 reads/second.
+    if (simNow - tetris.panelTopAt > 250) {
+      tetris.panelTopAt = simNow;
+      const el = tetris.panelEl;
+      let top = tetris.py - tetris.headerH;         // fallback: the old estimate
+      if (el && el.getBoundingClientRect) {
+        try { const pr = el.getBoundingClientRect(); if (pr) top = pr.top; } catch (e) {}
+      }
+      tetris.panelTop = (top < tetris.py) ? top : tetris.py;
+    }
+  }
+  function tColH(c) {
+    const g = tetris.geo;
+    if (!g || !g.colHeights || c >= g.colHeights.length) return 0;
+    return g.colHeights[c] | 0;
+  }
+  function tColX(c) { return tetris.px + (c + 0.5) * tetris.cell; }
+  function tStackY(c) {                            // viewport y of col c's stack top
+    return tetris.py + tetris.ph - tColH(c) * tetris.cell;
+  }
+  function tTallestCol() {
+    let best = 0, bh = -1;
+    for (let c = 0; c < tetris.cols; c++) { const h = tColH(c); if (h > bh) { bh = h; best = c; } }
+    return best;
+  }
+  function firstDuty() {
+    for (let i = 0; i < sprites.length; i++) {
+      const s = sprites[i];
+      if (s.duty && !s.dead && !s.retiring) return s;
+    }
+    return null;
+  }
+
+  /* invite chip — the ONE interactive DOM element this layer may own: two
+   * 44px-target buttons, theme-styled via the page's CSS variables, auto-
+   * dismissed from the logic clock (no timers to leak), removed on teardown. */
+  function removeInviteChip() {
+    tetris.inviteOn = false;
+    if (tetris.inviteEl && tetris.inviteEl.parentNode)
+      tetris.inviteEl.parentNode.removeChild(tetris.inviteEl);
+    tetris.inviteEl = null;
+    const s = tetris.inviteSprite;
+    tetris.inviteSprite = null;
+    if (s && !s.dead && s.state === 'react' && s.perf.kind === 'invite') endPerf(s);
+  }
+  function onInviteYes() { removeInviteChip(); startTetris(); }
+  function onInviteNo() {
+    tetris.declineUntil = simNow + INVITE_DECLINE; // NO -> 5min cooldown
+    tetris.lastGameAt = simNow;
+    removeInviteChip();
+  }
+  function showInvite(s) {
+    tetris.inviteOn = true; tetris.inviteAt = simNow; tetris.inviteSprite = s;
+    beginPerf(s, 'invite', s.x, '', 0);            // stop, face out
+    bubbleSay(s, pickLine('invite'));
+    const el = document.createElement('div');
+    el.setAttribute('data-krab-game', 'invite');
+    // placed AFTER it is measured: hidden first, so the clamp and the mic
+    // dead-zone test use the chip's REAL box (the buttons are theme-styled —
+    // font metrics decide the width; the old 124/132px guess put it under the
+    // mic button on wider fonts)
+    el.style.cssText = 'position:fixed;z-index:24;display:flex;gap:6px;padding:5px;' +
+      'border-radius:10px;background:var(--card,#fff);border:1px solid var(--line,#dfe1e6);' +
+      'box-shadow:0 6px 18px rgba(9,30,66,.22);left:0;top:0;visibility:hidden;';
+    const yes = document.createElement('button'), no = document.createElement('button');
+    yes.type = 'button'; no.type = 'button';
+    yes.textContent = 'YES'; no.textContent = 'NO';
+    const base = 'min-width:44px;min-height:44px;padding:0 10px;border-radius:8px;cursor:pointer;' +
+      'font:700 12px ui-monospace,SFMono-Regular,Menlo,monospace;';
+    yes.style.cssText = base + 'border:1px solid var(--accent,#0065ff);background:var(--accent,#0065ff);color:#fff;';
+    no.style.cssText = base + 'border:1px solid var(--line,#dfe1e6);background:transparent;color:var(--ink,#172b4d);';
+    yes.addEventListener('click', onInviteYes);
+    no.addEventListener('click', onInviteNo);
+    el.appendChild(yes); el.appendChild(no);
+    document.body.appendChild(el);
+    tetris.inviteEl = el;
+    const vw = window.innerWidth, vh = window.innerHeight;
+    const cw = Math.max(60, el.offsetWidth || 132);   // ONE layout read per invite
+    const ch = Math.max(44, el.offsetHeight || 54);
+    const maxX = Math.max(8, vw - cw - 8);
+    let lx = clamp(s.x - cw / 2, 8, maxX);
+    const ly = clamp(s.y - 150, 8, Math.max(8, vh - ch - 8));
+    if (lx + cw > dead.x0 && lx < dead.x1 && ly + ch > dead.y0)     // keep clear of the mic
+      lx = (s.x < vw / 2) ? clamp(dead.x0 - cw - 8, 8, maxX) : clamp(dead.x1 + 8, 8, maxX);
+    el.style.left = Math.round(lx) + 'px';       // whole px: crisp border, no blur
+    el.style.top = Math.round(ly) + 'px';
+    el.style.visibility = 'visible';
+  }
+
+  // the page styles its toasts out of the panel's way from this body class
+  function bodyTetrisClass(on) {
+    try {
+      if (!document.body) return;
+      if (on) document.body.classList.add('krab-tetris-on');
+      else document.body.classList.remove('krab-tetris-on');
+    } catch (e) {}
+  }
+  function armTetris(kt) {                         // shared: fresh start AND restart re-adopt
+    tetris.active = true; tetris.geo = null;
+    tetris.pw = 0; tetris.ph = 0;                  // no clip rect, no HUD band, and no
+                                                   //   bubble displacement against a
+                                                   //   previous game's stale geometry
+    tetris.blasts = 0; tetris.lastBlastAt = simNow;
+    tetris.nudgeAt = simNow; tetris.nudgePendAt = 0;
+    dyn.on = false;
+    removeInviteChip();                            // a running game supersedes any invite
+    tetris.panelEl = (kt.element && kt.element.style) ? kt.element
+                   : (kt.el && kt.el.style) ? kt.el : null;
+    // shake strings are built at ARM time (armShake) so a layout() transform
+    // change mid-game is never stomped — here they only get cleared
+    tetris.prevTransform = ''; tetris.shakeA = ''; tetris.shakeB = '';
+    tetris.shakeT = 0; tetris.shakeArmed = false;
+    tetris.panelTop = 0; tetris.panelTopAt = -1e9; // force a fresh card-top read
+    bodyTetrisClass(true);
+    if (cv) cv.style.zIndex = '23';                // over the panel (22); input unaffected
+    if (live && !REDUCED) { tPollGeo(); assignDuty(); }
+  }
+  function armShake() {                            // snapshot NOW, not at game start —
+    const el = tetris.panelEl;                     //   layout() may have moved the panel
+    tetris.prevTransform = el ? (el.style.transform || '') : '';
+    const pre = tetris.prevTransform ? tetris.prevTransform + ' ' : '';
+    tetris.shakeA = pre + 'translate(2px,1px)';    // prebuilt: no per-frame strings
+    tetris.shakeB = pre + 'translate(-2px,-1px)';
+    tetris.shakeT = 150; tetris.shakeArmed = true;
+  }
+  function startTetris() {
+    const kt = KT();
+    if (!kt || typeof kt.start !== 'function' || tetris.active) return;
+    // the module fires 'start' SYNCHRONOUSLY inside start(); the guard keeps
+    // the restart-adoption path in onTetrisEvent out of this fresh start
+    tetris.starting = true;
+    try {
+      kt.start({ onEvent: onTetrisEvent,
+                 onClose: function () { endTetris(false); } });   // user-close is a CALLBACK,
+    } catch (e) { tetris.starting = false; return; }              //   never an event
+    tetris.starting = false;
+    armTetris(kt);
+  }
+  function assignDuty() {                          // 1-2 sprites relocate to the panel
+    if (!tetris.geo || tetris.pw <= 0) return;
+    let active = 0;
+    for (let i = 0; i < sprites.length; i++)
+      if (!sprites[i].retiring && !sprites[i].dead) active++;
+    let want = Math.min(active >= 3 ? 2 : 1, active);
+    for (let i = 0; i < sprites.length; i++) if (sprites[i].duty) want--;
+    for (let i = 0; i < sprites.length && want > 0; i++) {
+      const s = sprites[i];
+      if (s.retiring || s.dead || s.duty) continue;
+      if (s.state === 'celebrate' || s.state === 'react') continue;
+      s.duty = 1; want--;
+      s.col = randi(tetris.cols); s.colH = -1;
+      s.colAt = simNow + rand(4000, 9000);
+      s.x = tetris.px + ((s.col < tetris.cols / 2) ? 8 : tetris.pw - 8);
+      s.y = tetris.py + tetris.ph - 2;
+      s.px = s.x; s.py = s.y;
+      s.alpha = 0;                                 // fade in on the panel
+      s.jumpY = 0; s.jumpV = 0; s.prop = '';
+      beginState(s, 'tetris');
+    }
+  }
+  function releaseDuty(s) {                        // …and walk back onto their rails
+    s.duty = 0; s.colH = -1; s.prop = '';
+    s.bandIx = bands.n > 1 ? s.pers.rail : 0;
+    const b = bandOf(s);
+    s.x = clamp(s.x, b.x + 16, b.x + b.w - 16);
+    s.y = (bands.mode === 'strip') ? b.y + b.h - 10
+        : b.y + 56 + Math.random() * Math.max(8, b.h - 70);
+    s.px = s.x; s.py = s.y;
+    s.alpha = 0; s.jumpY = 0; s.jumpV = 0;         // fade back in on the rail
+    pickWaypoint(s);
+    beginState(s, 'idle');
+  }
+  function endTetris(alsoStop) {
+    removeInviteChip();
+    bodyTetrisClass(false);                        // toasts go back where they were
+    const wasActive = tetris.active;
+    if (!wasActive && !alsoStop) return;
+    const kt = KT();
+    if (alsoStop && kt && typeof kt.stop === 'function') { try { kt.stop(); } catch (e) {} }
+    if (!wasActive) return;
+    tetris.active = false; tetris.geo = null; tetris.lastGameAt = simNow;
+    dyn.on = false;
+    // restore ONLY a transform we actually took a snapshot of: with no shake
+    // this game, prevTransform is '' — writing it would wipe the panel's own
+    // centering translate on a game-over panel that stays on screen
+    if (tetris.panelEl && tetris.shakeArmed) {
+      try { tetris.panelEl.style.transform = tetris.prevTransform; } catch (e) {}
+    }
+    tetris.panelEl = null; tetris.shakeT = 0; tetris.shakeArmed = false;
+    if (cv) cv.style.zIndex = 'var(--z-sprites,20)';    // restore stacking
+    for (let i = 0; i < sprites.length; i++) {          // stop per-tick geometry polling;
+      const s = sprites[i];                             // rooftop crew heads home
+      if (s.duty && !s.dead) releaseDuty(s);
+      else s.duty = 0;
+    }
+  }
+  function onTetrisEvent(ev) {
+    // events from the game module are DATA — only known types act
+    const type = (typeof ev === 'string') ? ev
+               : (ev && typeof ev.type === 'string') ? ev.type : '';
+    if (type === 'start') {
+      // RESTART after game over: 'over' sent the crew home and cleared
+      // tetris.active, but the panel is still live and a human just pressed
+      // RESTART.  Re-adopt it — crew back on the roof, invites suppressed.
+      // (A fresh start() emits this synchronously; tetris.starting skips it,
+      // startTetris arms straight after.)
+      if (tetris.active || tetris.starting) return;
+      const kt = KT();
+      let livePanel = false;
+      try {
+        livePanel = !!kt && ((typeof kt.active === 'function') ? !!kt.active()
+                                                              : !!kt.element);
+      } catch (e) { livePanel = false; }
+      if (livePanel) armTetris(kt);
+    } else if (type === 'clear') {                 // line clear: rooftop crew cheers
+      let said = false;
+      for (let i = 0; i < sprites.length; i++) {
+        const s = sprites[i];
+        if (!s.duty || s.dead) continue;
+        s.jumpV = -170; s.landed = false; s.happyUntil = simNow + 1500;
+        if (TIERS[tier].pmul > 0) emitConfetti(s.x, s.y - 20, (5 * TIERS[tier].pmul) | 0);
+        if (!said) said = bubbleSay(s, pickLine('clear'));
+      }
+    } else if (type === 'over') {                  // game over: slump, then head home
+      const mourner = firstDuty();
+      endTetris(false);
+      if (mourner && !mourner.dead) {
+        beginState(mourner, 'slump');
+        bubbleSay(mourner, pickLine('over'));
+      }
+    } else if (type === 'close' || type === 'stop') {
+      endTetris(false);
+    }
+  }
+  function dynArm(s) {                             // fuse lit; sprite scurries away
+    dyn.on = true; dyn.t = 0;
+    dyn.x = s.perf.tx; dyn.y = tStackY(dyn.col);
+    s.perf.tx = (s.x > tetris.px + tetris.pw / 2)  // far side of the panel
+      ? tetris.px + 10 : tetris.px + tetris.pw - 10;
+  }
+  function drawDyn(g) {                            // 6x8px stick, blinking fuse tip
+    if (!dyn.on) return;
+    const x = Math.round(dyn.x) - 3, y = Math.round(dyn.y) - 8;
+    g.fillStyle = '#c8433c'; g.fillRect(x, y, 6, 8);
+    g.fillStyle = '#93271f'; g.fillRect(x + 4, y, 2, 8);
+    g.fillStyle = (((simNow / 120) | 0) % 2) ? '#ffd964' : '#e2543b';
+    g.fillRect(x + 2, y - 2, 2, 2);
+  }
+  function tetrisUpdate(dt) {
+    // invite chip auto-dismiss, driven by the logic clock
+    if (tetris.inviteOn && simNow - tetris.inviteAt >= INVITE_TTL) {
+      tetris.lastGameAt = simNow;                  // soft decline: wait a full idle window
+      removeInviteChip();
+    }
+    if (!tetris.active) {
+      // INVITE: idle >= 90s since boot/last game, tier High/Medium, not reduced
+      if (tetris.inviteOn || REDUCED || tier > 1) return;
+      if (simNow - tetris.lastGameAt < INVITE_IDLE || simNow < tetris.declineUntil) return;
+      const kt = KT();
+      if (!kt || typeof kt.start !== 'function') return;
+      const s = pickPerformer();
+      if (s && (s.state === 'idle' || s.state === 'walk' || s.state === 'idleBreak'))
+        showInvite(s);
+      return;
+    }
+    tPollGeo();                                    // LOGIC rate, only while active
+    if (!tetris.geo || tetris.pw <= 0) return;
+    if (!firstDuty()) assignDuty();                // keep 1-2 sprites on duty
+    // PANEL-only screen shake: 1-2px for 150ms, composed over the panel's own
+    // transform — the page itself never moves
+    if (tetris.shakeT > 0) {
+      tetris.shakeT -= dt;
+      const done = tetris.shakeT <= 0;
+      const el = tetris.panelEl;
+      if (el) {
+        try {
+          el.style.transform = done ? tetris.prevTransform
+            : ((((simNow / 30) | 0) % 2) ? tetris.shakeA : tetris.shakeB);
+        } catch (e) {}
+      }
+      // the snapshot is already back on the element — endTetris must not write
+      // this (by then possibly stale) string a second time
+      if (done) tetris.shakeArmed = false;
+    }
+    // DYNAMITE: at most 3 per game, >= 20s apart
+    if (dyn.on) {
+      dyn.t += dt;
+      dyn.y = tStackY(dyn.col);                    // ride the stack if it shifts
+      if (dyn.t >= 1100) {
+        const kt = KT();
+        const rowTop = clamp(tetris.rows - tColH(dyn.col), 0, tetris.rows - 1);
+        let cleared = 0;
+        if (kt && typeof kt.blast === 'function') {
+          try { cleared = kt.blast(dyn.col, rowTop) | 0; } catch (e) { cleared = 0; }
+        }
+        // blast() refuses during the 150ms line-clear flash. Book the cost only
+        // when something actually blew up — otherwise hold the fuse and try
+        // again next tick, so one of just three dynamites is never burned on a
+        // no-op (and the player never sees an explosion that destroyed nothing).
+        if (!cleared && kt && !tetris.dynGaveUp) {
+          dyn.t = 1000;                            // re-arm: retry on a later tick
+          if ((tetris.dynRetries = (tetris.dynRetries || 0) + 1) > 30)
+            tetris.dynGaveUp = true;               // ~0.5s of retries, then let it go
+          return;
+        }
+        tetris.dynRetries = 0; tetris.dynGaveUp = false;
+        dyn.on = false;
+        tetris.blasts++; tetris.lastBlastAt = simNow;
+        emitBoom(dyn.x, dyn.y - 6);
+        armShake();                                // re-snapshots the panel's CURRENT
+                                                   //   transform: a layout() move
+                                                   //   mid-game is never stomped
+        const vs = firstDuty();
+        if (vs) bubbleSay(vs, pickLine('boom'));
+      }
+    } else if (tetris.blasts < 3 && simNow - tetris.lastBlastAt >= 20000 &&
+               Math.random() < 0.0007) {           // per logic tick ≈ every ~24s once armed
+      const vs = firstDuty();
+      if (vs && vs.state === 'tetris' && tColH(tTallestCol()) > 2) {
+        dyn.col = tTallestCol();
+        tetris.lastBlastAt = simNow;               // stamp at LAUNCH: enforces the 20s
+        beginPerf(vs, 'dyn',                       //   gap and bars a second run mid-plant
+          clamp(tColX(dyn.col), tetris.px + 8, tetris.px + tetris.pw - 8), '', 0);
+      }
+    }
+    // MISCHIEF: max once per 30s, telegraphed 600ms ahead of the nudge
+    if (tetris.nudgePendAt) {
+      if (simNow >= tetris.nudgePendAt) {
+        tetris.nudgePendAt = 0;
+        const kt = KT();
+        // The sprite already announced this 600ms ago — so if the telegraphed
+        // direction is blocked (wall or stack), push the OTHER way rather than
+        // let the tell land on nothing.
+        if (kt && typeof kt.nudge === 'function') {
+          try {
+            if (!kt.nudge(tetris.nudgeDir)) kt.nudge(-tetris.nudgeDir);
+          } catch (e) {}
+        }
+      }
+    } else if (simNow - tetris.nudgeAt >= 30000 && Math.random() < 0.0006) {
+      const vs = firstDuty();
+      if (vs) {
+        tetris.nudgeAt = simNow;
+        tetris.nudgeDir = Math.random() < 0.5 ? -1 : 1;
+        tetris.nudgePendAt = simNow + 600;
+        bubbleSay(vs, pickLine('mischief'));       // "hehe >:)" — the tell
+      }
+    }
+  }
+
   /* ── population management ──────────────────────────────────────────────── */
   function desiredSprites() {
     if (MODE === 'off') return 0;
     if (!live || bands.mode === 'none') return 0;
     let n = TIERS[tier].sprites;
-    if (MODE === 'subtle') n = Math.min(2, n);     // subtle = 2 sprites
+    if (MODE === 'subtle') n = Math.min(bands.mobile ? 1 : 2, n);  // subtle: 2 (1 on mobile)
     if (REDUCED) n = Math.min(2, n);
     return n;
   }
@@ -1434,7 +2250,8 @@ GAME_JS = r'''
     if (active > want) {                            // too many: walk one off, fading
       for (let i = 0; i < sprites.length && active > want; i++) {
         const s = sprites[i];
-        if (!s.retiring && !s.dead && s.state !== 'react' && s.state !== 'celebrate') {
+        if (!s.retiring && !s.dead && !s.duty &&
+            s.state !== 'react' && s.state !== 'celebrate') {
           beginState(s, 'exit'); active--;
         }
       }
@@ -1477,6 +2294,7 @@ GAME_JS = r'''
       if (bands.mode !== 'none') {
         for (let i = 0; i < sprites.length; i++) {  // re-home into the new bands
           const s = sprites[i];
+          if (s.duty) continue;                     // rooftop crew tracks the panel, not the bands
           if (bands.n === 1) s.bandIx = 0;
           clampToBand(s);
           if (wasMode !== bands.mode) { pickWaypoint(s); if (s.state === 'walk') s.walkRamp = 0; }
@@ -1498,7 +2316,9 @@ GAME_JS = r'''
       carUpdate(dt);
       updateParticles(dt);
       updateReactions(dt);
-    }
+      tetrisUpdate(dt);                            // geometry polling: logic rate,
+    }                                              //   and only while a game is on
+    bubbleUpdate(dt);                              // timers only — cheap, alloc-free
   }
   function render(alpha) {
     const g = ctx;
@@ -1510,14 +2330,18 @@ GAME_JS = r'''
     g.beginPath();                                  // ← the non-intrusion clip:
     g.rect(bands.a.x, bands.a.y, bands.a.w, bands.a.h);
     if (bands.n > 1) g.rect(bands.b.x, bands.b.y, bands.b.w, bands.b.h);
-    g.clip();                                       //   nothing draws outside the rails
+    if (tetris.active && tetris.pw > 0)             //   plus the tetris panel while a
+      g.rect(tetris.px, tetris.py, tetris.pw, tetris.ph);   // game is on (spec'd)
+    g.clip();                                       //   nothing draws outside these
     g.imageSmoothingEnabled = false;
     drawGlow(g);
     drawFlags(g);
     for (let i = 0; i < sprites.length; i++) drawSprite(g, sprites[i], alpha);
     carDraw(g, alpha);
+    drawDyn(g);
     renderParticles(g, alpha);
     g.restore();
+    drawBubbles(g);   // sanctioned overlay: viewport-clamped, dead-zone aware
   }
   function tick(ts) {
     raf = requestAnimationFrame(tick);
@@ -1552,7 +2376,8 @@ GAME_JS = r'''
     dbg.textContent = avgCost.toFixed(2) + 'ms · sprites ' + sprites.length +
       ' · parts ' + liveParts + ' · tier ' + TIERS[tier].name +
       ' · ' + bands.mode + (bands.mode === 'rails' ? ' ' + bands.railW + '|' + bands.railW : '') +
-      ' · mode ' + MODE + (REDUCED ? ' (reduced)' : '');
+      ' · mode ' + MODE + (REDUCED ? ' (reduced)' : '') +
+      (tetris.active ? ' · tetris(' + tetris.blasts + '💣)' : '');
   }
   function destroyDebug() { if (dbg && dbg.parentNode) dbg.parentNode.removeChild(dbg); dbg = null; }
 
@@ -1576,7 +2401,11 @@ GAME_JS = r'''
   let prmMq = null;
   function onPrm() {
     REDUCED = !!(prmMq && prmMq.matches);
-    if (REDUCED) { resetEffects(); }
+    if (REDUCED) {
+      resetEffects();
+      removeInviteChip();                          // invites need motion — pull it
+      if (tetris.active) endTetris(false);         // game keeps running; sprites bow out
+    }
   }
   function resetEffects() {
     for (let i = 0; i < P_MAX; i++) { pool[i].on = false; freeList[i] = i; }
@@ -1584,6 +2413,8 @@ GAME_JS = r'''
     car.on = false; goal.phase = 0;
     flags[0].on = false; flags[1].on = false;
     glowRail = 0; glowScreen = 0;
+    dyn.on = false;
+    clearBubbles();
     for (let i = 0; i < 3; i++) rq[i].on = false;
     for (let i = 0; i < R_TYPES.length; i++) { pend[R_TYPES[i]].on = false; pend[R_TYPES[i]].count = 0; }
   }
@@ -1606,6 +2437,10 @@ GAME_JS = r'''
     if (!live) return;
     live = false;
     if (raf) { cancelAnimationFrame(raf); raf = 0; }
+    removeInviteChip();                             // teardown: chips gone,
+    if (tetris.active) endTetris(true);             //   game closed, canvas z
+    bodyTetrisClass(false);                         //   restored, toast class off,
+    clearBubbles();                                 //   bubbles cleared
     destroyCanvas();
     destroyDebug();
     sprites.length = 0;
@@ -1629,7 +2464,9 @@ GAME_JS = r'''
     window.addEventListener('krab', onBus);
     window.addEventListener('resize', onResize);
     window.addEventListener('scroll', onScroll, { passive: true });
-    window.addEventListener('mousemove', onMouse, { passive: true });
+    // pointer events cover mouse AND touch; passive — preventDefault is never called
+    window.addEventListener('pointermove', onMouse, { passive: true });
+    window.addEventListener('pointerdown', onPointerDown, { passive: true });
     document.addEventListener('visibilitychange', onVis);
     try {
       const main = document.querySelector('main');
@@ -1648,7 +2485,8 @@ GAME_JS = r'''
     window.removeEventListener('krab', onBus);
     window.removeEventListener('resize', onResize);
     window.removeEventListener('scroll', onScroll);
-    window.removeEventListener('mousemove', onMouse);
+    window.removeEventListener('pointermove', onMouse);
+    window.removeEventListener('pointerdown', onPointerDown);
     document.removeEventListener('visibilitychange', onVis);
     if (prmMq) { try { prmMq.removeEventListener('change', onPrm); } catch (e) {} prmMq = null; }
     if (ro) { try { ro.disconnect(); } catch (e) {} ro = null; }
@@ -1667,12 +2505,19 @@ GAME_JS = r'''
     setMode: function (m) {
       if (m !== 'off' && m !== 'subtle' && m !== 'full') return MODE;
       MODE = m; saveMode(m);
+      // ANY mode change (subtle <-> full included) pulls a live invite chip:
+      // it was offered under the old mode's terms, and a 'full' -> 'subtle'
+      // switch can retire the very sprite that is standing there asking
+      removeInviteChip();
       if (m === 'off') {
         if (bootStart) {                            // cancel a still-pending boot start
           try { document.removeEventListener('DOMContentLoaded', bootStart); } catch (e) {}
           bootStart = null;
         }
-        stop();
+        stop();                                     // -> suspendLive: chips, bubbles, z
+        removeInviteChip();                         // and again unconditionally, for a
+        if (tetris.active) endTetris(true);         //   game started while already off
+        clearBubbles();
       }
       else if (!running) start();
       else { evalBands(); syncLive(); }
@@ -1685,6 +2530,35 @@ GAME_JS = r'''
       p.on = true; p.count++;
       p.last = performance.now() - COALESCE_MS;     // flush on the next update
       lastEventAt = simNow;
+    },
+    playTetris: function () {                       // the page's voice command calls this
+      // Documented NO-OP while the layer is off/suspended: the page enables a
+      // mode FIRST (setMode('subtle'|'full')), and only then can a game open —
+      // a panel with no sprite layer behind it is not this module's to own, and
+      // nothing would restore the canvas z or the crew when it closed.
+      // Returns whether a game is running as a result.
+      if (!running || !live) return false;
+      startTetris();
+      return tetris.active;
+    },
+    say: function (text) {                          // a random sprite speaks the line.
+      // Drawn via fillText so HTML is inert — still strip control chars and
+      // clamp to 60 chars before it becomes a bubble.
+      if (typeof text !== 'string' || !live) return false;
+      let t = '';
+      for (let i = 0; i < text.length && t.length < 60; i++) {
+        const c = text.charCodeAt(i);
+        if (c >= 32 && c !== 127 && (c < 0x80 || c > 0x9f)) t += text.charAt(i);
+      }
+      if (!t) return false;
+      let s = null, n = 0;
+      for (let i = 0; i < sprites.length; i++) {    // reservoir-pick an on-screen sprite
+        const c = sprites[i];
+        if (c.dead || c.retiring || c.alpha < 0.3) continue;
+        n++;
+        if (Math.random() < 1 / n) s = c;
+      }
+      return s ? bubbleSay(s, t) : false;
     },
   };
 
