@@ -145,6 +145,45 @@ def _instant_all_drivers_enabled() -> bool:
         return False
 
 
+def _driver_picker_rows(active: list, suspended: set, state_data: Optional[dict] = None) -> list:
+    """The driver-picking keyboard, shared by the button and voice paths.
+
+    All Drivers sits LAST for an ordinary lead — one driver is the usual answer
+    and the broadcast is the exception. For an Instant Tag with the supervisory
+    broadcast switched on it moves to the TOP and says it is the default,
+    because that is the whole point of turning the setting on: every driver gets
+    a payment link and the first card to clear wins. It is still only a button —
+    nothing is preselected and nothing dispatches until someone taps it.
+    """
+    state_data = state_data or {}
+    rows = []
+    for d in active:
+        did = d.get("id")
+        name = d.get("driver_name", "Unknown")
+        if str(did) in suspended:
+            rows.append([InlineKeyboardButton(
+                f"🚫 {name} (PENALTY)", callback_data=f"driver_suspended_{did}")])
+        else:
+            rows.append([InlineKeyboardButton(f"🚗 {name}", callback_data=f"seldrv_{did}")])
+
+    eligible = [d for d in active if str(d.get("id")) not in suspended]
+    instant = bool(state_data.get("instant_tag"))
+    broadcast_on = _instant_all_drivers_enabled()
+
+    # Instant Tag = ONE driver pays ONE link, unless supervisors switched the
+    # broadcast on in /settings.
+    if eligible and not (instant and not broadcast_on):
+        if instant and broadcast_on:
+            rows.insert(0, [InlineKeyboardButton(
+                "📢 Send to All Drivers (default)", callback_data="seldrv_all")])
+        else:
+            rows.append([InlineKeyboardButton(
+                "📢 Send to All Drivers", callback_data="seldrv_all")])
+
+    rows.append([InlineKeyboardButton("⬅️ Back", callback_data="ph1_sel_back")])
+    return rows
+
+
 def _driver_amount_cents(source: dict) -> Optional[int]:
     """The Stripe amount for an Instant Tag lead, in cents, or None."""
     amount = _price_amount_str((source or {}).get("driver_amount") or "")
@@ -7001,20 +7040,7 @@ async def _open_driver_picker(context: ContextTypes.DEFAULT_TYPE, state_data: di
         return
     active = [d for d in _get_all_drivers_cached() if record_is_active(d)]
     suspended = _get_suspended_driver_ids()
-    buttons = []
-    for d in active:
-        did = d.get("id"); name = d.get("driver_name", "Unknown")
-        if str(did) in suspended:
-            buttons.append([InlineKeyboardButton(f"🚫 {name} (PENALTY)", callback_data=f"driver_suspended_{did}")])
-        else:
-            buttons.append([InlineKeyboardButton(f"🚗 {name}", callback_data=f"seldrv_{did}")])
-    if ([d for d in active if str(d.get("id")) not in suspended]
-            and not ((state_data or {}).get("instant_tag")
-                     and not _instant_all_drivers_enabled())):
-        # Instant Tag = ONE driver pays ONE link, unless supervisors switched
-        # the broadcast on in /settings.
-        buttons.append([InlineKeyboardButton("📢 Send to All Drivers", callback_data="seldrv_all")])
-    buttons.append([InlineKeyboardButton("⬅️ Back", callback_data="ph1_sel_back")])
+    buttons = _driver_picker_rows(active, suspended, state_data)
     await _edit_message_keyboard(context, chat_id, mid, InlineKeyboardMarkup(buttons))
 
 
@@ -12189,18 +12215,7 @@ async def handle_phase1_ai_review_callback(update, context):
         all_drivers = _get_all_drivers_cached()
         active = [d for d in all_drivers if record_is_active(d)]
         suspended = _get_suspended_driver_ids()
-        buttons = []
-        for d in active:
-            did = d.get("id")
-            name = d.get("driver_name", "Unknown")
-            if str(did) in suspended:
-                buttons.append([InlineKeyboardButton(f"🚫 {name} (PENALTY)", callback_data=f"driver_suspended_{did}")])
-            else:
-                buttons.append([InlineKeyboardButton(f"🚗 {name}", callback_data=f"seldrv_{did}")])
-        elig = [d for d in active if str(d.get("id")) not in suspended]
-        if elig and not (state_data.get("instant_tag") and not _instant_all_drivers_enabled()):
-            buttons.append([InlineKeyboardButton("📢 Send to All Drivers", callback_data="seldrv_all")])
-        buttons.append([InlineKeyboardButton("⬅️ Back", callback_data="ph1_sel_back")])
+        buttons = _driver_picker_rows(active, suspended, state_data)
         await _edit_message_keyboard(context, chat_id, mid, InlineKeyboardMarkup(buttons))
         return STATE_AI_REVIEW
 
