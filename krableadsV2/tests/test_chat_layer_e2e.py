@@ -65,6 +65,7 @@ class FakeDB:
         self.offer_open = False
         self.lead = {
             "id": LEAD_ID, "reference_id": "XYZ98765", "price": "$150",
+            "user_id": USER_ID,
             "phone_number": "845-423-9476", "group_id": GROUP_ID,
             "vehicle_details": VEHICLE, "extra_info": "now 1 hour",
             "status": "pending",
@@ -266,6 +267,15 @@ class ChatLayerRoutingTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.app = _build_application()
+
+    def setUp(self):
+        # The password net only releases for a supervisor, on their own lead.
+        # Patched, not env: Config reads SUPERVISORY_TELEGRAM_ID once, at
+        # whichever test module imports bot first.
+        p = mock.patch.object(bot, "_user_is_global_supervisor",
+                              lambda uid: str(uid) == str(USER_ID))
+        p.start()
+        self.addCleanup(p.stop)
 
     # ------------------------------------------------------------------ helpers
     def _reset(self):

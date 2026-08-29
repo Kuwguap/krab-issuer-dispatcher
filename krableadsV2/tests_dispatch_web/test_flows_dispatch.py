@@ -853,6 +853,40 @@ def test_lead_detail_paid_checkout_shows_charged_not_quoted(authed, db):
     assert "Quoted" not in html
 
 
+def test_lead_detail_password_release_is_not_reported_as_paid(authed, db):
+    """A supervisor releasing a tag with the password stamps delivered_at with
+    paid_at still null — a state that could not occur before that release path
+    existed. Reading delivered_at alone called a giveaway a sale, on the page
+    the office reconciles instant-tag revenue from."""
+    db.get_lead_by_id.return_value = dict(
+        SEEDED_LEAD,
+        instant_tag=True,
+        instant_pdf_amount_cents=10000,
+        instant_pdf_requested_at="2026-08-27T15:00:00+00:00",
+        instant_pdf_paid_at=None,
+        instant_pdf_delivered_at="2026-08-27T15:06:00+00:00",
+    )
+    resp = authed.get(f"/dispatch/lead/{LEAD_ID}")
+    assert resp.status_code == 200
+    html = resp.get_data(as_text=True)
+    assert "Released without payment" in html
+    assert "Paid · tag delivered" not in html
+    assert "Charged" not in html
+
+
+def test_lead_detail_paid_and_delivered_still_reads_paid(authed, db):
+    db.get_lead_by_id.return_value = dict(
+        SEEDED_LEAD,
+        instant_pdf_amount_cents=10000,
+        instant_pdf_requested_at="2026-08-27T15:00:00+00:00",
+        instant_pdf_paid_at="2026-08-27T15:05:00+00:00",
+        instant_pdf_delivered_at="2026-08-27T15:06:00+00:00",
+    )
+    html = authed.get(f"/dispatch/lead/{LEAD_ID}").get_data(as_text=True)
+    assert "Paid · tag delivered" in html
+    assert "Released without payment" not in html
+
+
 # ------------------------------------- lead detail: awaiting-accept derivation
 
 # The exact "Awaiting accept: yes" badge cell — nothing else on a lead page

@@ -894,17 +894,142 @@ async def _delete_dispatch_messages(context, lead_id) -> tuple:
     return gone, left
 
 
+SKIP_DISPATCH_RELEASE_CB = "skiprel_"
+
+# Said the same way wherever a release is refused. Deliberately does NOT confirm
+# that the text was the right password: this handler sees every message in the
+# bot, and a reply that appears only for a correct password turns it into an
+# oracle for a secret whose default is a literal in this file.
+_SKIP_DISPATCH_REFUSED = (
+    "⛔ A tag can only be released <b>without payment</b> by a supervisor, "
+    "and only on a lead that supervisor sent themselves.\n"
+    "Ask a supervisor to send this one, or use the payment button."
+)
+
+
+def _skip_dispatch_allowed(lead: dict, user_id) -> tuple:
+    """(allowed, reason) — may this person release a tag without payment?
+
+    Both halves, as the office asked: a SUPERVISOR, and the person who sent this
+    lead. The password is the one way a tag leaves without money, so it is not
+    something an ordinary issuer can do, and not something a supervisor can do to
+    somebody else's lead.
+
+    A lead that records no issuer at all (web dispatch, API ingest) is releasable
+    by any supervisor — the alternative is a lead nobody on earth can release.
+
+    Blocking: _user_is_global_supervisor reads the settings store (30s cache), so
+    call it with asyncio.to_thread. The reason is for the log, never for the chat.
+    """
+    uid = _norm_chat_id(user_id)
+    if uid is None:
+        return False, "no_user"
+    if not _user_is_global_supervisor(uid):
+        return False, "not_supervisor"
+    creator = _norm_chat_id((lead or {}).get("user_id"))
+    if creator is None:
+        return True, "ok_no_issuer_on_lead"
+    if creator != uid:
+        return False, "not_the_issuer"
+    return True, "ok"
+
+
+def _password_matches(text: str) -> bool:
+    """Constant-time compare that cannot be tripped by what was typed.
+
+    hmac.compare_digest raises TypeError on a str holding non-ASCII, and this
+    handler reads every text message in the bot — one accented client name typed
+    while a release is armed would otherwise surface as a crash.
+    """
+    try:
+        return hmac.compare_digest(str(text).encode("utf-8"),
+                                   _skip_dispatch_password().encode("utf-8"))
+    except Exception:
+        return False
+
+
+async def _stamp_released_without_payment(lead: dict, driver_id: str) -> None:
+    """Close the paid path behind a release, so nothing sends the tag twice.
+
+    The 20-second sweep takes every lead with instant_pdf_paid_at set and
+    instant_pdf_delivered_at null (database.get_paid_instant_pdfs_undelivered).
+    Stamping DELIVERED is what stops a card that clears AFTER a password release
+    from sending the same tag again, to a different driver. paid_at is never
+    written here: nobody paid, and writing it would hand the sweep a lead to
+    deliver rather than take one away.
+    """
+    lead_id = str((lead or {}).get("id") or "")
+    if not lead_id or not (lead or {}).get("instant_tag"):
+        return
+    try:
+        if driver_id:
+            await asyncio.to_thread(db.update_lead, lead_id,
+                                    {"instant_pdf_driver_id": str(driver_id)})
+        await asyncio.to_thread(db.mark_instant_pdf_delivered, lead_id)
+    except Exception as e:
+        logger.warning("skip dispatch: could not stamp %s as released: %s", lead_id, e)
+
+
+def _skip_dispatch_ids(callback_data: str, prefix: str) -> tuple:
+    """(lead_id, driver_id) out of a Skip Dispatch button, or ("", "").
+
+    Accepts the raw ``lead|driver`` form too. Those buttons were 81 bytes and
+    Telegram never delivered any of them, so this is not compatibility so much
+    as refusing to care which shape arrives.
+    """
+    pair = _parse_paired_short_uuids(callback_data or "", prefix)
+    if pair:
+        try:
+            return _long_uuid(pair[0]), _long_uuid(pair[1])
+        except Exception:
+            return "", ""
+    body = (callback_data or "").replace(prefix, "", 1)
+    lead_id, _, driver_id = body.partition("|")
+    return lead_id.strip(), driver_id.strip()
+
+
+def _skip_dispatch_release_keyboard(lead_id, driver_ids) -> InlineKeyboardMarkup:
+    """Who receives a tag the supervisor just released with the password.
+
+    Its own callback prefix, not the Skip Dispatch picker's: that one arms a
+    fresh payment round and asks for the password again, which on this path would
+    loop the supervisor forever.
+    """
+    want = {str(i) for i in (driver_ids or []) if str(i).strip()}
+    rows = []
+    for d in (_get_all_drivers_cached() or []):
+        if str(d.get("id")) not in want or not record_is_active(d):
+            continue
+        name = str(d.get("driver_name") or "Driver").strip()
+        try:
+            data = (SKIP_DISPATCH_RELEASE_CB + _short_uuid(str(lead_id))
+                    + _short_uuid(str(d.get("id"))))
+        except Exception:
+            continue                      # not a UUID pair; nothing to point at
+        rows.append([InlineKeyboardButton(f"🚗 {name}", callback_data=data)])
+    return InlineKeyboardMarkup(rows)
+
+
 def _skip_dispatch_driver_keyboard(lead_id) -> InlineKeyboardMarkup:
     """Every active driver, one per row. No "All Drivers" on purpose: this path
-    sends ONE tag to ONE person, and a broadcast is the thing it just undid."""
+    sends ONE tag to ONE person, and a broadcast is the thing it just undid.
+
+    Two raw UUIDs plus a prefix is 81 bytes, and the Bot API's callback_data limit
+    is 64: Telegram rejects the ENTIRE keyboard with BUTTON_DATA_INVALID, so the
+    message carrying it never arrives. Every paired-id button in this file uses the
+    short encoding for exactly that reason (_short_uuid, 22 chars each -> 52).
+    """
     rows = []
     for d in (_get_all_drivers_cached() or []):
         if not record_is_active(d):
             continue
         name = str(d.get("driver_name") or "Driver").strip()
-        rows.append([InlineKeyboardButton(
-            f"🚗 {name}",
-            callback_data=f"{SKIP_DISPATCH_DRIVER_CB}{lead_id}|{d.get('id')}")])
+        try:
+            data = (SKIP_DISPATCH_DRIVER_CB + _short_uuid(str(lead_id))
+                    + _short_uuid(str(d.get("id"))))
+        except Exception:
+            continue
+        rows.append([InlineKeyboardButton(f"🚗 {name}", callback_data=data)])
     return InlineKeyboardMarkup(rows) if rows else InlineKeyboardMarkup([])
 
 
@@ -922,6 +1047,18 @@ async def handle_instant_pdf_request(update: Update, context: ContextTypes.DEFAU
     lead = await asyncio.to_thread(db.get_lead_by_id, lead_id) if lead_id else None
     if not lead:
         await query.message.reply_text("❌ That lead is gone — start a new one.")
+        return
+
+    # Before anything is undone. A refusal after the unsend would leave the lead
+    # in limbo: pulled back from the team, and releasable by nobody.
+    allowed, why = await asyncio.to_thread(
+        _skip_dispatch_allowed, lead,
+        query.from_user.id if query.from_user else None)
+    if not allowed:
+        logger.warning("skip dispatch: button refused uid=%s lead=%s ref=%s reason=%s",
+                       getattr(query.from_user, "id", None), lead_id,
+                       lead.get("reference_id"), why)
+        await query.message.reply_text(_SKIP_DISPATCH_REFUSED, parse_mode="HTML")
         return
 
     # Take it back FIRST. A team that reads the offer while the operator is still
@@ -953,17 +1090,28 @@ async def handle_skip_dispatch_driver_pick(update: Update, context: ContextTypes
     """A driver was chosen: offer the pay link, or the password."""
     query = update.callback_query
     await _safe_answer_callback_query(query)
-    payload = (query.data or "").replace(SKIP_DISPATCH_DRIVER_CB, "", 1)
-    lead_id, _, driver_id = payload.partition("|")
-    lead = await asyncio.to_thread(db.get_lead_by_id, lead_id.strip()) if lead_id else None
-    driver = await asyncio.to_thread(_driver_row_by_id, driver_id.strip()) if driver_id else None
+    lead_id, driver_id = _skip_dispatch_ids(query.data, SKIP_DISPATCH_DRIVER_CB)
+    lead = await asyncio.to_thread(db.get_lead_by_id, lead_id) if lead_id else None
+    driver = await asyncio.to_thread(_driver_row_by_id, driver_id) if driver_id else None
     if not lead or not driver:
         await query.message.reply_text("❌ That lead or driver is gone — start again.")
         return
 
+    # This callback is registered on its own (entry point AND fallback), so it is
+    # reachable without ever passing the button above.
+    who = query.from_user.id if query.from_user else None
+    allowed, why = await asyncio.to_thread(_skip_dispatch_allowed, lead, who)
+    if not allowed:
+        logger.warning("skip dispatch: pick refused uid=%s lead=%s reason=%s",
+                       who, lead_id, why)
+        await query.message.reply_text(_SKIP_DISPATCH_REFUSED, parse_mode="HTML")
+        return
+
     context.user_data[SKIP_DISPATCH_PENDING_KEY] = {
-        "lead_id": lead_id.strip(),
-        "driver_id": driver_id.strip(),
+        "lead_id": lead_id,
+        "driver_id": driver_id,
+        "driver_ids": [driver_id],
+        "by": who,
         "at": time.time(),
     }
 
@@ -1013,26 +1161,144 @@ async def handle_skip_dispatch_password(update: Update, context: ContextTypes.DE
         return
     msg = update.effective_message
     text = (msg.text or "").strip()
-    if not text or not hmac.compare_digest(text, _skip_dispatch_password()):
+    if not text or not _password_matches(text):
         return
 
-    context.user_data.pop(SKIP_DISPATCH_PENDING_KEY, None)
-    # The password must not sit in the chat history where the next person scrolls.
+    # The password must not sit in the chat history where the next person
+    # scrolls — including when the release is about to be refused.
     try:
         await msg.delete()
     except Exception as e:
         logger.info("skip dispatch: could not delete the password message: %s", e)
 
+    chat_id = update.effective_chat.id
     lead = await asyncio.to_thread(db.get_lead_by_id, pending.get("lead_id"))
-    driver = await asyncio.to_thread(_driver_row_by_id, pending.get("driver_id"))
-    if not lead or not driver:
-        await context.bot.send_message(chat_id=update.effective_chat.id,
-                                       text="❌ That lead or driver is gone — start again.")
+    if not lead:
+        context.user_data.pop(SKIP_DISPATCH_PENDING_KEY, None)
+        await context.bot.send_message(chat_id=chat_id, text="❌ That lead or driver is gone — start again.")
         raise ApplicationHandlerStop
-    await _deliver_skip_dispatch(context, lead, driver,
-                                 notify_chat_id=update.effective_chat.id,
-                                 how="password")
+
+    who = update.effective_user.id if update.effective_user else None
+    allowed, why = await asyncio.to_thread(_skip_dispatch_allowed, lead, who)
+    if not allowed:
+        # Left ARMED on purpose: a settings read that failed for a moment
+        # (_extra_supervisors caches an empty list for 30s) must not cost the
+        # supervisor their window — they can simply type it again.
+        logger.warning("skip dispatch: release refused uid=%s lead=%s ref=%s chat=%s reason=%s",
+                       who, lead.get("id"), lead.get("reference_id"), chat_id, why)
+        await context.bot.send_message(chat_id=chat_id, text=_SKIP_DISPATCH_REFUSED,
+                                       parse_mode="HTML")
+        raise ApplicationHandlerStop
+
+    if str(lead.get("instant_pdf_delivered_at") or "").strip():
+        context.user_data.pop(SKIP_DISPATCH_PENDING_KEY, None)
+        await context.bot.send_message(
+            chat_id=chat_id, text="✅ That tag has already gone out — nothing more to do.")
+        raise ApplicationHandlerStop
+
+    driver_id = str(pending.get("driver_id") or "").strip()
+    if not driver_id:
+        # An Instant Tag that went to several drivers. The password says "release
+        # it"; it cannot say to whom, and picking one would put the client's
+        # address and phone in the wrong driver's chat.
+        ids = [str(i) for i in (pending.get("driver_ids") or []) if str(i).strip()]
+        kb = await asyncio.to_thread(
+            _skip_dispatch_release_keyboard, str(lead.get("id")), ids)
+        if not kb.inline_keyboard:
+            context.user_data.pop(SKIP_DISPATCH_PENDING_KEY, None)
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text="❌ No active driver left to send this to — start again.")
+            raise ApplicationHandlerStop
+        armed = dict(pending)
+        armed.update({"await_pick": True, "by": who, "at": time.time()})
+        context.user_data[SKIP_DISPATCH_PENDING_KEY] = armed
+        try:
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text="🔑 Password accepted.\n🚗 <b>Who gets this tag?</b>",
+                parse_mode="HTML", reply_markup=kb)
+        except Exception as e:
+            # Whatever went wrong, this must not escape: the text on this update
+            # IS the password, and an exception here hands it to the next handler
+            # group, where the idle lead flow would write it into the database.
+            logger.error("skip dispatch: could not show the release picker: %s", e)
+            try:
+                await context.bot.send_message(
+                    chat_id=chat_id,
+                    text="⚠️ Could not show the driver list — use ⚡ Skip Dispatch "
+                         "on the lead instead.")
+            except Exception:
+                pass
+        raise ApplicationHandlerStop
+
+    driver = await asyncio.to_thread(_driver_row_by_id, driver_id)
+    if not driver:
+        context.user_data.pop(SKIP_DISPATCH_PENDING_KEY, None)
+        await context.bot.send_message(chat_id=chat_id, text="❌ That lead or driver is gone — start again.")
+        raise ApplicationHandlerStop
+
+    context.user_data.pop(SKIP_DISPATCH_PENDING_KEY, None)
+    ok = await _deliver_skip_dispatch(context, lead, driver,
+                                      notify_chat_id=chat_id, how="password")
+    if ok:
+        await _stamp_released_without_payment(lead, driver_id)
     raise ApplicationHandlerStop
+
+
+async def handle_skip_dispatch_release_pick(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """The supervisor named a driver after releasing an Instant Tag by password.
+
+    Separate from handle_skip_dispatch_driver_pick, which arms a fresh payment
+    round: here the password has already been accepted, so this tap delivers.
+    """
+    query = update.callback_query
+    await _safe_answer_callback_query(query)
+    pending = (context.user_data or {}).get(SKIP_DISPATCH_PENDING_KEY) or {}
+    expired = time.time() - float(pending.get("at") or 0) > _SKIP_DISPATCH_TTL_SEC
+    if not pending.get("await_pick") or expired:
+        context.user_data.pop(SKIP_DISPATCH_PENDING_KEY, None)
+        await query.message.reply_text(
+            "⌛ That release has expired — type the password again.")
+        return
+
+    lead_id, driver_id = _skip_dispatch_ids(query.data, SKIP_DISPATCH_RELEASE_CB)
+    # The callback data is attacker-shaped: it must name the lead the password
+    # was accepted for, and a driver that lead was actually offered to.
+    if (lead_id != str(pending.get("lead_id") or "").strip()
+            or driver_id not in {str(i) for i in (pending.get("driver_ids") or [])}):
+        logger.warning("skip dispatch: release pick rejected lead=%s driver=%s pending=%s",
+                       lead_id, driver_id, pending.get("lead_id"))
+        await query.message.reply_text("❌ That lead or driver is gone — start again.")
+        return
+
+    lead = await asyncio.to_thread(db.get_lead_by_id, lead_id)
+    driver = await asyncio.to_thread(_driver_row_by_id, driver_id)
+    if not lead or not driver:
+        await query.message.reply_text("❌ That lead or driver is gone — start again.")
+        return
+
+    # The password proved who may release it; this tap must come from that same
+    # person, and they must still pass the gate.
+    who = query.from_user.id if query.from_user else None
+    allowed, why = await asyncio.to_thread(_skip_dispatch_allowed, lead, who)
+    if not allowed or _norm_chat_id(who) != _norm_chat_id(pending.get("by")):
+        logger.warning("skip dispatch: release pick refused uid=%s lead=%s reason=%s",
+                       who, lead_id, why if not allowed else "not_the_releaser")
+        await query.message.reply_text(_SKIP_DISPATCH_REFUSED, parse_mode="HTML")
+        return
+
+    if str(lead.get("instant_pdf_delivered_at") or "").strip():
+        context.user_data.pop(SKIP_DISPATCH_PENDING_KEY, None)
+        await query.message.reply_text("✅ That tag has already gone out.")
+        return
+
+    context.user_data.pop(SKIP_DISPATCH_PENDING_KEY, None)
+    ok = await _deliver_skip_dispatch(context, lead, driver,
+                                      notify_chat_id=query.message.chat_id,
+                                      how="password")
+    if ok:
+        await _stamp_released_without_payment(lead, driver_id)
 
 
 async def _deliver_skip_dispatch(context, lead: dict, driver: dict, *,
@@ -1162,7 +1428,8 @@ def _instant_tag_when_line(lead: dict) -> str:
 
 
 async def _dispatch_instant_tag_lead(context, lead: dict, selected_drivers: list,
-                                     *, notify_chat_id=None, user_data=None) -> None:
+                                     *, notify_chat_id=None, user_data=None,
+                                     by_user_id=None) -> None:
     """🤖 Instant Tag dispatch: no Accept/Decline round. Every chosen driver
     gets a payment link for the AMOUNT (all-drivers only when supervisors
     switched it on); the first card to clear releases the tag automatically
@@ -1187,7 +1454,7 @@ async def _dispatch_instant_tag_lead(context, lead: dict, selected_drivers: list
                 keeps_label = f"${(_collect_cents - cents) // 100}"
         except ValueError:
             pass
-    sent, failed = [], []
+    sent, sent_ids, failed = [], [], []
     # Why the pay link could not be made, once — the drivers must not be shown
     # config detail, but whoever dispatched needs to know it is broken.
     link_error = None
@@ -1242,13 +1509,32 @@ async def _dispatch_instant_tag_lead(context, lead: dict, selected_drivers: list
             await context.bot.send_message(chat_id=cid, text=NL.join(body),
                                            parse_mode="HTML", reply_markup=kb)
             sent.append(str(d.get("driver_name") or "driver"))
+            if d.get("id"):
+                sent_ids.append(str(d.get("id")))
         except Exception as e:
             logger.warning("instant tag: could not reach driver %s: %s", d.get("driver_name"), e)
             failed.append(str(d.get("driver_name") or "driver"))
-    if user_data is not None and len(selected_drivers or []) == 1 and sent:
+    # The password release is armed only for someone who may actually use it. An
+    # issuer who is not a supervisor is never offered a bypass they cannot take,
+    # and the password handler never becomes an oracle for them.
+    #
+    # It used to arm only for a single driver, which since All Drivers became the
+    # default meant a normal Instant Tag had no password release at all. It arms
+    # for any number now; with more than one, the password opens a picker rather
+    # than guessing which driver gets the client's address.
+    arm_release = False
+    if user_data is not None and sent_ids:
+        try:
+            arm_release, _why = await asyncio.to_thread(
+                _skip_dispatch_allowed, lead, by_user_id)
+        except Exception as e:
+            logger.warning("instant tag: could not check the release gate: %s", e)
+    if arm_release:
         user_data[SKIP_DISPATCH_PENDING_KEY] = {
             "lead_id": str(lead.get("id")),
-            "driver_id": str((selected_drivers or [{}])[0].get("id") or ""),
+            "driver_id": sent_ids[0] if len(sent_ids) == 1 else "",
+            "driver_ids": list(sent_ids),
+            "by": by_user_id,
             "at": time.time(),
         }
     if notify_chat_id:
@@ -1274,8 +1560,12 @@ async def _dispatch_instant_tag_lead(context, lead: dict, selected_drivers: list
             if hint:
                 msg += NL + "💡 " + hint
             lines.append(msg)
-        if user_data is not None and len(selected_drivers or []) == 1 and sent:
-            lines.append("🔑 Or reply here with the password to release it without payment.")
+        if arm_release:
+            lines.append(
+                "🔑 Or reply here with the password to release it without payment."
+                if len(sent_ids) == 1 else
+                "🔑 Or reply here with the password to release it without payment — "
+                "you'll pick which driver gets it.")
         try:
             await context.bot.send_message(chat_id=notify_chat_id, text=NL.join(lines),
                                            parse_mode="HTML")
@@ -2252,7 +2542,11 @@ def _raw_supervisory_tokens(*sources: object) -> list[str]:
         s = str(src).strip()
         if not s:
             continue
-        for part in s.split(","):
+        # Split on whitespace as well as commas. .env.example documents "Comma
+        # or space separated", and a space-separated value used to collapse into
+        # ONE unparseable token — an empty supervisor set, which now means
+        # nobody can release a tag without payment.
+        for part in re.split(r"[\s,;]+", s):
             p = part.strip()
             if p:
                 out.append(p)
@@ -14392,7 +14686,8 @@ async def _background_dispatch_lead_after_driver_pick(
         # issuer types the password), delivered exactly like Skip Dispatch.
         await _dispatch_instant_tag_lead(
             context, lead, selected_drivers,
-            notify_chat_id=issuer_notify_chat_id, user_data=context.user_data)
+            notify_chat_id=issuer_notify_chat_id, user_data=context.user_data,
+            by_user_id=user_id)
         return
     monday_result = None
     if monday:
@@ -21159,6 +21454,8 @@ def main():
             CallbackQueryHandler(handle_instant_pdf_request, pattern=f"^{INSTANT_PDF_CB}"),
             CallbackQueryHandler(handle_skip_dispatch_driver_pick,
                                  pattern=f"^{SKIP_DISPATCH_DRIVER_CB}"),
+            CallbackQueryHandler(handle_skip_dispatch_release_pick,
+                                 pattern=f"^{SKIP_DISPATCH_RELEASE_CB}"),
             # Re-enter lead flow from inline buttons when CH in-memory state was lost (restart, multi-worker,
             # or rare routing gaps) but Supabase ``states`` still holds select_group / select_driver data.
             CallbackQueryHandler(handle_group_selection, pattern="^select_group_"),
@@ -21334,6 +21631,8 @@ def main():
             CallbackQueryHandler(handle_instant_pdf_request, pattern=f"^{INSTANT_PDF_CB}"),
             CallbackQueryHandler(handle_skip_dispatch_driver_pick,
                                  pattern=f"^{SKIP_DISPATCH_DRIVER_CB}"),
+            CallbackQueryHandler(handle_skip_dispatch_release_pick,
+                                 pattern=f"^{SKIP_DISPATCH_RELEASE_CB}"),
         ],
     )
 

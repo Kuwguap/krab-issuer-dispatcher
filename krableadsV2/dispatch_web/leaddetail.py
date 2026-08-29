@@ -152,8 +152,13 @@ def _instant_view(lead, db):
     requested_at = _s(lead, "instant_pdf_requested_at")
     paid_at = _s(lead, "instant_pdf_paid_at")
     delivered_at = _s(lead, "instant_pdf_delivered_at")
-    if delivered_at:
+    if delivered_at and paid_at:
         status, tone = "Paid · tag delivered", "ok"
+    elif delivered_at:
+        # Delivered with nothing paid: a supervisor released it with the password.
+        # Before that release stamped delivered_at this state could not occur, and
+        # reading it as "Paid" counted a giveaway as a sale.
+        status, tone = "Released without payment · tag delivered", "warn"
     elif paid_at:
         status, tone = "Paid · delivery pending (bot polls ~10s)", "warn"
     elif requested_at:

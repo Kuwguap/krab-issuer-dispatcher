@@ -26,6 +26,9 @@ import utils.database as udb  # noqa: E402
 LEAD_ID = "11111111-1111-4111-8111-111111111111"
 GROUP_ID = "22222222-2222-4222-8222-222222222222"
 GROUP_CHAT = -100123
+# A real UUID, because the picker encodes ids to keep callback_data inside
+# Telegram's 64-byte cap. A short fake id would hide the encoding entirely.
+DRIVER_ID = "44444444-4444-4444-8444-444444444444"
 ISSUER = 900500
 DRIVER_TG = 900600
 PASSWORD = "AdminPassword123!"
@@ -42,6 +45,7 @@ class FakeDB:
     def __init__(self):
         self.lead = {
             "id": LEAD_ID, "reference_id": "ABC12345", "price": "$150",
+            "user_id": ISSUER,
             "phone_number": "845-423-9476", "group_id": GROUP_ID,
             "vehicle_details": VEHICLE, "extra_info": "now 1 hour",
         }
@@ -57,7 +61,7 @@ class FakeDB:
                  "group_telegram_id": str(GROUP_CHAT)}]
 
     def get_all_drivers(self):
-        return [{"id": "d1", "driver_name": "Susan", "is_active": True,
+        return [{"id": DRIVER_ID, "driver_name": "Susan", "is_active": True,
                  "driver_telegram_id": str(DRIVER_TG)}]
 
     def get_group_lead_offers(self, lead_id):
@@ -175,11 +179,31 @@ def _typed(app, text, mid):
     }, app.bot)
 
 
+def _drv_cb():
+    """Exactly what _skip_dispatch_driver_keyboard puts on a button.
+
+    Built through the real encoder rather than spelled out, so a test can never
+    pass on a callback shape Telegram would have refused to deliver.
+    """
+    return (bot.SKIP_DISPATCH_DRIVER_CB + bot._short_uuid(LEAD_ID)
+            + bot._short_uuid(DRIVER_ID))
+
+
 class SkipDispatchTest(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
         cls.app = _build_application()
+
+    def setUp(self):
+        # Releasing a tag without paying for it is a supervisor's act now, and
+        # only on a lead that supervisor sent. Patched rather than set through
+        # SUPERVISORY_TELEGRAM_ID because Config reads the environment once, at
+        # whichever test module imports bot first.
+        p = mock.patch.object(bot, "_user_is_global_supervisor",
+                              lambda uid: str(uid) == str(ISSUER))
+        p.start()
+        self.addCleanup(p.stop)
 
     def _run(self, *updates):
         TRANSPORT.reset()
@@ -218,14 +242,14 @@ class SkipDispatchTest(unittest.TestCase):
 
     # -- step 2: pick, then pay or type ---------------------------------
     def test_picking_a_driver_offers_both_ways_to_release_it(self):
-        self._run(_tap(self.app, f"{bot.SKIP_DISPATCH_DRIVER_CB}{LEAD_ID}|d1", 8003))
+        self._run(_tap(self.app, _drv_cb(), 8003))
         sent = " ".join(d.get("text", "") for d in TRANSPORT.of("sendMessage"))
         self.assertIn("password", sent.lower())
         self.assertIn("100", sent)
 
     def test_the_password_releases_the_tag(self):
         self._run(
-            _tap(self.app, f"{bot.SKIP_DISPATCH_DRIVER_CB}{LEAD_ID}|d1", 8004),
+            _tap(self.app, _drv_cb(), 8004),
             _typed(self.app, PASSWORD, 8005),
         )
         docs = TRANSPORT.of("sendDocument")
@@ -236,7 +260,7 @@ class SkipDispatchTest(unittest.TestCase):
 
     def test_the_password_is_removed_from_the_chat(self):
         self._run(
-            _tap(self.app, f"{bot.SKIP_DISPATCH_DRIVER_CB}{LEAD_ID}|d1", 8006),
+            _tap(self.app, _drv_cb(), 8006),
             _typed(self.app, PASSWORD, 8007),
         )
         deleted = [int(d.get("message_id")) for d in TRANSPORT.of("deleteMessage")]
@@ -245,7 +269,7 @@ class SkipDispatchTest(unittest.TestCase):
 
     def test_a_wrong_password_releases_nothing(self):
         self._run(
-            _tap(self.app, f"{bot.SKIP_DISPATCH_DRIVER_CB}{LEAD_ID}|d1", 8008),
+            _tap(self.app, _drv_cb(), 8008),
             _typed(self.app, "AdminPassword123", 8009),      # one character short
         )
         self.assertEqual(TRANSPORT.of("sendDocument"), [],
