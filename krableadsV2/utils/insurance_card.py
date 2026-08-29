@@ -248,34 +248,100 @@ def split_insured_name(upper: str) -> dict:
     return {"dcs": last or "UNKNOWN", "dac": first or "UNKNOWN", "dad": middle or ""}
 
 
-_CITY_STATE_ZIP_RE = re.compile(
-    r"^\s*(?P<city>.+?)\s*,\s*(?P<state>[A-Z]{2})\s+(?P<zip>\d{5}(?:-?\d{4})?)\s*$",
-    re.IGNORECASE,
+_US_STATE_NAME_TO_ABBR = {
+    "alabama": "AL", "alaska": "AK", "arizona": "AZ", "arkansas": "AR",
+    "california": "CA", "colorado": "CO", "connecticut": "CT", "delaware": "DE",
+    "florida": "FL", "georgia": "GA", "hawaii": "HI", "idaho": "ID",
+    "illinois": "IL", "indiana": "IN", "iowa": "IA", "kansas": "KS",
+    "kentucky": "KY", "louisiana": "LA", "maine": "ME", "maryland": "MD",
+    "massachusetts": "MA", "michigan": "MI", "minnesota": "MN", "mississippi": "MS",
+    "missouri": "MO", "montana": "MT", "nebraska": "NE", "nevada": "NV",
+    "new hampshire": "NH", "new jersey": "NJ", "new mexico": "NM", "new york": "NY",
+    "north carolina": "NC", "north dakota": "ND", "ohio": "OH", "oklahoma": "OK",
+    "oregon": "OR", "pennsylvania": "PA", "rhode island": "RI", "south carolina": "SC",
+    "south dakota": "SD", "tennessee": "TN", "texas": "TX", "utah": "UT",
+    "vermont": "VT", "virginia": "VA", "washington": "WA", "west virginia": "WV",
+    "wisconsin": "WI", "wyoming": "WY", "district of columbia": "DC",
+}
+_US_STATE_ABBRS = set(_US_STATE_NAME_TO_ABBR.values())
+
+# "BRONX STATE: NY ZIP: 10451" — operators type labelled fields surprisingly often.
+_LABEL_CITY_RE = re.compile(
+    r"\bcity\b\s*[:#]\s*(.*?)\s*(?=[,;\n]|\bstate\b|\bzip\b|$)", re.IGNORECASE
 )
+_LABEL_STATE_RE = re.compile(r"\bstate\b\s*[:#]\s*([A-Za-z]{2}|[A-Za-z][A-Za-z ]+?)\s*(?=[,;\n]|\bcity\b|\bzip\b|$)", re.IGNORECASE)
+_LABEL_ZIP_RE = re.compile(r"\bzip(?:code)?\b\s*[:#]\s*(\d{5}(?:-?\d{4})?)", re.IGNORECASE)
+
+
+def _state_to_abbr(raw: str) -> str:
+    """'NY' / 'New York' / 'new york' → 'NY'. Empty when it is not a state."""
+    t = " ".join((raw or "").strip().strip(",.").split()).lower()
+    if not t:
+        return ""
+    if len(t) == 2 and t.upper() in _US_STATE_ABBRS:
+        return t.upper()
+    return _US_STATE_NAME_TO_ABBR.get(t, "")
 
 
 def parse_city_state_zip(s: str) -> dict:
-    """Parse ``'CITY, ST 12345[-1234]'`` → ``{'city','state','zip'}``.
+    """Parse a city/state/ZIP line → ``{'city','state','zip'}``.
 
-    Falls back to best-effort if the string is partially formed.
+    Handles every shape operators actually type, not just the canonical one:
+
+        'Bronx, NY 10451'      'Bronx NY 10451'        'Bronx, NY, 10451'
+        'Bronx New York 10451' 'Bronx New York, 10451' 'Bronx New York'
+        'state: NY city: Bronx zip:10451'
+
+    The old version required BOTH a comma before the state AND a two-letter
+    abbreviation, so anything else fell through to a fallback that also demanded
+    a comma. 'Bronx NY 10451' and 'Bronx New York 10451' therefore came back as
+    city='Bronx NY' / 'Bronx New York' with **no state at all** — and this feeds
+    the printed FS-20 card and its AAMVA barcode, so the wrong thing got printed.
     """
-    s = (s or "").strip()
+    s = " ".join((s or "").strip().split())
     if not s:
         return {"city": "", "state": "", "zip": ""}
-    m = _CITY_STATE_ZIP_RE.match(s)
+
+    # Labelled fields win outright — they are unambiguous.
+    m_city = _LABEL_CITY_RE.search(s)
+    m_state = _LABEL_STATE_RE.search(s)
+    m_zip = _LABEL_ZIP_RE.search(s)
+    if m_city or m_state or m_zip:
+        city = (m_city.group(1).strip() if m_city else "")
+        st = _state_to_abbr(m_state.group(1)) if m_state else ""
+        zp = re.sub(r"\D", "", m_zip.group(1))[:9] if m_zip else ""
+        if not city:
+            # Whatever is left once the labelled parts are removed.
+            leftover = _LABEL_CITY_RE.sub(" ", s)
+            leftover = _LABEL_STATE_RE.sub(" ", leftover)
+            leftover = _LABEL_ZIP_RE.sub(" ", leftover)
+            city = " ".join(leftover.replace(":", " ").split()).strip(" ,")
+        return {"city": city.strip(" ,")[:20], "state": st, "zip": zp}
+
+    # ZIP: trailing 5 (or 5-4) digits, with or without a comma in front.
+    zp = ""
+    m = re.search(r"[,\s]*(\d{5}(?:-?\d{4})?)\s*$", s)
+    head = s
     if m:
-        city = m.group("city").strip()[:20]
-        st = m.group("state").upper()
-        zp = re.sub(r"\D", "", m.group("zip"))[:9]
-        return {"city": city, "state": st, "zip": zp}
-    # Fallback: try to pull a ZIP and 2-letter state out of the tail
-    zip_match = re.search(r"(\d{5}(?:-?\d{4})?)\s*$", s)
-    zp = re.sub(r"\D", "", zip_match.group(1))[:9] if zip_match else ""
-    head = s[: zip_match.start()].rstrip(" ,") if zip_match else s
-    state_match = re.search(r",\s*([A-Z]{2})\s*$", head, re.IGNORECASE)
-    st = state_match.group(1).upper() if state_match else ""
-    city = (head[: state_match.start()].rstrip(", ") if state_match else head).strip()[:20]
-    return {"city": city, "state": st, "zip": zp}
+        zp = re.sub(r"\D", "", m.group(1))[:9]
+        head = s[: m.start()]
+    head = head.strip().strip(",").strip()
+
+    # State: trailing abbreviation, or a one/two-word spelled name, comma optional.
+    st = ""
+    toks = head.split()
+    if toks:
+        two = " ".join(toks[-2:]).strip(",") if len(toks) >= 2 else ""
+        one = toks[-1].strip(",")
+        if _state_to_abbr(two):
+            st = _state_to_abbr(two)
+            toks = toks[:-2]
+        elif _state_to_abbr(one):
+            st = _state_to_abbr(one)
+            toks = toks[:-1]
+
+    city = " ".join(toks).strip().strip(",").strip()
+    return {"city": city[:20], "state": st, "zip": zp}
 
 
 def build_address_parts(lines: Iterable[str]) -> dict:

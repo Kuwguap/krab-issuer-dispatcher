@@ -2933,6 +2933,42 @@ def _csz_tail_len(tokens: list) -> int:
     return len(tokens) - city_start
 
 
+_ADDR_LABEL_CITY_RE = re.compile(
+    r"\bcity\b\s*[:#]\s*(.*?)\s*(?=[,;]|\bstate\b|\bzip\b|$)", re.I
+)
+_ADDR_LABEL_STATE_RE = re.compile(
+    r"\bstate\b\s*[:#]\s*([A-Za-z]{2}|[A-Za-z][A-Za-z ]+?)\s*(?=[,;]|\bcity\b|\bzip\b|$)", re.I
+)
+_ADDR_LABEL_ZIP_RE = re.compile(r"\bzip(?:code)?\b\s*[:#]\s*(\d{5}(?:-\d{4})?)", re.I)
+
+
+def _split_labelled_csz(v: str) -> tuple:
+    """Handle 'street… state: NY city: Bronx zip:10451'.
+
+    Operators paste labelled fields often enough that leaving them to the
+    positional walk is hopeless — every label word ("state:", "zip:") looks like
+    a city word to it, so the whole string stayed on the street line.
+    Returns (street, csz) or ('', '') when there are no labels.
+    """
+    m_city = _ADDR_LABEL_CITY_RE.search(v)
+    m_state = _ADDR_LABEL_STATE_RE.search(v)
+    m_zip = _ADDR_LABEL_ZIP_RE.search(v)
+    if not (m_city or m_state or m_zip):
+        return ("", "")
+
+    city = m_city.group(1).strip(" ,") if m_city else ""
+    state = (m_state.group(1).strip(" ,") if m_state else "")
+    zipc = m_zip.group(1) if m_zip else ""
+
+    street = v
+    for rx in (_ADDR_LABEL_CITY_RE, _ADDR_LABEL_STATE_RE, _ADDR_LABEL_ZIP_RE):
+        street = rx.sub(" ", street)
+    street = " ".join(street.split()).strip(" ,")
+
+    csz = " ".join(p for p in (city, state, zipc) if p).strip()
+    return (street, csz)
+
+
 def _split_street_and_csz(value: str) -> tuple:
     """Split one typed address into (street, city_state_zip).
 
@@ -2943,9 +2979,21 @@ def _split_street_and_csz(value: str) -> tuple:
     v = " ".join((value or "").split()).strip().strip(",")
     if not v:
         return ("", "")
-    # A comma is the strongest boundary: take the EARLIEST one whose tail is a
-    # complete city/ST/ZIP, so "88 Ocean Ave Apt 3B, Fort Lee, NJ 07024" keeps the
-    # apartment on the street line.
+
+    # Labelled fields are unambiguous — resolve them before guessing positionally.
+    lab_street, lab_csz = _split_labelled_csz(v)
+    if lab_csz:
+        return (lab_street, lab_csz)
+
+    # A comma typed without a following space glues two tokens into one
+    # ("New York,10451"), and the positional walk then sees neither a state nor a
+    # ZIP and gives up, leaving the whole address on the street line.
+    v = re.sub(r",(?=\S)", ", ", v)
+
+    # Candidate A — comma boundary. "88 Ocean Ave Apt 3B, Fort Lee, NJ 07024"
+    # needs the EARLIEST comma whose tail is a complete city/ST/ZIP, so the
+    # apartment stays with the street.
+    comma_split = None
     if "," in v:
         parts = v.split(",")
         for k in range(len(parts) - 1):
@@ -2953,19 +3001,36 @@ def _split_street_and_csz(value: str) -> tuple:
             street = ",".join(parts[: k + 1]).strip().strip(",")
             tail_toks = tail.replace(",", " ").split()
             if tail and tail_toks and _csz_tail_len(tail_toks) == len(tail_toks):
-                return (street, " ".join(tail.split()))
+                comma_split = (street, " ".join(tail.split()))
+                break
+
+    # Candidate B — positional walk from the end.
+    space_split = None
     toks = v.split()
     n = _csz_tail_len(toks)
-    if not n:
+    if n:
+        cut = len(toks) - n
+        # A street of just a house number means the walk ate the street name too
+        # ("123 Broadway New York NY 10001"). Give one word back.
+        if cut == 1 and any(ch.isdigit() for ch in toks[0]) and n > 1:
+            cut += 1
+        space_split = (
+            " ".join(toks[:cut]).strip().strip(","),
+            " ".join(toks[cut:]).strip().strip(","),
+        )
+
+    # Prefer whichever recovered MORE of the city/state/ZIP tail. On
+    # "…apt 11D Bronx, NY, 10451" the first comma sits between city and state, so
+    # the comma candidate orphans "Bronx" onto the street line and returns only
+    # "NY, 10451"; the positional walk keeps the city. On "…Apt 3B, Fort Lee, NJ"
+    # the comma candidate is the longer one and still wins.
+    def _tail_words(c):
+        return len(c[1].replace(",", " ").split()) if c else -1
+
+    best = comma_split if _tail_words(comma_split) >= _tail_words(space_split) else space_split
+    if not best:
         return (v, "")
-    cut = len(toks) - n
-    # A street of just a house number means the walk ate the street name too
-    # ("123 Broadway New York NY 10001"). Give one word back.
-    if cut == 1 and any(ch.isdigit() for ch in toks[0]) and n > 1:
-        cut += 1
-    street = " ".join(toks[:cut]).strip().strip(",")
-    csz = " ".join(toks[cut:]).strip().strip(",")
-    return (street, csz)
+    return best
 
 
 # Which city/ST/ZIP field pairs with which street field.
