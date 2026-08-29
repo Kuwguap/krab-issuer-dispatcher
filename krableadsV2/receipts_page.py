@@ -791,6 +791,9 @@ BOARD_HTML = r"""<!doctype html>
  .ins.pending { color:#8a5b00; background:rgba(255,153,31,.18); border-color:transparent; }
  .ins.failed { color:var(--bad-ink); background:var(--bad-bg); border-color:transparent; }
  .ins.none { opacity:.45; }
+ /* The chip is the card once one exists — make that obvious. */
+ a.ins { cursor:pointer; text-decoration:none; }
+ a.ins:hover { filter:brightness(.94); text-decoration:none; box-shadow:0 0 0 1px var(--accent); }
  .insbox { margin-top:10px; border:1px solid var(--line); border-radius:10px;
            padding:10px 12px; background:var(--card); }
  .insbox h4 { margin:0 0 8px; font-size:11px; letter-spacing:.06em;
@@ -950,13 +953,13 @@ BOARD_HTML = r"""<!doctype html>
       <th>Receipt</th>
       <th>Client phone</th>
       <th>Tags</th>
-      <th>Insurance</th>
       <th>Client contact</th>
       <th>Driver</th>
       <th>Issuer</th>
       <th>Dispatcher</th>
       <th>Renewal</th>
       <th>Status</th>
+      <th>Insurance</th>
       <th class="hide-sm">Updated</th>
     </tr></thead>
     <tbody id="rows"><tr><td colspan="14" class="none">Loading…</td></tr></tbody>
@@ -1246,19 +1249,32 @@ function statusBits(r) {
   };
 }
 
+const INS_CARD = "/receipts/insurance/";
 const INS_LABEL = {
-  none: "tag only", pending: "not issued yet", issued: "issued",
-  sent: "card sent", failed: "failed",
+  none: "tag only", pending: "not issued yet", issued: "card",
+  sent: "card", failed: "failed",
 };
 
 // A lead is tag-only or tag + insurance. Tag-only rows stay quiet; the insured
 // ones say how far the card actually got, because a policy that was never
 // emailed is the failure worth seeing and it was invisible on this board.
+//
+// Once a card exists the chip IS the card: it opens the issued FS-20 rather
+// than merely reporting that one was sent. "Card sent" told you a thing had
+// happened somewhere else and left you no way to look at it.
 function insuranceChip(r) {
   const st = r.insurance_state || (r.has_insurance ? "pending" : "none");
   if (st === "none") return '<span class="ins none">—</span>';
   const label = INS_LABEL[st] || st;
-  let html = `<span class="ins ${esc(st)}" title="${esc(label)}">🛡 ${esc(label)}</span>`;
+  const viewable = st === "issued" || st === "sent";
+  const tip = st === "sent"
+    ? `Card emailed${r.insurance_sent_to ? " to " + r.insurance_sent_to : ""} — click to view`
+    : (viewable ? "Issued but not emailed — click to view" : label);
+
+  let html = viewable
+    ? `<a class="ins ${esc(st)}" href="${INS_CARD + encodeURIComponent(r.lead_id)}"
+          target="_blank" rel="noopener" title="${esc(tip)}">🛡 ${esc(label)}</a>`
+    : `<span class="ins ${esc(st)}" title="${esc(tip)}">🛡 ${esc(label)}</span>`;
   if (r.insurance_policy) html += `<div class="ref">${esc(r.insurance_policy)}</div>`;
   return html;
 }
@@ -1272,6 +1288,9 @@ function insuranceBlock(r) {
     <h4>🛡 Insurance</h4>
     <dl>
       <dt>State</dt><dd><span class="ins ${esc(st)}">${esc(INS_LABEL[st] || st)}</span></dd>
+      ${row("Card", (st === "issued" || st === "sent")
+            ? `<a href="${INS_CARD + encodeURIComponent(r.lead_id)}" target="_blank"
+                  rel="noopener">open the issued card (PDF)</a>` : "")}
       ${row("Policy #", r.insurance_policy ? ref(r.insurance_policy) : "")}
       ${row("Card sent to", esc(r.insurance_sent_to || ""))}
       ${row("Card sent", r.insurance_sent_at ? esc(when(r.insurance_sent_at)) : "")}
@@ -1324,13 +1343,13 @@ function rowHtml(r, idx) {
     <td>${receiptCell(r)}</td>
     <td class="phone">${phone}</td>
     <td>${(r.tags || 1) > 1 ? `<b title="one tag per car">${esc(r.tags)}×</b>` : ""}</td>
-    <td>${insuranceChip(r)}</td>
     <td>${block(r, "client")}</td>
     <td>${block(r, "driver")}</td>
     <td>${block(r, "issuer")}</td>
     <td>${block(r, "dispatcher")}</td>
     <td>${renewalChip(r)}</td>
     <td>${s.pill}<br>${s.select}</td>
+    <td>${insuranceChip(r)}</td>
     <td class="hide-sm">${esc(when(r.status_updated_at))}<br>
         <span class="counts">${esc(r.status_updated_by || "")}</span></td>
   </tr>
@@ -2081,6 +2100,48 @@ def register(app, db_provider):
         except Exception:
             status_col = False
         return jsonify({"email": email_ok, "sms": sms, "status_column": status_col})
+
+    @app.route("/receipts/insurance/<lead_id>", methods=["GET"])
+    def receipts_insurance_card(lead_id):
+        """The issued FS-20 card, rebuilt for viewing.
+
+        The card is emailed and never stored, so there is no file to serve —
+        but everything printed on it survives on the lead, so it is rebuilt from
+        exactly that. View only: no email, no portal, and no new policy number.
+        """
+        try:
+            r = (
+                _resolve().client.table("leads")
+                .select("id, reference_id, vehicle_details, delivery_details, extra_info, "
+                        "driver_license_id, insurance_card_policy_number, "
+                        "insurance_card_sent_at, issue_date, created_at")
+                .eq("id", str(lead_id)).limit(1).execute()
+            )
+            lead = (r.data or [None])[0]
+        except Exception as e:
+            logger.error("receipts board: insurance lead read failed for %s: %s", lead_id, e)
+            # The exception can carry query shape; the served page gets fixed text.
+            return jsonify({"error": "could not read the lead"}), 500
+        if not lead:
+            return jsonify({"error": "lead not found"}), 404
+
+        try:
+            import insurance_card_view
+        except Exception as e:
+            logger.error("insurance card view unavailable: %s", e)
+            return jsonify({"error": "card rendering is unavailable"}), 503
+
+        pdf, err = insurance_card_view.build_card_pdf_for_lead(lead)
+        if not pdf:
+            return jsonify({"error": err or "no card"}), 404
+
+        ref = (lead.get("reference_id") or lead_id)
+        safe = "".join(ch for ch in str(ref) if ch.isalnum() or ch in "-_") or "card"
+        return Response(pdf, mimetype="application/pdf", headers={
+            "Content-Disposition": f'inline; filename="insurance-card-{safe}.pdf"',
+            "Cache-Control": "private, max-age=300",
+            "X-Content-Type-Options": "nosniff",
+        })
 
     @app.route("/receipts/receipt/<lead_id>", methods=["GET"])
     def receipts_receipt_image(lead_id):

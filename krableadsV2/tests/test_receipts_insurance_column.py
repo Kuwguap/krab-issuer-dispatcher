@@ -70,6 +70,23 @@ class BoardMarkupTest(unittest.TestCase):
     def test_the_table_has_an_insurance_column(self):
         self.assertIn("<th>Insurance</th>", HTML)
 
+    def test_insurance_sits_between_status_and_updated(self):
+        head = HTML[HTML.index("<thead>"): HTML.index("</thead>")]
+        cols = re.findall(r"<th[^>]*>([^<]*)</th>", head)
+        self.assertIn("Insurance", cols)
+        self.assertEqual(cols[cols.index("Insurance") - 1], "Status")
+        self.assertEqual(cols[cols.index("Insurance") + 1], "Updated")
+
+    def test_an_issued_card_is_a_link_not_just_a_label(self):
+        self.assertIn("/receipts/insurance/", HTML)
+        self.assertIn('const viewable = st === "issued" || st === "sent"', HTML)
+
+    def test_the_chip_says_card_rather_than_card_sent(self):
+        # "card sent" reported an event elsewhere and gave nowhere to click.
+        self.assertNotIn('sent: "card sent"', HTML)
+        self.assertIn('sent: "card"', HTML)
+        self.assertIn('issued: "card"', HTML)
+
     def test_every_row_renders_the_chip(self):
         self.assertIn("${insuranceChip(r)}", HTML)
 
