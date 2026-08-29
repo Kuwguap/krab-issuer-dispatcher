@@ -783,6 +783,18 @@ BOARD_HTML = r"""<!doctype html>
  .renew.ok { color:var(--ok-ink); background:var(--ok-bg); border-color:transparent; }
  .renew.soon { color:#8a5b00; background:rgba(255,153,31,.18); border-color:transparent; }
  .renew.due { color:var(--bad-ink); background:var(--bad-bg); border-color:transparent; }
+ .ins { display:inline-block; padding:3px 9px; border-radius:8px; font-size:11.5px;
+        font-weight:700; white-space:nowrap; border:1px solid var(--line);
+        color:var(--muted); }
+ .ins.sent { color:var(--ok-ink); background:var(--ok-bg); border-color:transparent; }
+ .ins.issued { color:#0b5c7a; background:rgba(0,184,217,.18); border-color:transparent; }
+ .ins.pending { color:#8a5b00; background:rgba(255,153,31,.18); border-color:transparent; }
+ .ins.failed { color:var(--bad-ink); background:var(--bad-bg); border-color:transparent; }
+ .ins.none { opacity:.45; }
+ .insbox { margin-top:10px; border:1px solid var(--line); border-radius:10px;
+           padding:10px 12px; background:var(--card); }
+ .insbox h4 { margin:0 0 8px; font-size:11px; letter-spacing:.06em;
+              text-transform:uppercase; color:var(--muted); }
  .thumb { width:72px; height:52px; object-fit:cover; border-radius:8px;
           border:1px solid var(--line); cursor:zoom-in; display:block; background:var(--soft); }
  .nothumb { width:72px; height:52px; border:1px dashed var(--line); border-radius:8px;
@@ -938,6 +950,7 @@ BOARD_HTML = r"""<!doctype html>
       <th>Receipt</th>
       <th>Client phone</th>
       <th>Tags</th>
+      <th>Insurance</th>
       <th>Client contact</th>
       <th>Driver</th>
       <th>Issuer</th>
@@ -946,7 +959,7 @@ BOARD_HTML = r"""<!doctype html>
       <th>Status</th>
       <th class="hide-sm">Updated</th>
     </tr></thead>
-    <tbody id="rows"><tr><td colspan="13" class="none">Loading…</td></tr></tbody>
+    <tbody id="rows"><tr><td colspan="14" class="none">Loading…</td></tr></tbody>
   </table>
   </div>
   </div>
@@ -1233,6 +1246,45 @@ function statusBits(r) {
   };
 }
 
+const INS_LABEL = {
+  none: "tag only", pending: "not issued yet", issued: "issued",
+  sent: "card sent", failed: "failed",
+};
+
+// A lead is tag-only or tag + insurance. Tag-only rows stay quiet; the insured
+// ones say how far the card actually got, because a policy that was never
+// emailed is the failure worth seeing and it was invisible on this board.
+function insuranceChip(r) {
+  const st = r.insurance_state || (r.has_insurance ? "pending" : "none");
+  if (st === "none") return '<span class="ins none">—</span>';
+  const label = INS_LABEL[st] || st;
+  let html = `<span class="ins ${esc(st)}" title="${esc(label)}">🛡 ${esc(label)}</span>`;
+  if (r.insurance_policy) html += `<div class="ref">${esc(r.insurance_policy)}</div>`;
+  return html;
+}
+
+function insuranceBlock(r) {
+  if (!r.has_insurance) return "";
+  const st = r.insurance_state || "pending";
+  const row = (k, v) => (v ? `<dt>${k}</dt><dd>${v}</dd>` : "");
+  const ref = v => `<span class="ref">${esc(v)}</span>`;
+  return `<div class="insbox">
+    <h4>🛡 Insurance</h4>
+    <dl>
+      <dt>State</dt><dd><span class="ins ${esc(st)}">${esc(INS_LABEL[st] || st)}</span></dd>
+      ${row("Policy #", r.insurance_policy ? ref(r.insurance_policy) : "")}
+      ${row("Card sent to", esc(r.insurance_sent_to || ""))}
+      ${row("Card sent", r.insurance_sent_at ? esc(when(r.insurance_sent_at)) : "")}
+      ${row("Driver licence", r.insurance_dl ? ref(r.insurance_dl) : "")}
+      ${row("Portal login", r.portal_email
+            ? ref(r.portal_email) + (r.portal_password ? " / " + ref(r.portal_password) : "")
+            : "")}
+      ${row("Problem", r.insurance_error
+            ? `<span style="color:var(--bad-ink)">${esc(r.insurance_error)}</span>` : "")}
+    </dl>
+  </div>`;
+}
+
 function detailBody(r) {
   const c = contacts(r);
   const partyLines = PARTY_KEYS.map(p => {
@@ -1253,6 +1305,7 @@ function detailBody(r) {
                             : (r.has_receipt ? "external link" : "not handed in")}</dd>
       ${partyLines}
     </dl>
+    ${insuranceBlock(r)}
     ${r.has_receipt ? `<img loading="lazy" src="${IMG + encodeURIComponent(r.lead_id)}"
                          data-full="${IMG + encodeURIComponent(r.lead_id)}" alt="receipt">` : ""}`;
 }
@@ -1271,6 +1324,7 @@ function rowHtml(r, idx) {
     <td>${receiptCell(r)}</td>
     <td class="phone">${phone}</td>
     <td>${(r.tags || 1) > 1 ? `<b title="one tag per car">${esc(r.tags)}×</b>` : ""}</td>
+    <td>${insuranceChip(r)}</td>
     <td>${block(r, "client")}</td>
     <td>${block(r, "driver")}</td>
     <td>${block(r, "issuer")}</td>
@@ -1280,12 +1334,12 @@ function rowHtml(r, idx) {
     <td class="hide-sm">${esc(when(r.status_updated_at))}<br>
         <span class="counts">${esc(r.status_updated_by || "")}</span></td>
   </tr>
-  <tr class="detail" id="d-${esc(r.lead_id)}" hidden><td colspan="13">${detailBody(r)}</td></tr>`;
+  <tr class="detail" id="d-${esc(r.lead_id)}" hidden><td colspan="14">${detailBody(r)}</td></tr>`;
 }
 
 function monthRowHtml(g) {
   const closed = !!COLLAPSED[g.key];
-  return `<tr class="mrow" data-mk="${esc(g.key)}"><td colspan="13">
+  return `<tr class="mrow" data-mk="${esc(g.key)}"><td colspan="14">
     ${closed ? "📁" : "📂"} ${esc(g.label)}
     <span class="msum">${g.rows.length} lead${g.rows.length === 1 ? "" : "s"}
       · ${fmtMoney(g.sumAll)} total · ${fmtMoney(g.sumRec)} with receipts (${g.nRec})
@@ -1380,7 +1434,7 @@ function draw() {
 
   if (VIEW === "table") {
     if (!rows.length) {
-      tb.innerHTML = '<tr><td colspan="13" class="none">Nothing here yet.</td></tr>';
+      tb.innerHTML = '<tr><td colspan="14" class="none">Nothing here yet.</td></tr>';
       return;
     }
     let idx = 0;

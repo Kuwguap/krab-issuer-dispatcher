@@ -102,6 +102,51 @@ SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 if not SUPABASE_URL or not SUPABASE_KEY:
     raise ValueError("SUPABASE_URL and SUPABASE_KEY must be set in environment variables")
 
+def _insurance_fields(ins: dict) -> dict:
+    """The insurance half of a board row.
+
+    A lead is tag-only or tag + insurance. `has_insurance` is true when anything
+    at all says so — the flag, an issued policy number, or a delivery timestamp —
+    because the flag alone predates the columns that record what was issued, and
+    an older insured lead should not read as tag-only.
+
+    `insurance_state` is what the chip shows:
+      none    → tag only
+      pending → bought, nothing issued yet
+      issued  → policy number exists, not emailed
+      sent    → the card reached the client
+      failed  → issuing or emailing errored
+    """
+    s = lambda k: str(ins.get(k) or "").strip()          # noqa: E731
+    policy = s("insurance_card_policy_number")
+    sent_at = s("insurance_card_sent_at") or s("insurance_emailed_at")
+    err = s("insurance_card_error") or s("insurance_email_error")
+    wants = bool(ins.get("wants_insurance")) or bool(policy) or bool(sent_at) or bool(err)
+
+    if not wants:
+        state = "none"
+    elif err:
+        state = "failed"
+    elif sent_at:
+        state = "sent"
+    elif policy:
+        state = "issued"
+    else:
+        state = "pending"
+
+    return {
+        "has_insurance": wants,
+        "insurance_state": state,
+        "insurance_policy": policy,
+        "insurance_sent_to": s("insurance_card_sent_to_email"),
+        "insurance_sent_at": sent_at,
+        "insurance_error": err,
+        "insurance_dl": s("driver_license_id"),
+        "portal_email": s("portal_email"),
+        "portal_password": s("portal_password"),
+    }
+
+
 # Create a minimal database wrapper for admin dashboard
 class AdminDatabase:
     """Minimal database wrapper for admin dashboard (no Telegram dependencies)."""
@@ -305,6 +350,30 @@ class AdminDatabase:
         except Exception:
             pass                      # table may not exist yet
 
+        # Insurance, for the leads that bought it alongside the tag. Its own
+        # query on purpose: every one of these columns arrived by migration, and
+        # folding them into the main select would drop the WHOLE board back to
+        # the lean fallback (losing delivery_status) on any database that has
+        # not run them. A missing table here costs the insurance column, nothing
+        # else.
+        insurance_by_lead = {}
+        for cols in (
+            "id, wants_insurance, driver_license_id, insurance_card_policy_number, "
+            "insurance_card_sent_to_email, insurance_card_sent_at, insurance_card_error, "
+            "insurance_emailed_at, insurance_email_error, portal_email, portal_password",
+            "id, wants_insurance, insurance_card_policy_number",
+        ):
+            try:
+                ins = (
+                    self.client.table("leads").select(cols)
+                    .in_("id", lead_ids[:1000]).execute()
+                )
+                for row in (ins.data or []):
+                    insurance_by_lead[str(row.get("id"))] = row
+                break
+            except Exception as e:
+                logger.warning("transmissions: insurance lookup (%s) failed: %s", cols[:40], e)
+
         needle = (search or "").strip().lower()
         out = []
         for r in rows:
@@ -356,6 +425,11 @@ class AdminDatabase:
                 "delivery": (r.get("delivery_details") or "").replace("\n", ", "),
                 "notes": (r.get("extra_info") or "").strip(),
                 "email": (r.get("email") or "").strip(),
+                # A lead can be tag-only or tag + insurance. The board needs to
+                # show which, and for the insured ones what was actually issued
+                # — a policy number that never went out is the failure worth
+                # seeing, and it was invisible here before.
+                **_insurance_fields(insurance_by_lead.get(lid) or {}),
                 # Every party's reachable contacts, for the board's contact
                 # blocks and send buttons. Blank strings when nothing is known.
                 "client_phone": (r.get("phone_number") or "").strip(),
