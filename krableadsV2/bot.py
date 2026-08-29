@@ -7488,6 +7488,44 @@ def _add_extra_attachment(context: ContextTypes.DEFAULT_TYPE, ftype: str, mime: 
     return None
 
 
+def _paste_starts_a_new_lead(state_data: dict, text: str) -> bool:
+    """True when a pasted block is plainly the NEXT client, not an edit.
+
+    An issuer who pastes a whole lead while an unfinished card is still on
+    screen means "here is the next one" -- but every branch above treated it as
+    an edit and merged fragments of it into the OLD card, which is how a
+    complete paste came to do nothing at all.
+
+    Deliberately narrow, because filling a card IN by pasting is the normal way
+    to work: the card must already carry a real client, the paste must carry a
+    VIN, and it must open with a different name. A blank card being filled in --
+    including the two-cars-in-one-paste flow -- is never a switch.
+    """
+    if not _looks_like_multifield_block(text):
+        return False
+    if not _extract_vin_17(text):
+        return False
+
+    def _real(v) -> bool:
+        v = str(v or "").strip()
+        return bool(v) and v not in ("-", "N/A", "n/a")
+
+    old_name = str(state_data.get("name") or "").strip()
+    old_vin = str(state_data.get("vin") or "").strip().upper()
+    if not (_real(old_name) or _real(old_vin)):
+        return False                      # a blank card is being filled in
+
+    new_vin = (_extract_vin_17(text) or "").upper()
+    if _real(old_vin) and new_vin and new_vin != old_vin:
+        return True                       # a different car entirely
+
+    first = next((ln.strip() for ln in text.splitlines() if ln.strip()), "")
+    if _real(old_name) and first and len(first.split()) <= 5:
+        if first.strip().lower() != old_name.strip().lower():
+            return True                   # opens with somebody else's name
+    return False
+
+
 async def handle_phase1_review_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """STATE_AI_REVIEW: accept typed text / photo / PDF inline — no Edit button.
 
@@ -7567,17 +7605,33 @@ async def handle_phase1_review_message(update: Update, context: ContextTypes.DEF
     # trip between the question and its answer), which is the OR: the parked
     # take happens inside _ai_review_command, before any new classification.
     from utils import nl_router as _nlr_front
-    if (_chat_layer_enabled()
-            or _nlr_front.NL_PENDING_KEY in (context.user_data or {})
-            or "chat_submit_pending" in (context.user_data or {})):
+    # A WHOLE LEAD pasted in - a VIN together with several other fields - is not
+    # a command and not an edit: it is the next lead. Handing it to the chat
+    # layer let update_lead_fields merge a few of its lines into the OLD card
+    # (fill-only-empty) and answer with a toast, so a complete paste looked like
+    # it had done nothing. It belongs to the re-parse at step 3a, which already
+    # treats a multi-line VIN block as a full correction. A parked follow-up
+    # still gets its answer first: the layer owes a reply there.
+    _whole_lead_paste = _paste_starts_a_new_lead(state_data, text)
+    _nl_pending = (_nlr_front.NL_PENDING_KEY in (context.user_data or {})
+                   or "chat_submit_pending" in (context.user_data or {}))
+    if _nl_pending or (_chat_layer_enabled() and not _whole_lead_paste):
         handled = await _ai_review_command(update, context, user_id, state_data, text)
         if handled is not None:
             return handled
 
     # 0. Insurance on/off by voice/text ("add insurance", "no insurance") — before the
     #    field editor, so "insurance" isn't swallowed as an insurance-company edit.
+    #    A WHOLE PASTED LEAD that happens to contain "ADD INSURANCE" is NOT an
+    #    insurance command. Claiming it here deleted the issuer's paste, wrote the
+    #    flag onto the PREVIOUS card, redrew that card with identical text and
+    #    returned without a word -- an entire lead vanished and the bot looked
+    #    like it had ignored them. A multi-field block goes to the re-parse at
+    #    step 3a instead, which is where a pasted lead belongs; the insurance wish
+    #    is applied there, once the new card exists.
     _ins = _insurance_intent(text)
-    if _ins is not None:
+    _ins_is_whole_lead = _ins is not None and _looks_like_multifield_block(text)
+    if _ins is not None and not _ins_is_whole_lead:
         state_data["wants_insurance"] = _ins
         # Strip the insurance phrase; if the same message also carried field edits
         # ("add insurance, price 200"), apply them too instead of dropping them.
@@ -7655,7 +7709,13 @@ async def handle_phase1_review_message(update: Update, context: ContextTypes.DEF
     #     then let each remaining line find its own field (a bare email, phone, price
     #     or colour places itself). Only what is still unplaced goes to the AI — one
     #     unreadable line used to discard every readable one in the same message.
-    if "\n" in text or ";" in text:
+    #     A WHOLE LEAD pasted in - a VIN together with several other fields - is
+    #     not an edit of the card on screen; it is the next lead. Letting the bulk
+    #     editor have it first merged a few of its lines into the OLD card and
+    #     answered with a vanishing toast, so a complete paste looked like it did
+    #     nothing. It belongs to the re-parse at step 3a, which is already written
+    #     to treat a multi-line VIN block as a full correction.
+    if ("\n" in text or ";" in text) and not _whole_lead_paste:
         bulk_labels, leftovers = _apply_bulk_review_text(state_data, text)
         if bulk_labels:
             still: list[str] = []
@@ -7686,6 +7746,17 @@ async def handle_phase1_review_message(update: Update, context: ContextTypes.DEF
         # merely names fields can never clobber good data already on the card.
         fill_only = ("\n" not in text) and not _extract_vin_17(text)
         result = await handle_phase1_adjust_input(update, context, fill_only_empty=fill_only)
+        if _ins is not None:
+            # The same paste also asked for (or refused) insurance. The re-parse
+            # above rewrote the card, so the flag goes onto the FRESH row.
+            try:
+                _fresh = dict((db.get_user_state(user_id) or {}).get("data") or {})
+                if _fresh:
+                    _fresh["wants_insurance"] = _ins
+                    db.set_user_state(user_id, "phase1", _fresh)
+                    await _update_review_message_text(context, _fresh)
+            except Exception as e:
+                logger.warning("insurance wish from a pasted lead not applied: %s", e)
         await _cleanup_voice_echo(context, update.effective_chat.id if update.effective_chat else message.chat_id)
         return STATE_AI_REVIEW if result == STATE_ADJUST_INPUT else result
 
@@ -20549,6 +20620,24 @@ def main():
                 # Full traceback only once per type, but NEVER hide recurrences —
                 # invisible repeats made prod failures look like "does nothing".
                 logger.error(f"Exception while handling an update ({error_type}): {error}")
+
+            # ...and SAY so. A handler that raises used to leave the person
+            # staring at their own message with no reply, which is
+            # indistinguishable from the bot ignoring them: every "nothing
+            # happened" report starts here. Telegram errors are excluded -- if
+            # the send is what broke, sending again breaks the same way.
+            try:
+                from telegram.error import TelegramError as _TgErr
+                chat = getattr(getattr(update, "effective_chat", None), "id", None)
+                if chat is not None and not isinstance(error, _TgErr):
+                    await context.bot.send_message(
+                        chat_id=chat,
+                        text=("\u26a0\ufe0f Something went wrong handling that "
+                              "message. Nothing was saved from it.\n\n"
+                              "Send it again, or /start for a fresh lead."),
+                    )
+            except Exception:
+                pass          # the log above is the record; never crash in here
     
     # Add error handler - must be added before handlers
     application.add_error_handler(error_handler)
