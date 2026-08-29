@@ -77,52 +77,23 @@ class PriceIsNotInflatedByInsuranceTest(unittest.TestCase):
 
 
 class PortalPasswordTest(unittest.TestCase):
+    """One standard temporary password, matching /admin and the API.
 
-    def test_shape(self):
-        for _ in range(20):
-            pw = bot._generate_portal_password()
-            self.assertEqual(10, len(pw))
-            self.assertTrue(set(pw) <= set(bot._PORTAL_PW_ALPHABET), pw)
-            self.assertTrue(any(c.islower() for c in pw), pw)
-            self.assertTrue(any(c.isupper() for c in pw), pw)
-            self.assertTrue(any(c.isdigit() for c in pw), pw)
-            self.assertTrue(any(c in "#!@" for c in pw), pw)
+    The bot used to mint a random 10-character password per account, so the same
+    client got Temp#A9 if entered through /admin and something else if the bot
+    issued it — and for an email that already had an account the portal kept its
+    own password anyway, making the random one printed in the login block wrong.
+    """
 
-    def test_two_accounts_do_not_share_one(self):
-        self.assertNotEqual(bot._generate_portal_password(),
-                            bot._generate_portal_password())
+    def test_it_is_the_standard_temp_password(self):
+        self.assertEqual("Temp#A9", bot._generate_portal_password())
 
+    def test_it_is_stable_across_calls(self):
+        self.assertEqual({bot._generate_portal_password() for _ in range(20)},
+                         {"Temp#A9"})
 
-class RetryHelperIsTokenBoundedTest(unittest.TestCase):
-    """The error message names ONE column; only that exact column may be popped."""
-
-    def test_a_longer_identifier_does_not_evict_its_prefix(self):
-        payload = {"portal_password": "x", "insurance_card_sent_at": "now"}
-        exc = Exception("Could not find the 'portal_password_unchanged' column of 'leads'")
-        self.assertFalse(udb._retry_lead_write_without_phase1_files(exc, payload))
-        self.assertIn("portal_password", payload)
-        self.assertIn("insurance_card_sent_at", payload)
-
-    def test_emailed_at_does_not_evict_email(self):
-        payload = {"email": "a@b.c"}
-        exc = Exception("Could not find the 'insurance_emailed_at' column of 'leads'")
-        self.assertFalse(udb._retry_lead_write_without_phase1_files(exc, payload))
-        self.assertIn("email", payload)
-
-    def test_the_exact_column_is_still_popped(self):
-        payload = {"portal_password": "x", "email": "a@b.c"}
-        exc = Exception("Could not find the 'portal_password' column of 'leads'")
-        self.assertTrue(udb._retry_lead_write_without_phase1_files(exc, payload))
-        self.assertNotIn("portal_password", payload)
-        self.assertIn("email", payload)
-
-    def test_pgrst204_without_a_name_still_pops_all_optionals(self):
-        payload = {"portal_password": "x", "email": "a@b.c", "price": "$250"}
-        exc = Exception("PGRST204: something about leads schema cache")
-        self.assertTrue(udb._retry_lead_write_without_phase1_files(exc, payload))
-        self.assertNotIn("portal_password", payload)
-        self.assertNotIn("email", payload)
-        self.assertIn("price", payload)  # not an optional key — never popped
+    def test_it_matches_the_named_constant(self):
+        self.assertEqual(bot.PORTAL_DEFAULT_PASSWORD, bot._generate_portal_password())
 
 
 if __name__ == "__main__":

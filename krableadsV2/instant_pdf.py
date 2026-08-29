@@ -113,11 +113,28 @@ def register(app, db_provider):
         expected = _admin_key()
         return bool(expected and supplied and hmac.compare_digest(supplied, expected))
 
+    def _auth_error() -> str:
+        """Which side is wrong — without ever echoing a key.
+
+        A bare "unauthorized" is indistinguishable between "this server has no
+        key at all" and "the two keys differ", and those need opposite fixes.
+        Drivers only ever saw "Payment page unavailable", so this cost real
+        dispatches while nobody could tell what to change.
+        """
+        if not _admin_key():
+            return ("INTEGRATIONS_API_KEY is not set on the admin dashboard "
+                    "(krab-issuer-admin) — set it to the same value the bot uses.")
+        supplied = (request.headers.get("Authorization") or "").strip()
+        if not supplied:
+            return "No Authorization header was sent."
+        return ("The caller's INTEGRATIONS_API_KEY does not match the admin "
+                "dashboard's — set the same value on both Render services.")
+
     @app.route("/api/instant/checkout", methods=["POST"])
     def api_instant_checkout():
         """The bot asks for a pay link for one lead and one driver."""
         if not _authorised():
-            return jsonify({"error": "unauthorized"}), 401
+            return jsonify({"error": "unauthorized", "detail": _auth_error()}), 401
         key = _stripe_key()
         if not key:
             return jsonify({"error": "STRIPE_SECRET_KEY is not configured"}), 503
