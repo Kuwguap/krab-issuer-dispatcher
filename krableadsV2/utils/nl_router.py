@@ -196,6 +196,18 @@ TOOLS = [
         {"enable": _flag()},
     ),
     _fn(
+        "set_instant_tag",
+        "Turn Instant Tag (cash / prepay dispatch) for the lead on screen on or "
+        "off: 'cash payment', 'collect cash', 'prepay', 'prepayment', 'instant "
+        "dispatch', 'activate instant', 'payment method cash' -> true; 'instant "
+        "off', 'no prepay', 'normal dispatch' -> false. Only when the operator "
+        "is setting HOW this lead is dispatched. NOT when 'cash' merely "
+        "describes the client's payment inside a pasted lead ('250 total cash', "
+        "'client pays cash on delivery'), and NOT for a price — that is "
+        "update_lead with field price.",
+        {"enable": _flag()},
+    ),
+    _fn(
         "select_driver",
         "Choose which driver gets this lead. Pass 'all' to broadcast.",
         {"driver": _req("a driver's name, or the word 'all'")},

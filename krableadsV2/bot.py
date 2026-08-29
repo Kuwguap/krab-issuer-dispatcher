@@ -134,6 +134,43 @@ def _sync_driver_amount_from_price(state_data: dict) -> None:
     state_data["driver_amount"] = f"${val}"
 
 
+def _apply_instant_driver_default(state_data: dict) -> None:
+    """What the driver box should say once Instant Tag is on.
+
+    Instant is ONE driver paying ONE link -- unless supervisors switched the
+    broadcast on in /settings, and then All Drivers IS the default and the card
+    should say so. It used to reset to "auto" either way, so the setting was on
+    and the card still asked the issuer to choose.
+    """
+    picked = str(state_data.get("selected_driver_names") or "").strip()
+    if _instant_all_drivers_enabled():
+        if not picked or picked.lower() in ("auto", "none"):
+            state_data["selected_driver_names"] = "All Drivers"
+        return
+    if picked.lower().startswith("all"):
+        state_data["selected_driver_names"] = "auto"
+
+
+def _instant_toggle_note(state_data: dict) -> str:
+    """The line the issuer sees when Instant Tag comes on."""
+    amt = (state_data.get("driver_amount") or "").strip()
+    # Resolved OUTSIDE the f-strings below: an escape inside an f-string
+    # expression is a SyntaxError on the Python that Render deploys.
+    shown = amt or "\u2026"
+    if _instant_all_drivers_enabled():
+        note = (f"\U0001f916 Instant Tag: every driver gets a link for "
+                f"{shown} \u2014 first card to clear wins. "
+                "All Drivers is the default; pick one driver to narrow it.")
+    else:
+        note = (f"\U0001f916 Instant Tag: the driver pays {shown} by card "
+                "(or you release it with the password) and the tag sends itself. "
+                "Pick ONE driver \u2014 All Drivers is off for this lead.")
+    if not amt:
+        note += ("\n\u26a0\ufe0f No amount yet \u2014 set the price (amount = price "
+                 "\u2212 $50) or \u270f\ufe0f Edit \u2192 \U0001f4b5 Amount.")
+    return note
+
+
 def _instant_all_drivers_enabled() -> bool:
     """Supervisory switch: allow the All-Drivers broadcast for Instant Tag
     leads (every driver gets their own payment link; first card to clear
@@ -4164,6 +4201,49 @@ _INS_ON_RE = re.compile(
 )
 
 
+# Turning Instant Tag on out loud. The operator dictates these into the card,
+# so they are matched as a WHOLE message ("cash" typed on its own is the
+# instruction; "250 total cash" inside a pasted lead is not).
+_ITAG_ON_PHRASES = (
+    "cash payment", "collect cash", "prepay tag", "cash", "payment method cash",
+    "prepay", "instant tag on", "prepay on", "submit cash on", "prepayment",
+    "temp tag instant", "instant temp tag", "activate instant", "instant tag",
+    "skip dispatch", "instant dispatch", "activate instant mode",
+    "instant", "instant mode", "cash on", "cash delivery", "prepaid",
+    "collect cash on delivery", "cod", "payment cash", "cash prepay",
+)
+_ITAG_OFF_PHRASES = (
+    "instant tag off", "instant off", "no instant", "cancel instant",
+    "prepay off", "no prepay", "turn off instant", "not instant",
+    "no cash", "cash off", "normal dispatch", "regular dispatch",
+)
+# Longest first: "instant tag off" must be read before "instant tag".
+_ITAG_ON_RE = re.compile(
+    r"^\s*(?:turn\s+on\s+|switch\s+on\s+|set\s+|make\s+it\s+|use\s+|do\s+)?"
+    r"(?:" + "|".join(re.escape(p) for p in sorted(_ITAG_ON_PHRASES, key=len, reverse=True))
+    + r")\s*(?:on|please|mode)?\s*[.!]*$", re.I)
+_ITAG_OFF_RE = re.compile(
+    r"^\s*(?:turn\s+off\s+|switch\s+off\s+)?"
+    r"(?:" + "|".join(re.escape(p) for p in sorted(_ITAG_OFF_PHRASES, key=len, reverse=True))
+    + r")\s*[.!]*$", re.I)
+
+
+def _instant_intent(text: str):
+    """True = turn Instant Tag on, False = off, None = not about it at all.
+
+    Whole-message only, deliberately: "cash" is an instruction on its own and
+    just a word inside a pasted lead.
+    """
+    t = (text or "").strip()
+    if not t:
+        return None
+    if _ITAG_OFF_RE.match(t):
+        return False
+    if _ITAG_ON_RE.match(t):
+        return True
+    return None
+
+
 def _insurance_intent(text: str):
     """True = turn insurance on, False = off, None = not an insurance command.
     Whole-ish phrase match so a value like 'insurance GEICO' stays a field edit."""
@@ -7108,7 +7188,7 @@ async def _open_source_picker(context: ContextTypes.DEFAULT_TYPE) -> None:
 # exactly the same code a tap does.
 _AI_CARD_TOOLS = frozenset({
     "update_lead", "update_lead_fields", "select_driver", "select_dispatcher",
-    "add_vehicle", "submit_lead", "set_insurance_addon",
+    "add_vehicle", "submit_lead", "set_insurance_addon", "set_instant_tag",
 })
 
 
@@ -7315,6 +7395,21 @@ async def _run_ai_card_tool(update, context, user_id, state_data, tool, args):
         state_data["wants_insurance"] = bool(args.get("enable"))
         db.set_user_state(user_id, "phase1", state_data)
         await _ai_card_housekeeping(update, context, state_data, chat_id)
+        return STATE_AI_REVIEW
+
+    if tool == "set_instant_tag":
+        # The spoken twin of the 🤖 button. It lands in the same helpers a tap
+        # does, so the driver default and the note cannot drift between them.
+        on = bool(args.get("enable"))
+        state_data["instant_tag"] = on
+        if on:
+            if not (state_data.get("driver_amount") or "").strip():
+                _sync_driver_amount_from_price(state_data)
+            _apply_instant_driver_default(state_data)
+        db.set_user_state(user_id, "phase1", state_data)
+        await _ai_card_housekeeping(
+            update, context, state_data, chat_id,
+            toast=_instant_toggle_note(state_data) if on else "🤖 Instant Tag off.")
         return STATE_AI_REVIEW
 
     if tool in ("select_driver", "select_dispatcher"):
@@ -7709,7 +7804,32 @@ async def handle_phase1_review_message(update: Update, context: ContextTypes.DEF
         if handled is not None:
             return handled
 
-    # 0. Insurance on/off by voice/text ("add insurance", "no insurance") — before the
+    # 0. Instant Tag on/off by voice/text ("cash payment", "prepay", "instant
+    #    dispatch") — said out loud instead of tapped, which is how the issuer
+    #    works while driving. Same guard as insurance below: a whole pasted lead
+    #    that happens to contain "cash" is a lead, not a switch.
+    _itag = _instant_intent(text)
+    if _itag is not None and not _looks_like_multifield_block(text):
+        state_data["instant_tag"] = _itag
+        if _itag:
+            if not (state_data.get("driver_amount") or "").strip():
+                _sync_driver_amount_from_price(state_data)
+            _apply_instant_driver_default(state_data)
+        db.set_user_state(user_id, "phase1", state_data)
+        chat_id = update.effective_chat.id if update.effective_chat else message.chat_id
+        try:
+            await message.delete()
+        except Exception:
+            pass
+        await _cleanup_voice_echo(context, chat_id)
+        await _update_review_message_text(context, state_data)
+        await _send_vanishing(
+            context, chat_id,
+            _instant_toggle_note(state_data) if _itag else "\U0001f916 Instant Tag off.",
+            delay=10.0)
+        return STATE_AI_REVIEW
+
+    # 0b. Insurance on/off by voice/text ("add insurance", "no insurance") — before the
     #    field editor, so "insurance" isn't swallowed as an insurance-company edit.
     #    A WHOLE PASTED LEAD that happens to contain "ADD INSURANCE" is NOT an
     #    insurance command. Claiming it here deleted the issuer's paste, wrote the
@@ -9037,7 +9157,7 @@ async def _route_supervisor_message(update, context, user_id, text: str) -> bool
             )
         elif intent in ("update_lead", "update_lead_fields", "select_driver",
                         "select_dispatcher", "add_vehicle", "submit_lead",
-                        "set_insurance_addon"):
+                        "set_insurance_addon", "set_instant_tag"):
             if not _chat_layer_enabled():
                 # Layer off, key present: the old hint path classified this and
                 # answered with the help text. Keep that cell byte-identical.
@@ -12306,23 +12426,12 @@ async def handle_phase1_ai_review_callback(update, context):
         if state_data["instant_tag"]:
             if not (state_data.get("driver_amount") or "").strip():
                 _sync_driver_amount_from_price(state_data)
-            # Instant is ONE driver by definition; a card already set to the
-            # broadcast resets to auto so the picker asks again.
-            if str(state_data.get("selected_driver_names") or "").strip().lower().startswith("all"):
-                state_data["selected_driver_names"] = "auto"
+            _apply_instant_driver_default(state_data)
         db.set_user_state(user_id, "phase1", state_data)
         await _update_review_message_text(context, state_data)
         if state_data.get("instant_tag"):
-            amt = (state_data.get("driver_amount") or "").strip()
-            note = (
-                f"🤖 Instant Tag: the driver pays {amt or '…'} by card (or you release it "
-                "with the password) and the tag sends itself. Pick ONE driver — "
-                "All Drivers is off for this lead."
-            )
-            if not amt:
-                note += ("\n⚠️ No amount yet — set the price (amount = price − $50) "
-                         "or ✏️ Edit → 💵 Amount.")
-            await _send_vanishing(context, query.message.chat_id, note, delay=10.0)
+            await _send_vanishing(context, query.message.chat_id,
+                                  _instant_toggle_note(state_data), delay=10.0)
         return STATE_AI_REVIEW
 
     elif data == "ph1_tagmail_toggle":
