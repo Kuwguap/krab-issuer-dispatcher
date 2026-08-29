@@ -3606,7 +3606,8 @@ def _fresh_price_picker(context, state_data) -> InlineKeyboardMarkup:
 # answer it (see _adopt_review_message).
 PH1_REVIEW_CB_PATTERN = (
     r"^(ph1_accept|ph1_edit|ph1_vin_check|ph1_add_image|ph1_adjust|ph1_attach|"
-    r"ph1_ins_toggle|ph1_itag_toggle|adjust_cancel|ph1_back|ph1_pick_group|ph1_pick_driver|"
+    r"ph1_ins_toggle|ph1_itag_toggle|ph1_tagmail_toggle|adjust_cancel|ph1_back|"
+    r"ph1_pick_group|ph1_pick_driver|"
     r"ph1_pick_source|selgrp_|seldrv_|selsrc_|ph1_sel_back|driver_suspended_|"
     r"edit_cancel|ph1edit_|ph1_add_car|ph1car_|ph1carrm_)"
 )
@@ -4203,6 +4204,11 @@ def _build_review_keyboard_with_selections(state_data):
         )],
         [InlineKeyboardButton("🖼 Add image (title / license)", callback_data="ph1_add_image")],
     ] + _add_car_button_rows(state_data) + [
+        [InlineKeyboardButton(
+            "📧 Tag email: ON" if state_data.get("wants_tag_email")
+            else "📧 Email tag to client",
+            callback_data="ph1_tagmail_toggle",
+        )],
         [InlineKeyboardButton(
             (f"🤖 Instant Tag 🏷️: ON ({(state_data.get('driver_amount') or '').strip()})"
              if (state_data.get("driver_amount") or "").strip()
@@ -10268,6 +10274,85 @@ async def _tag_fields_from_lead(lead: dict, *, renewal: bool = False,
     }
 
 
+async def _maybe_email_tag_to_client(lead: dict, vehicle: int, pdf: bytes,
+                                     filename: str) -> None:
+    """Email this tag to the client, when the issuer asked for it.
+
+    Nothing in this system emailed a tag before, which is why "Tag emailed" was
+    the one stop on the /receipts ladder with no automatic trigger. It is
+    stamped per car -- car 1 on the lead row, the rest in their own blob entry,
+    the same shape the insurance uses -- so a tag re-sent to the group never
+    mails the client a second copy. Best effort throughout: the tag is already
+    in the team's hands and must never fail because an inbox did.
+    """
+    try:
+        if not lead or not lead.get("wants_tag_email") or not pdf:
+            return
+        email = (lead.get("email") or "").strip()
+        if not email:
+            logger.info("tag email: lead %s asked for it but has no address",
+                        lead.get("id"))
+            return
+        # Already sent for THIS car?
+        if vehicle <= 1:
+            if str(lead.get("tag_emailed_at") or "").strip():
+                return
+        else:
+            vehicles = _extra_vehicles(lead)
+            v = vehicles[vehicle - 2] if 0 <= vehicle - 2 < len(vehicles) else None
+            if v is None or str(v.get("tag_emailed_at") or "").strip():
+                return
+
+        from utils import resend_client as rc
+        ref = (lead.get("reference_id") or "").strip()
+        name = rc.first_name_from_full(_client_display_name_from_lead(lead) or "")
+        subject = f"Your temporary tag{f' - {ref}' if ref else ''}"
+        body = (
+            f"Hi {name or 'there'},\n\n"
+            "Your temporary tag is attached. Print it and keep it with the "
+            "vehicle.\n\n"
+            + (f"Reference: {ref}\n" if ref else "")
+            + f"\nThank you,\n{Config.FOLLOWUP_AGENCY_NAME}\n"
+            f"{Config.FOLLOWUP_WEBSITE}"
+        )
+        # The PDF sender is shared with the insurance card -- same transport,
+        # same attachment handling; only the paperwork differs.
+        result = await asyncio.to_thread(
+            lambda: rc.send_insurance_card_email(
+                to_address=email, subject=subject, body=body,
+                pdf_bytes=pdf, pdf_filename=filename))
+        now_iso = datetime.now(pytz.timezone("America/New_York")).isoformat()
+        if getattr(result, "ok", False):
+            if vehicle <= 1:
+                await asyncio.to_thread(db.update_lead, str(lead.get("id")), {
+                    "tag_emailed_at": now_iso, "tag_email_error": None})
+                lead["tag_emailed_at"] = now_iso
+            else:
+                vehicles = _extra_vehicles(lead)
+                vehicles[vehicle - 2]["tag_emailed_at"] = now_iso
+                await asyncio.to_thread(db.update_lead, str(lead.get("id")),
+                                        {EXTRA_VEHICLES_KEY: vehicles})
+                lead[EXTRA_VEHICLES_KEY] = vehicles
+            logger.info("tag emailed to the client for lead %s car %s",
+                        lead.get("id"), vehicle)
+            # The board's own stop for this, now that something reaches it.
+            try:
+                await asyncio.to_thread(
+                    db.advance_delivery_status, str(lead.get("id")), "tag_emailed")
+            except Exception as e:
+                logger.warning("tag_emailed status advance failed: %s", e)
+        else:
+            err = str(getattr(result, "error", "") or "unknown")[:500]
+            logger.warning("tag email failed for lead %s: %s", lead.get("id"), err)
+            try:
+                await asyncio.to_thread(db.update_lead, str(lead.get("id")),
+                                        {"tag_email_error": err})
+            except Exception:
+                pass
+    except Exception as e:
+        logger.warning("tag email skipped for lead %s: %s", (lead or {}).get("id"), e)
+
+
 async def _build_and_send_tag_pdf(
     context: ContextTypes.DEFAULT_TYPE, lead: dict, target_chat_ids: list,
     *, renewal: bool = False, accepted_by: str | None = None,
@@ -10342,6 +10427,10 @@ async def _build_and_send_tag_pdf(
                 )
             except Exception as e2:
                 logger.warning("Tag-failure notice also undeliverable to %s: %s", cid, e2)
+    # The client's own copy, when the issuer asked for it. After the send loop,
+    # so it only ever goes out for a tag that actually reached somebody.
+    if sent:
+        await _maybe_email_tag_to_client(lead, vehicle, pdf, filename)
     # If the issuer opted into insurance, issue + drop the card right next to the tag.
     if ride_insurance:
         await _maybe_ride_insurance_with_tag(context, lead, list(seen))
@@ -12234,6 +12323,21 @@ async def handle_phase1_ai_review_callback(update, context):
                 note += ("\n⚠️ No amount yet — set the price (amount = price − $50) "
                          "or ✏️ Edit → 💵 Amount.")
             await _send_vanishing(context, query.message.chat_id, note, delay=10.0)
+        return STATE_AI_REVIEW
+
+    elif data == "ph1_tagmail_toggle":
+        state_data["wants_tag_email"] = not state_data.get("wants_tag_email")
+        db.set_user_state(user_id, "phase1", state_data)
+        await _update_review_message_text(context, state_data)
+        if state_data.get("wants_tag_email") and not (state_data.get("email") or "").strip():
+            # Switched on with nowhere to send it. Ask now, while the issuer is
+            # still on the card, rather than discovering it at dispatch.
+            await _send_vanishing(
+                context, query.message.chat_id,
+                "📧 Which email should the tag go to? "
+                "Tap ✏️ Edit → 📧 Email, or just type it here.",
+                delay=12.0,
+            )
         return STATE_AI_REVIEW
 
     elif data == "ph1_ins_toggle":
@@ -19233,6 +19337,13 @@ async def _on_lead_created(context: ContextTypes.DEFAULT_TYPE, lead: dict | None
         # Instant Tag rides the same deploy-safe channel: flag + the amount the
         # driver pays. Optional write keys, so a DB behind the migration
         # degrades to a normal lead instead of failing.
+        if st_data.get("wants_tag_email"):
+            try:
+                await asyncio.to_thread(db.update_lead, lead["id"],
+                                        {"wants_tag_email": True})
+                lead["wants_tag_email"] = True
+            except Exception as e:
+                logger.info("wants_tag_email not persisted (column missing yet?): %s", e)
         if st_data.get("instant_tag"):
             try:
                 _amt = (st_data.get("driver_amount") or "").strip() or None

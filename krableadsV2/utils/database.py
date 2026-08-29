@@ -37,6 +37,9 @@ _OPTIONAL_LEADS_WRITE_KEYS = frozenset({
     "ingest_dispatch_pending",
     "external_order_id",
     "tag_sent_at_creation",
+    "wants_tag_email",
+    "tag_emailed_at",
+    "tag_email_error",
 })
 
 
