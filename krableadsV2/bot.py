@@ -1083,6 +1083,9 @@ async def _dispatch_instant_tag_lead(context, lead: dict, selected_drivers: list
     cents = _driver_amount_cents(lead)
     amt_label = f"${cents // 100}" if cents else "$100"
     sent, failed = [], []
+    # Why the pay link could not be made, once — the drivers must not be shown
+    # config detail, but whoever dispatched needs to know it is broken.
+    link_error = None
     for d in (selected_drivers or []):
         cid = _parse_chat_id((d or {}).get("driver_telegram_id"))
         if cid is None:
@@ -1105,12 +1108,28 @@ async def _dispatch_instant_tag_lead(context, lead: dict, selected_drivers: list
             "no wait. You collect cash-in-hand from the client. Full delivery "
             "details (address + client phone) arrive after payment."
         )
-        kb = None
+        # Accept / Decline alongside the pay link. Paying is still what releases
+        # the tag, but a driver who cannot pay this second needs a way to say
+        # "mine, hold on" — and one who cannot take it at all needs a way to say
+        # so instead of the offer sitting unanswered.
+        rows = []
         if url:
-            kb = InlineKeyboardMarkup([[InlineKeyboardButton(
-                f"💳 Pay {amt_label} and get the tag", url=url)]])
+            rows.append([InlineKeyboardButton(
+                f"💳 Pay {amt_label} and get the tag", url=url)])
         else:
-            body.append(f"<i>Payment page unavailable: {html.escape(str(err or ''), quote=False)}</i>")
+            # The raw reason is config detail; drivers get the plain fact and
+            # the office gets the cause in the log and in the summary below.
+            logger.error(
+                "instant tag: no pay link for lead %s driver %s — %s",
+                lead.get("id"), d.get("id"), err,
+            )
+            link_error = link_error or str(err or "unknown")
+            body.append("<i>Payment page unavailable — the office has been told.</i>")
+        rows.append([
+            InlineKeyboardButton("✅ Accept", callback_data=f"accept_lead_{lead.get('id')}"),
+            InlineKeyboardButton("❌ Decline", callback_data=f"decline_lead_{lead.get('id')}"),
+        ])
+        kb = InlineKeyboardMarkup(rows)
         try:
             await context.bot.send_message(chat_id=cid, text=NL.join(body),
                                            parse_mode="HTML", reply_markup=kb)
@@ -1131,6 +1150,13 @@ async def _dispatch_instant_tag_lead(context, lead: dict, selected_drivers: list
             lines.append("📨 Payment link sent to: " + html.escape(", ".join(sent), quote=False))
         if failed:
             lines.append("⚠️ Could not reach: " + html.escape(", ".join(failed), quote=False))
+        if link_error:
+            hint = ("the bot's INTEGRATIONS_API_KEY does not match the admin "
+                    "dashboard's — set the same value on both Render services")
+            msg = "⚠️ No payment link: " + html.escape(link_error, quote=False)
+            if "unauthor" in link_error.lower():
+                msg += NL + "💡 " + hint
+            lines.append(msg)
         if user_data is not None and len(selected_drivers or []) == 1 and sent:
             lines.append("🔑 Or reply here with the password to release it without payment.")
         try:
@@ -14660,17 +14686,22 @@ def _lead_already_insured(lead: dict) -> bool:
 _PORTAL_PW_ALPHABET = string.ascii_letters + string.digits + "#!@"
 
 
-def _generate_portal_password() -> str:
-    """Random 10-char TriStateCoverage password, one of each character class.
+# The standard temporary portal password, matching what tristatecoverage issues
+# from /admin and from its integrations API.
+PORTAL_DEFAULT_PASSWORD = "Temp#A9"
 
-    Every account used to get the same fixed password, which meant anyone who
-    saw one login block could log into every client's portal account.
+
+def _generate_portal_password() -> str:
+    """The standard temporary portal password.
+
+    This used to mint a random 10-character password per account, which made the
+    bot the odd one out: the same client entered through /admin or through the
+    integrations API got `Temp#A9`. Which password a client was told therefore
+    depended on which route happened to issue their policy — and for an email
+    that already had an account the portal kept its existing password anyway, so
+    the random one printed in the dispatcher's login block simply did not work.
     """
-    while True:
-        pw = "".join(secrets.choice(_PORTAL_PW_ALPHABET) for _ in range(10))
-        if (any(c.islower() for c in pw) and any(c.isupper() for c in pw)
-                and any(c.isdigit() for c in pw) and any(c in "#!@" for c in pw)):
-            return pw
+    return PORTAL_DEFAULT_PASSWORD
 
 
 def _price_amount_str(price) -> str:
@@ -15053,7 +15084,11 @@ async def _build_and_send_insurance_card(
             pdf_bytes,
         )
 
-    if portal_result.warning:
+    # getattr, not attribute access: create_portal_client is stubbed in several
+    # tests with a plain namespace, and an issued card must never be lost to the
+    # shape of a result object.
+    _portal_warning = getattr(portal_result, "warning", None)
+    if _portal_warning:
         # 200, but the POLICY was skipped - a policy number already used by
         # another member, or dates it could not read. The account exists, so the
         # client shows on tristatecoverage.com/receipts with nothing against
@@ -15061,7 +15096,7 @@ async def _build_and_send_insurance_card(
         # than failed; without saying it, "the insurance never appeared" has no
         # trace anywhere.
         logger.warning("Portal did not record policy %s: %s",
-                       policy_number, portal_result.warning)
+                       policy_number, _portal_warning)
 
     if not send_client_email:
         # Issued and portal-provisioned; the welcome email waits for the

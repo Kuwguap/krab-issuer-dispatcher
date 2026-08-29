@@ -18,6 +18,26 @@ class CreatePortalClientResult:
     error: Optional[str] = None
     payload: Optional[Dict[str, Any]] = None
 
+    @property
+    def warning(self) -> Optional[str]:
+        """What the portal did NOT manage to do, despite answering ok.
+
+        A globally-duplicate policy number, or dates it could not parse, make it
+        skip the policy row (and with it the invoice, the stored card and the
+        coverage flags) and return 200 with a warning instead. The account still
+        exists, so the member shows on the coverage receipts board with no
+        policy against them -- which is the shape of "the insurance never
+        appeared". Reading `ok` alone cannot see it."""
+        if not isinstance(self.payload, dict):
+            return None
+        w = self.payload.get("warning")
+        return str(w).strip() or None if w else None
+
+    @property
+    def policy_registered(self) -> bool:
+        """True when the portal really does hold a policy for this client."""
+        return bool(self.ok) and not self.warning
+
 
 _DUPLICATE_MARKERS = (
     "already exists",
