@@ -161,6 +161,13 @@ services:
         value: https://krab-dispatch-api.onrender.com
       - key: KRAB_DISPATCH_ADMIN_PASSWORD
         sync: false
+      # Instant Tag checkout + the Stripe webhook that releases the tag BOTH
+      # live on this service. Without STRIPE_SECRET_KEY every pay link fails
+      # with 503 and the driver just sees "Payment page unavailable".
+      - key: STRIPE_SECRET_KEY
+        sync: false
+      - key: STRIPE_WEBHOOK_SECRET
+        sync: false
       # The /receipts board's send buttons (email via Resend→SendGrid, SMS via
       # GoHighLevel→Twilio). Same keys the bot uses — set them here too, or the
       # buttons explain they are unconfigured instead of sending.

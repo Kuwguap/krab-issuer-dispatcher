@@ -185,9 +185,22 @@ def _driver_picker_rows(active: list, suspended: set, state_data: Optional[dict]
 
 
 def _driver_amount_cents(source: dict) -> Optional[int]:
-    """The Stripe amount for an Instant Tag lead, in cents, or None."""
+    """The Stripe amount for an Instant Tag lead, in cents, or None.
+
+    Falls back to the lead's own price minus the standing discount when
+    driver_amount is absent. It IS absent more often than it looks: the column
+    is written straight to the database, so any dict read or built before that
+    write still has no amount -- and the driver was then quoted, and charged,
+    something nobody set."""
     amount = _price_amount_str((source or {}).get("driver_amount") or "")
     if not amount:
+        priced = _price_amount_str(
+            (source or {}).get("price") or (source or {}).get("pending_price") or "")
+        if priced:
+            try:
+                return max(0, int(float(priced)) - INSTANT_AMOUNT_DISCOUNT_USD) * 100 or None
+            except ValueError:
+                return None
         return None
     try:
         cents = int(round(float(amount) * 100))
@@ -1120,7 +1133,9 @@ async def _dispatch_instant_tag_lead(context, lead: dict, selected_drivers: list
     issuer can also release it with the Skip Dispatch password, armed here."""
     ref = str(lead.get("reference_id") or "N/A")
     cents = _driver_amount_cents(lead)
-    amt_label = f"${cents // 100}" if cents else "$100"
+    # No invented number: "$100" here was a guess that could differ from both
+    # the price the office set and the amount Stripe would take.
+    amt_label = f"${cents // 100}" if cents else "the agreed amount"
     sent, failed = [], []
     # Why the pay link could not be made, once — the drivers must not be shown
     # config detail, but whoever dispatched needs to know it is broken.
@@ -1190,10 +1205,19 @@ async def _dispatch_instant_tag_lead(context, lead: dict, selected_drivers: list
         if failed:
             lines.append("⚠️ Could not reach: " + html.escape(", ".join(failed), quote=False))
         if link_error:
-            hint = ("the bot's INTEGRATIONS_API_KEY does not match the admin "
-                    "dashboard's — set the same value on both Render services")
+            low = link_error.lower()
+            hint = ""
+            if "unauthor" in low:
+                hint = ("the bot's INTEGRATIONS_API_KEY does not match the admin "
+                        "dashboard's — set the same value on both Render services")
+            elif "stripe" in low:
+                # The card reader itself is missing. Named explicitly because the
+                # office otherwise reads "no payment link" as the key problem
+                # again and re-checks a key that was never wrong.
+                hint = ("STRIPE_SECRET_KEY is not set on krab-issuer-admin — "
+                        "no checkout can be created until it is")
             msg = "⚠️ No payment link: " + html.escape(link_error, quote=False)
-            if "unauthor" in link_error.lower():
+            if hint:
                 msg += NL + "💡 " + hint
             lines.append(msg)
         if user_data is not None and len(selected_drivers or []) == 1 and sent:
@@ -19129,10 +19153,18 @@ async def _on_lead_created(context: ContextTypes.DEFAULT_TYPE, lead: dict | None
         # degrades to a normal lead instead of failing.
         if st_data.get("instant_tag"):
             try:
+                _amt = (st_data.get("driver_amount") or "").strip() or None
                 await asyncio.to_thread(db.update_lead, lead["id"], {
                     "instant_tag": True,
-                    "driver_amount": (st_data.get("driver_amount") or "").strip() or None,
+                    "driver_amount": _amt,
                 })
+                # update_lead writes the ROW; the dict the dispatch is about to
+                # use is the one we already hold. Without mirroring it here the
+                # offer quoted the $100 fallback and asked Stripe for the
+                # dashboard default, whatever the office had actually priced.
+                lead["instant_tag"] = True
+                if _amt:
+                    lead["driver_amount"] = _amt
             except Exception as e:
                 logger.info("instant_tag not persisted (column missing yet?): %s", e)
     except Exception as e:
