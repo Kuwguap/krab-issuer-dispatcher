@@ -3060,6 +3060,16 @@ def _normalize_car_for_compare(car: str) -> str:
     return " ".join((car or "").lower().split())
 
 
+def _car_is_blank(car: str | None) -> bool:
+    """Is there actually a vehicle written on the card?
+
+    The review card renders an empty field as "-", and a few operators type
+    "n/a" or an em dash. None of those is a car anyone would want to keep.
+    """
+    t = (car or "").strip().lower()
+    return t in ("", "-", "--", "—", "–", "n/a", "na", "none", "unknown", "?")
+
+
 def _vin_check_after_phase1(state_data: dict) -> tuple:
     """
     Run VIN lookup when we have a 17-char VIN. Uses provider from Config (.env).
@@ -3067,6 +3077,13 @@ def _vin_check_after_phase1(state_data: dict) -> tuple:
       (alert_msg, conflict) where
       alert_msg: optional warning to show before Phase 2 (no result / not 17).
       conflict: (api_car_line, stated_car) if VIN returned different car; else None.
+
+    When the card carries NO car, the decode is written straight into
+    ``state_data["car"]`` and no conflict is raised — the caller must persist
+    state afterwards. Asking "use the DMV decode, or keep '-'?" offered a choice
+    between a vehicle and nothing, and every operator who ignored that prompt
+    (or whose inline buttons died in a redeploy) dispatched a lead with an empty
+    Car field even though the VIN had decoded perfectly well.
     """
     vin = (state_data.get("vin") or "").strip()
     if not vin or vin == "-" or len(vin) != 17:
@@ -3083,6 +3100,9 @@ def _vin_check_after_phase1(state_data: dict) -> tuple:
     api_car = (result.get("car_line") or "").strip()
     stated = (state_data.get("car") or "").strip()
     if not api_car:
+        return (None, None)
+    if _car_is_blank(stated):
+        state_data["car"] = api_car
         return (None, None)
     if _normalize_car_for_compare(api_car) == _normalize_car_for_compare(stated):
         return (None, None)
@@ -12490,6 +12510,9 @@ async def handle_vin_retype(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         context.user_data["vin_conflict_msg_id"] = vin_msg.message_id
         _track_vin_flow_msg(context, vin_msg)
         return STATE_VIN_CHOICE
+    # The check may have auto-filled the car from the decode; persist that before
+    # the review card is redrawn, or the fill is lost on the next state read.
+    db.set_user_state(user_id, "phase1", state_data)
     # VIN resolved — wipe every VIN message so only the review card remains.
     await _clear_vin_flow_msgs(context)
     if alert_msg:
@@ -12550,6 +12573,17 @@ async def _handle_phase1_vin_check_button(
         await query.message.reply_text("⚠️ DMV did not return a car for this VIN.")
         return STATE_AI_REVIEW
     stated = (state_data.get("car") or "").strip()
+    # Nothing on the card to keep — take the decode and say so, rather than
+    # asking the operator to choose between a vehicle and an empty field.
+    if _car_is_blank(stated):
+        state_data["car"] = api_car
+        db.set_user_state(user_id, "phase1", state_data)
+        await _clear_vin_flow_msgs(context)
+        chat_id = getattr(getattr(query, "message", None), "chat_id", None)
+        if chat_id is not None:
+            await _send_vanishing(context, chat_id, f"🚘 Car filled from VIN: {api_car}")
+        await _update_review_message_text(context, state_data)
+        return STATE_AI_REVIEW
     context.user_data["vin_choice_api_car"] = api_car
     context.user_data["vin_choice_stated_car"] = stated
     vin_msg = await query.message.reply_text(
