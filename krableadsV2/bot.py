@@ -2721,6 +2721,37 @@ def extract_reference_id(text: str, exists=None) -> str:
     return up
 
 
+# A dictated name often carries its own spelling, and then whatever the
+# transcript ran into next: "Bianca Laidlaw, B-I-A-N-C-A-L-A-I-D-L-A-W. The".
+# Four or more single letters in a row, joined by dashes, dots or spaces, is
+# somebody spelling out loud -- no real name looks like that. Two or three are
+# left alone so initials ("J. R. R. Tolkien") survive untouched.
+_SPELLED_OUT = re.compile(r"\b(?:[A-Za-z][-.\s]){3,}[A-Za-z]\b")
+_NAME_TAIL_FILLER = re.compile(
+    r"[\s,.;:-]*\b(?:the|and|uh+|um+|er+|a|an|is|it|thats|that)\b[\s,.;:!?-]*$",
+    re.IGNORECASE)
+
+
+def _clean_spoken_name(value: str) -> str:
+    """Keep the name, drop the recital.
+
+    Never returns empty: if the cleaning eats everything (a name that really
+    was only letters), the original is kept -- losing the client is far worse
+    than an ugly one.
+    """
+    raw = str(value or "").strip()
+    if not raw:
+        return raw
+    cleaned = _SPELLED_OUT.sub(" ", raw)
+    for _ in range(3):                     # "... . The uh" needs a few passes
+        stripped = _NAME_TAIL_FILLER.sub("", cleaned)
+        if stripped == cleaned:
+            break
+        cleaned = stripped
+    cleaned = re.sub(r"\s{2,}", " ", cleaned).strip(" ,.;:-\t")
+    return cleaned or raw
+
+
 def parse_phase1_structured(message_text: str) -> dict:
     """
     Parse Phase 1 structured input into individual fields.
@@ -2749,7 +2780,7 @@ def parse_phase1_structured(message_text: str) -> dict:
         v = get_line(idx)
         return "" if _value_is_refusal(v) else v
 
-    name = field(0)
+    name = _clean_spoken_name(field(0))
     address = field(1)
     city_state_zip = field(2)
     delivery_address = field(3)
@@ -9516,7 +9547,7 @@ def _client_display_name_from_lead(lead: dict) -> str:
     """Client / registrant name from stored Phase 1 (for supervisory receipt notices)."""
     try:
         p1 = _phase1_from_stored_lead(lead)
-        n = (p1.get("name") or "").strip()
+        n = _clean_spoken_name(p1.get("name") or "")
         return n if n else "—"
     except Exception:
         return "—"
@@ -21029,7 +21060,8 @@ def main():
                                 chat_id=gchat27,
                                 text=(
                                     f"🔔 Renewal reminder — `{ref27}` is due tomorrow.\n"
-                                    f"It goes to {dname27}; if they pass, you pick the next driver."
+                                    f"The offer goes to {dname27} — it stays theirs "
+                                    "unless they pass it back."
                                 ),
                                 parse_mode="Markdown",
                             )
@@ -21042,7 +21074,8 @@ def main():
                             chat_id=drv_chat27,
                             text=(
                                 f"🔔 Heads up — renewal `{ref27}` is due tomorrow.\n"
-                                "It comes to you — accept it, or pass it back."
+                                "It's yours — no time limit. Accept it when you're "
+                                "ready, or pass it back."
                             ),
                             parse_mode="Markdown",
                         )
@@ -21103,8 +21136,8 @@ def main():
                                     chat_id=gchat,
                                     text=(
                                         f"🔄 Renewal `{ref}` sent to {dname}.\n"
-                                        "If they pass it back, whoever created the "
-                                        "lead picks the next driver."
+                                        "It stays theirs — if they pass it back, "
+                                        "whoever created the lead picks the next driver."
                                     ),
                                     parse_mode="Markdown",
                                 )
