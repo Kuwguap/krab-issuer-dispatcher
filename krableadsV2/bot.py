@@ -16502,7 +16502,14 @@ async def handle_reassign_lead(update: Update, context: ContextTypes.DEFAULT_TYP
 async def handle_accept_group_offer(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle a group member accepting a broadcast lead offer."""
     query = update.callback_query
-    await query.answer()
+    # Acknowledge the callback query immediately. If the query has already expired
+    # (because the event loop was congested and processing was delayed), Telegram
+    # returns a 400 Bad Request — catch and log it gracefully so the rest of the
+    # handler can still run and update the group messages correctly.
+    try:
+        await query.answer()
+    except BadRequest as e:
+        logger.warning("handle_accept_group_offer: could not answer callback query (likely expired): %s", e)
     pair = _parse_paired_short_uuids(query.data, "ag_")
     if not pair:
         await query.message.reply_text("❌ Invalid request.")
@@ -16515,8 +16522,10 @@ async def handle_accept_group_offer(update: Update, context: ContextTypes.DEFAUL
         await query.message.reply_text("❌ Invalid request.")
         return
 
-    lead = db.get_lead_by_id(lead_id)
-    group = db.get_group_by_id(group_id)
+    lead, group = await asyncio.gather(
+        asyncio.to_thread(db.get_lead_by_id, lead_id),
+        asyncio.to_thread(db.get_group_by_id, group_id),
+    )
     if not lead or not group or not record_is_active(group):
         try:
             await query.message.edit_text(
@@ -16527,12 +16536,15 @@ async def handle_accept_group_offer(update: Update, context: ContextTypes.DEFAUL
             pass
         return
 
-    accepted = db.accept_group_lead_offer(lead_id, group_id, accepted_by_telegram_id=str(query.from_user.id))
+    accepted = await asyncio.to_thread(
+        db.accept_group_lead_offer, lead_id, group_id,
+        accepted_by_telegram_id=str(query.from_user.id),
+    )
     if not accepted:
         # Someone else already accepted — refresh every group's message so Accept is gone everywhere.
-        accepted_row = db.get_accepted_group_for_lead(lead_id)
+        accepted_row = await asyncio.to_thread(db.get_accepted_group_for_lead, lead_id)
         win_gid = (accepted_row or {}).get("group_id")
-        accepted_group = db.get_group_by_id(win_gid) if win_gid else None
+        accepted_group = (await asyncio.to_thread(db.get_group_by_id, win_gid)) if win_gid else None
         gname = accepted_group.get("group_name") if accepted_group else "another group"
         ref_show = lead.get("reference_id", "N/A")
         # "Accepted by" line should show the team member who actually tapped
@@ -16541,7 +16553,7 @@ async def handle_accept_group_offer(update: Update, context: ContextTypes.DEFAUL
             query.from_user.full_name or "Unknown"
         )
         acceptor_esc = _telegram_md1_escape(acceptor_handle)
-        for o in db.get_group_lead_offers(lead_id):
+        for o in await asyncio.to_thread(db.get_group_lead_offers, lead_id):
             ocid = _parse_chat_id(o.get("group_chat_id"))
             mid = o.get("group_message_id")
             ogid = o.get("group_id")
@@ -16576,9 +16588,12 @@ async def handle_accept_group_offer(update: Update, context: ContextTypes.DEFAUL
         return
 
     # Set lead.group_id to winning group (single accepted group per lead — enforced in DB)
-    db.update_lead(lead_id, {"group_id": group_id})
-    lead = db.get_lead_by_id(lead_id) or lead
-    acc_row = db.get_accepted_group_for_lead(lead_id)
+    await asyncio.to_thread(db.update_lead, lead_id, {"group_id": group_id})
+    lead, acc_row = await asyncio.gather(
+        asyncio.to_thread(db.get_lead_by_id, lead_id),
+        asyncio.to_thread(db.get_accepted_group_for_lead, lead_id),
+    )
+    lead = lead or {}
     if not acc_row or str(acc_row.get("group_id")) != str(group_id):
         logger.error(
             "accept_group_offer: accepted offer row missing or mismatch (lead=%s group=%s row=%s)",
@@ -16587,7 +16602,7 @@ async def handle_accept_group_offer(update: Update, context: ContextTypes.DEFAUL
             acc_row,
         )
     win_gid = str((acc_row or {}).get("group_id") or group_id).strip()
-    winner_group = db.get_group_by_id(win_gid) or group
+    winner_group = (await asyncio.to_thread(db.get_group_by_id, win_gid)) or group
     if not lead or str(lead.get("group_id")) != str(win_gid):
         logger.error(
             "accept_group_offer: leads.group_id not set to winner (lead=%s expected=%s got=%s)",
@@ -16606,7 +16621,7 @@ async def handle_accept_group_offer(update: Update, context: ContextTypes.DEFAUL
     accepted_by_label = f"{winner_name} (@{acceptor_handle})"
 
     # Update all group offer messages to reflect taken/accepted
-    offers = db.get_group_lead_offers(lead_id)
+    offers = await asyncio.to_thread(db.get_group_lead_offers, lead_id)
     for o in offers:
         ocid = _parse_chat_id(o.get("group_chat_id"))
         mid = o.get("group_message_id")
@@ -16640,7 +16655,7 @@ async def handle_accept_group_offer(update: Update, context: ContextTypes.DEFAUL
         except Exception as e:
             logger.warning("Could not edit group offer message: %s", e)
 
-    lead_for_files = db.get_lead_by_id(lead_id) or lead
+    lead_for_files = (await asyncio.to_thread(db.get_lead_by_id, lead_id)) or lead
     att = lead_for_files.get("phase1_attached_files")
     if isinstance(att, list) and att:
         await _forward_phase1_attached_files_to_targets(
@@ -16658,9 +16673,9 @@ async def handle_accept_group_offer(update: Update, context: ContextTypes.DEFAUL
     # with it. Anything left False at the end still owes the group a tag.
     tag_released = False
 
-    if db.lead_has_assignments(lead_id):
+    if await asyncio.to_thread(db.lead_has_assignments, lead_id):
         try:
-            lead_for_group = db.get_lead_by_id(lead_id) or lead
+            lead_for_group = (await asyncio.to_thread(db.get_lead_by_id, lead_id)) or lead
             if offers:
                 tag_released = True
                 await _send_full_group_lead_to_chat(
@@ -16690,7 +16705,7 @@ async def handle_accept_group_offer(update: Update, context: ContextTypes.DEFAUL
     else:
         # Multi-group broadcast: offers exist; issuer picks drivers only after a team accepts.
         if offers:
-            lead_fresh = db.get_lead_by_id(lead_id) or lead
+            lead_fresh = (await asyncio.to_thread(db.get_lead_by_id, lead_id)) or lead
             if lead_fresh.get("external_order_id"):
                 # Website lead — no human issuer: auto-dispatch drivers now.
                 await _api_lead_auto_dispatch_after_group_accept(
@@ -16744,7 +16759,7 @@ async def handle_accept_group_offer(update: Update, context: ContextTypes.DEFAUL
             if _tag_cid:
                 await _send_all_tag_pdfs(
                     context,
-                    db.get_lead_by_id(lead_id) or lead,
+                    (await asyncio.to_thread(db.get_lead_by_id, lead_id)) or lead,
                     [_tag_cid],
                     accepted_by=accepted_by_label,
                 )
@@ -16758,7 +16773,10 @@ async def handle_accept_group_offer(update: Update, context: ContextTypes.DEFAUL
 async def handle_decline_group_offer(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle a group member declining a broadcast lead offer (for that group only)."""
     query = update.callback_query
-    await query.answer()
+    try:
+        await query.answer()
+    except BadRequest as e:
+        logger.warning("handle_decline_group_offer: could not answer callback query (likely expired): %s", e)
     pair = _parse_paired_short_uuids(query.data, "dg_")
     if not pair:
         await query.message.reply_text("❌ Invalid request.")
@@ -16770,7 +16788,7 @@ async def handle_decline_group_offer(update: Update, context: ContextTypes.DEFAU
     except (ValueError, Exception):
         await query.message.reply_text("❌ Invalid request.")
         return
-    db.decline_group_lead_offer(lead_id, group_id)
+    await asyncio.to_thread(db.decline_group_lead_offer, lead_id, group_id)
     try:
         await query.message.edit_text(
             "❌ **Declined**",
@@ -16784,7 +16802,10 @@ async def handle_decline_group_offer(update: Update, context: ContextTypes.DEFAU
 async def handle_different_team_offer(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Single-group approval: team asks the lead creator to assign a different group."""
     query = update.callback_query
-    await query.answer()
+    try:
+        await query.answer()
+    except BadRequest as e:
+        logger.warning("handle_different_team_offer: could not answer callback query (likely expired): %s", e)
     pair = _parse_paired_short_uuids(query.data, "dt_")
     if not pair:
         await query.message.reply_text("❌ Invalid request.")
@@ -16797,8 +16818,10 @@ async def handle_different_team_offer(update: Update, context: ContextTypes.DEFA
         await query.message.reply_text("❌ Invalid request.")
         return
 
-    lead = db.get_lead_by_id(lead_id)
-    group = db.get_group_by_id(group_id)
+    lead, group = await asyncio.gather(
+        asyncio.to_thread(db.get_lead_by_id, lead_id),
+        asyncio.to_thread(db.get_group_by_id, group_id),
+    )
     if not lead or not group or not record_is_active(group):
         try:
             await query.message.edit_text(
@@ -16809,7 +16832,7 @@ async def handle_different_team_offer(update: Update, context: ContextTypes.DEFA
             pass
         return
 
-    db.decline_group_lead_offer(lead_id, group_id)
+    await asyncio.to_thread(db.decline_group_lead_offer, lead_id, group_id)
     try:
         await query.message.edit_text(
             "🔄 **Different team**\n\nThe lead creator will pick another group.",
