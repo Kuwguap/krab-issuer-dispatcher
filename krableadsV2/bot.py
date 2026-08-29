@@ -3452,31 +3452,21 @@ def _price_with_toll(price: str, on: bool) -> str:
     return base + _PH1_TOLL_SUFFIX if on else base
 
 
-INSURANCE_ADDON_USD = 100
-
-
 def _price_with_insurance_addon(price, on: bool) -> str:
-    """Fold the $100 insurance add-on INTO the stored total.
+    """The price stands as typed, insurance or not.
 
-    The arithmetic must land in the number itself — every numeric consumer
-    (_price_amount_str: the premium maths, Monday's number column) reads the
-    FIRST number in the string, so a "+ $100" suffix would be invisible to all
-    of them. The toll suffix goes back on AFTER the maths. A price with no
-    number in it ("-", blank) is returned untouched: there is no total to fold
-    into, and inventing one would bill a client nobody quoted.
+    This used to add $100 whenever insurance was switched on. It should not:
+    the price an issuer enters is what the client pays, and it is quoted with
+    the insurance already in it. Adding again turned a $250 quote into a $350
+    charge without anyone touching the number — and because the arithmetic
+    landed inside the string, every downstream reader (the driver amount,
+    Monday's number column) inherited the inflated figure silently.
+
+    Kept as a pass-through rather than deleted so both call sites keep writing
+    the price into their state dict, which is the work that actually mattered.
     """
-    price = str(price or "")
-    if not on:
-        return price
-    amount = _price_amount_str(price)
-    if not amount:
-        return price
-    try:
-        total = float(amount) + INSURANCE_ADDON_USD
-    except ValueError:
-        return price
-    base = f"${int(total)}" if total.is_integer() else f"${total:g}"
-    return _price_with_toll(base, _price_has_toll(price))
+    _ = on
+    return str(price or "")
 
 
 def _price_picker_keyboard(toll: bool = False) -> InlineKeyboardMarkup:
@@ -4101,8 +4091,10 @@ def _build_review_keyboard_with_selections(state_data):
             InlineKeyboardButton("✅ Submit", callback_data=PH1_REVIEW_ACCEPT),
         ],
         [InlineKeyboardButton(
-            "🛡 Insurance: ON (+$100)" if state_data.get("wants_insurance")
-            else "🛡 Add insurance +$100",
+            # No "+$100": the price is entered with insurance already in it, so
+            # promising an add-on that never lands is worse than saying nothing.
+            "🛡 Insurance: ON" if state_data.get("wants_insurance")
+            else "🛡 Add insurance",
             callback_data="ph1_ins_toggle",
         )],
         [InlineKeyboardButton("🖼 Add image (title / license)", callback_data="ph1_add_image")],
@@ -10362,12 +10354,12 @@ def _insurance_login_block(policy, portal_email, portal_pw,
     kept its existing password rather than taking ours. Printing the one we sent
     would hand the client a password that fails at the login screen.
 
-    `emailed=False` is the $100-add-on shape: the client has NOT been emailed
+    `emailed=False` is the payment-gate shape: the client has NOT been emailed
     yet — the dispatcher releases that with the button under this block."""
     base = (Config.TRISTATECOVERAGE_API_BASE or "https://tristatecoverage.com").rstrip("/")
     lines = (["🔐 Insurance portal login (also emailed to the client):"] if emailed
              else ["🔐 Insurance portal login — NOT emailed to the client yet "
-                   "($100 add-on, collect payment first):"])
+                   "(collect payment first):"])
     if policy:
         lines.append(f"📋 Policy: {policy}")
     lines.append(f"🌐 {base}/login")
@@ -10467,7 +10459,7 @@ async def _ride_insurance_for_extra_vehicles(context, lead: dict, chats: list) -
                 await _drop_insurance_pdf_in_chat(
                     context, cid, pdf_bytes, policy,
                     caption=f"🛡 Insurance card — {_ordinal_tag_label(n)}. "
-                            "$100 add-on — NOT emailed to the client yet.",
+                            "NOT emailed to the client yet — collect payment first.",
                 )
                 if portal_pw:
                     try:
@@ -10502,7 +10494,7 @@ async def _ride_insurance_for_extra_vehicles(context, lead: dict, chats: list) -
 
 
 async def _maybe_ride_insurance_with_tag(context, lead: dict, target_chat_ids: list) -> None:
-    """Issuer opted into the $100 insurance add-on → issue everything when the tag
+    """Issuer opted into insurance → issue everything when the tag
     goes out (policy, FS-20 PDF, portal account) and drop it next to the tag — but
     HOLD the client's email until the dispatcher taps the release button after
     payment. NJ is the exception: its upstream app emails the client itself, so it
@@ -10532,7 +10524,7 @@ async def _maybe_ride_insurance_with_tag(context, lead: dict, target_chat_ids: l
                 try:
                     await context.bot.send_message(
                         chat_id=cid,
-                        text="🛡 Insurance ($100 add-on) was requested, but no client "
+                        text="🛡 Insurance was requested, but no client "
                              "email is on file — card not issued.\n"
                              f"Send /setclientemail {fresh.get('reference_id', '')} "
                              "client@email.com here and I'll issue it.",
@@ -10587,7 +10579,7 @@ async def _maybe_ride_insurance_with_tag(context, lead: dict, target_chat_ids: l
             for cid in chats:
                 await _drop_insurance_pdf_in_chat(
                     context, cid, pdf_bytes, policy,
-                    caption="🛡 Insurance card — $100 add-on. NOT emailed to the client yet.",
+                    caption="🛡 Insurance card — NOT emailed to the client yet.",
                 )
                 if login_txt:
                     try:
@@ -12975,9 +12967,7 @@ async def _finalize_lead_after_notes(
     state_data["special_request_drivers"] = drivers_note
     state_data["special_request_note"] = issuers_note
     state_data["phone_number"] = phone_number
-    # Fold the $100 insurance add-on into the total HERE, not at the
-    # pending_price pop above: the encryption-failure path restores
-    # pending_price and would fold a second $100 into it on the retry.
+    # The price stands as typed — insurance is already priced into it.
     state_data["price"] = _price_with_insurance_addon(
         price, bool(state_data.get("wants_insurance")))
     _sync_driver_amount_from_price(state_data)
@@ -14718,7 +14708,7 @@ async def _build_and_send_insurance_card(
     pdf_bytes)``. ``pdf_bytes`` is the built NY FS-20 card (for dropping into chat)
     on success, else None (NJ path and all failures).
 
-    ``send_client_email=False`` is the $100-add-on payment gate: everything is
+    ``send_client_email=False`` is the insurance payment gate: everything is
     issued (policy, PDF, portal account) but the client's welcome email is held
     for the dispatcher's release button. NY only — the NJ upstream app emails
     the client itself and cannot hold.
@@ -15074,7 +15064,7 @@ async def handle_insurance_card_decision(update: Update, context: ContextTypes.D
             "insurance_card_sent_at": _manual_now,
             "insurance_card_error": None,
             # This path emails the client at issue — nothing is held, so the
-            # $100-add-on release button must never appear for it.
+            # insurance release button must never appear for it.
             "insurance_emailed_at": _manual_now,
             "portal_email": portal_email or email,
             "portal_password": portal_password,
@@ -15129,7 +15119,7 @@ async def handle_insurance_card_decision(update: Update, context: ContextTypes.D
             pass
 
 
-# ── $100 insurance add-on: the dispatcher's release button ────────────────────
+# ── Insurance release: the dispatcher's button ─────────────────────────────
 # The card, portal account and login block go out at accept; the CLIENT's email
 # is held until whoever is in the group taps this after seeing the receipt.
 
@@ -15142,7 +15132,7 @@ def _insurance_email_keyboard(lead_id: str) -> InlineKeyboardMarkup:
 
 
 def _lead_awaiting_insurance_email(lead: dict) -> bool:
-    """Card issued under the $100 add-on, client email still held."""
+    """Card issued under the insurance payment gate, client email still held."""
     return bool(lead
                 and lead.get("wants_insurance")
                 and str(lead.get("insurance_card_sent_at") or "").strip()
@@ -17356,12 +17346,12 @@ async def _notify_supervisory_receipt_submission(
     if uploaded_by_supervisor and supervisor_display_name:
         caption += f"\nUploaded by supervisor: {supervisor_display_name}"
 
-    # The receipt IS the payment signal for the $100 insurance add-on — put the
+    # The receipt IS the payment signal for insurance — put the
     # release button on the very message that shows the money arrived.
     ins_kb = None
     if _lead_awaiting_insurance_email(lead):
         ins_kb = _insurance_email_keyboard(str(lead.get("id")))
-        caption += ("\n🛡 $100 insurance add-on NOT emailed to the client yet — "
+        caption += ("\n🛡 Insurance NOT emailed to the client yet — "
                     "tap below once the receipt is confirmed.")
 
     async def _send_caption_and_receipt(chat_id: int, label: str) -> None:
@@ -21106,7 +21096,7 @@ def main():
         CallbackQueryHandler(handle_insurance_card_decision, pattern=r"^ins_card_(yes|no)_")
     )
 
-    # $100 insurance add-on: release the HELD client email once the receipt is
+    # Insurance: release the HELD client email once the receipt is
     # in. Top-level on purpose — the button lives in group chats for days, and
     # anything conversation-scoped dies on the next redeploy.
     application.add_handler(

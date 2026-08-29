@@ -31,17 +31,29 @@ if "bot" not in sys.modules:
 import bot  # noqa: E402
 
 
-class PriceFoldTest(unittest.TestCase):
+class PriceIsNotInflatedByInsuranceTest(unittest.TestCase):
+    """Insurance must not change the price.
 
-    def test_plain_price_gains_100(self):
-        self.assertEqual("$250", bot._price_with_insurance_addon("$150", True))
+    It used to add $100 whenever the toggle went on, so a $250 quote became a
+    $350 charge without anybody touching the number — and because the arithmetic
+    landed inside the string, every downstream reader (driver amount, Monday's
+    number column) inherited the inflated figure silently. The price an issuer
+    types already has insurance in it.
+    """
 
-    def test_toll_survives_outside_the_maths(self):
-        self.assertEqual("$250 + toll",
+    def test_a_plain_price_is_unchanged(self):
+        self.assertEqual("$150", bot._price_with_insurance_addon("$150", True))
+
+    def test_the_reported_case_stays_put(self):
+        # $250 with insurance on was being dispatched as $350.
+        self.assertEqual("$250", bot._price_with_insurance_addon("$250", True))
+
+    def test_a_toll_price_is_unchanged(self):
+        self.assertEqual("$150 + toll",
                          bot._price_with_insurance_addon("$150 + toll", True))
 
-    def test_thousands_separator_is_read_as_one_number(self):
-        self.assertEqual("$1600", bot._price_with_insurance_addon("1,500", True))
+    def test_a_thousands_separator_is_not_rewritten(self):
+        self.assertEqual("1,500", bot._price_with_insurance_addon("1,500", True))
 
     def test_a_price_with_no_number_is_left_alone(self):
         for raw in ("-", "", None):
@@ -49,14 +61,19 @@ class PriceFoldTest(unittest.TestCase):
                 self.assertEqual(str(raw or ""),
                                  bot._price_with_insurance_addon(raw, True))
 
-    def test_toggle_off_changes_nothing(self):
-        for raw in ("$150", "$150 + toll", "-", ""):
+    def test_on_and_off_agree(self):
+        for raw in ("$150", "$250", "$150 + toll", "1,500", "-", ""):
             with self.subTest(price=raw):
-                self.assertEqual(raw, bot._price_with_insurance_addon(raw, False))
+                self.assertEqual(bot._price_with_insurance_addon(raw, False),
+                                 bot._price_with_insurance_addon(raw, True))
 
-    def test_downstream_number_readers_see_the_total(self):
-        folded = bot._price_with_insurance_addon("$150 + toll", True)
-        self.assertEqual("250", bot._price_amount_str(folded))
+    def test_downstream_number_readers_see_what_was_typed(self):
+        kept = bot._price_with_insurance_addon("$150 + toll", True)
+        self.assertEqual("150", bot._price_amount_str(kept))
+
+    def test_no_addon_constant_survives(self):
+        self.assertFalse(hasattr(bot, "INSURANCE_ADDON_USD"),
+                         "the $100 constant should be gone, not merely unused")
 
 
 class PortalPasswordTest(unittest.TestCase):
