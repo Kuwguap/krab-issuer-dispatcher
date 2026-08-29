@@ -14699,9 +14699,16 @@ async def _build_and_send_insurance_card(
         "policyExpirationDate": expiration_date.isoformat(),
         "annualPremium": _parse_annual_premium(lead),
         "vehicleColor": color if color and color != "-" else None,
-        "vehicleYear": vehicle_year if vehicle_year != "0000" else None,
+        # The portal's field is modelYear. Sent as "vehicleYear" it was silently
+        # dropped (zod strips unknown keys), so every client landed there with no
+        # year on their vehicle record.
+        "modelYear": vehicle_year if vehicle_year != "0000" else None,
         "vehicleMake": vehicle_make_full or None,
         "vehicleModel": vehicle_model or None,
+        # We send the welcome email ourselves below, with the portal password in
+        # it. Without this the portal ALSO sends its own "policy issued" mail —
+        # two emails for one purchase, and the portal's copy has no login in it.
+        "skipWelcomeEmail": True,
     }
     portal_payload = {k: v for k, v in portal_payload.items() if v is not None}
 

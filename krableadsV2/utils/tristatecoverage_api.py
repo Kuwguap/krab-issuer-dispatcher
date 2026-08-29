@@ -80,7 +80,11 @@ def create_portal_client(
     """
     Create a portal client via POST /api/integrations/clients.
 
-    Does not send the welcome email — the bot sends that via Resend with portal credentials.
+    The caller must pass ``skipWelcomeEmail: True`` in the payload — the bot
+    sends the welcome email itself via Resend, with the portal credentials in
+    it. Omitting the flag makes the portal send its own "policy issued" mail as
+    well, so the client gets two emails for one purchase and the portal's copy
+    carries no login.
     """
     try:
         from config import Config
