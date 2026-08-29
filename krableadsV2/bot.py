@@ -36,6 +36,7 @@ from config import Config
 from utils.database import Database, record_is_active
 from utils.onetimesecret import OneTimeSecret
 from utils.monday import MondayClient
+from utils import address_complete
 from utils import ai_vision
 from utils import motivation
 from utils import driver_motivation
@@ -620,15 +621,14 @@ async def _start_tracking_gate_or_send_details(
         )
         return
     link = _tracking_link(token)
-    kb = InlineKeyboardMarkup([[InlineKeyboardButton("📍 Share my location", url=link)]])
+    kb = InlineKeyboardMarkup([[InlineKeyboardButton("🚗 I’m on the way", url=link)]])
     try:
         await context.bot.send_message(
             chat_id=chat_id,
             text=(
-                "📍 Optional — but it helps!\n\n"
-                "Tap below to share your location: dispatch can follow your "
-                "delivery live, and you'll get an automatic receipt reminder "
-                "the moment you arrive.\n\n"
+                "⚡️Fast ! 🖨️ Print Tag & 🚗 Deliver Tag 🏷️\n\n"
+                "Tap below when you’re on your way\n\n\n"
+                "> “I’m on the way” <\n\n"
                 f"{link}"
             ),
             reply_markup=kb,
@@ -3086,6 +3086,38 @@ async def _ai_split_addresses_if_needed(state_data: dict) -> list:
             changed.append(_INLINE_EDIT_KEY_LABEL[street_ek])
     if changed:
         _apply_single_address_as_both(state_data)
+    return changed
+
+
+async def _complete_partial_addresses(state_data: dict) -> list:
+    """Fill in the city/state/ZIP parts nobody typed.
+
+    Leads arrive with whatever fitted in a text message — "Bronx New York" with
+    no ZIP, or a bare ZIP with no city. Both print badly on a tag and neither
+    geocodes for the driver map. Anything the operator DID type is kept exactly
+    as typed; this only ever adds. Returns the labels that changed."""
+    changed: list = []
+    for street_ek, csz_ek in _ADDR_TO_CSZ_EK.items():
+        street_key = _INLINE_EK_STATE_KEY[street_ek]
+        csz_key = _INLINE_EK_STATE_KEY[csz_ek]
+        street_val = str(state_data.get(street_key) or "").strip()
+        csz_val = str(state_data.get(csz_key) or "").strip()
+        if street_val == "-":
+            street_val = ""
+        if csz_val == "-":
+            csz_val = ""
+        if not street_val and not csz_val:
+            continue
+        try:
+            filled, did = await asyncio.to_thread(
+                address_complete.complete_city_state_zip, street_val, csz_val
+            )
+        except Exception as e:
+            logger.info("address completion skipped: %s", e)
+            continue
+        if did and filled:
+            _apply_single_phase1_edit(state_data, csz_ek, filled)
+            changed.append(_INLINE_EDIT_KEY_LABEL[csz_ek])
     return changed
 
 
@@ -7152,6 +7184,7 @@ async def _run_ai_card_tool(update, context, user_id, state_data, tool, args):
         # A whole address landed in one street field leaves city/ST/ZIP empty on
         # the printed tag — same re-split the labeled path has always done.
         await _ai_split_addresses_if_needed(state_data)
+        await _complete_partial_addresses(state_data)
         db.set_user_state(user_id, "phase1", state_data)
         await _ai_card_housekeeping(
             update, context, state_data, chat_id,
@@ -7181,6 +7214,7 @@ async def _run_ai_card_tool(update, context, user_id, state_data, tool, args):
             return None                # nothing landed — let the old bulk path try
         _clean_vin_and_car(state_data)
         await _ai_split_addresses_if_needed(state_data)
+        await _complete_partial_addresses(state_data)
         db.set_user_state(user_id, "phase1", state_data)
         toast = "✅ Updated: " + ", ".join(dict.fromkeys(updated))
         if unread:
@@ -7585,6 +7619,7 @@ async def handle_phase1_review_message(update: Update, context: ContextTypes.DEF
     updated = _apply_inline_review_text(state_data, text)
     if updated:
         updated += await _ai_split_addresses_if_needed(state_data)
+        updated += await _complete_partial_addresses(state_data)
         db.set_user_state(user_id, "phase1", state_data)
         chat_id = update.effective_chat.id if update.effective_chat else message.chat_id
         try:
@@ -7632,6 +7667,7 @@ async def handle_phase1_review_message(update: Update, context: ContextTypes.DEF
                 else:
                     still.append(line)
             bulk_labels += await _ai_split_addresses_if_needed(state_data)
+            bulk_labels += await _complete_partial_addresses(state_data)
             db.set_user_state(user_id, "phase1", state_data)
             chat_id = update.effective_chat.id if update.effective_chat else message.chat_id
             await _cleanup_voice_echo(context, chat_id)
@@ -7662,6 +7698,7 @@ async def handle_phase1_review_message(update: Update, context: ContextTypes.DEF
     updated = [] if _COMMAND_LIKE_RE.search(text) else await _smart_place_single_value(state_data, text)
     if updated:
         updated += await _ai_split_addresses_if_needed(state_data)
+        updated += await _complete_partial_addresses(state_data)
         db.set_user_state(user_id, "phase1", state_data)
         await _cleanup_voice_echo(context, chat_id)
         await _send_vanishing(context, chat_id, "✅ Updated: " + ", ".join(dict.fromkeys(updated)))
@@ -19201,6 +19238,16 @@ def _haversine_m(lat1, lng1, lat2, lng2) -> float:
         return float("inf")
 
 
+def _advance_on_the_way_from_tracking(lead_id: str) -> bool:
+    """Mark a lead 'Driver on the way' because its driver actually set off.
+
+    Forward-only and respect_human, exactly like the timed sweep — a receipt
+    that already landed is never demoted, and an operator who set the status by
+    hand keeps it.
+    """
+    return db.advance_delivery_status(lead_id, "on_the_way", respect_human=True)
+
+
 # Driver GPS tracking job: every 10s, (a) send deferred details for sessions
 # whose location arrived, (b) remind drivers still pending past the window and
 # alert supervisors with a manual override button (hard block — no auto-send),
@@ -19217,6 +19264,31 @@ async def process_tracking_sessions(context: ContextTypes.DEFAULT_TYPE) -> None:
                 continue
             if not await asyncio.to_thread(db.claim_tracking_details_sent, sid):
                 continue  # another tick claimed it
+
+            # The session only reaches "located" on the driver's FIRST GPS ping —
+            # they tapped "I'm on the way" and started moving. That is the real
+            # event, so the board says "Driver on the way" now instead of waiting
+            # out the 8-minute timer that was only ever a guess.
+            #
+            # Deliberately before the details_sent_at check below: in
+            # optional-location mode the details already went out at accept and
+            # that branch returns early, which would skip the status entirely.
+            # respect_human keeps it off any row an operator has set by hand.
+            trk_lead_id = str(s.get("lead_id") or "")
+            if trk_lead_id and s.get("kind") == "lead":
+                try:
+                    moved = await asyncio.to_thread(
+                        _advance_on_the_way_from_tracking, trk_lead_id
+                    )
+                    if moved:
+                        logger.info(
+                            "lead %s → on_the_way (driver started moving)", trk_lead_id
+                        )
+                except Exception as e:
+                    logger.warning(
+                        "could not mark lead %s on the way: %s", trk_lead_id, e
+                    )
+
             if s.get("details_sent_at"):
                 continue  # optional-location mode: details went out at accept
             lead = await asyncio.to_thread(db.get_lead_by_id, s.get("lead_id")) if s.get("lead_id") else None
