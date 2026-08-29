@@ -49,6 +49,8 @@ class TheCityLineNeverLeaksTheStreetTest(unittest.TestCase):
 
 
 class TheWhenLineTest(unittest.TestCase):
+    """Kept: the helper still formats a NY timestamp, though the cash alert
+    the operator asked for no longer shows a time."""
 
     def test_created_at_renders_in_ny_time(self):
         lead = {"created_at": "2026-08-27T18:42:00+00:00"}   # 2:42 PM in NY (EDT)
@@ -69,12 +71,20 @@ class TheOfferMessageReadsLikeTheTicketTest(unittest.TestCase):
         return body.split("\nasync def ", 1)[0]
 
     def test_the_lines_are_all_there_in_order(self):
+        """The cash-delivery alert, in the order the operator specified."""
         offer = self._offer()
-        needles = ["Instant Tag 🏷️", "Reference:", "_instant_tag_city_line",
-                   "_instant_tag_when_line", "Payment in cash",
-                   "sends itself here", "cash-in-hand from the client"]
+        needles = ["CASH DELIVERY ALERT", "Ref:", "_instant_tag_city_line",
+                   "Cash collection:", "Required prepay:", "Driver keeps:",
+                   "GET DELIVERY DETAILS",
+                   "Address + client phone released after payment.",
+                   "Instant dispatch"]
         positions = [offer.index(n) for n in needles]
         self.assertEqual(positions, sorted(positions), needles)
+
+    def test_the_money_lines_are_dropped_when_the_amount_is_unknown(self):
+        """Without a prepay figure, a "driver keeps" number would be invented."""
+        offer = self._offer()
+        self.assertIn("if collect_label and cents:", offer)
 
     def test_full_details_are_promised_after_payment_not_before(self):
         offer = self._offer()

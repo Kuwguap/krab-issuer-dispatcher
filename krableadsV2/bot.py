@@ -1136,6 +1136,20 @@ async def _dispatch_instant_tag_lead(context, lead: dict, selected_drivers: list
     # No invented number: "$100" here was a guess that could differ from both
     # the price the office set and the amount Stripe would take.
     amt_label = f"${cents // 100}" if cents else "the agreed amount"
+    # What the client hands over, and what is left for the driver after the
+    # prepay. Both come from the lead itself -- the difference IS the driver's
+    # cut, so it is never a second number anybody has to keep in step.
+    _collect = _price_amount_str(lead.get("price") or "")
+    collect_label = ""
+    keeps_label = ""
+    if _collect and cents:
+        try:
+            _collect_cents = int(round(float(_collect) * 100))
+            if _collect_cents >= cents:
+                collect_label = f"${_collect_cents // 100}"
+                keeps_label = f"${(_collect_cents - cents) // 100}"
+        except ValueError:
+            pass
     sent, failed = [], []
     # Why the pay link could not be made, once — the drivers must not be shown
     # config detail, but whoever dispatched needs to know it is broken.
@@ -1148,20 +1162,23 @@ async def _dispatch_instant_tag_lead(context, lead: dict, selected_drivers: list
         url, err = await request_instant_pdf_link(
             str(lead.get("id")), str(d.get("id")), ref, amount_cents=cents)
         body = [
-            "🤖 <b>Instant Tag 🏷️</b>",
-            f"📋 Reference: <code>{html.escape(ref, quote=False)}</code>",
+            "🤖 <b>CASH DELIVERY ALERT</b> 💵",
+            f"🏷️ Ref: <code>{html.escape(ref, quote=False)}</code>",
         ]
         place = _instant_tag_city_line(lead)
         if place:
             body.append(f"📍 {html.escape(place, quote=False)}")
-        body.append(f"🕒 {html.escape(_instant_tag_when_line(lead), quote=False)}")
-        body.append("💵 Payment in cash")
-        body.append("")
-        body.append(
-            f"Pay <b>{amt_label}</b> and this tag sends itself here — no dispatch, "
-            "no wait. You collect cash-in-hand from the client. Full delivery "
-            "details (address + client phone) arrive after payment."
-        )
+        # The three money lines only add up when we know the amount; with an
+        # unknown prepay a "driver keeps" figure would be invented.
+        if collect_label and cents:
+            body.append(f"💰 Cash collection: <b>{collect_label}</b>")
+            body.append(f"💳 Required prepay: <b>{amt_label}</b>")
+            body.append(f"🤑 Driver keeps: <b>{keeps_label}</b>")
+        else:
+            body.append(f"💳 Required prepay: <b>{amt_label}</b>")
+        body.append(f"🔐 <b>PAY {amt_label} → GET DELIVERY DETAILS</b>")
+        body.append("📲 Address + client phone released after payment.")
+        body.append("⚡️ Instant dispatch")
         # Accept / Decline alongside the pay link. Paying is still what releases
         # the tag, but a driver who cannot pay this second needs a way to say
         # "mine, hold on" — and one who cannot take it at all needs a way to say
@@ -10100,6 +10117,56 @@ def _persist_extra_vehicle_plate(lead: dict, vehicle: int, plate: str, control: 
     db.update_lead(str(lead.get("id")), {EXTRA_VEHICLES_KEY: vehicles})
 
 
+# What the tag prints as the insurer for a car the bot is covering itself.
+# The card's own carrier line carries the NAIC prefix and the full legal name
+# ("169 National Specialty Insurance Company"); the tag's insurer box is far
+# narrower, so it gets the short form the operator uses.
+TAG_INSURER_NAME = "National Specialty Ins"
+
+
+def _tristate_policy_for_vehicle(lead: dict, vehicle: int) -> str:
+    """The policy number this car's TriState card will carry, minted now if it
+    does not exist yet.
+
+    The tag is built and sent BEFORE the insurance rides along after it, so
+    waiting for the issue meant the tag always printed an empty insurer and an
+    empty policy for exactly the cars the bot was about to insure. The number
+    is minted locally either way (both states use the same ABP63 series), so
+    it can be settled here and reused by the issue -- one number on the tag,
+    on the card and in the portal.
+    """
+    # Imported here, as everywhere else in this file: utils are pulled in lazily
+    # inside the functions that need them, never at module scope.
+    from utils import insurance_card as ic
+    try:
+        if vehicle <= 1:
+            existing = str(lead.get("insurance_card_policy_number") or "").strip()
+            if existing:
+                return existing
+            policy = ic.generate_policy_number()
+            db.update_lead(str(lead.get("id")), {"insurance_card_policy_number": policy})
+            lead["insurance_card_policy_number"] = policy
+            return policy
+        vehicles = _extra_vehicles(lead)
+        v = vehicles[vehicle - 2] if 0 <= vehicle - 2 < len(vehicles) else None
+        if v is None:
+            return ""
+        existing = str(v.get("insurance_card_policy_number") or "").strip()
+        if existing:
+            return existing
+        policy = ic.generate_policy_number()
+        v["insurance_card_policy_number"] = policy
+        db.update_lead(str(lead.get("id")), {EXTRA_VEHICLES_KEY: vehicles})
+        lead[EXTRA_VEHICLES_KEY] = vehicles
+        return policy
+    except Exception as e:
+        # A tag must never fail to print because the policy number could not be
+        # settled -- it simply goes out with the insurer box as it was.
+        logger.warning("Could not settle a policy number for lead %s car %s: %s",
+                       lead.get("id"), vehicle, e)
+        return ""
+
+
 async def _tag_fields_from_lead(lead: dict, *, renewal: bool = False,
                                 vehicle: int = 1) -> dict:
     """Resolve a stored lead into the field dict tag_pdf.build_tag_pdf expects.
@@ -10162,6 +10229,17 @@ async def _tag_fields_from_lead(lead: dict, *, renewal: bool = False,
         except Exception as e:
             logger.warning("Could not persist plate for lead %s: %s", lead.get("id"), e)
 
+    # A car the bot is insuring itself prints OUR carrier and OUR policy number.
+    # Only when the car arrived with no insurer of its own: a client who already
+    # has Geico keeps Geico on the tag.
+    ins_company = phase1.get("insurance_company", "")
+    ins_policy = phase1.get("insurance_policy_number", "")
+    if lead.get("wants_insurance") and _vehicle_needs_coverage(phase1):
+        _policy = _tristate_policy_for_vehicle(lead, vehicle)
+        if _policy:
+            ins_company = TAG_INSURER_NAME
+            ins_policy = _policy
+
     if renewal:
         issued = datetime.now(pytz.timezone("America/New_York")).date()  # fresh 30-day window
     else:
@@ -10184,8 +10262,8 @@ async def _tag_fields_from_lead(lead: dict, *, renewal: bool = False,
         "city": city,
         "state": state,
         "zip": zipc,
-        "insurance_company": phase1.get("insurance_company", ""),
-        "policy": phase1.get("insurance_policy_number", ""),
+        "insurance_company": ins_company,
+        "policy": ins_policy,
         "issued": issued,
     }
 
@@ -14968,7 +15046,11 @@ async def _build_and_send_insurance_card(
                 None,
                 pdf_bytes,
             )
-        policy_number = nj.generate_nj_policy_number()
+        # Reuse whatever the tag already printed for this car. NJ used to
+        # mint fresh every time, so the card and the tag disagreed on the very
+        # policy number the tag exists to evidence.
+        policy_number = ((lead.get("insurance_card_policy_number") or "").strip()
+                         or nj.generate_nj_policy_number())
         nj_payload = nj.build_nj_email_payload(
             policy_number=policy_number,
             effective_mm_dd_yyyy=effective_label,
