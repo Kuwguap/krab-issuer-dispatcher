@@ -4091,10 +4091,8 @@ def _build_review_keyboard_with_selections(state_data):
             InlineKeyboardButton("✅ Submit", callback_data=PH1_REVIEW_ACCEPT),
         ],
         [InlineKeyboardButton(
-            # No "+$100": the price is entered with insurance already in it, so
-            # promising an add-on that never lands is worse than saying nothing.
-            "🛡 Insurance: ON" if state_data.get("wants_insurance")
-            else "🛡 Add insurance",
+            "🛡 Insurance: ON (+$100)" if state_data.get("wants_insurance")
+            else "🛡 Add insurance +$100",
             callback_data="ph1_ins_toggle",
         )],
         [InlineKeyboardButton("🖼 Add image (title / license)", callback_data="ph1_add_image")],
@@ -10354,12 +10352,12 @@ def _insurance_login_block(policy, portal_email, portal_pw,
     kept its existing password rather than taking ours. Printing the one we sent
     would hand the client a password that fails at the login screen.
 
-    `emailed=False` is the payment-gate shape: the client has NOT been emailed
+    `emailed=False` is the $100-add-on shape: the client has NOT been emailed
     yet — the dispatcher releases that with the button under this block."""
     base = (Config.TRISTATECOVERAGE_API_BASE or "https://tristatecoverage.com").rstrip("/")
     lines = (["🔐 Insurance portal login (also emailed to the client):"] if emailed
              else ["🔐 Insurance portal login — NOT emailed to the client yet "
-                   "(collect payment first):"])
+                   "($100 add-on, collect payment first):"])
     if policy:
         lines.append(f"📋 Policy: {policy}")
     lines.append(f"🌐 {base}/login")
@@ -10459,7 +10457,7 @@ async def _ride_insurance_for_extra_vehicles(context, lead: dict, chats: list) -
                 await _drop_insurance_pdf_in_chat(
                     context, cid, pdf_bytes, policy,
                     caption=f"🛡 Insurance card — {_ordinal_tag_label(n)}. "
-                            "NOT emailed to the client yet — collect payment first.",
+                            "$100 add-on — NOT emailed to the client yet.",
                 )
                 if portal_pw:
                     try:
@@ -10494,7 +10492,7 @@ async def _ride_insurance_for_extra_vehicles(context, lead: dict, chats: list) -
 
 
 async def _maybe_ride_insurance_with_tag(context, lead: dict, target_chat_ids: list) -> None:
-    """Issuer opted into insurance → issue everything when the tag
+    """Issuer opted into the $100 insurance add-on → issue everything when the tag
     goes out (policy, FS-20 PDF, portal account) and drop it next to the tag — but
     HOLD the client's email until the dispatcher taps the release button after
     payment. NJ is the exception: its upstream app emails the client itself, so it
@@ -10524,7 +10522,7 @@ async def _maybe_ride_insurance_with_tag(context, lead: dict, target_chat_ids: l
                 try:
                     await context.bot.send_message(
                         chat_id=cid,
-                        text="🛡 Insurance was requested, but no client "
+                        text="🛡 Insurance ($100 add-on) was requested, but no client "
                              "email is on file — card not issued.\n"
                              f"Send /setclientemail {fresh.get('reference_id', '')} "
                              "client@email.com here and I'll issue it.",
@@ -10579,7 +10577,7 @@ async def _maybe_ride_insurance_with_tag(context, lead: dict, target_chat_ids: l
             for cid in chats:
                 await _drop_insurance_pdf_in_chat(
                     context, cid, pdf_bytes, policy,
-                    caption="🛡 Insurance card — NOT emailed to the client yet.",
+                    caption="🛡 Insurance card — $100 add-on. NOT emailed to the client yet.",
                 )
                 if login_txt:
                     try:
@@ -14696,6 +14694,84 @@ def _parse_annual_premium(lead: dict) -> float:
         return 0.0
 
 
+def _portal_payload_for_lead(
+    *,
+    email: str,
+    password: str,
+    name: str,
+    phone: str,
+    vehicle_name: str,
+    vin: str,
+    policy_number: str,
+    effective_iso: str,
+    expiration_iso: str,
+    annual_premium: float,
+    model_year: str | None,
+    vehicle_make: str | None,
+    vehicle_model: str | None,
+    policy_address: str | None,
+) -> dict:
+    """The body TriState Coverage's /api/integrations/clients wants.
+
+    Keys are exactly the ones its schema accepts -- it silently DROPS anything
+    else, which is how vehicleYear once went missing (it wants modelYear). The
+    address matters more than it looks: the coverage receipts board has no field
+    of its own for it and falls back to the vehicle's policy_address, so leaving
+    it out is why bot-made members showed there with no address at all.
+    """
+    payload = {
+        "email": email,
+        "password": password,
+        "name": (name or "UNKNOWN").upper(),
+        "phone": (phone or "").strip() or "+1 000 000 0000",
+        "vehicleName": vehicle_name,
+        "vin": vin,
+        "policyNumber": policy_number,
+        "policyEffectiveDate": effective_iso,
+        "policyExpirationDate": expiration_iso,
+        "annualPremium": annual_premium,
+        "modelYear": model_year,
+        "vehicleMake": vehicle_make,
+        "vehicleModel": vehicle_model,
+        "policyAddress": policy_address,
+        # The bot sends its own welcome mail, with the portal login in it.
+        "skipWelcomeEmail": True,
+    }
+    return {k: v for k, v in payload.items() if v is not None}
+
+
+async def _register_policy_with_portal(payload: dict, pdf_bytes: bytes | None,
+                                       *, why: str) -> tuple:
+    """Put a policy on TriState Coverage. Returns (ok, note).
+
+    Every insurance this bot issues belongs on tristatecoverage.com/receipts,
+    whichever state's card it is. Best effort by design for the NJ path: that
+    client already has their card in hand, so a portal outage must not turn a
+    completed issue into a failure -- it returns a note the caller can record
+    and show, and the next tag send retries.
+    """
+    if not Config.is_portal_integration_configured():
+        return (False, "INTEGRATIONS_API_KEY is not set on the bot.")
+    # Imported here, like the issuer does: the module is optional at boot.
+    from utils import tristatecoverage_api as tsc
+    try:
+        result = await asyncio.to_thread(tsc.create_portal_client, payload, pdf_bytes)
+    except Exception as e:
+        logger.warning("portal registration (%s) raised: %s", why, e)
+        return (False, str(e))
+    if not result.ok:
+        logger.warning("portal registration (%s) failed: %s", why, result.error)
+        return (False, result.error or "portal refused the client")
+    if result.warning:
+        # 200 with a warning means the ACCOUNT exists but the POLICY does not --
+        # a policy number already used by another member, or dates it could not
+        # read. The member would sit on the receipts board with nothing against
+        # them, so say it out loud rather than stamping this a clean success.
+        logger.warning("portal registration (%s) incomplete: %s", why, result.warning)
+        return (False, f"portal did not record the policy: {result.warning}")
+    return (True, None)
+
+
 async def _build_and_send_insurance_card(
     lead: dict,
     *,
@@ -14708,7 +14784,7 @@ async def _build_and_send_insurance_card(
     pdf_bytes)``. ``pdf_bytes`` is the built NY FS-20 card (for dropping into chat)
     on success, else None (NJ path and all failures).
 
-    ``send_client_email=False`` is the insurance payment gate: everything is
+    ``send_client_email=False`` is the $100-add-on payment gate: everything is
     issued (policy, PDF, portal account) but the client's welcome email is held
     for the dispatcher's release button. NY only — the NJ upstream app emails
     the client itself and cannot hold.
@@ -14805,6 +14881,13 @@ async def _build_and_send_insurance_card(
     if not address_lines:
         address_lines = ["UNKNOWN ADDRESS"]
 
+    # Built before the state split: NJ now registers its policy with the
+    # coverage portal too, and it needs the same vehicle label NY sends.
+    vehicle_label = ic.format_suggested_vehicle_name(vehicle_year, vehicle_make_full, vehicle_model)
+    if color and color != "-":
+        vehicle_label = f"{vehicle_label} — {color}".strip(" —")
+    vehicle_name_api = vehicle_label or car_raw or "Vehicle on file"
+
     if card_state == "NJ":
         if not Config.is_nj_configured():
             return (
@@ -14837,12 +14920,43 @@ async def _build_and_send_insurance_card(
             if nj_result.status_code:
                 err = f"{err} (HTTP {nj_result.status_code})"
             return (False, policy_number, err, None, None, pdf_bytes)
+
+        # ALL insurance is TriState Coverage's, so a NJ policy belongs on their
+        # receipts board too. This branch used to return here, which is why NJ
+        # cards -- the bulk of them -- existed only in Telegram and in the
+        # client's inbox. Best effort: the client already has the card, so a
+        # portal outage records a note instead of failing the issue.
+        nj_policy = nj_result.policy_number or policy_number
+        nj_portal_ok, nj_portal_note = await _register_policy_with_portal(
+            _portal_payload_for_lead(
+                email=email,
+                password=portal_password,
+                name=name,
+                phone=(lead.get("phone_number") or "").strip(),
+                vehicle_name=vehicle_name_api,
+                vin=vin_clean,
+                policy_number=nj_policy,
+                effective_iso=today.isoformat(),
+                expiration_iso=expiration_date.isoformat(),
+                annual_premium=_parse_annual_premium(lead),
+                model_year=vehicle_year if vehicle_year != "0000" else None,
+                vehicle_make=vehicle_make_full or None,
+                vehicle_model=vehicle_model or None,
+                policy_address=", ".join(address_lines) if address_lines
+                and address_lines != ["UNKNOWN ADDRESS"] else None,
+            ),
+            None,                       # the NJ card is built upstream, not here
+            why="NJ",
+        )
+        if not nj_portal_ok:
+            logger.warning("NJ policy %s not on the coverage board: %s",
+                           nj_policy, nj_portal_note)
         return (
             True,
-            nj_result.policy_number or policy_number,
+            nj_policy,
             None,
             nj_result.email or email,
-            None,
+            portal_password if nj_portal_ok else None,
             pdf_bytes,
         )
 
@@ -14878,11 +14992,6 @@ async def _build_and_send_insurance_card(
         logger.exception("Failed to build FS-20 PDF for lead %s: %s", lead.get("id"), e)
         return (False, policy_number, f"Could not build insurance card PDF: {e}", None, None, None)
 
-    vehicle_label = ic.format_suggested_vehicle_name(vehicle_year, vehicle_make_full, vehicle_model)
-    if color and color != "-":
-        vehicle_label = f"{vehicle_label} — {color}".strip(" —")
-    vehicle_name_api = vehicle_label or car_raw or "Vehicle on file"
-
     phone_raw = (lead.get("phone_number") or "").strip()
     portal_payload = {
         "email": email,
@@ -14902,6 +15011,12 @@ async def _build_and_send_insurance_card(
         "modelYear": vehicle_year if vehicle_year != "0000" else None,
         "vehicleMake": vehicle_make_full or None,
         "vehicleModel": vehicle_model or None,
+        # The coverage receipts board has no address field of its own for
+        # API-made members - it falls back to the vehicle's policy_address - so
+        # without this every bot client showed there with a blank address.
+        "policyAddress": (", ".join(address_lines)
+                          if address_lines and address_lines != ["UNKNOWN ADDRESS"]
+                          else None),
         # We send the welcome email ourselves below, with the portal password in
         # it. Without this the portal ALSO sends its own "policy issued" mail —
         # two emails for one purchase, and the portal's copy has no login in it.
@@ -14937,6 +15052,16 @@ async def _build_and_send_insurance_card(
             None,
             pdf_bytes,
         )
+
+    if portal_result.warning:
+        # 200, but the POLICY was skipped - a policy number already used by
+        # another member, or dates it could not read. The account exists, so the
+        # client shows on tristatecoverage.com/receipts with nothing against
+        # them. The card is real and already built, so this is reported rather
+        # than failed; without saying it, "the insurance never appeared" has no
+        # trace anywhere.
+        logger.warning("Portal did not record policy %s: %s",
+                       policy_number, portal_result.warning)
 
     if not send_client_email:
         # Issued and portal-provisioned; the welcome email waits for the
@@ -15064,7 +15189,7 @@ async def handle_insurance_card_decision(update: Update, context: ContextTypes.D
             "insurance_card_sent_at": _manual_now,
             "insurance_card_error": None,
             # This path emails the client at issue — nothing is held, so the
-            # insurance release button must never appear for it.
+            # $100-add-on release button must never appear for it.
             "insurance_emailed_at": _manual_now,
             "portal_email": portal_email or email,
             "portal_password": portal_password,
@@ -15119,7 +15244,7 @@ async def handle_insurance_card_decision(update: Update, context: ContextTypes.D
             pass
 
 
-# ── Insurance release: the dispatcher's button ─────────────────────────────
+# ── $100 insurance add-on: the dispatcher's release button ────────────────────────
 # The card, portal account and login block go out at accept; the CLIENT's email
 # is held until whoever is in the group taps this after seeing the receipt.
 
@@ -15132,7 +15257,7 @@ def _insurance_email_keyboard(lead_id: str) -> InlineKeyboardMarkup:
 
 
 def _lead_awaiting_insurance_email(lead: dict) -> bool:
-    """Card issued under the insurance payment gate, client email still held."""
+    """Card issued under the $100 add-on, client email still held."""
     return bool(lead
                 and lead.get("wants_insurance")
                 and str(lead.get("insurance_card_sent_at") or "").strip()
@@ -17346,12 +17471,12 @@ async def _notify_supervisory_receipt_submission(
     if uploaded_by_supervisor and supervisor_display_name:
         caption += f"\nUploaded by supervisor: {supervisor_display_name}"
 
-    # The receipt IS the payment signal for insurance — put the
+    # The receipt IS the payment signal for the $100 insurance add-on — put the
     # release button on the very message that shows the money arrived.
     ins_kb = None
     if _lead_awaiting_insurance_email(lead):
         ins_kb = _insurance_email_keyboard(str(lead.get("id")))
-        caption += ("\n🛡 Insurance NOT emailed to the client yet — "
+        caption += ("\n🛡 $100 insurance add-on NOT emailed to the client yet — "
                     "tap below once the receipt is confirmed.")
 
     async def _send_caption_and_receipt(chat_id: int, label: str) -> None:
@@ -21096,7 +21221,7 @@ def main():
         CallbackQueryHandler(handle_insurance_card_decision, pattern=r"^ins_card_(yes|no)_")
     )
 
-    # Insurance: release the HELD client email once the receipt is
+    # $100 insurance add-on: release the HELD client email once the receipt is
     # in. Top-level on purpose — the button lives in group chats for days, and
     # anything conversation-scoped dies on the next redeploy.
     application.add_handler(
