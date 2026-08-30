@@ -194,16 +194,23 @@ def _driver_picker_rows(active: list, suspended: set, state_data: Optional[dict]
     """
     state_data = state_data or {}
     rows = []
-    for d in active:
+    # Two rosters, listed separately. Paper girls are ordinary driver rows, so
+    # they take the same seldrv_ callback and need no handler of their own --
+    # they are simply not shown unless a supervisor asked for them to be.
+    plain, girls = _split_rosters(active)
+    shown = plain + (girls if _paper_girls_shown_in_picker() else [])
+    for d in shown:
         did = d.get("id")
         name = d.get("driver_name", "Unknown")
+        icon = "📰" if _is_paper_girl(d) else "🚗"
         if str(did) in suspended:
             rows.append([InlineKeyboardButton(
                 f"🚫 {name} (PENALTY)", callback_data=f"driver_suspended_{did}")])
         else:
-            rows.append([InlineKeyboardButton(f"🚗 {name}", callback_data=f"seldrv_{did}")])
+            rows.append([InlineKeyboardButton(f"{icon} {name}", callback_data=f"seldrv_{did}")])
 
-    eligible = [d for d in active if str(d.get("id")) not in suspended]
+    eligible = [d for d in plain if str(d.get("id")) not in suspended]
+    girls_eligible = [d for d in girls if str(d.get("id")) not in suspended]
     instant = bool(state_data.get("instant_tag"))
     broadcast_on = _instant_all_drivers_enabled()
 
@@ -216,6 +223,13 @@ def _driver_picker_rows(active: list, suspended: set, state_data: Optional[dict]
         else:
             rows.append([InlineKeyboardButton(
                 "📢 Send to All Drivers", callback_data="seldrv_all")])
+
+    # Its own prefix, not seldrv_: that one carries a driver id, and "pg" is not
+    # one. The broadcast follows the same Instant Tag rule as All Drivers --
+    # an instant lead is ONE driver paying ONE link unless supervisors said otherwise.
+    if girls_eligible and not (instant and not broadcast_on):
+        rows.append([InlineKeyboardButton(
+            "📢 Send to all papergirls", callback_data="selpg_all")])
 
     rows.append([InlineKeyboardButton("⬅️ Back", callback_data="ph1_sel_back")])
     return rows
@@ -741,11 +755,18 @@ def _drivers_sent_label(state_data: dict, drivers_list: list) -> str:
     picked = str((state_data or {}).get("selected_driver_names") or "").strip()
     if picked.lower() == "all drivers":
         return f"All drivers ({len(names)})"
+    if picked.lower() == "all paper girls":
+        return f"All paper girls ({len(names)})"
     # Everyone eligible got it even though it was not an explicit "all" pick.
+    # Compared as SETS of ids, not counts: two drivers and two paper girls are
+    # the same number, and a count test called a papergirl blast "All drivers".
     try:
-        eligible = [d for d in _get_all_drivers_cached() if record_is_active(d)]
+        sent_ids = {str(d.get("id")) for d in (drivers_list or []) if d and d.get("id")}
+        eligible = [d for d in _only_drivers(_get_all_drivers_cached())
+                    if record_is_active(d)]
         suspended = _get_suspended_driver_ids()
-        if len({str(d.get("id")) for d in eligible if str(d.get("id")) not in suspended}) == len(names) > 1:
+        pool = {str(d.get("id")) for d in eligible if str(d.get("id")) not in suspended}
+        if len(pool) > 1 and pool == sent_ids:
             return f"All drivers ({len(names)})"
     except Exception:
         pass
@@ -1953,10 +1974,12 @@ def _norm_chat_id(cid) -> int | str | None:
 def _build_driver_keyboard(drivers: list, exclude_suspended: bool = True, include_all: bool = True):
     """Build driver selection keyboard. Suspended drivers get driver_suspended_X callback and (PENALTY) label."""
     suspended = _get_suspended_driver_ids() if exclude_suspended else set()
+    plain, girls = _split_rosters(drivers)
     buttons = []
-    for d in drivers:
+    for d in plain + (girls if _paper_girls_shown_in_picker() else []):
         did = d.get("id")
         name = d.get("driver_name", "Unknown")
+        icon = "📰" if _is_paper_girl(d) else "🚗"
         if str(did) in suspended:
             buttons.append([
                 InlineKeyboardButton(
@@ -1966,12 +1989,16 @@ def _build_driver_keyboard(drivers: list, exclude_suspended: bool = True, includ
             ])
         else:
             buttons.append([
-                InlineKeyboardButton(f"🚗 {name}", callback_data=f"select_driver_{did}")
+                InlineKeyboardButton(f"{icon} {name}", callback_data=f"select_driver_{did}")
             ])
     if include_all:
-        elig = [d for d in drivers if str(d.get("id")) not in suspended]
+        elig = [d for d in plain if str(d.get("id")) not in suspended]
         if elig:
             buttons.append([InlineKeyboardButton("📢 Send to All Drivers", callback_data="select_driver_all")])
+        girls_elig = [d for d in girls if str(d.get("id")) not in suspended]
+        if girls_elig:
+            buttons.append([InlineKeyboardButton("📢 Send to all papergirls",
+                                                 callback_data="select_driver_pg")])
     return InlineKeyboardMarkup(buttons)
 
 
@@ -2349,7 +2376,9 @@ def _resolve_all_active_driver_ids() -> list[str]:
         suspended = _get_suspended_driver_ids()
     except Exception:
         suspended = set()
-    pool = _get_all_drivers_cached() or []
+    # Website leads dispatch with no human picker at all, so this must be the
+    # driver roster only -- the paper girls are reached by their own button.
+    pool = _only_drivers(_get_all_drivers_cached()) or []
     return [
         str(d.get("id"))
         for d in pool
@@ -2628,6 +2657,105 @@ def _remove_extra_supervisor(chat_id: str) -> bool:
     key = _norm_chat_id(chat_id)
     rows = [r for r in _extra_supervisors(force=True) if _norm_chat_id(r.get("id")) != key]
     return _save_extra_supervisors(rows)
+
+
+# ── Paper girls ──────────────────────────────────────────────────────────
+# A second roster beside the drivers, dispatched the same way but on its own
+# broadcast button.
+#
+# A paper girl is a REAL row in `drivers`. lead_assignments.driver_id is a
+# foreign key to drivers(id), so a roster kept only in a settings blob could
+# never be assigned a lead, and every feature keyed on a driver id -- accepts,
+# receipts, suspensions, renewals, the leaderboard -- would have to grow a
+# second code path. What lives in settings is only the MEMBERSHIP list, which is
+# also why this needs no migration on a database that has several outstanding.
+PAPER_GIRLS_KEY = "paper_girl_driver_ids"
+# Off by default: the picker stays as short as it is today and the roster is
+# reached through its own broadcast button.
+PAPER_GIRLS_IN_PICKER_KEY = "paper_girls_in_driver_list"
+_PAPER_GIRL_TTL_SEC = 30
+_paper_girl_cache: dict = {"at": 0.0, "ids": []}
+
+
+def _paper_girl_ids(force: bool = False) -> set:
+    """Driver ids on the paper-girls roster. Briefly cached: every picker asks."""
+    now = time.time()
+    if not force and (now - float(_paper_girl_cache.get("at") or 0)) < _PAPER_GIRL_TTL_SEC:
+        return set(_paper_girl_cache.get("ids") or [])
+    ids: list = []
+    try:
+        raw = db.get_setting(PAPER_GIRLS_KEY)
+        if raw:
+            parsed = json.loads(raw)
+            if isinstance(parsed, list):
+                ids = [str(x).strip() for x in parsed if str(x).strip()]
+    except Exception as e:
+        logger.warning("paper girls read failed: %s", e)
+        ids = list(_paper_girl_cache.get("ids") or [])
+    _paper_girl_cache["at"] = now
+    _paper_girl_cache["ids"] = ids
+    return set(ids)
+
+
+def _save_paper_girl_ids(ids) -> bool:
+    ok = False
+    try:
+        ok = bool(db.set_setting(PAPER_GIRLS_KEY,
+                                 json.dumps(sorted({str(i) for i in (ids or [])}))))
+    except Exception as e:
+        logger.warning("paper girls write failed: %s", e)
+    _paper_girl_cache["at"] = 0.0           # next read is live, whatever happened
+    return ok
+
+
+def _add_paper_girl(driver_id: str) -> bool:
+    ids = _paper_girl_ids(force=True)
+    ids.add(str(driver_id).strip())
+    return _save_paper_girl_ids(ids)
+
+
+def _remove_paper_girl(driver_id: str) -> bool:
+    ids = _paper_girl_ids(force=True)
+    ids.discard(str(driver_id).strip())
+    return _save_paper_girl_ids(ids)
+
+
+def _is_paper_girl(driver: dict, ids: set = None) -> bool:
+    known = _paper_girl_ids() if ids is None else ids
+    return str((driver or {}).get("id") or "") in known
+
+
+def _split_rosters(rows) -> tuple:
+    """(drivers, paper_girls) out of one driver list, in the given order.
+
+    The two rosters are separate on purpose: "Send to All Drivers" must not
+    reach the paper girls, or their own button would be pointless.
+    """
+    ids = _paper_girl_ids()
+    drivers, girls = [], []
+    for d in (rows or []):
+        (girls if str((d or {}).get("id") or "") in ids else drivers).append(d)
+    return drivers, girls
+
+
+def _only_drivers(rows) -> list:
+    """Everyone on the driver roster who is NOT a paper girl."""
+    return _split_rosters(rows)[0]
+
+
+def _paper_girls_shown_in_picker() -> bool:
+    """Whether paper girls are listed one by one beside the drivers."""
+    try:
+        return str(db.get_setting(PAPER_GIRLS_IN_PICKER_KEY) or "").strip().lower() in (
+            "1", "true", "yes", "on")
+    except Exception:
+        return False
+
+
+def _paper_girl_rows(active: list, suspended: set) -> list:
+    """The paper girls out of an already-active, already-filtered driver list."""
+    _, girls = _split_rosters(active)
+    return [g for g in girls if str(g.get("id")) not in (suspended or set())]
 
 
 def _global_supervisory_chat_ids() -> list:
@@ -3000,12 +3128,15 @@ async def _send_driver_requests_for_group(
     if not group_id:
         return (0, "", "no_drivers_linked", "group_linked")
 
-    linked_rows = db.get_group_driver_rows_for_group(group_id)
+    # Both pools are drivers only. This fan-out runs with NO picker on screen --
+    # a website lead, or a reassign -- so a paper girl reaching it would be a
+    # lead nobody chose to send her. Same rule as _dispatch_drivers_with_reasons.
+    linked_rows = _only_drivers(db.get_group_driver_rows_for_group(group_id))
     if linked_rows:
         rows = linked_rows
         scope = "group_linked"
     else:
-        rows = [d for d in _get_all_drivers_cached() if d]
+        rows = [d for d in _only_drivers(_get_all_drivers_cached()) if d]
         scope = "all_drivers"
         if rows:
             logger.info(
@@ -3939,7 +4070,7 @@ PH1_REVIEW_CB_PATTERN = (
     r"^(ph1_accept|ph1_edit|ph1_vin_check|ph1_add_image|ph1_adjust|ph1_attach|"
     r"ph1_ins_toggle|ph1_itag_toggle|ph1_tagmail_toggle|adjust_cancel|ph1_back|"
     r"ph1_pick_group|ph1_pick_driver|"
-    r"ph1_pick_source|selgrp_|seldrv_|selsrc_|ph1_sel_back|driver_suspended_|"
+    r"ph1_pick_source|selgrp_|seldrv_|selpg_|selsrc_|ph1_sel_back|driver_suspended_|"
     r"edit_cancel|ph1edit_|ph1_add_car|ph1car_|ph1carrm_)"
 )
 # ``ph1edit_[a-z]+`` silently excluded every per-car key (v2vin, v2col, ...):
@@ -4955,6 +5086,9 @@ def _dispatch_drivers_with_reasons(
     payload = data or {}
     all_rows = _get_all_drivers_cached() or []
     id_set = {str(x).strip() for x in (payload.get("selected_driver_ids") or []) if str(x).strip()}
+    # An explicit pick may name a paper girl; the no-pick POOL below never does.
+    # Nobody chose them, and they are not who an unaddressed lead goes to.
+    pool_rows = _only_drivers(all_rows)
     dropped: list[tuple[str, str]] = []
 
     if id_set:
@@ -4968,13 +5102,13 @@ def _dispatch_drivers_with_reasons(
                 selected.append(row)
     else:
         if is_all_groups:
-            pool = all_rows
+            pool = pool_rows
         else:
             try:
                 linked = db.get_group_driver_rows_for_group(group_id) if group_id else []
             except Exception:
                 linked = []
-            pool = linked or all_rows
+            pool = _only_drivers(linked) or pool_rows
         selected = list(pool or [])
 
     suspended = _get_suspended_driver_ids()
@@ -5018,7 +5152,10 @@ async def _send_phase1_ai_review(target_message, state_data: dict, context, user
         state_data["selected_group_id"] = None
         state_data["selected_group_name"] = "None"
 
-    drivers = _get_all_drivers_cached()
+    # _only_drivers: the card's default must not quietly include the paper girls.
+    # This is the widest reach in the bot — every new lead starts here — so a
+    # roster that leaked in here would reach them on essentially every job.
+    drivers = _only_drivers(_get_all_drivers_cached())
     active_drivers = [d for d in drivers if record_is_active(d)]
     suspended = _get_suspended_driver_ids()
     eligible = [d for d in active_drivers if str(d.get("id")) not in suspended]
@@ -5053,7 +5190,8 @@ async def _repost_review_card(target_message, state_data: dict, context, user_id
         state_data["selected_group_id"] = "all" if groups else None
         state_data["selected_group_name"] = "All Dispatchers" if groups else "None"
     if not state_data.get("selected_driver_names"):
-        drivers = [d for d in _get_all_drivers_cached() if record_is_active(d)]
+        drivers = [d for d in _only_drivers(_get_all_drivers_cached())
+                   if record_is_active(d)]
         suspended = _get_suspended_driver_ids()
         eligible = [d for d in drivers if str(d.get("id")) not in suspended]
         state_data["selected_driver_ids"] = [d["id"] for d in eligible] if eligible else []
@@ -6874,6 +7012,11 @@ _RUN_VIN_RE = re.compile(r"\b(run|check|lookup|look\s+up|decode|verify|pull|scan
 # The quantifier must be the WHOLE answer, optionally naming what it quantifies.
 # Matching anything merely STARTING with "all" meant "all called already" — the
 # tail of "the drivers all called already" — broadcast the lead to every driver.
+_PAPERGIRLS_SELECT_RE = re.compile(
+    r"^\s*(?:(?:send\s+)?(?:to\s+)?)?(?:all\s+(?:of\s+)?(?:the\s+)?)?"
+    r"paper\s*girls?\s*[.!]*\s*$",
+    re.I,
+)
 _ALL_SELECT_RE = re.compile(
     r"^\s*(?:all|every\s*one|everybody|everything|every)"
     r"(?:\s+(?:of\s+)?(?:the\s+)?"
@@ -7003,8 +7146,14 @@ async def _apply_selection(kind: str, payload: str, state_data: dict, user_id: i
         _select_group(state_data, user_id, g)
         return True, f"Dispatcher → {g.get('group_name', '?')}"
     if kind == "SELECT_DRIVER":
+        # Before the all-drivers rule: "all paper girls" begins with "all".
+        if _PAPERGIRLS_SELECT_RE.match(payload):
+            if not _select_driver(state_data, user_id, "papergirls"):
+                return False, "No paper girl is available"
+            return True, "Driver → All Paper Girls"
         if _ALL_SELECT_RE.match(payload):
-            _select_driver(state_data, user_id, "all")
+            if not _select_driver(state_data, user_id, "all"):
+                return False, "No driver is available"
             return True, "Driver → All Drivers"
         active = [d for d in _get_all_drivers_cached() if record_is_active(d)]
         suspended = _get_suspended_driver_ids()
@@ -7332,6 +7481,11 @@ def _classify_review_command_once(text: str, *, vin_pending: bool = True):
         first = name.split()[0].lower() if name.split() else ""
         if first not in ("note", "notes", "license", "licence"):  # 'driver note/license' are field edits
             return ("SELECT_DRIVER", name)
+    # "paper girls" names the roster on its own, the way a driver's name does —
+    # without this the phrase classifies as NONE and is written to the card as a
+    # note instead of picking anybody.
+    if _PAPERGIRLS_SELECT_RE.match(t):
+        return ("SELECT_DRIVER", t.strip())
     # C) VIN verbs. Order matters: "keep/same" first ("use the same" = keep); then
     # "use <vin>" ("use vin lookup"/"use the new" = use decoded); retype; else run.
     #
@@ -7423,17 +7577,36 @@ def _select_group(state_data: dict, user_id: int, group) -> None:
     db.set_user_state(user_id, "phase1", state_data)
 
 
-def _select_driver(state_data: dict, user_id: int, driver) -> None:
-    if driver == "all":
+def _select_driver(state_data: dict, user_id: int, driver) -> bool:
+    """Write a driver pick onto the card. False = it resolved to nobody.
+
+    A roster pick that comes to nothing must NOT be written. An empty
+    selected_driver_ids reads downstream as "nobody picked anyone", and
+    _dispatch_drivers_with_reasons then falls back to the whole pool -- so
+    saying "paper girls" with an empty roster used to wipe the driver already
+    chosen and widen the lead to EVERY driver, which is the opposite of what
+    was asked for.
+    """
+    if driver in ("all", "papergirls"):
         active = [d for d in _get_all_drivers_cached() if record_is_active(d)]
         suspended = _get_suspended_driver_ids()
-        selected = [d for d in active if str(d["id"]) not in suspended]
+        if driver == "papergirls":
+            selected = _paper_girl_rows(active, suspended)
+            label = "All Paper Girls"
+        else:
+            # The paper girls have their own roster; "all drivers" is not them.
+            selected = [d for d in _only_drivers(active)
+                        if str(d["id"]) not in suspended]
+            label = "All Drivers"
+        if not selected:
+            return False                  # nothing written, nothing widened
         state_data["selected_driver_ids"] = [d["id"] for d in selected]
-        state_data["selected_driver_names"] = "All Drivers"
+        state_data["selected_driver_names"] = label
     else:
         state_data["selected_driver_ids"] = [driver["id"]]
         state_data["selected_driver_names"] = driver.get("driver_name", "?")
     db.set_user_state(user_id, "phase1", state_data)
+    return True
 
 
 def _select_source(state_data: dict, user_id: int, source) -> None:
@@ -7865,8 +8038,18 @@ async def _interpret_review_command(update, context, user_id, state_data, text):
         return STATE_AI_REVIEW
 
     if kind == "SELECT_DRIVER":
+        if _PAPERGIRLS_SELECT_RE.match(payload or ""):
+            if not _select_driver(state_data, user_id, "papergirls"):
+                await _finish("📰 No paper girl is available — add one in "
+                              "/settings → 📰 Paper Girls.")
+                return STATE_AI_REVIEW
+            await _update_review_message_text(context, state_data)
+            await _finish("✅ Driver → All Paper Girls")
+            return STATE_AI_REVIEW
         if _ALL_SELECT_RE.match(payload or ""):
-            _select_driver(state_data, user_id, "all")
+            if not _select_driver(state_data, user_id, "all"):
+                await _finish("🤔 No driver is available to send this to.")
+                return STATE_AI_REVIEW
             await _update_review_message_text(context, state_data)
             if state_data.get("instant_tag") and not _instant_all_drivers_enabled():
                 await _finish("🤖 Instant Tag needs ONE driver — say a driver's name "
@@ -12872,6 +13055,27 @@ async def handle_phase1_ai_review_callback(update, context):
             await _update_review_message_text(context, state_data)
         return STATE_AI_REVIEW
 
+    elif data == "selpg_all":
+        active = [d for d in (_get_all_drivers_cached() or []) if record_is_active(d)]
+        suspended = _get_suspended_driver_ids()
+        if state_data.get("instant_tag") and not _instant_all_drivers_enabled():
+            await _send_vanishing(
+                context, query.message.chat_id,
+                "🤖 Instant Tag needs ONE person — the broadcast is off for this "
+                "lead (a supervisor can allow it in /settings → ⚡ Instant Tag).")
+            return STATE_AI_REVIEW
+        selected = _paper_girl_rows(active, suspended)
+        if not selected:
+            await _send_vanishing(
+                context, query.message.chat_id,
+                "📰 No paper girl is available — add one in /settings → 📰 Paper Girls.")
+            return STATE_AI_REVIEW
+        state_data["selected_driver_ids"] = [d["id"] for d in selected]
+        state_data["selected_driver_names"] = "All Paper Girls"
+        db.set_user_state(user_id, "phase1", state_data)
+        await _update_review_message_text(context, state_data)
+        return STATE_AI_REVIEW
+
     elif data.startswith("seldrv_") or data == "seldrv_all":
         drivers = _get_all_drivers_cached()
         active = [d for d in drivers if record_is_active(d)]
@@ -12883,7 +13087,8 @@ async def handle_phase1_ai_review_callback(update, context):
                     "🤖 Instant Tag needs ONE driver — All Drivers is off for this "
                     "lead (a supervisor can allow it in /settings → ⚡ Instant Tag).")
                 return STATE_AI_REVIEW
-            selected = [d for d in active if str(d["id"]) not in suspended]
+            # The paper girls have their own button; All Drivers is the drivers.
+            selected = [d for d in _only_drivers(active) if str(d["id"]) not in suspended]
             names = "All Drivers"
             ids = [d["id"] for d in selected]
         else:
@@ -13996,9 +14201,10 @@ async def _submit_lead_from_review(message, context, user_id, data):
                     linked = db.get_group_driver_rows_for_group(group.get("id"))
                 except Exception:
                     linked = []
-                fallback_pool = linked or _get_all_drivers_cached() or []
+                fallback_pool = (_only_drivers(linked)
+                                 or _only_drivers(_get_all_drivers_cached()) or [])
             else:
-                fallback_pool = _get_all_drivers_cached() or []
+                fallback_pool = _only_drivers(_get_all_drivers_cached()) or []
             drivers_list = [
                 d
                 for d in fallback_pool
@@ -14426,8 +14632,17 @@ async def handle_driver_selection(update: Update, context: ContextTypes.DEFAULT_
     active_drivers = [d for d in all_drivers if record_is_active(d)]
     
     suspended = _get_suspended_driver_ids()
-    if callback_data == "select_driver_all":
-        selected_drivers = [d for d in active_drivers if str(d.get("id")) not in suspended]
+    if callback_data == "select_driver_pg":
+        selected_drivers = _paper_girl_rows(active_drivers, suspended)
+        selected_driver_ids = [d['id'] for d in selected_drivers]
+        if not selected_drivers:
+            await query.message.reply_text(
+                "📰 No paper girl is available — add one in /settings → 📰 Paper Girls.")
+            return STATE_SELECT_DRIVER
+    elif callback_data == "select_driver_all":
+        # The paper girls have their own button; All Drivers is the drivers.
+        selected_drivers = [d for d in _only_drivers(active_drivers)
+                            if str(d.get("id")) not in suspended]
         selected_driver_ids = [d['id'] for d in selected_drivers]
         if not selected_drivers:
             await query.message.reply_text("❌ No eligible drivers (all suspended). Please select a driver individually.")
@@ -16229,8 +16444,20 @@ async def _handle_resend_to_drivers(
     all_drivers = _get_all_drivers_cached()
     active_drivers = [d for d in all_drivers if record_is_active(d)]
     suspended = _get_suspended_driver_ids()
-    if callback_data == "select_driver_all":
-        selected_drivers = [d for d in active_drivers if str(d.get("id")) not in suspended]
+    if callback_data == "select_driver_pg":
+        selected_drivers = _paper_girl_rows(active_drivers, suspended)
+        if not selected_drivers:
+            await update.callback_query.message.reply_text(
+                "📰 No paper girl is available — add one in /settings → 📰 Paper Girls.")
+            return STATE_SELECT_DRIVER
+    elif callback_data == "select_driver_all":
+        # The paper girls have their own button; All Drivers is the drivers.
+        selected_drivers = [d for d in _only_drivers(active_drivers)
+                            if str(d.get("id")) not in suspended]
+        if not selected_drivers:
+            await update.callback_query.message.reply_text(
+                "❌ No eligible drivers (all suspended). Please select a driver individually.")
+            return STATE_SELECT_DRIVER
     else:
         driver_id = callback_data.replace("select_driver_", "")
         selected_drivers = [d for d in active_drivers if str(d.get("id")) == str(driver_id)]
@@ -17089,7 +17316,8 @@ async def handle_reassign_lead(update: Update, context: ContextTypes.DEFAULT_TYP
         offer_text = _driver_offer_message_text(lead)
         kb = _keyboard_lead_accept_decline(str(lead_id))
         suspended = _get_suspended_driver_ids()
-        for d in _get_all_drivers_cached() or []:
+        # Drivers only: a reassign with no group shows no picker either.
+        for d in _only_drivers(_get_all_drivers_cached()) or []:
             if not d or not record_is_active(d) or str(d.get("id")) in suspended:
                 continue
             if old_driver_id and str(d.get("id")) == str(old_driver_id):
@@ -20463,6 +20691,7 @@ def _settings_main_kb() -> InlineKeyboardMarkup:
         # "Groups" in the schema are "Dispatchers" everywhere the user sees them.
         [InlineKeyboardButton("🏢 Dispatchers", callback_data="tset_groups")],
         [InlineKeyboardButton("🚗 Drivers", callback_data="tset_drivers")],
+        [InlineKeyboardButton("📰 Paper Girls", callback_data="tset_pg")],
         [InlineKeyboardButton("🚫 Suspensions", callback_data="tset_susp")],
         [InlineKeyboardButton("📊 Client Sources", callback_data="tset_srcs")],
         [InlineKeyboardButton("👑 Supervisors", callback_data="tset_sups")],
@@ -20703,6 +20932,47 @@ async def _settings_view_followups() -> tuple:
     return ("\n".join(lines), kb)
 
 
+async def _settings_view_paper_girls() -> tuple:
+    """The second roster. Everyone here is a real driver row, so they keep their
+    receipts, suspensions and contact details -- this screen only decides who is
+    ON the roster, and whether the pickers list them one by one."""
+    rows_all = await asyncio.to_thread(_get_all_drivers_cached)
+    ids = await asyncio.to_thread(_paper_girl_ids, True)
+    suspended = await asyncio.to_thread(_get_suspended_driver_ids)
+    girls = [d for d in (rows_all or []) if str(d.get("id")) in ids]
+    shown = await asyncio.to_thread(_paper_girls_shown_in_picker)
+
+    lines = ["📰 *Paper Girls*",
+             "_Their own broadcast button: 📢 Send to all papergirls._",
+             "_They never receive a 📢 Send to All Drivers lead._", ""]
+    rows = []
+    for g in girls:
+        mark, note = _driver_status(g, suspended)
+        name = _telegram_md1_escape(str(g.get("driver_name") or "(unnamed)"))
+        lines.append(f"{mark} *{name}* — `{g.get('driver_telegram_id') or '—'}`"
+                     + (f" _({note})_" if note else ""))
+        rows.append([InlineKeyboardButton(
+            f"Remove {g.get('driver_name') or g.get('id')}"[:40],
+            callback_data=f"tset_pgdel:{g.get('id')}")])
+    # An id on the roster whose driver row is gone would otherwise be invisible
+    # and un-removable from here.
+    orphans = sorted(ids - {str(d.get("id")) for d in (rows_all or [])})
+    for oid in orphans:
+        lines.append(f"⚠️ `{oid}` _(no driver row — removed from the roster on save)_")
+        rows.append([InlineKeyboardButton(f"Remove {oid}"[:40],
+                                          callback_data=f"tset_pgdel:{oid}")])
+    if not girls and not orphans:
+        lines.append("_Nobody on the roster yet._")
+    lines += ["", "_They can get their own id from /whoami._"]
+
+    rows.append([InlineKeyboardButton(
+        f"👀 Show in driver list: {'ON' if shown else 'OFF'}",
+        callback_data="tset_pgtog")])
+    rows.append([InlineKeyboardButton("➕ Add Paper Girl", callback_data="tset_pgadd")])
+    rows.append([InlineKeyboardButton("⬅️ Back", callback_data="tset_menu")])
+    return ("\n".join(lines).rstrip(), InlineKeyboardMarkup(rows))
+
+
 async def _settings_view_supervisors() -> tuple:
     """Who can open /settings. The env-configured ones are shown but fixed —
     removing the last way in from inside the room is not a thing to allow."""
@@ -20881,6 +21151,7 @@ _SETTINGS_VIEWS = {
     "tset_plates": _settings_view_plates,
     "tset_groups": _settings_view_groups,
     "tset_drivers": _settings_view_drivers,
+    "tset_pg": _settings_view_paper_girls,
     "tset_susp": _settings_view_suspensions,
     "tset_srcs": _settings_view_sources,
     "tset_sups": _settings_view_supervisors,
@@ -20898,6 +21169,9 @@ _SETTINGS_NAV = [
     (re.compile(r"\b(?:suspen\w*|unsuspend\w*|lift|penalt\w*|block\w*)\b", re.I), "tset_susp"),
     (re.compile(r"\b(?:plates?|tag\s*numbers?|control\s*numbers?)\b", re.I), "tset_plates"),
     (re.compile(r"\b(?:dispatchers?|groups?|teams?|crews?)\b", re.I), "tset_groups"),
+    # Before drivers: "paper girl drivers" is about this screen, and the driver
+    # rule below would otherwise claim it.
+    (re.compile(r"\bpaper\s*girls?\b|\bpapergirls?\b", re.I), "tset_pg"),
     (re.compile(r"\b(?:drivers?|drv)\b", re.I), "tset_drivers"),
     (re.compile(r"\b(?:sources?|client\s*source|lead\s*source|origin)\b", re.I), "tset_srcs"),
     (re.compile(r"\b(?:supervisors?|admins?|administrators?|owners?)\b", re.I), "tset_sups"),
@@ -21056,6 +21330,23 @@ async def handle_settings_cb(update: Update, context: ContextTypes.DEFAULT_TYPE)
     # --- drivers -------------------------------------------------------
     if data == "tset_drivers":
         await _show_settings_view("tset_drivers", query=query); return SET_MENU
+    if data == "tset_pg":
+        await _show_settings_view("tset_pg", query=query); return SET_MENU
+    if data == "tset_pgtog":
+        now_on = not await asyncio.to_thread(_paper_girls_shown_in_picker)
+        await asyncio.to_thread(db.set_setting, PAPER_GIRLS_IN_PICKER_KEY,
+                                "1" if now_on else "0")
+        await _show_settings_view("tset_pg", query=query); return SET_MENU
+    if data.startswith("tset_pgdel:"):
+        await asyncio.to_thread(_remove_paper_girl, data.split(":", 1)[1])
+        await _show_settings_view("tset_pg", query=query); return SET_MENU
+    if data == "tset_pgadd":
+        context.user_data["tset_await"] = {"kind": "add_paper_girl"}
+        await query.message.reply_text(
+            "Send the new paper girl as: *Name | telegram_id*\n"
+            "She can get her id by sending /whoami to this bot.",
+            parse_mode="Markdown")
+        return SET_INPUT
     if data.startswith("tset_drv:"):
         await _show_driver_detail(query, data.split(":", 1)[1])
         return SET_MENU
@@ -21189,6 +21480,32 @@ async def apply_settings_input(update: Update, context: ContextTypes.DEFAULT_TYP
         await update.message.reply_text(msg)
         return SET_INPUT
 
+    if st.get("kind") == "add_paper_girl":
+        parts = [p.strip() for p in text.split("|")]
+        if len(parts) < 2 or not parts[0] or not parts[1]:
+            return await _retry("❌ Format: Name | telegram_id")
+        if not re.fullmatch(r"-?\d{5,}", parts[1]):
+            return await _retry(
+                "❌ The telegram_id must be digits — she can get hers from /whoami.")
+        # A paper girl IS a driver row: that is what lets a lead be assigned to
+        # her at all. Someone already on the roster keeps their row, receipts and
+        # history, and simply joins the second list.
+        row = await asyncio.to_thread(db.get_driver_by_telegram_id, parts[1])
+        if not row:
+            await asyncio.to_thread(db.create_driver, parts[0], parts[1], None, None)
+            _bust_driver_caches()
+            row = await asyncio.to_thread(db.get_driver_by_telegram_id, parts[1])
+        if not row or not row.get("id"):
+            await update.message.reply_text("❌ Could not add the paper girl.",
+                                            reply_markup=_settings_main_kb())
+            return SET_MENU
+        ok = await asyncio.to_thread(_add_paper_girl, str(row["id"]))
+        _bust_driver_caches()
+        await update.message.reply_text(
+            (f"✅ {parts[0]} is on the paper girls roster." if ok
+             else "❌ Could not save the roster."),
+            reply_markup=_settings_main_kb())
+        return SET_MENU
     if st.get("kind") == "add_driver":
         parts = [p.strip() for p in text.split("|")]
         if len(parts) < 2 or not parts[0] or not parts[1]:
