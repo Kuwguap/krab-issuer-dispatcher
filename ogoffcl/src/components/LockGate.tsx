@@ -1,7 +1,7 @@
 import { useEffect, useState, ReactNode, FormEvent } from "react";
 import { Link, useLocation } from "react-router-dom";
 import { motion } from "framer-motion";
-import { cachedLocked, fetchSiteLocked, subscribe } from "../lib/settings";
+import { cachedLocked, fetchSiteLocked, getLockVideo, subscribe } from "../lib/settings";
 
 /**
  * Site lock with waitlist. Lock state lives in site_settings and is flipped
@@ -60,16 +60,18 @@ export default function LockGate({ children }: { children: ReactNode }) {
 
   // when locked, /tournament* can stay live (admin's choice in Site & Mail)
   const [tournamentOpen, setTournamentOpen] = useState(false);
+  const [videoUrl, setVideoUrl] = useState<string | null>(null);
   const loc = useLocation();
 
   useEffect(() => {
-    if (ENV_FORCED) return;
+    if (ENV_FORCED) { getLockVideo().then((u) => setVideoUrl(u)).catch(() => {}); return; }
     let alive = true;
     fetchSiteLocked().then(({ locked: dbLocked, lockedAt, tournamentOpen: tOpen }) => {
       if (!alive) return;
       setLocked(dbLocked && !bypassValid(lockedAt));
       setTournamentOpen(tOpen);
     });
+    getLockVideo().then((u) => { if (alive) setVideoUrl(u); }).catch(() => {});
     return () => { alive = false; };
   }, []);
 
@@ -133,15 +135,28 @@ export default function LockGate({ children }: { children: ReactNode }) {
             // my-auto on the content centers when there's room, scrolls when not.
             className="fixed inset-0 z-[100] bg-ink flex flex-col items-center px-6 py-10 overflow-y-auto"
           >
-            {/* moving backdrop type (overflow-hidden here so its nowrap rows
-                can't hand the now-scrollable parent a horizontal scrollbar) */}
-            <div className="fixed inset-0 overflow-hidden opacity-[0.05] pointer-events-none select-none" aria-hidden>
-              {[...Array(7)].map((_, r) => (
-                <div key={r} className="whitespace-nowrap font-display uppercase text-[11vh] leading-none" style={{ transform: `translateX(${r % 2 ? -12 : 0}%)` }}>
-                  {Array(8).fill("NEXT DROP LOADING ").join("")}
-                </div>
-              ))}
-            </div>
+            {/* background: looping drop video if the admin uploaded one,
+                otherwise the moving type. A dark scrim keeps the form legible. */}
+            {videoUrl ? (
+              <>
+                <video
+                  key={videoUrl}
+                  className="fixed inset-0 w-full h-full object-cover pointer-events-none"
+                  src={videoUrl}
+                  autoPlay muted loop playsInline preload="auto"
+                  aria-hidden
+                />
+                <div className="fixed inset-0 bg-gradient-to-b from-ink/80 via-ink/55 to-ink/85 pointer-events-none" aria-hidden />
+              </>
+            ) : (
+              <div className="fixed inset-0 overflow-hidden opacity-[0.05] pointer-events-none select-none" aria-hidden>
+                {[...Array(7)].map((_, r) => (
+                  <div key={r} className="whitespace-nowrap font-display uppercase text-[11vh] leading-none" style={{ transform: `translateX(${r % 2 ? -12 : 0}%)` }}>
+                    {Array(8).fill("NEXT DROP LOADING ").join("")}
+                  </div>
+                ))}
+              </div>
+            )}
 
             <motion.div
               initial={{ opacity: 0, y: 24 }}

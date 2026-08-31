@@ -45,3 +45,18 @@ export async function uploadImage(file: File, folder = "product-images"): Promis
   const { data } = supabase.storage.from(STORAGE_BUCKET).getPublicUrl(path);
   return data.publicUrl;
 }
+
+/** Upload a background/lock-screen video, returns its public URL. Long cache
+ *  so the CDN serves repeat visits fast. onProgress is best-effort. */
+export async function uploadVideo(file: File, folder = "site"): Promise<string> {
+  const ext = (file.name.split(".").pop() || "mp4").toLowerCase();
+  const path = `${folder}/lock-${Date.now()}.${ext}`;
+  const { error } = await supabase.storage.from(STORAGE_BUCKET).upload(path, file, {
+    contentType: file.type || "video/mp4",
+    upsert: true,
+    cacheControl: "31536000",
+  });
+  if (error) throw error;
+  const { data } = supabase.storage.from(STORAGE_BUCKET).getPublicUrl(path);
+  return data.publicUrl;
+}

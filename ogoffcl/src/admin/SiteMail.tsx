@@ -1,8 +1,9 @@
 import { useEffect, useMemo, useState } from "react";
 import {
   fetchSiteLocked, setSiteLocked, setTournamentOpen, listSubscribers, deleteSubscriber,
-  SubscriberRow,
+  getLockVideo, setLockVideo, SubscriberRow,
 } from "../lib/settings";
+import { uploadVideo } from "../lib/supabase";
 
 const MIGRATION_HINT =
   "Run supabase/migration_waitlist.sql once in the Supabase SQL editor (creates site_settings + subscribers), then reload this page.";
@@ -19,14 +20,47 @@ export default function AdminSiteMail() {
   const [filter, setFilter] = useState<"all" | "waitlist" | "newsletter" | "tournament">("all");
   const [copied, setCopied] = useState(false);
 
+  const [videoUrl, setVideoUrl] = useState<string | null>(null);
+  const [vidBusy, setVidBusy] = useState(false);
+  const [vidMsg, setVidMsg] = useState<string | null>(null);
+
   const load = async () => {
     const s = await fetchSiteLocked();
     setLocked(s.locked);
     setTournamentOpenState(s.tournamentOpen);
     setSettingsMissing(s.tableMissing);
+    getLockVideo().then(setVideoUrl).catch(() => {});
     const l = await listSubscribers();
     setSubs(l.rows);
     setSubsMissing(l.tableMissing);
+  };
+
+  const onVideo = async (file: File | null) => {
+    if (!file) return;
+    if (!/^video\//.test(file.type)) { setVidMsg("Please choose a video file (MP4 or WebM)."); return; }
+    const mb = file.size / 1048576;
+    if (mb > 45) { setVidMsg(`That's ${mb.toFixed(0)}MB — too large. Compress to a short web loop (aim under ~15MB) and try again.`); return; }
+    setVidBusy(true); setVidMsg(mb > 15 ? "Uploading… (large file — trim it for faster visitor loads)" : "Uploading…");
+    try {
+      const url = await uploadVideo(file);
+      const r = await setLockVideo(url);
+      if (!r.ok) throw new Error(r.error);
+      setVideoUrl(url);
+      setVidMsg("Video live on the lock screen ✓");
+    } catch (ex) {
+      setVidMsg(`Upload failed: ${ex instanceof Error ? ex.message : "try again"}`);
+    } finally {
+      setVidBusy(false);
+    }
+  };
+
+  const removeVideo = async () => {
+    if (!confirm("Remove the lock-screen video? It reverts to the moving-type background.")) return;
+    setVidBusy(true);
+    const r = await setLockVideo(null);
+    setVidBusy(false);
+    if (r.ok) { setVideoUrl(null); setVidMsg("Video removed."); }
+    else setVidMsg(`Could not remove: ${r.error}`);
   };
   useEffect(() => { load(); }, []);
 
@@ -139,6 +173,44 @@ export default function AdminSiteMail() {
           Locked = every visitor sees the waitlist screen and can drop their email. Staff bypass with the
           staff code (VITE_SITE_PASSWORD) or <code className="text-bone/50">?unlock=&lt;code&gt;</code>. Takes effect on next page load — no redeploy.
         </p>
+
+        {/* ── Lock-screen background video ─────────────────────── */}
+        {!settingsMissing && (
+          <div className="mt-6 pt-6 border-t border-ash">
+            <p className="font-display uppercase text-xs tracking-[0.3em] text-bone/50 mb-3">Lock-screen background video</p>
+            {videoUrl ? (
+              <div className="flex flex-wrap items-start gap-4">
+                <video src={videoUrl} muted loop autoPlay playsInline className="w-48 h-28 object-cover border border-ash bg-ink" />
+                <div className="flex flex-col gap-2">
+                  <span className="text-acid text-xs uppercase tracking-widest">● Live on the waitlist screen</span>
+                  <div className="flex gap-2">
+                    <label className="btn-og border-2 border-ash text-bone/70 px-4 py-2 text-[10px] hover:border-bone cursor-pointer">
+                      Replace
+                      <input type="file" accept="video/mp4,video/webm,video/*" className="hidden" disabled={vidBusy}
+                        onChange={(e) => { onVideo(e.target.files?.[0] || null); e.currentTarget.value = ""; }} />
+                    </label>
+                    <button onClick={removeVideo} disabled={vidBusy} className="btn-og border-2 border-blood/40 text-blood px-4 py-2 text-[10px] hover:bg-blood hover:text-bone">Remove</button>
+                  </div>
+                </div>
+              </div>
+            ) : (
+              <label className="flex items-center gap-4 border border-dashed border-ash hover:border-acid transition-colors p-5 cursor-pointer max-w-md">
+                <div className="w-14 h-14 border border-ash bg-ink flex items-center justify-center text-bone/30 text-2xl shrink-0">▶</div>
+                <div className="min-w-0">
+                  <p className="text-bone/80 text-sm font-display uppercase tracking-wide">{vidBusy ? "Uploading…" : "Upload a background video"}</p>
+                  <p className="text-bone/40 text-xs mt-1">MP4 or WebM · it loops muted behind the waitlist form.</p>
+                </div>
+                <input type="file" accept="video/mp4,video/webm,video/*" className="hidden" disabled={vidBusy}
+                  onChange={(e) => { onVideo(e.target.files?.[0] || null); e.currentTarget.value = ""; }} />
+              </label>
+            )}
+            {vidMsg && <p className={`text-xs mt-3 ${/✓|live/i.test(vidMsg) ? "text-acid" : "text-bone/60"}`}>{vidMsg}</p>}
+            <p className="text-bone/30 text-[11px] mt-3 leading-relaxed max-w-xl">
+              Autoplay needs a <strong className="text-bone/50">muted</strong> video (browsers block sound on load). For fast loading keep it a short
+              5–10s loop, 1080p, H.264 MP4 (or VP9 WebM), compressed to <strong className="text-bone/50">~5–15MB</strong> — true lossless files are hundreds of MB and won't stream smoothly on mobile.
+            </p>
+          </div>
+        )}
       </section>
 
       {/* ── Mailing list ─────────────────────────────────────── */}

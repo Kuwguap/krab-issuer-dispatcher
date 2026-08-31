@@ -79,6 +79,24 @@ export async function setTournamentOpen(open: boolean): Promise<{ ok: boolean; e
   }
 }
 
+/** Lock-screen background video (looped). Stored under its own key so
+ *  toggling the lock never clobbers it. Returns the public URL or null. */
+export async function getLockVideo(): Promise<string | null> {
+  try {
+    const { data } = await supabase.from("site_settings").select("value").eq("key", "lock_video").maybeSingle();
+    const v = (data?.value || {}) as { url?: string };
+    return v.url ? String(v.url) : null;
+  } catch { return null; }
+}
+
+export async function setLockVideo(url: string | null): Promise<{ ok: boolean; error?: string }> {
+  const { error } = await supabase
+    .from("site_settings")
+    .upsert({ key: "lock_video", value: url ? { url } : {}, updated_at: new Date().toISOString() }, { onConflict: "key" });
+  if (error) return { ok: false, error: error.message };
+  return { ok: true };
+}
+
 export type SubscribeSource = "waitlist" | "newsletter";
 
 export async function subscribe(emailRaw: string, source: SubscribeSource): Promise<{ ok: boolean; already?: boolean; error?: string }> {
