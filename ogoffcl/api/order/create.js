@@ -50,16 +50,34 @@ export default async (req, res) => {
     }
     subtotal = money2(subtotal);
 
-    // Discount (validated server-side).
+    // Discount — validated + enforced server-side (this is the authoritative
+    // charge). Supports percent OR fixed amount, a minimum order, a usage cap,
+    // and audience targeting (all / new / returning) — returning is judged by
+    // whether this email already has a paid order.
     let discountAmount = 0;
     let appliedCode = null;
     if (discountCode) {
       const code = String(discountCode).trim().toUpperCase();
       const dRes = await sb("GET", `discount_codes?code=eq.${encodeURIComponent(code)}&is_active=eq.true&select=*&limit=1`);
       const d = dRes.ok && Array.isArray(dRes.data) && dRes.data[0];
-      if (d && (!d.expires_at || new Date(d.expires_at) >= new Date())) {
-        const pct = Number(d.percentage || 0);
-        if (pct > 0) { discountAmount = money2(subtotal * (pct / 100)); appliedCode = code; }
+      if (d) {
+        const notExpired = !d.expires_at || new Date(d.expires_at) >= new Date();
+        const minOk = !(Number(d.min_subtotal || 0) > 0) || subtotal >= Number(d.min_subtotal || 0);
+        const usesOk = d.max_uses == null || Number(d.used_count || 0) < Number(d.max_uses);
+        let audienceOk = true;
+        const audience = String(d.audience || "all");
+        if (audience === "new" || audience === "returning") {
+          const past = await sb("GET", `orders?customer_email=eq.${encodeURIComponent(email)}&payment_status=eq.paid&select=id&limit=1`);
+          const isReturning = past.ok && Array.isArray(past.data) && past.data.length > 0;
+          audienceOk = audience === "returning" ? isReturning : !isReturning;
+        }
+        if (notExpired && minOk && usesOk && audienceOk) {
+          const kind = d.discount_type === "amount" || (d.amount_off != null && d.percentage == null) ? "amount" : "percent";
+          const amt = kind === "amount"
+            ? Math.min(Number(d.amount_off || 0), subtotal)
+            : subtotal * (Number(d.percentage ?? d.value ?? 0) / 100);
+          if (amt > 0) { discountAmount = money2(amt); appliedCode = code; }
+        }
       }
     }
     const total = money2(Math.max(0, subtotal - discountAmount));

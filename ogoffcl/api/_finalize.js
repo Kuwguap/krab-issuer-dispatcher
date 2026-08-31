@@ -25,6 +25,16 @@ async function finalizePaidOrder(order, moolreTx) {
   });
   await appendStatusHistory(order, { status: "confirmed", note: "Payment received (Moolre MoMo)" });
 
+  // Count a discount redemption once, ON payment — so abandoned checkouts don't
+  // burn a code's use and max_uses reflects real redemptions.
+  if (order.discount_code) {
+    try {
+      const { data } = await sb("GET", `discount_codes?code=eq.${encodeURIComponent(order.discount_code)}&select=id,used_count&limit=1`);
+      const dc = Array.isArray(data) && data[0];
+      if (dc) await sb("PATCH", `discount_codes?id=eq.${dc.id}`, { used_count: Number(dc.used_count || 0) + 1 });
+    } catch { /* non-fatal */ }
+  }
+
   const items = await getOrderItems(order.id);
 
   // best-effort stock decrement

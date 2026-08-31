@@ -49,11 +49,22 @@ export interface OrderRow {
   created_at: string;
 }
 
+export type DiscountKind = "percent" | "amount";
+export type DiscountAudience = "all" | "new" | "returning";
+
 export interface DiscountCode {
   id: string;
   code: string;
-  percentage: number | null;
+  discount_type: DiscountKind | null;
+  percentage: number | null;   // when discount_type = 'percent'
+  amount_off: number | null;   // when discount_type = 'amount'
+  audience: DiscountAudience | null;
+  min_subtotal: number | null;
+  max_uses: number | null;
+  used_count: number | null;
   is_active: boolean;
   expires_at: string | null;
+  created_at?: string | null;
+  value?: number | null;       // legacy column, still read as a percent fallback
   [key: string]: unknown;
 }

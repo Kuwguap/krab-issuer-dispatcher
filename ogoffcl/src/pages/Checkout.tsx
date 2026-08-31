@@ -6,11 +6,8 @@ import { useCart } from "../store/CartContext";
 import Reveal from "../components/Reveal";
 import MomoHelp from "../components/MomoHelp";
 import { usePageMeta } from "../lib/seo";
-
-interface Applied {
-  code: string;
-  percentage: number;
-}
+import { evaluateDiscount, discountLabel } from "../lib/discounts";
+import type { DiscountCode } from "../lib/types";
 
 type PayState =
   | { step: "form" }
@@ -31,8 +28,9 @@ export default function Checkout() {
   const [momoPhone, setMomoPhone] = useState("");
   const [network, setNetwork] = useState<"mtn" | "telecel" | "at">("mtn");
   const [codeInput, setCodeInput] = useState("");
-  const [applied, setApplied] = useState<Applied | null>(null);
+  const [applied, setApplied] = useState<DiscountCode | null>(null);
   const [codeMsg, setCodeMsg] = useState<string | null>(null);
+  const [charged, setCharged] = useState<number | null>(null);
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState<string | null>(null);
   const [pay, setPay] = useState<PayState>({ step: "form" });
@@ -47,10 +45,13 @@ export default function Checkout() {
   });
   const pollRef = useRef<number | null>(null);
 
-  const discountAmount = useMemo(
-    () => (applied ? Math.round(subtotal * (applied.percentage / 100) * 100) / 100 : 0),
-    [applied, subtotal],
-  );
+  const discountAmount = useMemo(() => {
+    if (!applied) return 0;
+    // Client preview; the audience gate (new vs returning) is enforced on the
+    // server, which alone knows the customer's order history.
+    const ev = evaluateDiscount(applied, subtotal);
+    return ev.ok ? ev.amount : 0;
+  }, [applied, subtotal]);
   const total = Math.max(0, subtotal - discountAmount);
 
   const set = (k: keyof typeof form) => (e: { target: { value: string } }) =>
@@ -65,11 +66,14 @@ export default function Checkout() {
     const { data, error } = await supabase
       .from("discount_codes").select("*").eq("code", code).eq("is_active", true).single();
     if (error || !data) { setApplied(null); setCodeMsg("Invalid or inactive code."); return; }
-    if (data.expires_at && new Date(data.expires_at) < new Date()) { setApplied(null); setCodeMsg("This code has expired."); return; }
-    const pct = Number(data.percentage ?? 0);
-    if (!pct) { setApplied(null); setCodeMsg("This code has no discount attached."); return; }
-    setApplied({ code, percentage: pct });
-    setCodeMsg(`Applied — ${pct}% off.`);
+    const d = data as DiscountCode;
+    const ev = evaluateDiscount(d, subtotal);
+    if (!ev.ok) { setApplied(null); setCodeMsg(ev.reason || "This code can't be applied."); return; }
+    setApplied(d);
+    const aud = (d.audience as string) || "all";
+    const note = aud === "returning" ? " · returning customers"
+      : aud === "new" ? " · first-time customers" : "";
+    setCodeMsg(`Applied — ${discountLabel(d)}${note}.`);
   };
 
   const startPolling = (orderId: string, ref: string) => {
@@ -147,6 +151,10 @@ export default function Checkout() {
       });
       const j = await r.json().catch(() => ({}));
       if (!r.ok || !j.orderId) throw new Error(j.error || "Could not create the order. Try again.");
+      // The server recomputes the authoritative total (it alone knows returning
+      // vs new customer, usage caps, etc.), so show THAT on the approval screen
+      // to match the mobile-money prompt.
+      if (typeof j.total === "number") setCharged(j.total);
 
       await initiate(j.orderId);
     } catch (ex) {
@@ -175,7 +183,7 @@ export default function Checkout() {
         <div className="w-20 h-20 mx-auto border-4 border-acid border-t-transparent rounded-full animate-spin mb-8" />
         <h1 className="display-xl text-4xl text-bone">Check your phone</h1>
         <p className="text-bone/60 mt-4 leading-relaxed">
-          Approve the <strong className="text-bone">{money(total)}</strong> mobile-money prompt on{" "}
+          Approve the <strong className="text-bone">{money(charged ?? total)}</strong> mobile-money prompt on{" "}
           <strong className="text-acid">{momoPhone}</strong>. This page updates automatically once it lands.
         </p>
         <p className="text-bone/40 text-xs mt-3">
@@ -315,8 +323,8 @@ export default function Checkout() {
 
             <div className="border-t border-ash mt-6 pt-4 space-y-2 text-sm">
               <div className="flex justify-between text-bone/60"><span>Subtotal</span><span>{money(subtotal)}</span></div>
-              {applied && (
-                <div className="flex justify-between text-acid"><span>{applied.code} (−{applied.percentage}%)</span><span>−{money(discountAmount)}</span></div>
+              {applied && discountAmount > 0 && (
+                <div className="flex justify-between text-acid"><span>{applied.code} · {discountLabel(applied)}</span><span>−{money(discountAmount)}</span></div>
               )}
               <div className="flex justify-between text-bone/60"><span>Delivery</span><span>Paid to rider / arranged</span></div>
               <div className="flex justify-between font-display uppercase text-bone text-lg pt-2">

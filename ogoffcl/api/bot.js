@@ -176,7 +176,7 @@ async function overview(res) {
 // ── discounts ─────────────────────────────────────────────────────────────────
 async function discounts(res) {
   const { data } = await sb("GET",
-    "discount_codes?select=id,code,percentage,is_active,expires_at&order=created_at.desc&limit=50");
+    "discount_codes?select=id,code,discount_type,percentage,amount_off,audience,min_subtotal,max_uses,used_count,is_active,expires_at&order=created_at.desc&limit=50");
   return res.json({ codes: Array.isArray(data) ? data : [] });
 }
 
@@ -189,10 +189,21 @@ async function discountToggle(body, res) {
 
 async function discountCreate(body, res) {
   const code = String(body.code || "").toUpperCase().trim();
-  const percentage = Math.max(1, Math.min(Number(body.percentage || 0) || 0, 100));
   if (!code) return res.status(400).json({ error: "code required" });
-  const { data } = await sb("POST", "discount_codes",
-    { code, percentage, is_active: true }, { Prefer: "return=representation" });
+  const kind = body.discount_type === "amount" ? "amount" : "percent";
+  const val = Number(body.amount ?? body.value ?? body.percentage ?? 0) || 0;
+  if (val <= 0) return res.status(400).json({ error: "a discount amount is required" });
+  const row = {
+    code,
+    discount_type: kind,
+    percentage: kind === "percent" ? Math.min(val, 100) : null,
+    amount_off: kind === "amount" ? val : null,
+    audience: ["all", "new", "returning"].includes(body.audience) ? body.audience : "all",
+    min_subtotal: Number(body.min_subtotal || 0) || 0,
+    max_uses: body.max_uses ? Number(body.max_uses) : null,
+    is_active: true,
+  };
+  const { data } = await sb("POST", "discount_codes", row, { Prefer: "return=representation" });
   return res.json({ ok: true, code: Array.isArray(data) ? data[0] : data });
 }
 
