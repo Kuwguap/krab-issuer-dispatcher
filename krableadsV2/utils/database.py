@@ -718,19 +718,44 @@ class Database:
             )
             return r.data or []
         except Exception as e:
-            # The columns may not exist yet (migration not run). Quiet, because this
-            # runs every 20 seconds — but never silent about a real failure.
-            msg = str(e)
-            if "instant_pdf" not in msg and "42703" not in msg:
-                logger.warning("get_paid_instant_pdfs_undelivered: %s", e)
+            # This used to suppress anything whose text mentioned "instant_pdf" or
+            # 42703, to stay quiet about an un-run migration on a 20-second job.
+            # But PostgREST puts the column name in the message, hint AND details,
+            # so the filter also swallowed a stale schema cache, a bad filter, and
+            # every real fault on this query — with no log line at all. A missing
+            # column is a total outage of the paid path, so it is loud, just not
+            # three times a minute.
+            code = str(getattr(e, "code", "") or "")
+            missing = code == "42703" or "42703" in str(e)
+            if missing:
+                if not getattr(self, "_instant_pdf_cols_warned", False):
+                    self._instant_pdf_cols_warned = True
+                    logger.error(
+                        "instant pdf sweep DISABLED: the instant_pdf columns are "
+                        "missing — run database/migration_instant_pdf.sql. Every paid "
+                        "tag is stranded until then: %s", e)
+            else:
+                logger.error("get_paid_instant_pdfs_undelivered: %s", e)
             return []
 
     def mark_instant_pdf_delivered(self, lead_id: str) -> bool:
-        """Stamped only once the document is actually in the driver's chat."""
+        """Stamped only once the document is actually in the driver's chat.
+
+        Zero affected rows is not success. PostgREST answers 200 with an empty
+        list when RLS refuses the write or the id matches nothing, and calling
+        that True is how the same tag went out every 20 seconds: the delivery
+        succeeded, the stamp did not, and the sweep found the lead again."""
         try:
-            self.client.table("leads").update(
+            r = self.client.table("leads").update(
                 {"instant_pdf_delivered_at": "now()"}
             ).eq("id", str(lead_id)).execute()
+            rows = getattr(r, "data", None)
+            if isinstance(rows, list) and not rows:
+                logger.error(
+                    "mark_instant_pdf_delivered(%s) matched NO row — the tag will be "
+                    "delivered again on the next sweep; check RLS and the lead id",
+                    lead_id)
+                return False
             return True
         except Exception as e:
             logger.error("mark_instant_pdf_delivered(%s): %s", lead_id, e)
@@ -1057,16 +1082,24 @@ class Database:
             return False
     
     def get_all_drivers(self) -> list:
-        """Get all drivers."""
+        """Get all drivers. One quick retry before giving up.
+
+        This feeds a process-wide cache, so a single recycled HTTP/2 connection
+        raising mid-read used to make the whole bot believe it had no drivers —
+        which a paid instant tag then reported as a driver with no chat id."""
         if not self._check_tables_exist():
             return []
         
-        try:
-            response = self.client.table("drivers").select("*").order("driver_name").execute()
-            return response.data or []
-        except Exception as e:
-            logger.error(f"Error getting drivers: {e}")
-            return []
+        for attempt in (0, 1):
+            try:
+                response = self.client.table("drivers").select("*").order("driver_name").execute()
+                return response.data or []
+            except Exception as e:
+                if attempt == 0:
+                    time.sleep(0.4)
+                    continue
+                logger.error(f"Error getting drivers: {e}")
+        return []
 
     def get_driver_by_telegram_id(self, telegram_user_id: str) -> Optional[Dict[str, Any]]:
         """Single-row lookup by driver_telegram_id (indexed). Prefer over scanning get_all_drivers()."""

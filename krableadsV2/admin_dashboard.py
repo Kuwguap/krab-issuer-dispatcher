@@ -78,6 +78,22 @@ def api_health():
         # it permits event submission, and this endpoint is public.
         "sentry": bool((os.environ.get("SENTRY_DSN") or "").strip()),
         "environment": os.environ.get("SENTRY_ENVIRONMENT") or "unset",
+        # The instant-tag payment chain, checkable without spending $100. Stripe's
+        # webhook authenticates itself with a signature rather than a header we
+        # control, so a missing STRIPE_WEBHOOK_SECRET does not look like a config
+        # error from outside — every real callback is simply rejected as a bad
+        # signature and no lead is ever stamped paid. Booleans only: all three are
+        # live credentials and this endpoint is public.
+        "instant_pdf": {
+            "mounted": INSTANT_PDF_MOUNTED,
+            "mount_error": INSTANT_PDF_MOUNT_ERROR,
+            "stripe_key": bool((os.environ.get("STRIPE_SECRET_KEY") or "").strip()),
+            "webhook_secret": bool((os.environ.get("STRIPE_WEBHOOK_SECRET") or "").strip()),
+            "integrations_key": bool(
+                (os.environ.get("INTEGRATIONS_API_KEY")
+                 or os.environ.get("ADMIN_API_KEY") or "").strip()
+            ),
+        },
     })
 
 
@@ -1490,10 +1506,18 @@ except Exception as e:
     logger.error("Could not mount the receipts board: %s", e)
 
 # $100 instant PDF — Stripe checkout, its webhook, and the pages either side.
+# The outcome is remembered, not just logged. When the payment chain goes quiet the
+# first thing to rule out is whether /api/stripe/webhook exists at all on this
+# deploy, and an import error swallowed here answers that only in a log nobody is
+# tailing. /api/health reads what this leaves behind.
+INSTANT_PDF_MOUNTED = False
+INSTANT_PDF_MOUNT_ERROR = None
 try:
     import instant_pdf
     instant_pdf.register(app, lambda: db)
+    INSTANT_PDF_MOUNTED = True
 except Exception as e:
+    INSTANT_PDF_MOUNT_ERROR = str(e)
     logger.error("Could not mount the instant-PDF endpoints: %s", e)
 
 # Dispatch web mirror — the bot's flows on a browser page, same Supabase. It

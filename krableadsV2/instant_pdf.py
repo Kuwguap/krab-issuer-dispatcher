@@ -11,16 +11,24 @@ Nothing hangs, by design. Every step is a column on the lead:
 
     requested_at -> session_id -> paid_at -> delivered_at
 
-The webhook only ever writes `paid_at`. The bot polls for paid-and-undelivered and
-stamps `delivered_at` once the tag is actually in the driver's chat. A crash between
-the two delays a tag; it cannot lose one, and it cannot take the money without
-eventually delivering.
+Nothing writes `paid_at` but the settlement helper, and two paths call it: the
+webhook, and the driver's own trip back to /instant/success. Both claim the same
+null column, so whichever arrives first wins and the other is a no-op. Two paths
+because only one of them is ours -- the webhook fires only if somebody registered
+the endpoint in the Stripe dashboard and STRIPE_WEBHOOK_SECRET matches, and a
+blank secret makes verify_stripe_signature refuse every event in silence. The
+browser always comes back.
+
+The bot polls for paid-and-undelivered and stamps `delivered_at` once the tag is
+actually in the driver's chat. A crash between the two delays a tag; it cannot
+lose one, and it cannot take the money without eventually delivering.
 """
 import hashlib
 import hmac
 import logging
 import os
 import time
+from urllib.parse import quote
 
 import requests
 from flask import jsonify, render_template_string, request
@@ -31,6 +39,15 @@ INSTANT_PDF_CENTS = int(os.getenv("INSTANT_PDF_CENTS") or "10000")   # $100.00
 _STRIPE_API = "https://api.stripe.com/v1/checkout/sessions"
 # Stripe's own tolerance for replayed webhooks.
 _WEBHOOK_TOLERANCE_S = 300
+
+# What a settlement attempt actually did. Three, not two: a write that changed
+# no rows is either "somebody settled it first" -- fine, and Stripe should stop
+# retrying -- or "nothing was recorded at all", which is a real failure that
+# Stripe must retry. They look identical at the database, and they need opposite
+# answers, so every caller gets told which.
+_STAMPED = "stamped"
+_ALREADY = "already"
+_UNRECORDED = "unrecorded"
 
 
 def _stripe_key() -> str:
@@ -131,6 +148,148 @@ def verify_stripe_signature(payload: bytes, header: str, secret: str,
         hashlib.sha256,
     ).hexdigest()
     return hmac.compare_digest(expected, sig)
+
+
+def _already_settled_or_lost(db_client, lead_id: str) -> str:
+    """Zero rows changed. Was it already paid, or was nothing recorded at all?
+
+    The null-claim matches nothing in both cases, so the update alone cannot
+    tell them apart -- and they are opposites. Re-reading paid_at is the only
+    thing that can: set means another path won the race, still null (or no such
+    row) means the money is in Stripe and nothing on this side knows it.
+
+    An unreadable answer counts as already-settled. Guessing the other way puts
+    the webhook in a 500 loop over a question we cannot answer, and Stripe would
+    retry that for days.
+    """
+    try:
+        r = (db_client.table("leads").select("instant_pdf_paid_at")
+             .eq("id", lead_id).limit(1).execute())
+        rows = getattr(r, "data", None)
+        if not isinstance(rows, list):
+            return _ALREADY
+        row0 = rows[0] if rows else None
+        if isinstance(row0, dict) and str(row0.get("instant_pdf_paid_at") or "").strip():
+            return _ALREADY
+        return _UNRECORDED
+    except Exception as e:
+        logger.warning("instant settle: could not re-read lead %s to tell an "
+                       "already-paid lead from an unrecorded one: %s", lead_id, e)
+        return _ALREADY
+
+
+def record_paid_session(db_client, lead_id: str, session_id, driver_id="") -> str:
+    """Stamp the one column the delivery sweep waits on. Says which of the three.
+
+    Both settlement paths -- the webhook and the driver's own return trip --
+    come through here, so the two can never disagree about what "paid" means on
+    a lead row. The claim is `.is_(paid_at, null)`: whichever path arrives first
+    stamps, the second matches no rows and changes nothing. That is what makes a
+    Stripe retry harmless, and what stops the success page from overwriting a
+    timestamp the webhook already wrote.
+
+    The driver who PAID gets the tag. Several drivers can hold links (the
+    all-drivers broadcast); the checkout stamp holds whoever asked LAST, which
+    is not necessarily who paid, so the session's own metadata wins.
+
+    PostgREST hands back the rows it actually touched, and a write that touched
+    none of them must never read as success: that is the failure where every
+    surface goes green -- the log says PAID, Stripe gets its 2xx and stops
+    retrying -- while paid_at is still null and no tag will ever be delivered.
+    Zero rows therefore goes for a second look before anyone believes it.
+
+    An answer that is not a list at all is unknown, not empty, and unknown reads
+    as stamped: PostgREST raises on a write it could not do, so the caller has
+    already been told about the failures that matter.
+    """
+    paid_update = {
+        "instant_pdf_paid_at": "now()",
+        "instant_pdf_session_id": session_id,
+    }
+    if str(driver_id or "").strip():
+        paid_update["instant_pdf_driver_id"] = str(driver_id).strip()
+    r = (db_client.table("leads").update(paid_update)
+         .eq("id", lead_id).is_("instant_pdf_paid_at", "null").execute())
+    rows = getattr(r, "data", None)
+    if not isinstance(rows, list) or rows:
+        return _STAMPED
+    return _already_settled_or_lost(db_client, lead_id)
+
+
+def settle_checkout_session(db_client, session_id: str) -> None:
+    """Ask Stripe whether this session was really paid, and record it if so.
+
+    The webhook is the designed path, but it is the one path this repo cannot
+    prove is alive: it fires only if somebody registered /api/stripe/webhook in
+    the Stripe dashboard, and verify_stripe_signature refuses EVERY event when
+    STRIPE_WEBHOOK_SECRET is blank -- so a half-configured account 400s the lot
+    and never says a word. paid_at is then never written, the sweep never finds
+    the lead, and the driver has paid for a tag that will never arrive. The
+    sibling coverage product shipped exactly that, with no webhook registered at
+    all. The browser, meanwhile, always comes back here, carrying the session id.
+
+    So we verify with Stripe directly rather than trusting the query string: a
+    session_id in a URL is something anyone can type, and only Stripe knows
+    whether it was paid.
+
+    Never raises. The driver's money is gone; a thank-you page is the least they
+    are owed, and a settlement that failed is the sweep's problem next tick.
+    """
+    key = _stripe_key()
+    if not key:
+        logger.error("instant success: STRIPE_SECRET_KEY is not set, cannot "
+                     "confirm session %s -- only the webhook can settle it", session_id)
+        return
+    try:
+        # Quoted: session_id arrives from a query string, and an unescaped
+        # slash in it would aim our authenticated key at a different Stripe
+        # endpoint entirely.
+        resp = requests.get(
+            f"{_STRIPE_API}/{quote(session_id, safe='')}", timeout=20, auth=(key, ""),
+            headers={"Stripe-Version": "2024-06-20"},
+        )
+        data = resp.json() if resp.content else {}
+        if not isinstance(data, dict):
+            data = {}
+        if not resp.ok:
+            msg = ((data.get("error") or {}).get("message")) or f"Stripe {resp.status_code}"
+            logger.error("instant success: could not read session %s: %s", session_id, msg)
+            return
+        status = data.get("payment_status") or ""
+        if status not in ("paid", "no_payment_required"):
+            logger.info("instant success: session %s is %s, nothing to settle",
+                        session_id, status or "unreadable")
+            return
+        meta = data.get("metadata") or {}
+        lead_id = str(meta.get("lead_id") or data.get("client_reference_id") or "").strip()
+        if not lead_id:
+            logger.error("instant success: paid session %s carries no lead_id", session_id)
+            return
+        outcome = record_paid_session(db_client, lead_id,
+                                      data.get("id") or session_id,
+                                      meta.get("driver_id"))
+        if outcome == _STAMPED:
+            # The loud one. Reaching here means the webhook did NOT get there
+            # first, and the webhook is meant to be seconds ahead of a human
+            # tapping through a redirect -- so seeing this at all says the
+            # endpoint is unregistered or STRIPE_WEBHOOK_SECRET is wrong.
+            logger.info("instant pdf PAID for lead %s (session %s) — settled by the "
+                        "SUCCESS PAGE, not the webhook: check that "
+                        "/api/stripe/webhook is registered in Stripe and that "
+                        "STRIPE_WEBHOOK_SECRET matches", lead_id, session_id)
+        elif outcome == _ALREADY:
+            logger.info("instant success: lead %s was already settled (session %s)",
+                        lead_id, session_id)
+        else:
+            # Paid at Stripe, unrecorded here, and this page has no retry to
+            # offer -- the driver is already on their way back to the chat.
+            # Nothing will chase it but a human reading this line.
+            logger.error("instant success: session %s is PAID at Stripe but lead %s "
+                         "was not recorded — no row changed and paid_at is still "
+                         "null, so the tag will never be delivered",
+                         session_id, lead_id)
+    except Exception as e:
+        logger.error("instant success: settling session %s failed: %s", session_id, e)
 
 
 _SUCCESS_PAGE = """<!doctype html>
@@ -310,12 +469,22 @@ def register(app, db_provider):
         if not url:
             return jsonify({"error": "Stripe returned no checkout url"}), 502
         try:
-            _resolve().client.table("leads").update({
+            r = _resolve().client.table("leads").update({
                 "instant_pdf_requested_at": "now()",
                 "instant_pdf_session_id": session_id,
                 "instant_pdf_driver_id": driver_id,
                 "instant_pdf_amount_cents": amount_cents,
             }).eq("id", lead_id).execute()
+            rows = getattr(r, "data", None)
+            if isinstance(rows, list) and not rows:
+                # A vanished row or a refused write swallows this silently —
+                # zero affected rows must not read as success. The session id
+                # never lands, so the driver's success page finds no lead and
+                # shows a blank Reference box, and settlement has to fall back
+                # to the session's own metadata to know who paid for what.
+                logger.error("instant checkout: stamping lead %s affected no rows "
+                             "— session %s was not recorded on the lead",
+                             lead_id, session_id)
         except Exception as e:
             # The link is valid and the webhook can still find the lead by metadata,
             # so this is worth shouting about but not worth refusing the sale.
@@ -325,7 +494,11 @@ def register(app, db_provider):
 
     @app.route("/api/stripe/webhook", methods=["POST"])
     def api_stripe_webhook():
-        """Stripe telling us the money arrived. The ONLY thing that sets paid_at."""
+        """Stripe telling us the money arrived — the fast path to paid_at.
+
+        Not the only one any more: /instant/success settles the same session if
+        this never fires. Both go through record_paid_session and claim the same
+        null column, so the pair cannot drift or double-stamp."""
         secret = (os.getenv("STRIPE_WEBHOOK_SECRET") or "").strip()
         raw = request.get_data()
         if not verify_stripe_signature(raw, request.headers.get("Stripe-Signature", ""), secret):
@@ -349,22 +522,28 @@ def register(app, db_provider):
         try:
             # Only stamp paid_at, and only once — the bot delivers off the back of
             # it. Stripe retries until it gets a 2xx, so this must be idempotent.
-            paid_update = {
-                "instant_pdf_paid_at": "now()",
-                "instant_pdf_session_id": obj.get("id"),
-            }
-            # The driver who PAID gets the tag. Several drivers can hold links
-            # (the all-drivers broadcast); the checkout stamp holds whoever asked
-            # LAST, which is not necessarily who paid.
-            if str(meta.get("driver_id") or "").strip():
-                paid_update["instant_pdf_driver_id"] = str(meta.get("driver_id")).strip()
-            _resolve().client.table("leads").update(paid_update).eq(
-                "id", lead_id).is_("instant_pdf_paid_at", "null").execute()
-            logger.info("instant pdf PAID for lead %s (session %s)", lead_id, obj.get("id"))
+            outcome = record_paid_session(_resolve().client, lead_id, obj.get("id"),
+                                          meta.get("driver_id"))
         except Exception as e:
             # A 500 makes Stripe retry, which is what we want when the write failed.
             logger.error("stripe webhook: could not mark %s paid: %s", lead_id, e)
             return jsonify({"error": "could not record the payment"}), 500
+        if outcome == _UNRECORDED:
+            # The write changed nothing AND paid_at is still null. Answering 2xx
+            # here is the worst thing this endpoint can do: Stripe marks the
+            # event delivered and never mentions it again, the log says PAID,
+            # and the driver's tag is lost with nobody looking for it. Take the
+            # retry instead.
+            logger.error("stripe webhook: lead %s was NOT recorded (session %s) — "
+                         "no row changed and paid_at is still null", lead_id, obj.get("id"))
+            return jsonify({"error": "the payment was not recorded"}), 500
+        if outcome == _ALREADY:
+            # A retry of an event we already handled, or the success page beat us
+            # to it. Nothing to do, and 2xx so Stripe stops asking.
+            logger.info("instant pdf already settled for lead %s (session %s)",
+                        lead_id, obj.get("id"))
+            return jsonify({"ok": True, "lead_id": lead_id, "already": True})
+        logger.info("instant pdf PAID for lead %s (session %s)", lead_id, obj.get("id"))
         return jsonify({"ok": True, "lead_id": lead_id})
 
     @app.route("/instant/success", methods=["GET"])
@@ -373,6 +552,15 @@ def register(app, db_provider):
         ref, amount = "", ""
         sid = (request.args.get("session_id") or "").strip()
         if sid:
+            # Before the lookup, not after: this is the call that may write the
+            # paid_at the sweep is waiting on, and the lookup below reads a
+            # column it can set. Wrapped even though the helper swallows its
+            # own errors -- resolving the database client is itself a call that
+            # can fail, and nothing here may cost the driver their thank-you.
+            try:
+                settle_checkout_session(_resolve().client, sid)
+            except Exception as e:
+                logger.error("instant success: no database to settle %s: %s", sid, e)
             try:
                 r = (_resolve().client.table("leads")
                      .select("reference_id, instant_pdf_amount_cents")

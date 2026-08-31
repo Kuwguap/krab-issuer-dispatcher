@@ -50,7 +50,14 @@ both.
 
 **`INTEGRATIONS_API_KEY`** — the bot authenticating to tristatecoverage.com, and
 the dashboard authenticating the bot. Same key in three places: the bot, the
-dashboard, and the TriStateCoverage deployment.
+dashboard (`krab-issuer-admin`), and the TriStateCoverage deployment.
+
+One name carrying one secret across two unrelated services is a trap worth
+naming: set the bot's copy to the coverage portal's bearer key and the instant
+checkout 401s, which reaches the driver as "the payment page could not be
+opened" and reads like a Stripe problem. The dashboard also accepts the legacy
+`ADMIN_API_KEY`, so it can look configured while never matching what the bot
+sends. If checkout 401s, compare the two values before touching anything else.
 
 **`SUPERVISORY_TELEGRAM_ID`** — who may open `/settings`, `/drivers`,
 `/leaderboard`, and `/entries` on the insurance bot. Extra supervisors can be added
@@ -63,21 +70,42 @@ there, so the last way in can never be locked.
 
 One account, shared with tristatecoverage.com. Copy `STRIPE_SECRET_KEY` from there.
 
-Then add a webhook endpoint in the Stripe dashboard:
+Then add a webhook endpoint in the Stripe dashboard. Use the Render origin
+**directly**, not a tristatetags.com path:
 
 ```
-https://tristatetags.com/backend/api/stripe/webhook
+https://krab-issuer-admin.onrender.com/api/stripe/webhook
 ```
 
 subscribed to `checkout.session.completed` and
 `checkout.session.async_payment_succeeded`, and put its signing secret in
-`STRIPE_WEBHOOK_SECRET`.
+`STRIPE_WEBHOOK_SECRET` on **krab-issuer-admin**.
+
+The origin rather than the proxy, for three reasons. Drop the `/backend` and
+`https://tristatetags.com/api/stripe/webhook` is a **different service**
+(quicktags), which answers 503 `Webhook secret not configured`: point Stripe
+there and the events never reach this app at all. `/backend/*` is a Vercel
+rewrite that has gone missing before, and while it was down it served the
+marketing 404 with a **200** status, so Stripe recorded every event as
+delivered and never retried; money taken in that window is unrecoverable by
+webhook. And the signature is computed over the exact request bytes, so the
+fewer hops that can re-encode them, the better.
 
 **Without that secret every webhook is refused**, which means a customer can pay
-and never receive a tag. The signature check is not optional — without it anyone
-who knows the URL could mark any lead paid.
+and never receive a tag. `verify_stripe_signature` returns False on a blank
+secret before it looks at anything else, so from outside a missing secret and a
+forged signature are the same 400: curl cannot tell them apart. `GET /api/health`
+reports `instant_pdf.webhook_secret` as a boolean for exactly that reason.
+The signature check is not optional — without it anyone who knows the URL
+could mark any lead paid.
 
-Nothing hangs, by design. The webhook only ever writes `instant_pdf_paid_at`; the
+The webhook is no longer the only settler: `/instant/success` re-checks the
+session with Stripe on the driver's trip back and claims the same column, so a
+dead webhook no longer means a lost tag. It is not a replacement, though. It
+fires only when the driver's browser actually comes back, so a closed tab or a
+payment method that settles minutes later still needs the webhook. Register it.
+
+Nothing hangs, by design. Settlement only ever writes `instant_pdf_paid_at`; the
 bot sweeps every 20 seconds for paid-and-undelivered and stamps
 `instant_pdf_delivered_at` **only once the document is really in the driver's
 chat**. A crash between the two delays a tag; it cannot lose one, and it cannot

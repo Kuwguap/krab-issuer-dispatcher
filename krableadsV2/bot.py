@@ -319,9 +319,35 @@ def _get_all_drivers_cached() -> list:
     now = time.monotonic()
     if _ALL_DRIVERS_CACHE is not None and (now - _ALL_DRIVERS_CACHE_TS) < _ALL_DRIVERS_TTL_SEC:
         return _ALL_DRIVERS_CACHE
-    _ALL_DRIVERS_CACHE = db.get_all_drivers()
+    fresh = db.get_all_drivers()
+    if not fresh and _ALL_DRIVERS_CACHE:
+        # get_all_drivers cannot tell "there are no drivers" from "the read
+        # failed" — it swallows the exception and returns []. Caching that empty
+        # answer blanks every driver keyboard and every lookup in the process for
+        # the whole TTL, which is enough for a paid instant tag to report a
+        # driver who has simply not been read. Keep the last roster we saw.
+        logger.warning("driver roster came back empty; keeping the last known %d row(s)",
+                       len(_ALL_DRIVERS_CACHE))
+        return _ALL_DRIVERS_CACHE
+    _ALL_DRIVERS_CACHE = fresh
     _ALL_DRIVERS_CACHE_TS = now
     return _ALL_DRIVERS_CACHE
+
+
+def _delivery_chat_id(raw):
+    """A chat id we are willing to send a PAID product to, or None.
+
+    _parse_chat_id hands a non-numeric string straight back, on purpose — it also
+    resolves @channel handles elsewhere. On this path that tolerance is a trap:
+    "@bob", "n/a", "12345.7" and a literal backslash-r-n all sail past an
+    `is None` check, fail at the Bot API instead, and leave the sweep retrying a
+    tag forever. "0" is the same story with a falsy twist. A driver DM is always
+    a real numeric chat id, so anything else is an unusable id, not a chat.
+    """
+    cid = _parse_chat_id(raw)
+    if isinstance(cid, bool) or not isinstance(cid, int) or cid == 0:
+        return None
+    return cid
 
 
 def _callback_query_stale_message(msg: str) -> bool:
@@ -857,6 +883,13 @@ SKIP_DISPATCH_PENDING_KEY = "skip_dispatch_pending"
 # not silently eat whatever the operator types an hour later.
 _SKIP_DISPATCH_TTL_SEC = 900
 _DISPATCH_MSGS_KEY = "dispatch_msgs"
+# "lead|car|chat" for every tag PDF confirmed delivered into that chat. The paid
+# instant sweep retries every 20 seconds until a lead is stamped, and a delivery
+# is only stamped when EVERY car's tag landed — so without this, one failing car
+# on a two-car lead re-sends the car that worked, three times a minute, forever.
+# In memory on purpose: a redeploy costs at most one duplicate, where a fifth
+# un-run migration costs the operator a great deal more.
+_TAG_DELIVERED_KEY = "tag_pdf_delivered"
 
 
 def _skip_dispatch_password() -> str:
@@ -1003,6 +1036,19 @@ async def _stamp_released_without_payment(lead: dict, driver_id: str) -> None:
     if not lead_id or not (lead or {}).get("instant_tag"):
         return
     try:
+        # Re-read: `lead` here is as old as the arming, and a card can clear in
+        # between. Stamping DELIVERED over a payment removes the row from the
+        # sweep's "paid AND not delivered" query for good, so the driver who paid
+        # is never sent anything and nothing is left to say why. The duplicate
+        # this stamp exists to prevent is by far the cheaper problem.
+        fresh = await asyncio.to_thread(db.get_lead_by_id, lead_id) or {}
+        if str(fresh.get("instant_pdf_paid_at") or "").strip():
+            logger.error(
+                "skip dispatch: lead %s was PAID by driver %s while it was being "
+                "released to %s — NOT stamping it delivered; the payer is owed the "
+                "tag or a refund",
+                lead_id, fresh.get("instant_pdf_driver_id"), driver_id)
+            return
         if driver_id:
             await asyncio.to_thread(db.update_lead, lead_id,
                                     {"instant_pdf_driver_id": str(driver_id)})
@@ -1231,10 +1277,20 @@ async def handle_skip_dispatch_password(update: Update, context: ContextTypes.DE
                                        parse_mode="HTML")
         raise ApplicationHandlerStop
 
-    if str(lead.get("instant_pdf_delivered_at") or "").strip():
+    if (str(lead.get("instant_pdf_delivered_at") or "").strip()
+            or str(lead.get("instant_pdf_paid_at") or "").strip()):
+        # The ARM handler checks both of these; these two release paths only ever
+        # checked delivered_at. A card that cleared between arming and the
+        # password reaches here as "not delivered yet", and releasing it then
+        # overwrites instant_pdf_driver_id and stamps delivered — which hides the
+        # lead from the sweep for good. Paid, undelivered, and invisible to the
+        # one job that would have delivered it.
         context.user_data.pop(SKIP_DISPATCH_PENDING_KEY, None)
         await context.bot.send_message(
-            chat_id=chat_id, text="✅ That tag has already gone out — nothing more to do.")
+            chat_id=chat_id,
+            text=("✅ That one is settled — it has been paid for, or already "
+                  "released.\nA card that has cleared is delivered by the sweep; "
+                  "releasing it now would take the tag off the driver who paid."))
         raise ApplicationHandlerStop
 
     driver_id = str(pending.get("driver_id") or "").strip()
@@ -1395,9 +1451,13 @@ async def handle_skip_dispatch_release_pick(update: Update, context: ContextType
         await query.message.reply_text(_SKIP_DISPATCH_REFUSED, parse_mode="HTML")
         return
 
-    if str(lead.get("instant_pdf_delivered_at") or "").strip():
+    if (str(lead.get("instant_pdf_delivered_at") or "").strip()
+            or str(lead.get("instant_pdf_paid_at") or "").strip()):
+        # Same window as the typed path above: a payment can clear between
+        # picking the driver and this tap.
         context.user_data.pop(SKIP_DISPATCH_PENDING_KEY, None)
-        await query.message.reply_text("✅ That tag has already gone out.")
+        await query.message.reply_text(
+            "✅ That one is settled — it has been paid for, or already released.")
         return
 
     context.user_data.pop(SKIP_DISPATCH_PENDING_KEY, None)
@@ -1421,7 +1481,7 @@ def _acting_user_label(user) -> str:
 
 async def _deliver_skip_dispatch(context, lead: dict, driver: dict, *,
                                  notify_chat_id=None, how: str = "password",
-                                 released_by=None) -> bool:
+                                 released_by=None, paid_takeover: bool = False) -> bool:
     """The send itself: the driver first, then every group and supervisory chat.
 
     The driver is treated as a delivery target of the same shape as a group, so
@@ -1454,9 +1514,27 @@ async def _deliver_skip_dispatch(context, lead: dict, driver: dict, *,
     # Claim it FIRST. This used to run after the send, which meant a driver who
     # had accepted a half-second earlier still got a second complete job ticket.
     booked, held_by = await asyncio.to_thread(_book_delivery_against_driver, lead, driver)
+    if not booked and held_by and paid_takeover:
+        # Money outranks a tap. Every offered driver holds a live Pay link BESIDE
+        # Accept, and Accept is only refused once instant_pdf_paid_at exists — so
+        # for the whole length of one driver's checkout, another can tap Accept
+        # and take the claim. Refusing here left the driver who actually paid
+        # with nothing, forever, at one WARNING per 20-second tick.
+        logger.warning("skip dispatch: %s was held by %s, but %s PAID — taking it over",
+                       ref, held_by, dname)
+        try:
+            await asyncio.to_thread(db.reopen_lead_for_reassign, str(lead.get("id")), None)
+            booked, held_by = await asyncio.to_thread(
+                _book_delivery_against_driver, lead, driver)
+        except Exception as e:
+            logger.error("skip dispatch: could not take %s over for %s: %s", ref, dname, e)
+        await _tell_supervisors(context, (
+            f"↔️ <b>{_dname_h}</b> paid for <code>{_ref_h}</code>, which "
+            f"{html.escape(str(held_by or 'someone else'), quote=False)} had accepted."
+            + ("\nThe paid driver now holds it." if booked else
+               "\n<b>The takeover FAILED — this tag is paid for and undelivered.</b>")))
     if not booked and held_by:
-        logger.warning("skip dispatch: %s is already held by %s — refusing",
-                       lead.get("reference_id"), held_by)
+        logger.warning("skip dispatch: %s is already held by %s — refusing", ref, held_by)
         if notify_chat_id:
             try:
                 await context.bot.send_message(
@@ -1466,13 +1544,30 @@ async def _deliver_skip_dispatch(context, lead: dict, driver: dict, *,
                     parse_mode="HTML")
             except Exception as e:
                 logger.warning("skip dispatch: could not report the clash: %s", e)
+        elif how == "paid":
+            # The paid sweep passes no operator chat, so without this the refusal
+            # is invisible and simply repeats every 20 seconds while the driver
+            # who paid waits for a tag that cannot come.
+            await _tell_supervisors(context, (
+                f"❌ <b>Paid and undelivered</b> — <code>{_ref_h}</code> is held by "
+                f"{html.escape(str(held_by), quote=False)}, so {_dname_h} paid and "
+                f"cannot be sent it."))
         return False
+    if not booked:
+        # (False, None) is "could not tell", not "somebody else has it" — a
+        # Supabase blip, or an assignments table this deployment cannot read.
+        # Carry on: refusing here would strand a driver who has already paid, and
+        # the duplicate it would guard against is what revoking the other offers
+        # below is for. Worth a line, because an unbooked delivery leaves no
+        # accepted row and so no receipt debt against the driver.
+        logger.warning("skip dispatch: %s could not be claimed for %s — delivering "
+                       "anyway, with no assignment row behind it", ref, dname)
 
-    driver_cid = _parse_chat_id(driver.get("driver_telegram_id"))
+    driver_cid = _delivery_chat_id(driver.get("driver_telegram_id"))
     driver_ok = False
     if driver_cid:
         try:
-            await _send_full_group_lead_to_chat(
+            bodies_ok, tags_ok = await _send_full_group_lead_to_chat(
                 context,
                 {"group_telegram_id": driver_cid, "group_name": dname},
                 lead,
@@ -1480,12 +1575,25 @@ async def _deliver_skip_dispatch(context, lead: dict, driver: dict, *,
                 mirror_supervisory=False,
                 accepted_by=label,
                 driver_dm=True,
+                # A paid delivery is the only send that retries itself: the sweep
+                # comes back every 20 seconds until every car's tag has landed.
+                # Without this, one failing car re-sends the car that worked,
+                # three times a minute, for as long as the lead exists.
+                once=(how == "paid"),
             )
-            driver_ok = True
+            # That helper swallows every send error, so simply returning proved
+            # nothing: a blocked driver, a bot barred from sending documents, a
+            # failed plate allocation — all of them used to read as a delivery,
+            # stamp the lead, and tell supervisors the tag had gone out.
+            driver_ok = bool(bodies_ok) and tags_ok
+            if not driver_ok:
+                logger.error("skip dispatch: %s — ticket=%s tag=%s for %s; NOT delivered",
+                             ref, bodies_ok, tags_ok, dname)
         except Exception as e:
             logger.error("skip dispatch: could not send to driver %s: %s", dname, e)
     else:
-        logger.error("skip dispatch: driver %s has no chat id", dname)
+        logger.error("skip dispatch: driver %s has no usable chat id (%r)",
+                     dname, driver.get("driver_telegram_id"))
 
     if driver_ok:
         # Whoever else was holding this offer must stop being able to work it --
@@ -1506,7 +1614,16 @@ async def _deliver_skip_dispatch(context, lead: dict, driver: dict, *,
     # Then the usual audience, exactly the way an accepted lead reaches them.
     # mirror_supervisory only on the first, or every group re-posts to the same
     # supervisory chats.
-    groups = [g for g in (db.get_all_groups() or []) if record_is_active(g)]
+    try:
+        groups = [g for g in (await asyncio.to_thread(db.get_all_groups) or [])
+                  if record_is_active(g)]
+    except Exception as e:
+        # The driver already has the job by this point. A Supabase GOAWAY on this
+        # read used to escape the whole function, so the sweep never stamped the
+        # lead and re-sent the entire ticket and every tag on the next tick, over
+        # and over. (It was a blocking call on the event loop, too.)
+        logger.error("skip dispatch: could not read the groups for %s: %s", ref, e)
+        groups = []
     group_ok = 0
     for i, g in enumerate(groups):
         try:
@@ -1554,6 +1671,15 @@ async def _deliver_skip_dispatch(context, lead: dict, driver: dict, *,
             note = (f"🤖 Instant tag paid by <b>{_dname_h}</b>"
                     f"\n📋 Ref: <code>{_ref_h}</code>")
         await _tell_supervisors(context, note)
+    elif not notify_chat_id:
+        # how="paid" has no operator chat to report into, so this is the last
+        # chance to tell anyone that money was taken and nothing was delivered.
+        await _tell_supervisors(context, (
+            f"❌ <b>Tag NOT delivered</b> to <b>{_dname_h}</b>"
+            f"\n📋 Ref: <code>{_ref_h}</code>"
+            + ("\n💰 <b>The deposit was already taken.</b>" if how == "paid" else "")
+            + f"\nCheck their Telegram id in /settings, and whether the bot is "
+              f"allowed to send documents to that chat."))
     return driver_ok
 
 
@@ -1698,10 +1824,41 @@ async def _instant_tag_link_after_accept(context, lead: dict, driver: dict) -> N
     )
 
 
+def _all_supervisory_chat_ids() -> list:
+    """Every supervisor: the fixed env ones AND the ones added under /settings.
+
+    _user_is_global_supervisor has always consulted both, so anyone added in
+    /settings can open every gated screen — but the notices only ever went to
+    SUPERVISORY_TELEGRAM_ID. A supervisor with full authority who is never told
+    anything is the same, from the office's side, as a bot that does not notify.
+    """
+    out = list(_global_supervisory_chat_ids())
+    try:
+        for row in _extra_supervisors():
+            cid = _parse_chat_id(row.get("id"))
+            if cid is not None:
+                out.append(cid)
+    except Exception as e:
+        # The env supervisors are still worth telling.
+        logger.warning("could not read the added supervisors: %s", e)
+    return out
+
+
 async def _tell_supervisors(context, text: str, *, skip=None) -> None:
-    """One line to every supervisor. Best effort — never fails a caller."""
+    """One line to every supervisor. Best effort — never fails a caller.
+
+    Best effort is not the same as unaccountable. This used to return quietly
+    whether it had reached ten supervisors or none, so "nobody was told" and
+    "everybody was told" produced identical logs — which is how a payment
+    chain can go weeks without anyone noticing it stopped announcing itself.
+    """
     seen = set()
-    for sid in _global_supervisory_chat_ids():
+    targets = _all_supervisory_chat_ids()
+    if not targets:
+        logger.error("NO SUPERVISORS CONFIGURED — dropping notice: %s", text[:160])
+        return
+    delivered = 0
+    for sid in targets:
         key = _norm_chat_id(sid)
         if key is None or key in seen or (skip is not None and key == _norm_chat_id(skip)):
             continue
@@ -1709,8 +1866,21 @@ async def _tell_supervisors(context, text: str, *, skip=None) -> None:
         try:
             await context.bot.send_message(chat_id=sid, text=text, parse_mode="HTML",
                                            disable_web_page_preview=True)
+            delivered += 1
         except Exception as e:
             logger.warning("could not tell supervisor %s: %s", sid, e)
+            try:
+                # One bad tag in the HTML is not worth losing the whole alert;
+                # the words matter more than the bold.
+                await context.bot.send_message(
+                    chat_id=sid, text=re.sub(r"<[^>]+>", "", text),
+                    disable_web_page_preview=True)
+                delivered += 1
+            except Exception as e2:
+                logger.error("supervisor %s unreachable (plain retry too): %s", sid, e2)
+    if not delivered and seen:
+        logger.error("supervisory notice reached NOBODY of %d target(s): %s",
+                     len(seen), text[:160])
 
 
 async def _dispatch_instant_tag_lead(context, lead: dict, selected_drivers: list,
@@ -1919,48 +2089,181 @@ async def _dispatch_instant_tag_lead(context, lead: dict, selected_drivers: list
             logger.warning("instant tag: could not confirm to issuer: %s", e)
 
 
+# A paid tag that cannot be delivered is an emergency, not a log line. The sweep
+# retries every 20 seconds, so these speak once an hour per lead — often enough
+# that nobody finds out from the driver, rarely enough that the chat stays usable.
+_STUCK_INSTANT_TOLD: dict = {}
+_STUCK_INSTANT_REPEAT_SEC = 3600
+# Announced the moment the money lands, before anything that can fail.
+_PAID_INSTANT_ANNOUNCED: set = set()
+
+
+async def _announce_instant_payment(context, lead: dict, driver) -> None:
+    """The money arrived. Say so now — delivery can still go wrong after this.
+
+    Every supervisory notice on this path used to hang off a SUCCESSFUL delivery,
+    so the one case that most needs a human — paid, and the tag never left —
+    was also the one case nobody heard about. In-process dedupe, because the
+    sweep re-reads the same row every 20s until it is stamped delivered; a
+    restart re-announcing once is a far smaller sin than never announcing.
+    """
+    lead_id = str(lead.get("id") or "")
+    if not lead_id or lead_id in _PAID_INSTANT_ANNOUNCED:
+        return
+    _PAID_INSTANT_ANNOUNCED.add(lead_id)
+    ref = html.escape(str(lead.get("reference_id") or "N/A"), quote=False)
+    dname = html.escape(
+        str((driver or {}).get("driver_name")
+            or lead.get("instant_pdf_driver_id") or "a driver"), quote=False)
+    cents = lead.get("instant_pdf_amount_cents")
+    amount = f"${int(cents) // 100}" if cents else ""
+    try:
+        await _tell_supervisors(context, (
+            f"\U0001f4b3 <b>Instant Tag PAID</b>"
+            + (f" — {amount}" if amount else "")
+            + f"\n\U0001f697 Driver: <b>{dname}</b>"
+            f"\n\U0001f4cb Ref: <code>{ref}</code>"
+            f"\n\u23f3 Sending the tag now\u2026"))
+    except Exception as e:
+        logger.warning("instant tag: could not announce the payment for %s: %s", lead_id, e)
+
+
+async def _warn_stuck_instant_tag(context, lead: dict, why: str, *, driver=None) -> None:
+    """Paid, undelivered, and retrying. Somebody has to hear about it."""
+    lead_id = str(lead.get("id") or "")
+    ref = str(lead.get("reference_id") or lead_id or "N/A")
+    logger.error("instant pdf STUCK: lead %s (%s) — %s", lead_id, ref, why)
+    now = time.monotonic()
+    if now - float(_STUCK_INSTANT_TOLD.get(lead_id) or 0) < _STUCK_INSTANT_REPEAT_SEC:
+        return
+    _STUCK_INSTANT_TOLD[lead_id] = now
+    dname = html.escape(str((driver or {}).get("driver_name") or "the paying driver"),
+                        quote=False)
+    try:
+        await _tell_supervisors(context, (
+            f"\U0001f6a8 <b>PAID BUT NOT DELIVERED</b>"
+            f"\n\U0001f4cb Ref: <code>{html.escape(ref, quote=False)}</code>"
+            f"\n\U0001f697 Driver: {dname}"
+            f"\n\u2757 {html.escape(str(why), quote=False)}"
+            f"\n\nThey have been charged and have nothing. Release it with the "
+            f"password, or refund — the sweep keeps retrying every 20s until one "
+            f"of those happens."))
+    except Exception as e:
+        logger.warning("could not escalate stuck instant tag %s: %s", lead_id, e)
+
+
 async def deliver_paid_instant_pdfs(context: ContextTypes.DEFAULT_TYPE) -> None:
     """Every paid instant tag that has not been delivered yet — send it now.
 
     Driven by the database rather than by the webhook's own request, so a payment
     that lands while the bot is restarting is still delivered on the next tick. The
     delivered stamp is written only after the document is actually in the chat."""
+    # A heartbeat the dashboard can read. The bot is a worker with no HTTP
+    # surface of its own, so a stored timestamp is the only way anything outside
+    # this process can answer "is the delivery sweep actually running?" — which
+    # nobody could answer while paid tags were going undelivered.
+    try:
+        await asyncio.to_thread(
+            db.set_setting, "instant_pdf_sweep_last_tick",
+            datetime.now(pytz.UTC).isoformat())
+    except Exception:
+        pass                       # a heartbeat must never cost a delivery
     try:
         rows = await asyncio.to_thread(db.get_paid_instant_pdfs_undelivered)
     except Exception as e:
-        logger.warning("instant pdf sweep: %s", e)
+        # ERROR, not WARNING: only ERROR becomes a Sentry event, and a sweep that
+        # cannot read is a total outage of the paid path.
+        logger.error("instant pdf sweep: could not read paid-undelivered leads — %s", e)
         return
+    if rows:
+        logger.info("instant pdf sweep: %d paid lead(s) awaiting delivery", len(rows))
     for lead in rows or []:
         lead_id = str(lead.get("id") or "")
         driver_id = str(lead.get("instant_pdf_driver_id") or "")
-        if not lead_id or not driver_id:
+        if not lead_id:
+            continue
+        if not driver_id:
+            # Paid, and the row never learned who paid: the checkout stamp failed
+            # AND the settled session carried no metadata[driver_id]. Skipping
+            # this silently every 20 seconds is how a paid tag disappears.
+            await _warn_stuck_instant_tag(
+                context, lead,
+                "no driver is recorded on the payment — nobody can be sent this tag")
             continue
         driver = await asyncio.to_thread(_driver_row_by_id, driver_id)
-        if driver and lead.get("instant_tag"):
+        if not driver:
+            # _driver_row_by_id cannot raise — db.get_all_drivers swallows the
+            # error and returns []. So an empty roster means the READ failed
+            # (transient), while a populated roster without this id means the
+            # driver row is gone (permanent). The old code called both "no chat
+            # id", which sent people to check a Telegram id nobody had read.
+            roster = await asyncio.to_thread(_get_all_drivers_cached)
+            if not roster:
+                logger.warning(
+                    "instant pdf: lead %s is paid but the driver roster came back "
+                    "EMPTY — retrying next tick (driver %s)", lead_id, driver_id)
+            else:
+                await _warn_stuck_instant_tag(
+                    context, lead,
+                    f"driver {driver_id} is no longer in the roster")
+            continue
+        # The money is in. Announce it BEFORE anything below can fail.
+        await _announce_instant_payment(context, lead, driver)
+        if lead.get("instant_tag"):
             # 🤖 Instant Tag: the payment replaces the whole dispatch round, so
             # delivery is the FULL Skip Dispatch send — driver, groups,
             # supervisory, tag + auto-insurance ride-along — not just a DM.
             try:
-                ok = await _deliver_skip_dispatch(context, lead, driver, how="paid")
+                ok = await _deliver_skip_dispatch(context, lead, driver, how="paid",
+                                                  paid_takeover=True)
                 if ok:
-                    await asyncio.to_thread(db.mark_instant_pdf_delivered, lead_id)
+                    stamped = await asyncio.to_thread(db.mark_instant_pdf_delivered, lead_id)
+                    _STUCK_INSTANT_TOLD.pop(lead_id, None)
+                    logger.info("instant pdf DELIVERED for ref %s to driver %s",
+                                lead.get("reference_id"), driver.get("driver_name"))
+                    if not stamped:
+                        # Delivered but not recorded: the next tick will find it
+                        # again and send the whole job a second time.
+                        logger.error(
+                            "instant pdf: ref %s was delivered but NOT stamped — it "
+                            "will be sent again next tick", lead.get("reference_id"))
+                else:
+                    await _warn_stuck_instant_tag(
+                        context, lead,
+                        "the send was refused — the lead is held by someone else, or "
+                        "the driver's chat would not take it",
+                        driver=driver)
             except Exception as e:
                 logger.error("instant tag delivery failed for %s: %s", lead_id, e)
+                await _warn_stuck_instant_tag(context, lead, str(e), driver=driver)
             continue
-        chat_id = _parse_chat_id((driver or {}).get("driver_telegram_id"))
-        if not driver or chat_id is None:
-            logger.error("instant pdf: lead %s is paid but driver %s has no chat id",
-                         lead_id, driver_id)
+        # No instant_tag flag: the DM-only path, with no groups and no insurance
+        # ride-along. Worth saying out loud, because it usually means
+        # database/migration_instant_tag.sql has not been run.
+        logger.warning("instant pdf: lead %s is paid but instant_tag is not set — "
+                       "delivering DM-only; run migration_instant_tag.sql", lead_id)
+        chat_id = _delivery_chat_id(driver.get("driver_telegram_id"))
+        if chat_id is None:
+            await _warn_stuck_instant_tag(
+                context, lead,
+                f"driver {driver.get('driver_name') or driver_id} has an unusable "
+                f"Telegram id ({driver.get('driver_telegram_id')!r}) — fix it in /settings",
+                driver=driver)
             continue
         try:
             sent = await _send_instant_tag_to_driver(context, lead, driver, chat_id)
         except Exception as e:
             logger.error("instant pdf: delivery failed for %s: %s", lead_id, e)
+            await _warn_stuck_instant_tag(context, lead, str(e), driver=driver)
             continue                      # left undelivered — the next tick retries
         if sent:
             await asyncio.to_thread(db.mark_instant_pdf_delivered, lead_id)
+            _STUCK_INSTANT_TOLD.pop(lead_id, None)
             logger.info("instant pdf delivered for lead %s to %s", lead_id,
                         driver.get("driver_name"))
+        else:
+            await _warn_stuck_instant_tag(
+                context, lead, "not every car's tag reached the chat", driver=driver)
 
 
 async def _send_instant_tag_to_driver(context, lead, driver, chat_id) -> bool:
@@ -11061,8 +11364,15 @@ async def _send_full_group_lead_to_chat(
     renewal: bool = False,
     accepted_by: str | None = None,
     driver_dm: bool = False,
-) -> None:
+    once: bool = False,
+) -> tuple:
     """Post the same detailed HTML lead as the issuer flow; optionally mirror to supervisory chat(s).
+
+    Returns ``(bodies_delivered, every_tag_delivered)``. Every send in here is
+    swallowed so one dead chat cannot stop the rest, which meant the bare call
+    told a caller nothing at all — and a caller that STAMPS a lead delivered
+    on the strength of it (the paid Instant Tag sweep) marked tags as sent that
+    never left. Most callers ignore the return; the ones handling money must not.
 
     ``driver_dm`` swaps the body for the driver's LEAD ACCEPTED job ticket —
     Skip Dispatch and paid Instant Tags send a DRIVER the exact message a
@@ -11102,27 +11412,31 @@ async def _send_full_group_lead_to_chat(
             "Cannot post full lead: group %s missing group_telegram_id and no supervisory targets",
             group_name,
         )
-        return
+        return 0, False
 
-    async def _post_one(target_cid, label: str) -> None:
+    async def _post_one(target_cid, label: str) -> bool:
         try:
             try:
                 await _send_message_resiliently(context, target_cid, full_html,
                                                 parse_mode="HTML")
+                return True
             except Exception as html_err:
                 logger.warning("Full lead HTML failed for %s: %s", label, html_err)
                 try:
                     await _send_message_resiliently(context, target_cid, body,
                                                     parse_mode="HTML")
+                    return True
                 except Exception as e2:
                     logger.error("Could not send full lead to %s (retry body fallback): %s", label, e2)
         except Exception as e:
             logger.error("Could not send full lead to %s: %s", label, e)
+        return False
 
-    await asyncio.gather(
+    _results = await asyncio.gather(
         *(_post_one(tid, label) for tid, label in targets),
         return_exceptions=True,
     )
+    bodies_ok = sum(1 for r in _results if r is True)
 
     # Second message: the generated NJ temp-tag PDF (+ insurance ride-along) to the
     # same targets. This runs only from accept handlers, so the tag goes out for
@@ -11130,11 +11444,15 @@ async def _send_full_group_lead_to_chat(
     # Either side's Accept releases it: handle_accept_lead does the same send for a
     # DRIVER, and the two check each other so exactly one tag is ever built.
     try:
-        await _send_all_tag_pdfs(
-            context, lead, [tid for tid, _ in targets], renewal=renewal, accepted_by=accepted_by,
+        counts = await _send_all_tag_pdfs(
+            context, lead, [tid for tid, _ in targets], renewal=renewal,
+            accepted_by=accepted_by, once=once,
         )
     except Exception as e:
         logger.warning("Tag PDF send failed for ref %s: %s", reference_id, e)
+        counts = []
+    # "The first of two arrived" is a failure — the customer paid for both.
+    return bodies_ok, (bool(counts) and all(counts))
 
 
 def _extra_vehicle_phase1(lead: dict, vehicle: int) -> dict:
@@ -11493,7 +11811,7 @@ async def send_approved_tag_emails(context: ContextTypes.DEFAULT_TYPE) -> None:
 async def _build_and_send_tag_pdf(
     context: ContextTypes.DEFAULT_TYPE, lead: dict, target_chat_ids: list,
     *, renewal: bool = False, accepted_by: str | None = None,
-    vehicle: int = 1, ride_insurance: bool = True,
+    vehicle: int = 1, ride_insurance: bool = True, once: bool = False,
 ) -> int:
     """Generate ONE car's NJ temp-tag PDF and send it to each chat.
 
@@ -11530,10 +11848,23 @@ async def _build_and_send_tag_pdf(
                 else f"tag_{re.sub(r'[^A-Za-z0-9]+', '', plate) or 'tag'}{_sfx}.pdf")
     seen: set = set()
     sent = 0
+    book = {}
+    if once:
+        try:
+            book = context.application.bot_data.setdefault(_TAG_DELIVERED_KEY, {})
+        except Exception:
+            book = {}      # no application (tests, a bare context): send as before
     for cid in target_chat_ids:
         if cid is None or cid in seen:
             continue
         seen.add(cid)
+        _book_key = f"{lead.get('id')}|{vehicle}|{_norm_chat_id(cid)}"
+        if once and book.get(_book_key):
+            # Already in that chat on an earlier attempt. Count it, so a retry
+            # driven by a DIFFERENT car's failure reports this one as delivered
+            # instead of sending it a second time.
+            sent += 1
+            continue
         try:
             await context.bot.send_document(
                 chat_id=cid,
@@ -11545,6 +11876,8 @@ async def _build_and_send_tag_pdf(
                               if _lead_awaiting_tag_email(lead) else None),
             )
             sent += 1
+            if once:
+                book[_book_key] = True
         except Exception as e:
             logger.error("Could not send tag PDF to %s: %s", cid, e)
             # Every acceptance TEXT still arrives in a chat that blocks file
@@ -11581,6 +11914,7 @@ async def _build_and_send_tag_pdf(
 async def _send_all_tag_pdfs(
     context: ContextTypes.DEFAULT_TYPE, lead: dict, target_chat_ids: list,
     *, renewal: bool = False, accepted_by: str | None = None,
+    once: bool = False,
 ) -> list:
     """Every car on this lead gets its own tag. Returns per-car send counts.
 
@@ -11593,7 +11927,7 @@ async def _send_all_tag_pdfs(
         try:
             counts.append(await _build_and_send_tag_pdf(
                 context, lead, target_chat_ids, renewal=renewal,
-                accepted_by=accepted_by, vehicle=n,
+                accepted_by=accepted_by, vehicle=n, once=once,
                 # Insurance is a per-lead hand-off; make it once, on the last car,
                 # so every car's details are already persisted when it runs.
                 ride_insurance=(n == _lead_vehicle_indices(lead)[-1]),
@@ -18285,7 +18619,29 @@ async def handle_accept_group_offer(update: Update, context: ContextTypes.DEFAUL
     # with it. Anything left False at the end still owes the group a tag.
     tag_released = False
 
-    if db.lead_has_assignments(lead_id):
+    # 🤖 Instant Tag: the tag IS the thing being sold, so a team Accept is a
+    # claim on the lead and never a release of it. handle_accept_lead has carried
+    # this guard since Accept was made to work — "the tag waits for payment or a
+    # password release" — but this handler never got the matching one, so the
+    # team leg of the very same offer round posted the full client card AND the
+    # tag PDF for free, while every offered driver still held a live pay link for
+    # it. It also books the lead, which is what then refused the driver who did
+    # pay.
+    if lead.get("instant_tag"):
+        tag_released = True             # payment or the password releases it, not this
+        try:
+            _cid = _parse_chat_id(winner_group.get("group_telegram_id"))
+            if _cid:
+                await context.bot.send_message(
+                    chat_id=_cid,
+                    text=(f"🤖 <b>Instant Tag claimed</b> — "
+                          f"<code>{html.escape(str(reference_id), quote=False)}</code>\n\n"
+                          "The driver pays for this one. The tag and the client's "
+                          "details go out the moment the deposit clears."),
+                    parse_mode="HTML")
+        except Exception as e:
+            logger.warning("could not confirm the instant claim for %s: %s", lead_id, e)
+    elif db.lead_has_assignments(lead_id):
         try:
             lead_for_group = db.get_lead_by_id(lead_id) or lead
             if offers:
