@@ -34,6 +34,7 @@ export default function AdminOrders() {
   const [busyId, setBusyId] = useState<string | null>(null);
   const [flash, setFlash] = useState<string | null>(null);
   const [noteDraft, setNoteDraft] = useState<Record<string, string>>({});
+  const [certBusy, setCertBusy] = useState<string | null>(null);
 
   const load = async () => {
     const { data } = await supabase.from("orders").select("*").order("created_at", { ascending: false });
@@ -42,6 +43,24 @@ export default function AdminOrders() {
   useEffect(() => { load(); }, []);
 
   const say = (m: string) => { setFlash(m); setTimeout(() => setFlash(null), 3500); };
+
+  // Authenticity PDF for any order — backfills the code if missing, then opens
+  // the printable A4 certificate which auto-triggers the print/save-as-PDF dialog.
+  const downloadCert = async (o: OrderRow) => {
+    // open the tab synchronously so the browser doesn't block the popup
+    const w = window.open("about:blank", "_blank");
+    let code = o.authenticity_code || "";
+    if (!code) {
+      setCertBusy(o.id);
+      const r = await adminApi("/api/admin/authcode", { orderId: o.id });
+      setCertBusy(null);
+      if (!r.ok || !r.code) { if (w) w.close(); say(String(r.error || "Could not prepare the certificate.")); return; }
+      code = String(r.code);
+      setRows((rs) => rs.map((x) => (x.id === o.id ? { ...x, authenticity_code: code } : x)));
+    }
+    const url = `/authenticity-certificate?code=${encodeURIComponent(code)}&print=1`;
+    if (w) w.location.href = url; else window.open(url, "_blank");
+  };
 
   const toggle = async (id: string) => {
     if (openId === id) { setOpenId(null); return; }
@@ -199,13 +218,13 @@ export default function AdminOrders() {
                     </p>
                     {o.payment_ref && <p className="text-bone/40 text-xs">Ref: {o.payment_ref}</p>}
                     {o.paid_at && <p className="text-bone/40 text-xs">Paid {new Date(o.paid_at).toLocaleString()}</p>}
-                    {o.authenticity_code && (
-                      <p className="text-bone/40 text-xs flex flex-wrap items-center gap-2 mt-1">
-                        <span>Auth: <span className="text-acid break-all">{o.authenticity_code}</span></span>
-                        <a href={`/authenticity-certificate?code=${encodeURIComponent(o.authenticity_code)}`} target="_blank" rel="noreferrer"
-                          className="btn-og border border-acid/50 text-acid px-2.5 py-1 text-[10px] hover:bg-acid hover:text-ink">⎙ Certificate</a>
-                      </p>
-                    )}
+                    <p className="text-bone/40 text-xs flex flex-wrap items-center gap-2 mt-1">
+                      {o.authenticity_code && <span>Auth: <span className="text-acid break-all">{o.authenticity_code}</span></span>}
+                      <button onClick={() => downloadCert(o)} disabled={certBusy === o.id}
+                        className="btn-og border border-acid/50 text-acid px-2.5 py-1 text-[10px] hover:bg-acid hover:text-ink">
+                        {certBusy === o.id ? "Preparing…" : "⬇ Authenticity PDF"}
+                      </button>
+                    </p>
                     {o.refund_status === "refunded" && (
                       <p className="text-blood text-xs">Refunded {money(o.refund_amount || 0)} · {o.refunded_at ? new Date(o.refunded_at).toLocaleString() : ""}</p>
                     )}

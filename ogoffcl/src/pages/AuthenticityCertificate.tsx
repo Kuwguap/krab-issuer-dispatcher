@@ -2,7 +2,7 @@ import { useEffect, useState } from "react";
 import { useSearchParams } from "react-router-dom";
 
 interface Product { name: string; image: string | null; size: string | null; qty: number; }
-interface Result { authentic: boolean; orderNumber?: string; purchasedOn?: string; products?: Product[]; }
+interface Result { found: boolean; orderNumber?: string; purchasedOn?: string; products?: Product[]; paid?: boolean; }
 
 /**
  * Printable A4 Certificate of Authenticity. Admin opens it with ?code=OGA-...
@@ -12,6 +12,7 @@ interface Result { authentic: boolean; orderNumber?: string; purchasedOn?: strin
 export default function AuthenticityCertificate() {
   const [params] = useSearchParams();
   const code = (params.get("code") || "").trim().toUpperCase();
+  const autoPrint = params.get("print") === "1";
   const [res, setRes] = useState<Result | null>(null);
   const [loading, setLoading] = useState(true);
 
@@ -20,12 +21,19 @@ export default function AuthenticityCertificate() {
 
   useEffect(() => {
     if (!code) { setLoading(false); return; }
-    fetch(`/api/order/authentic?code=${encodeURIComponent(code)}`)
-      .then((r) => (r.ok ? r.json() : { authentic: false }))
+    fetch(`/api/order/cert?code=${encodeURIComponent(code)}`)
+      .then((r) => (r.ok ? r.json() : { found: false }))
       .then((j) => setRes(j))
-      .catch(() => setRes({ authentic: false }))
+      .catch(() => setRes({ found: false }))
       .finally(() => setLoading(false));
   }, [code]);
+
+  // auto-open the print dialog once the sheet + QR have had a moment to render
+  useEffect(() => {
+    if (!autoPrint || loading || !res || !res.found) return;
+    const t = setTimeout(() => window.print(), 900);
+    return () => clearTimeout(t);
+  }, [autoPrint, loading, res]);
 
   const S = {
     body: { background: "#3a3a3a", minHeight: "100vh", display: "flex", flexDirection: "column" as const, alignItems: "center", padding: "24px", fontFamily: '"Space Grotesk",sans-serif' },
@@ -63,7 +71,7 @@ export default function AuthenticityCertificate() {
             </div>
           </div>
 
-          {!res || !res.authentic ? (
+          {!res || !res.found ? (
             <div style={{ marginTop: "60px", textAlign: "center" }}>
               <p style={{ fontFamily: '"Archivo Black"', fontSize: "40px", color: "#c0392b" }}>NO RECORD FOUND</p>
               <p style={{ color: "#555", marginTop: "14px", fontSize: "15px" }}>Code <b>{code || "—"}</b> did not match a paid order.</p>
