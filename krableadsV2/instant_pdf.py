@@ -52,6 +52,46 @@ def _telegram_deep_link() -> str:
     return f"https://t.me/{handle}" if handle else "https://t.me"
 
 
+_PAYMENTS_READY = {"at": 0.0, "ok": None, "why": ""}
+
+
+def payments_ready(db_client, *, ttl: float = 60.0) -> tuple:
+    """(ok, why) — can this database record a payment at all?
+
+    The whole instant-tag chain lives in columns created by
+    database/migration_instant_pdf.sql: the checkout stamps
+    instant_pdf_session_id, the webhook stamps instant_pdf_paid_at, and the
+    bot's sweep finds the lead by exactly those two. On a database without
+    them PostgREST answers 42703 to every one of those writes and reads, so
+    the money is taken, the webhook 500s (and Stripe retries it forever), and
+    the tag is never delivered to anybody.
+
+    Checked here because this endpoint is the single place money starts, and
+    refusing to sell is the only honest answer when delivery is impossible.
+    Cached for a minute: it is one HEAD-shaped select, but it is on the hot path.
+    """
+    import time as _t
+    now = _t.monotonic()
+    if _PAYMENTS_READY["ok"] is not None and (now - _PAYMENTS_READY["at"]) < ttl:
+        return _PAYMENTS_READY["ok"], _PAYMENTS_READY["why"]
+    ok, why = True, ""
+    try:
+        db_client.table("leads").select(
+            "instant_pdf_paid_at, instant_pdf_delivered_at, "
+            "instant_pdf_driver_id, instant_pdf_session_id"
+        ).limit(1).execute()
+    except Exception as e:
+        msg = str(e)
+        if "42703" in msg or "does not exist" in msg:
+            ok = False
+            why = ("This database has not run database/migration_instant_pdf.sql, "
+                   "so a payment cannot be recorded or the tag delivered.")
+        else:
+            logger.warning("payments_ready check failed: %s", e)
+    _PAYMENTS_READY.update({"at": now, "ok": ok, "why": why})
+    return ok, why
+
+
 def _public_base() -> str:
     """Where Stripe sends the driver back to.
 
@@ -219,6 +259,14 @@ def register(app, db_provider):
                 return jsonify({"error": "already paid"}), 409
         except Exception as e:
             logger.warning("instant checkout: paid-check failed for %s: %s", lead_id, e)
+
+        # Refuse to sell what cannot be delivered. Without the instant_pdf
+        # columns the webhook cannot record this payment and the sweep can never
+        # find it -- the driver pays and no tag ever arrives.
+        _ready, _why = payments_ready(_resolve().client)
+        if not _ready:
+            logger.error("instant checkout REFUSED for %s: %s", lead_id, _why)
+            return jsonify({"error": "payments are not configured", "detail": _why}), 503
 
         base = _public_base()
         form = {

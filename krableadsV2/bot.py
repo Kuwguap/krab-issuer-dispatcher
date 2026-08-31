@@ -1751,6 +1751,9 @@ async def _dispatch_instant_tag_lead(context, lead: dict, selected_drivers: list
         except ValueError:
             pass
     sent, sent_ids, failed = [], [], []
+    # Why no deposit link could be made, reported ONCE to whoever dispatched.
+    # Drivers are shown no config detail; the office cannot fix what it is not told.
+    link_error = None
 
     # Each driver's own deposit link, minted up front so the offer can carry a
     # one-tap "Pay now" beside Accept. Several live links are safe: the webhook
@@ -1799,6 +1802,7 @@ async def _dispatch_instant_tag_lead(context, lead: dict, selected_drivers: list
         else:
             logger.warning("instant tag: no deposit link for %s (%s) — Accept still works",
                            d.get("driver_name"), link_err)
+            link_error = link_error or str(link_err or "unknown")
         # The same list the message after Accept uses, so the two cannot drift.
         body += _instant_tag_what_you_get(collect_label)
         # Accept stays a CALLBACK and Pay is its own button beside it. Making
@@ -1873,6 +1877,22 @@ async def _dispatch_instant_tag_lead(context, lead: dict, selected_drivers: list
             lines.append("📨 Offered to: " + html.escape(", ".join(sent), quote=False))
         if failed:
             lines.append("⚠️ Could not reach: " + html.escape(", ".join(failed), quote=False))
+        if link_error:
+            low = link_error.lower()
+            hint = ""
+            if "migration_instant_pdf" in low or "not configured" in low:
+                hint = ("run database/migration_instant_pdf.sql — until then a "
+                        "deposit cannot be recorded and no tag would arrive")
+            elif "unauthor" in low:
+                hint = ("the bot's INTEGRATIONS_API_KEY does not match the admin "
+                        "dashboard's — set the same value on both Render services")
+            elif "stripe" in low:
+                hint = ("STRIPE_SECRET_KEY is not set on krab-issuer-admin — "
+                        "no checkout can be created until it is")
+            msg = "⚠️ No deposit link: " + html.escape(link_error, quote=False)
+            if hint:
+                msg += NL + "💡 " + hint
+            lines.append(msg)
         summary_kb = None
         if arm_release:
             lines.append(
