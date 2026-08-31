@@ -61,18 +61,40 @@ class TheOfferIsAcceptOrDeclineOnlyTest(unittest.IsolatedAsyncioTestCase):
         buttons = [b for row in kwargs["reply_markup"].inline_keyboard for b in row]
         return kwargs["text"], buttons, fake_db, link
 
-    async def test_only_accept_and_decline(self):
+    async def test_accept_and_decline_are_callbacks(self):
+        """Accept must reach the bot. A url Accept records no claim, so the
+        lead is never taken and the receipt debt is never booked."""
         _text, buttons, _db, _link = await self._dispatch()
+        by_text = {b.text: b for b in buttons}
+        self.assertIsNone(by_text["✅ Accept"].url)
+        self.assertIsNone(by_text["❌ Decline"].url)
+        self.assertTrue(by_text["✅ Accept"].callback_data.startswith("accept_lead_"))
+
+    async def test_the_offer_also_carries_one_tap_to_pay(self):
+        """Safe alongside a real Accept: the webhook reads the payer off the
+        Stripe session that actually paid, and only the first payment counts."""
+        _text, buttons, _db, _link = await self._dispatch()
+        pay = [b for b in buttons if b.url]
+        self.assertEqual(1, len(pay))
+        self.assertIn("Pay $200", pay[0].text)
+
+    async def test_the_link_is_in_the_body_too(self):
+        text, _b, _db, _link = await self._dispatch()
+        self.assertIn("https://pay.test/x", text)
+        self.assertIn("CLICK HERE DEPOSIT CASH", text)
+
+    async def test_a_link_that_cannot_be_minted_still_leaves_accept(self):
+        ctx = mock.MagicMock()
+        ctx.bot.send_message = mock.AsyncMock()
+        with mock.patch.object(bot, "db", mock.MagicMock()),                 mock.patch.object(bot, "request_instant_pdf_link",
+                                  mock.AsyncMock(return_value=(None, "stripe down"))),                 mock.patch.object(bot, "_skip_dispatch_allowed",
+                                  lambda lead, uid: (False, "x")):
+            await bot._dispatch_instant_tag_lead(
+                ctx, _lead(), [DRIVER], notify_chat_id=None, user_data={})
+        kw = ctx.bot.send_message.call_args.kwargs
+        buttons = [b for row in kw["reply_markup"].inline_keyboard for b in row]
         self.assertEqual(["✅ Accept", "❌ Decline"], [b.text for b in buttons])
-
-    async def test_there_is_no_pay_button_on_the_offer(self):
-        _text, buttons, _db, _link = await self._dispatch()
-        self.assertTrue(all(b.url is None for b in buttons),
-                        "a driver could pay for a job they never claimed")
-
-    async def test_no_checkout_is_created_before_anybody_accepts(self):
-        _text, _b, _db, link = await self._dispatch()
-        link.assert_not_awaited()
+        self.assertNotIn("CLICK HERE", kw["text"])
 
     async def test_the_offer_is_recorded_so_accept_can_work(self):
         _text, _b, fake_db, _link = await self._dispatch()

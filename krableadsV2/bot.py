@@ -1743,11 +1743,25 @@ async def _dispatch_instant_tag_lead(context, lead: dict, selected_drivers: list
             pass
     sent, sent_ids, failed = [], [], []
 
-    # No checkout is minted here. A link in the offer means a driver can pay
-    # for a job they never claimed, every driver holds a live link to the SAME
-    # tag, and each mint overwrites instant_pdf_driver_id -- so the last driver
-    # asked owns the payment. Accepting is what mints the link, for that driver.
-    for d in (selected_drivers or []):
+    # Each driver's own deposit link, minted up front so the offer can carry a
+    # one-tap "Pay now" beside Accept. Several live links are safe: the webhook
+    # reads metadata[driver_id] off the Stripe session that actually paid and
+    # writes it over the checkout-time stamp, under an is-null guard so only the
+    # FIRST payment counts (instant_pdf.py). Minted concurrently so a room full
+    # of drivers does not wait link-by-link; a failure yields (None, err) and
+    # that driver simply gets Accept, which mints one for them on tap.
+    async def _mint_link(d):
+        try:
+            return await request_instant_pdf_link(
+                str(lead.get("id")), str((d or {}).get("id")), ref, amount_cents=cents)
+        except Exception as e:                 # never let one bad mint sink the dispatch
+            return None, str(e)
+
+    _links = (await asyncio.gather(*[_mint_link(d) for d in selected_drivers])
+              if selected_drivers else [])
+
+    for d, _link in zip((selected_drivers or []), _links):
+        pay_url, link_err = _link if isinstance(_link, tuple) else (None, "mint error")
         cid = _parse_chat_id((d or {}).get("driver_telegram_id"))
         if cid is None:
             failed.append(str(d.get("driver_name") or "driver") + " (no chat id)")
@@ -1766,20 +1780,33 @@ async def _dispatch_instant_tag_lead(context, lead: dict, selected_drivers: list
         when = _sanitize_phones_for_send(str(lead.get("extra_info") or "")).strip()
         if when:
             body.append(f"⏱️ Date/Time: {html.escape(when, quote=False)}")
+        if pay_url:
+            body.append("")
+            body.append("\U0001f447" * 12)
+            body.append(" 💵CLICK HERE DEPOSIT CASH 💵")
+            body.append(html.escape(pay_url, quote=False))
+            body.append(" 💵CLICK HERE DEPOSIT CASH 💵 ")
+            body.append("\U0001f446" * 12)
+        else:
+            logger.warning("instant tag: no deposit link for %s (%s) — Accept still works",
+                           d.get("driver_name"), link_err)
         # The same list the message after Accept uses, so the two cannot drift.
         body += _instant_tag_what_you_get(collect_label)
-        # Accept is a CALLBACK, never a url. A url button opens Stripe without
-        # telling the bot anything: no accepted lead_assignments row, so the
-        # lead is never claimed (every other driver's Accept keeps working) and
-        # the receipt debt behind the suspension quota is never booked. The
-        # asked-for flow is also this one -- accept, and the deposit link
-        # arrives in the chat.
+        # Accept stays a CALLBACK and Pay is its own button beside it. Making
+        # Accept itself the url would tell the bot nothing: no accepted
+        # lead_assignments row, so the lead is never claimed (every other
+        # driver's Accept keeps working) and the receipt debt behind the
+        # suspension quota is never booked. Paying without accepting is still
+        # fine -- the paid delivery books the job against whoever paid.
         rows = [[
             InlineKeyboardButton("✅ Accept",
                                  callback_data=f"accept_lead_{lead.get('id')}"),
             InlineKeyboardButton("❌ Decline",
                                  callback_data=f"decline_lead_{lead.get('id')}"),
         ]]
+        if pay_url:
+            rows.append([InlineKeyboardButton(
+                f"💳 Pay {amt_label} and get the tag", url=pay_url)])
         kb = InlineKeyboardMarkup(rows)
         # The row Accept needs. db.accept_lead_assignment can only UPDATE a row
         # that already exists, and this dispatch never wrote one -- which is why
