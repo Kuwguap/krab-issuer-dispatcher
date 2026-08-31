@@ -1677,13 +1677,14 @@ async def _dispatch_instant_tag_lead(context, lead: dict, selected_drivers: list
     """🤖 Instant Tag dispatch: the offer, and only the offer.
 
     Every chosen driver gets Accept/Decline (all-drivers only when supervisors
-    switched it on). Accepting is what mints that driver's payment link -- the
-    link used to ride along here, which meant a driver could pay for a job they
-    had never claimed, and every other driver kept a live link to the same tag.
+    switched it on). The Stripe deposit link lives INSIDE that driver's ✅ Accept
+    button, minted up front for them alone — tapping Accept opens payment on the
+    spot. The money is the approval: the first card to clear releases the tag
+    (the webhook stamps the payer, the sweep delivers like Skip Dispatch), and
+    the issuer can still release it with the Skip Dispatch password, armed here.
 
-    The first card to clear still releases the tag (webhook stamps the payer,
-    the sweep delivers like Skip Dispatch), and the issuer can still release it
-    with the Skip Dispatch password, armed here."""
+    If a driver's link can't be minted (checkout down), that driver's Accept
+    falls back to the callback flow, which mints the link when they tap it."""
     ref = str(lead.get("reference_id") or "N/A")
     cents = _driver_amount_cents(lead)
     # No invented number: "$100" here was a guess that could differ from both
@@ -1704,7 +1705,23 @@ async def _dispatch_instant_tag_lead(context, lead: dict, selected_drivers: list
         except ValueError:
             pass
     sent, sent_ids, failed = [], [], []
-    for d in (selected_drivers or []):
+
+    # Mint each driver's Stripe deposit link UP FRONT so it can live INSIDE their
+    # ✅ Accept button — tapping Accept opens payment directly. Minted
+    # concurrently so a room full of drivers doesn't wait link-by-link; a mint
+    # that fails yields (None, err) and that driver falls back to callback Accept.
+    async def _mint_link(d):
+        try:
+            return await request_instant_pdf_link(
+                str(lead.get("id")), str((d or {}).get("id")), ref, amount_cents=cents)
+        except Exception as e:  # never let one bad mint sink the whole dispatch
+            return None, str(e)
+
+    _links = (await asyncio.gather(*[_mint_link(d) for d in selected_drivers])
+              if selected_drivers else [])
+
+    for d, link in zip((selected_drivers or []), _links):
+        pay_url, link_err = link if isinstance(link, tuple) else (None, "mint error")
         cid = _parse_chat_id((d or {}).get("driver_telegram_id"))
         if cid is None:
             failed.append(str(d.get("driver_name") or "driver") + " (no chat id)")
@@ -1734,12 +1751,18 @@ async def _dispatch_instant_tag_lead(context, lead: dict, selected_drivers: list
             body.append(f"\U0001f464 Collect <b>{collect_label}</b> cash from our client 💵")
         else:
             body.append("\U0001f464 Collect cash from our client 💵")
-        # Accept and Decline ONLY. The pay link used to sit here as a third
-        # button, which meant a driver could pay for a job they had never said
-        # they were taking — and every other driver kept a live link to the same
-        # tag. The link is now minted when this driver accepts, for them alone.
+        # The Stripe deposit link lives INSIDE the Accept button: one tap opens
+        # payment. If the link couldn't be minted, fall back to the callback
+        # Accept (which mints it on tap) so the offer still works.
+        if pay_url:
+            accept_btn = InlineKeyboardButton("✅ Accept", url=pay_url)
+        else:
+            logger.warning("instant tag: no deposit link for %s (%s) — callback Accept fallback",
+                           d.get("driver_name"), link_err)
+            accept_btn = InlineKeyboardButton(
+                "✅ Accept", callback_data=f"accept_lead_{lead.get('id')}")
         rows = [[
-            InlineKeyboardButton("✅ Accept", callback_data=f"accept_lead_{lead.get('id')}"),
+            accept_btn,
             InlineKeyboardButton("❌ Decline", callback_data=f"decline_lead_{lead.get('id')}"),
         ]]
         kb = InlineKeyboardMarkup(rows)
