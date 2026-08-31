@@ -368,6 +368,30 @@ class Database:
             logger.warning("get_recently_paid_instant_leads: %s", e)
             return []
 
+    def get_unpaid_instant_lead_ids(self, hours: int = 48) -> set:
+        """Instant tags created in the window that nobody has paid for yet.
+
+        The timed status sweep walks accepted leads to "Tag printed" and then
+        "Driver on the way". Accepting an Instant Tag is not delivering it --
+        the tag is what the payment buys -- so these must be left alone or the
+        board reports progress on a job that has not started.
+        """
+        from datetime import datetime, timedelta, timezone
+        since = (datetime.now(timezone.utc) - timedelta(hours=hours)).isoformat()
+        try:
+            r = (self.client.table("leads")
+                 .select("id")
+                 .eq("instant_tag", True)
+                 .is_("instant_pdf_paid_at", "null")
+                 .gte("created_at", since)
+                 .limit(500).execute())
+            return {str(row["id"]) for row in (r.data or []) if row.get("id")}
+        except Exception as e:
+            # An un-migrated instant_pdf column must not stop the sweep; the cost
+            # is only that an unpaid instant tag shows optimistic progress.
+            logger.warning("get_unpaid_instant_lead_ids: %s", e)
+            return set()
+
     def update_lead(self, lead_id: str, updates: Dict[str, Any]) -> bool:
         """Update a lead record."""
         if not self._check_tables_exist():
@@ -2163,6 +2187,27 @@ class Database:
             logger.error(f"Error getting contact info source: {e}")
             return None
 
+    # leads.exclude_from_count is created by database/migration_exclude_from_count.sql.
+    # Until that runs, PostgREST answers 42703 for ANY select naming it -- which
+    # blanked the leaderboard and the Recent Leads browser on a table full of
+    # leads. Reading is more important than striking: drop the column, treat
+    # every lead as counting, and say so once.
+    _EXCLUDE_COL = "exclude_from_count"
+
+    @staticmethod
+    def _missing_column(err, name: str) -> bool:
+        s = str(err)
+        return name in s and ("42703" in s or "does not exist" in s)
+
+    def _warn_missing_exclude_col(self, where: str) -> None:
+        if getattr(self, "_warned_exclude_col", False):
+            return
+        self._warned_exclude_col = True
+        logger.warning(
+            "%s: leads.%s does not exist -- counting every lead. "
+            "Run database/migration_exclude_from_count.sql to enable striking.",
+            where, self._EXCLUDE_COL)
+
     def get_lead_counts_by_sender(self) -> list:
         """[(name, count), …] — who ENTERED each lead, most first.
 
@@ -2172,28 +2217,30 @@ class Database:
         every other number in the system."""
         if not self._check_tables_exist():
             return []
-        try:
-            r = (
-                self.client.table("leads")
-                .select("user_id, telegram_name, telegram_username, exclude_from_count")
-                .execute()
-            )
-        except Exception as e:
-            # A DB behind migration_telegram_name.sql answers 42703 for the new
-            # column — the board must not go blank over it.
-            if "telegram_name" in str(e) or "42703" in str(e):
-                try:
-                    r = (
-                        self.client.table("leads")
-                        .select("user_id, telegram_username, exclude_from_count")
-                        .execute()
-                    )
-                except Exception as e2:
-                    logger.error("get_lead_counts_by_sender: %s", e2)
-                    return []
-            else:
-                logger.error("get_lead_counts_by_sender: %s", e)
-                return []
+        # Widest first, then drop whichever optional column this database is
+        # missing. The old version only ever retried without telegram_name, so a
+        # missing exclude_from_count failed BOTH attempts and the board went
+        # blank -- which is exactly what it did.
+        attempts = [
+            "user_id, telegram_name, telegram_username, exclude_from_count",
+            "user_id, telegram_username, exclude_from_count",
+            "user_id, telegram_name, telegram_username",
+            "user_id, telegram_username",
+        ]
+        r = None
+        last = None
+        for cols in attempts:
+            try:
+                r = self.client.table("leads").select(cols).execute()
+                if self._EXCLUDE_COL not in cols:
+                    self._warn_missing_exclude_col("get_lead_counts_by_sender")
+                break
+            except Exception as e:
+                last = e
+                continue
+        if r is None:
+            logger.error("get_lead_counts_by_sender: %s", last)
+            return []
         tally: Dict[str, int] = {}
         for row in (r.data or []):
             if row.get("exclude_from_count"):
@@ -2217,23 +2264,33 @@ class Database:
         removed rows stay LISTED so the strike is visible and reversible."""
         if not self._check_tables_exist():
             return [], 0
-        cols = ("id, reference_id, telegram_name, telegram_username, user_id, "
-                "vehicle_details, created_at, exclude_from_count")
-        for attempt_cols in (cols, cols.replace("telegram_name, ", "")):
+        base = ("id, reference_id, telegram_name, telegram_username, user_id, "
+                "vehicle_details, created_at")
+        # Same story as the leaderboard: naming a column this database does not
+        # have made the browser report "0 total" for a table full of leads.
+        attempts = [
+            base + ", " + self._EXCLUDE_COL,
+            base.replace("telegram_name, ", "") + ", " + self._EXCLUDE_COL,
+            base,
+            base.replace("telegram_name, ", ""),
+        ]
+        last = None
+        for cols in attempts:
             try:
                 r = (
                     self.client.table("leads")
-                    .select(attempt_cols, count="exact")
+                    .select(cols, count="exact")
                     .order("created_at", desc=True)
                     .range(int(offset), int(offset) + int(limit) - 1)
                     .execute()
                 )
+                if self._EXCLUDE_COL not in cols:
+                    self._warn_missing_exclude_col("list_recent_leads_for_review")
                 return (r.data or []), int(getattr(r, "count", None) or 0)
             except Exception as e:
-                if attempt_cols is cols and ("telegram_name" in str(e) or "42703" in str(e)):
-                    continue
-                logger.error("list_recent_leads_for_review: %s", e)
-                return [], 0
+                last = e
+                continue
+        logger.error("list_recent_leads_for_review: %s", last)
         return [], 0
 
     def set_lead_excluded(self, lead_id: str, excluded: bool) -> bool:
@@ -2304,7 +2361,16 @@ class Database:
             import pytz
             now_eastern = datetime.now(pytz.timezone("America/New_York"))
             cutoff_7d = (now_eastern - timedelta(days=7)).astimezone(pytz.UTC).strftime("%Y-%m-%dT%H:%M:%S") + "Z"
-            r = self.client.table("leads").select("user_id, created_at, exclude_from_count").order("created_at", desc=True).execute()
+            try:
+                r = (self.client.table("leads")
+                     .select("user_id, created_at, exclude_from_count")
+                     .order("created_at", desc=True).execute())
+            except Exception as e:
+                if not self._missing_column(e, self._EXCLUDE_COL):
+                    raise
+                self._warn_missing_exclude_col("get_user_usage_rows")
+                r = (self.client.table("leads").select("user_id, created_at")
+                     .order("created_at", desc=True).execute())
             by_user = {}
             for row in (r.data or []):
                 if row.get("exclude_from_count"):
