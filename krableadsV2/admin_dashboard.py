@@ -2147,8 +2147,10 @@ RECEIPT_LINK_SECRET = (
     or "krab-receipt-portal"
 ).strip()
 # Where the portal is reachable from a phone. tristatetags.com/backend proxies here.
+# The origin that actually answers — see the note in bot.py. Both processes
+# must agree, or a link minted by one is not the link the other verifies.
 RECEIPT_PORTAL_BASE = (
-    os.getenv("RECEIPT_PORTAL_BASE") or "https://tristatetags.com/backend"
+    os.getenv("RECEIPT_PORTAL_BASE") or "https://krab-issuer-admin.onrender.com"
 ).strip().rstrip("/")
 
 _MAX_RECEIPT_BYTES = 12 * 1024 * 1024      # a phone photo, with room to spare

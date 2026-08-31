@@ -3287,8 +3287,14 @@ _TELEGRAM_FILE_API_MARKER = "https://api.telegram.org/file/bot"
 
 # Where a driver can upload a receipt from a phone. The bytes go straight into the
 # database; nothing about the link expires, unlike a Telegram file URL.
+# The admin's OWN origin, not the tristatetags.com/backend proxy in front of it.
+# That proxy is a Vercel rewrite on a site this repo does not deploy, and when the
+# rewrite is missing from the live deployment every link minted here -- receipt
+# uploads, the tag-approval page, the payment return -- lands on the marketing
+# site's 404 instead. The origin is always the service that actually answers.
+# Set RECEIPT_PORTAL_BASE to the pretty domain once that rewrite is live again.
 RECEIPT_PORTAL_BASE = (
-    os.getenv("RECEIPT_PORTAL_BASE") or "https://tristatetags.com/backend"
+    os.getenv("RECEIPT_PORTAL_BASE") or "https://krab-issuer-admin.onrender.com"
 ).strip().rstrip("/")
 _RECEIPT_LINK_SECRET = (
     os.getenv("RECEIPT_LINK_SECRET") or (Config.SUPABASE_KEY or "") or "krab-receipt-portal"

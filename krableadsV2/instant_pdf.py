@@ -53,8 +53,15 @@ def _telegram_deep_link() -> str:
 
 
 def _public_base() -> str:
+    """Where Stripe sends the driver back to.
+
+    The admin's own origin by default, NOT the tristatetags.com/backend proxy:
+    that is a Vercel rewrite on a site this repo does not deploy, and a
+    deployment without it answers every /backend/* path with the marketing
+    site's own 404 -- which is exactly what a paying driver saw.
+    """
     return (os.getenv("RECEIPT_PORTAL_BASE")
-            or "https://tristatetags.com/backend").strip().rstrip("/")
+            or "https://krab-issuer-admin.onrender.com").strip().rstrip("/")
 
 
 def verify_stripe_signature(payload: bytes, header: str, secret: str,
@@ -89,39 +96,58 @@ def verify_stripe_signature(payload: bytes, header: str, secret: str,
 _SUCCESS_PAGE = """<!doctype html>
 <html><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Payment received</title>
+<title>{{ heading }}</title>
 <style>
- body{font:16px/1.5 -apple-system,system-ui,sans-serif;margin:0;padding:32px;
-      background:#f6f7f9;color:#111;display:flex;justify-content:center}
- @media (prefers-color-scheme:dark){body{background:#111;color:#eee}}
- .card{background:#fff;border-radius:14px;padding:26px;max-width:32rem;
-       box-shadow:0 1px 3px rgba(0,0,0,.15)}
- @media (prefers-color-scheme:dark){.card{background:#1c1c1e}}
- h1{font-size:1.3rem;margin:0 0 .5rem}
- .ok{color:#0a7;font-weight:650}
- .ref{font-family:ui-monospace,monospace}
- .back{display:inline-block;margin-top:.4rem;padding:13px 20px;border-radius:10px;
-       background:#2f6df6;color:#fff;text-decoration:none;font-weight:650}
- .tiny{color:#777;font-size:.88rem}
+ :root{color-scheme:light dark}
+ body{font:16px/1.55 -apple-system,system-ui,Segoe UI,Roboto,sans-serif;margin:0;
+      padding:28px 20px;background:#f4f6f8;color:#12161c;
+      display:flex;justify-content:center;align-items:flex-start}
+ @media (prefers-color-scheme:dark){body{background:#0f1115;color:#e8eaed}}
+ .card{background:#fff;border-radius:18px;padding:30px 26px;max-width:30rem;width:100%;
+       box-shadow:0 6px 24px rgba(16,24,40,.10);text-align:center}
+ @media (prefers-color-scheme:dark){.card{background:#171a21}}
+ .tick{width:74px;height:74px;border-radius:50%;margin:2px auto 18px;
+       background:#e7f7ef;color:#0a7a4f;font-size:38px;line-height:74px}
+ @media (prefers-color-scheme:dark){.tick{background:#12301f;color:#5fd08a}}
+ h1{font-size:1.45rem;margin:0 0 .35rem;letter-spacing:-.01em}
+ .lead{color:#0a7a4f;font-weight:650;margin:0 0 18px}
+ @media (prefers-color-scheme:dark){.lead{color:#5fd08a}}
+ dl{margin:0 0 20px;text-align:left;background:#f6f8fa;border-radius:12px;padding:14px 16px}
+ @media (prefers-color-scheme:dark){dl{background:#11141a}}
+ .row{display:flex;justify-content:space-between;gap:14px;padding:5px 0}
+ .k{color:#6b7280}  .v{font-weight:600;text-align:right;word-break:break-word}
+ .ref{font-family:ui-monospace,SFMono-Regular,monospace}
+ .back{display:block;padding:15px 20px;border-radius:12px;background:#2f6df6;
+       color:#fff;text-decoration:none;font-weight:650}
+ .tiny{color:#6b7280;font-size:.87rem;margin:14px 0 0}
+ ul{text-align:left;margin:0 0 20px;padding-left:20px;color:#374151}
+ @media (prefers-color-scheme:dark){ul{color:#aab2c0}.k,.tiny{color:#8b93a7}}
+ li{margin:4px 0}
 </style></head><body>
 <div class="card">
-  <h1>✅ Payment received</h1>
-  <p class="ok">The tag is on its way to the driver now.</p>
-  <p>Reference <span class="ref">{{ reference_id or "—" }}</span>. It arrives in
-     their Telegram chat within a minute — no dispatch approval needed.</p>
-  <p><a class="back" href="{{ tg_deep }}">Back to Telegram</a></p>
-  <p class="tiny">This page closes itself. If it does not, the button above
-     takes you back to the chat — the tag is already on its way.</p>
+  <div class="tick">{{ tick }}</div>
+  <h1>{{ heading }}</h1>
+  <p class="lead">{{ lead }}</p>
+  {% if reference_id %}
+  <dl>
+    <div class="row"><span class="k">Reference</span>
+                     <span class="v ref">{{ reference_id }}</span></div>
+    {% if amount %}<div class="row"><span class="k">Paid</span>
+                     <span class="v">{{ amount }}</span></div>{% endif %}
+  </dl>
+  {% endif %}
+  {% if steps %}<ul>{% for s in steps %}<li>{{ s }}</li>{% endfor %}</ul>{% endif %}
+  <a class="back" href="{{ tg_deep }}">Back to Telegram</a>
+  <p class="tiny">This page returns you to the chat on its own.</p>
 </div>
 <script>
-  // Straight back to the chat the driver came from. window.close() only works
-  // on a tab the page itself opened, which a Stripe redirect is not, so the
-  // deep link is the one that actually lands -- and the button is there for a
-  // browser that blocks both.
+  // Straight back to the chat. window.close() only works on a tab the page
+  // itself opened, which a Stripe redirect is not, so the deep link is the one
+  // that actually lands -- and the button is there for a browser that blocks it.
   setTimeout(function () {
     try { window.location.replace({{ tg_deep|tojson }}); } catch (e) {}
     setTimeout(function () { try { window.close(); } catch (e) {} }, 900);
-  }, 1200);
+  }, 2500);
 </script>
 </body></html>"""
 
@@ -295,27 +321,44 @@ def register(app, db_provider):
 
     @app.route("/instant/success", methods=["GET"])
     def instant_success():
-        ref = ""
+        """Thank the driver, tell them what happens next, send them back."""
+        ref, amount = "", ""
         sid = (request.args.get("session_id") or "").strip()
         if sid:
             try:
-                r = (_resolve().client.table("leads").select("reference_id")
+                r = (_resolve().client.table("leads")
+                     .select("reference_id, instant_pdf_amount_cents")
                      .eq("instant_pdf_session_id", sid).limit(1).execute())
-                ref = ((r.data or [{}])[0].get("reference_id") or "").strip()
+                row = (r.data or [{}])[0]
+                ref = (row.get("reference_id") or "").strip()
+                cents = row.get("instant_pdf_amount_cents")
+                if cents:
+                    amount = f"${int(cents) // 100}"
             except Exception:
-                ref = ""
-        return render_template_string(_SUCCESS_PAGE, reference_id=ref,
-                                      tg_deep=_telegram_deep_link())
+                ref, amount = "", ""
+        return render_template_string(
+            _SUCCESS_PAGE,
+            tick="✓",
+            heading="Thank you — payment received",
+            lead="Your deposit is in. The job is yours.",
+            reference_id=ref, amount=amount,
+            steps=[
+                "The temp tag arrives in your Telegram chat in under a minute.",
+                "The client's full address and phone come with it.",
+                "Collect the cash on delivery and upload the receipt.",
+            ],
+            tg_deep=_telegram_deep_link())
 
     @app.route("/instant/cancelled", methods=["GET"])
     def instant_cancelled():
         return render_template_string(
-            _SUCCESS_PAGE.replace("✅ Payment received", "Payment cancelled")
-            .replace("The tag is on its way to the driver now.",
-                     "Nothing was charged.")
-            .replace("It arrives in their Telegram chat within a minute — no "
-                     "dispatch approval needed.",
-                     "Send the lead the usual way, or ask for the link again."),
-            reference_id="", tg_deep=_telegram_deep_link())
+            _SUCCESS_PAGE,
+            tick="×",
+            heading="Payment cancelled",
+            lead="Nothing was charged.",
+            reference_id="", amount="",
+            steps=["The job is still open — the offer is in your chat.",
+                   "Tap the deposit link again whenever you are ready."],
+            tg_deep=_telegram_deep_link())
 
     logger.info("Instant-PDF endpoints mounted (amount: %d cents)", INSTANT_PDF_CENTS)
