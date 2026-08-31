@@ -1433,6 +1433,23 @@ async def _deliver_skip_dispatch(context, lead: dict, driver: dict, *,
     except Exception as e:
         logger.warning("skip dispatch: could not arm auto-insurance: %s", e)
 
+    # Claim it FIRST. This used to run after the send, which meant a driver who
+    # had accepted a half-second earlier still got a second complete job ticket.
+    booked, held_by = await asyncio.to_thread(_book_delivery_against_driver, lead, driver)
+    if not booked and held_by:
+        logger.warning("skip dispatch: %s is already held by %s — refusing",
+                       lead.get("reference_id"), held_by)
+        if notify_chat_id:
+            try:
+                await context.bot.send_message(
+                    chat_id=notify_chat_id,
+                    text=(f"❌ <b>Already taken</b> — {html.escape(str(held_by), quote=False)} "
+                          f"has this one.\n📋 Ref: <code>{_ref_h}</code>"),
+                    parse_mode="HTML")
+            except Exception as e:
+                logger.warning("skip dispatch: could not report the clash: %s", e)
+        return False
+
     driver_cid = _parse_chat_id(driver.get("driver_telegram_id"))
     driver_ok = False
     if driver_cid:
@@ -1451,6 +1468,13 @@ async def _deliver_skip_dispatch(context, lead: dict, driver: dict, *,
             logger.error("skip dispatch: could not send to driver %s: %s", dname, e)
     else:
         logger.error("skip dispatch: driver %s has no chat id", dname)
+
+    if driver_ok:
+        # Whoever else was holding this offer must stop being able to work it.
+        try:
+            await _revoke_other_driver_offers(context, lead.get("id"), driver_cid)
+        except Exception as e:
+            logger.warning("skip dispatch: could not close the other offers: %s", e)
 
     # Then the usual audience, exactly the way an accepted lead reaches them.
     # mirror_supervisory only on the first, or every group re-posts to the same
@@ -1699,8 +1723,13 @@ async def _dispatch_instant_tag_lead(context, lead: dict, selected_drivers: list
             logger.warning("instant tag: could not record the offer to %s: %s",
                            d.get("driver_name"), e)
         try:
-            await context.bot.send_message(chat_id=cid, text=NL.join(body),
-                                           parse_mode="HTML", reply_markup=kb)
+            _offer = await context.bot.send_message(chat_id=cid, text=NL.join(body),
+                                                    parse_mode="HTML", reply_markup=kb)
+            # Without this the Instant Tag offer DMs were unreachable: nothing
+            # could take them back or mark them taken, so every driver kept a
+            # live Accept button for a job somebody else had already been given.
+            _remember_dispatch_message(context, str(lead.get("id")), cid,
+                                       getattr(_offer, "message_id", None))
             sent.append(str(d.get("driver_name") or "driver"))
             if d.get("id"):
                 sent_ids.append(str(d.get("id")))
@@ -3353,7 +3382,12 @@ async def _send_driver_requests_for_group(
             continue
         try:
             db.create_lead_assignment(lead["id"], driver["id"], group_id)
-            await context.bot.send_message(chat_id=cid, text=driver_request_message, parse_mode="Markdown", reply_markup=accept_keyboard)
+            _offer = await context.bot.send_message(chat_id=cid, text=driver_request_message, parse_mode="Markdown", reply_markup=accept_keyboard)
+            # Remembered so the winner's Accept can close this copy. Without it
+            # every driver on the team kept a live Accept button for a job that
+            # was already gone.
+            _remember_dispatch_message(context, str(lead["id"]), cid,
+                                       getattr(_offer, "message_id", None))
             assigned_count += 1
         except Exception as e:
             logger.error("Error sending driver request to %s: %s", driver.get("driver_name"), e)
@@ -17112,6 +17146,92 @@ async def handle_driver_word_answer(update: Update, context: ContextTypes.DEFAUL
     raise ApplicationHandlerStop
 
 
+def _book_delivery_against_driver(lead: dict, driver: dict) -> tuple:
+    """CLAIM this job for this driver. Returns (booked, held_by).
+
+    Two jobs in one, and the order matters. The accepted lead_assignments row is
+    both the receipt ledger AND the exclusive claim on a lead:
+
+      * the receipt debt and the suspension counter can only see accepted rows,
+        so a delivery that writes none is free work to them; and
+      * db.accept_lead_assignment refuses only when an accepted row already
+        exists -- so a hand-over that takes no row leaves every other driver's
+        Accept button still WORKING. That is how one lead was handed to two
+        drivers in full while the database showed no lead accepted twice.
+
+    held_by is the name of the driver who already holds it, when there is one.
+    Blocking; call it in a thread, and call it BEFORE handing anything over.
+    """
+    lead_id, driver_id = str(lead.get("id") or ""), str(driver.get("id") or "")
+    if not lead_id or not driver_id:
+        return False, None
+    held = db.get_lead_assignment_status(lead_id)   # accepted rows only
+    if held:
+        if str(held.get("driver_id") or "") == driver_id:
+            return True, None                       # already ours
+        who = str((held.get("driver") or {}).get("driver_name") or "another driver")
+        return False, who
+    try:
+        db.create_lead_assignment(lead_id, driver_id, lead.get("group_id"))
+    except Exception as e:
+        logger.warning("could not create the assignment for %s: %s", lead_id, e)
+    row = db.accept_lead_assignment(lead_id, driver_id)
+    if not row:
+        # Somebody won the race between the check above and this line.
+        held = db.get_lead_assignment_status(lead_id)
+        who = str((held or {}).get("driver", {}).get("driver_name") or "another driver")
+        return False, (who if held else None)
+    logger.info("booked %s against %s — claimed, and the receipt is now owed",
+                lead.get("reference_id"), driver.get("driver_name"))
+    return True, None
+
+
+async def _revoke_other_driver_offers(context, lead_id, winner_chat_id=None) -> int:
+    """Close every other driver's copy of this offer. Returns how many changed.
+
+    An accepted lead used to leave every losing driver holding a live-looking
+    offer: the reference, the delivery city and an Accept button that still
+    looked available. Two drivers would work the same job, and the one who lost
+    only found out by tapping. The database was never confused -- one accepted
+    row, always -- but nothing ever told the other chats.
+
+    Best effort by design: the message ids live in bot_data, so a restart
+    between the offer and the accept loses them, and Telegram refuses edits to
+    messages older than 48h. Neither is worth failing an acceptance over.
+    """
+    try:
+        book = context.application.bot_data.get(_DISPATCH_MSGS_KEY, {})
+        targets = list(book.get(str(lead_id), []))
+    except Exception as e:
+        logger.warning("could not read remembered offers for %s: %s", lead_id, e)
+        return 0
+    win = _norm_chat_id(winner_chat_id)
+    closed, seen = 0, set()
+    for cid, mid in targets:
+        chat = _parse_chat_id(cid) or cid
+        if win is not None and _norm_chat_id(chat) == win:
+            continue                      # the winner's own message says so already
+        key = (str(chat), int(mid))
+        if key in seen:
+            continue
+        seen.add(key)
+        try:
+            await context.bot.edit_message_text(
+                chat_id=chat, message_id=int(mid),
+                text=("❌ Taken by another driver.\n\n"
+                      "Turn on notifications 🔔 and check back — the next one "
+                      "goes to whoever answers first."),
+                reply_markup=_EMPTY_INLINE_KB,
+            )
+            closed += 1
+        except Exception as e:
+            # Already edited, too old, or deleted by the driver. Nothing to do.
+            logger.debug("could not close offer %s/%s: %s", chat, mid, e)
+    if closed:
+        logger.info("lead %s: closed %d other driver offer(s)", lead_id, closed)
+    return closed
+
+
 async def handle_accept_lead(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle driver accepting a lead."""
     query = update.callback_query
@@ -17268,6 +17388,12 @@ async def handle_accept_lead(update: Update, context: ContextTypes.DEFAULT_TYPE)
                 "✅ **You accepted this lead!**", parse_mode="Markdown")
         except Exception as e:
             logger.warning("could not confirm the acceptance to the driver: %s", e)
+
+    # The other drivers were holding the same offer with a live Accept button.
+    try:
+        await _revoke_other_driver_offers(context, lead_id, query.message.chat_id)
+    except Exception as e:
+        logger.warning("could not close the other offers for %s: %s", lead_id, e)
 
     if lead.get("instant_tag"):
         # An Instant Tag is paid for, not dispatched. Now that this driver has
