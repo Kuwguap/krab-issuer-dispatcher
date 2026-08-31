@@ -71,25 +71,29 @@ class TheOfferMessageReadsLikeTheTicketTest(unittest.TestCase):
         return body.split("\nasync def ", 1)[0]
 
     def test_the_lines_are_all_there_in_order(self):
-        """The cash-delivery alert, in the order the operator specified."""
+        """The cash-delivery offer, in the order the operator specified."""
         offer = self._offer()
-        needles = ["CASH DELIVERY ALERT", "Ref:", "_instant_tag_city_line",
-                   "Cash collection:", "Required prepay:", "Driver keeps:",
-                   "ACCEPT → GET YOUR PAYMENT LINK",
-                   "Address + client phone released after payment.",
-                   "Instant dispatch"]
+        needles = ["CASH DELIVERY - ", "DEPOSIT", "Ref:", "_instant_tag_city_line",
+                   "Receive client info immediately",
+                   "Client Name", "After Cash Payment Deposit",
+                   "cash from our client"]
         positions = [offer.index(n) for n in needles]
         self.assertEqual(positions, sorted(positions), needles)
 
-    def test_the_money_lines_are_dropped_when_the_amount_is_unknown(self):
-        """Without a prepay figure, a "driver keeps" number would be invented."""
+    def test_the_deposit_figure_comes_from_the_lead(self):
+        """"$100" hardcoded here was a guess that could differ from the price
+        the office set and from what Stripe would take."""
         offer = self._offer()
-        self.assertIn("if collect_label and cents:", offer)
+        self.assertIn("CASH DELIVERY - {amt_label} DEPOSIT", offer)
+        self.assertIn("_driver_amount_cents(lead)", offer)
 
-    def test_full_details_are_promised_after_payment_not_before(self):
+    def test_the_collection_figure_is_dropped_when_it_is_unknown(self):
         offer = self._offer()
-        self.assertIn("after payment", offer)
-        # The offer never prints the raw address or phone fields itself.
+        self.assertIn("if collect_label:", offer)
+
+    def test_the_offer_never_prints_the_address_or_phone(self):
+        """They are what the deposit buys."""
+        offer = self._offer()
         self.assertNotIn('lead.get("phone_number")', offer)
         self.assertNotIn("encrypted_link", offer)
 

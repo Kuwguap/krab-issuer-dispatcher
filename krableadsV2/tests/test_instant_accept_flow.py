@@ -81,13 +81,14 @@ class TheOfferIsAcceptOrDeclineOnlyTest(unittest.IsolatedAsyncioTestCase):
 
     async def test_the_money_lines_survive(self):
         text, _b, _db, _link = await self._dispatch()
-        for needle in ("CASH DELIVERY ALERT", "Cash collection:", "$250",
-                       "Required prepay:", "$200", "Driver keeps:", "$50"):
+        for needle in ("CASH DELIVERY - $200 DEPOSIT", "$250",
+                       "cash from our client"):
             self.assertIn(needle, text, needle)
 
     async def test_it_says_accept_gets_you_the_link(self):
         text, _b, _db, _link = await self._dispatch()
-        self.assertIn("ACCEPT → GET YOUR PAYMENT LINK", text)
+        self.assertIn("Receive client info immediately", text)
+        self.assertIn("After Cash Payment Deposit", text)
         self.assertNotIn("PAY $200 →", text)
 
     async def test_a_driver_who_cannot_be_reached_is_not_recorded_as_offered(self):
@@ -116,14 +117,16 @@ class AcceptingHandsOverTheLinkTest(unittest.IsolatedAsyncioTestCase):
             await bot._instant_tag_link_after_accept(ctx, _lead(), DRIVER)
         return ctx.bot.send_message
 
-    async def test_the_link_is_in_the_text_and_on_a_button(self):
+    async def test_the_link_itself_is_the_thing_that_opens(self):
+        """Accept was already the tap. A second button before the payment page
+        is one tap too many, and it hides the url where it cannot be copied."""
         send = await self._accept()
         kwargs = send.call_args.kwargs
-        self.assertIn("https://pay.test/abc", kwargs["text"],
-                      "a button alone cannot be copied or forwarded")
-        button = kwargs["reply_markup"].inline_keyboard[0][0]
-        self.assertEqual("https://pay.test/abc", button.url)
-        self.assertIn("$200", button.text)
+        self.assertIn("https://pay.test/abc", kwargs["text"])
+        self.assertIsNone(kwargs.get("reply_markup"),
+                          "no second button to press after accepting")
+        self.assertIn("CLICK HERE DEPOSIT CASH", kwargs["text"])
+        self.assertIn("CASH DELIVERY - $200 DEPOSIT", kwargs["text"])
 
     async def test_it_goes_to_the_driver(self):
         send = await self._accept()

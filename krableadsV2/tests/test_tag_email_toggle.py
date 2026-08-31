@@ -224,5 +224,85 @@ class ItIsWiredIntoTheTagSendTest(unittest.TestCase):
             self.assertIn(col, keys, col)
 
 
+class TheReleaseButtonHoldsTheClientsCopyTest(unittest.IsolatedAsyncioTestCase):
+    """Asked for: "don't send email immediately — add a release tag button on
+    one message, so once everything is confirmed the user can release it"."""
+
+    def _fn(self, name):
+        return SRC.split(f"async def {name}", 1)[1].split("\nasync def ", 1)[0]
+
+    def test_the_button_rides_with_the_tag_itself(self):
+        body = self._fn("_build_and_send_tag_pdf")
+        self.assertIn("_tag_email_keyboard(str(lead.get(\"id\")))", body)
+        self.assertIn("_lead_awaiting_tag_email(lead)", body)
+
+    def test_it_shows_only_while_the_client_still_needs_it(self):
+        for lead, want in (
+                ({"wants_tag_email": True, "email": "a@b.com"}, True),
+                ({"wants_tag_email": False, "email": "a@b.com"}, False),
+                ({"wants_tag_email": True, "email": ""}, False),
+                ({"wants_tag_email": True, "email": "a@b.com",
+                  "tag_emailed_at": "x"}, False),
+                ({"wants_tag_email": True, "email": "a@b.com",
+                  "tag_email_approved_at": "x"}, False)):
+            self.assertEqual(want, bot._lead_awaiting_tag_email(lead), lead)
+
+    def test_no_approver_configured_sends_no_email_at_all(self):
+        """The button is the gate; an address list is opt-in on top of it."""
+        body = self._fn("_maybe_email_tag_to_client")
+        i = body.index("if not approvers:")
+        self.assertIn("return", body[i:i + 500])
+
+    async def _press(self, lead, update_ok=True):
+        q = mock.MagicMock()
+        q.data = "tag_email_" + LEAD_ID
+        q.message.reply_text = mock.AsyncMock()
+        q.edit_message_reply_markup = mock.AsyncMock()
+        upd = mock.MagicMock(callback_query=q)
+        db = mock.MagicMock()
+        db.get_lead_by_id.return_value = lead
+        db.update_lead.return_value = update_ok
+        said = []
+
+        async def _ans(q_, text="", **k):
+            said.append(text)
+
+        with mock.patch.object(bot, "db", db), \
+                mock.patch.object(bot, "_safe_answer_callback_query", _ans):
+            await bot.handle_tag_email_to_client(upd, mock.MagicMock())
+        return db, " ".join(said)
+
+    async def test_pressing_it_records_the_release_not_a_send(self):
+        db, _said = await self._press(
+            {"id": LEAD_ID, "reference_id": "R1", "email": "a@b.com"})
+        (lead_id, patch), _ = db.update_lead.call_args
+        self.assertEqual(LEAD_ID, lead_id)
+        self.assertIn("tag_email_approved_at", patch)
+        self.assertNotIn("tag_emailed_at", patch,
+                         "the client has not been sent anything yet")
+
+    async def test_a_tag_already_sent_is_not_sent_again(self):
+        db, said = await self._press(
+            {"id": LEAD_ID, "email": "a@b.com", "tag_emailed_at": "yesterday"})
+        db.update_lead.assert_not_called()
+        self.assertIn("already", said.lower())
+
+    async def test_no_address_says_so(self):
+        db, said = await self._press({"id": LEAD_ID, "email": ""})
+        db.update_lead.assert_not_called()
+        self.assertIn("no email", said.lower())
+
+    async def test_an_un_migrated_database_says_so(self):
+        _db, said = await self._press(
+            {"id": LEAD_ID, "email": "a@b.com"}, update_ok=False)
+        self.assertIn("migration_tag_email", said)
+
+    def test_the_button_survives_a_redeploy(self):
+        """It lives in a group chat for days; anything conversation-scoped dies
+        on the next deploy."""
+        self.assertIn('CallbackQueryHandler(handle_tag_email_to_client, '
+                      'pattern=r"^tag_email_")', SRC)
+
+
 if __name__ == "__main__":
     unittest.main()

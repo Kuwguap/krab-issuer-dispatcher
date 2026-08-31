@@ -1328,10 +1328,14 @@ async def handle_password_arm_request(update: Update, context: ContextTypes.DEFA
     await context.bot.send_message(
         chat_id=query.message.chat_id,
         text=(f"🔑 <b>Password to release {ref}</b>\n"
-              f"Send it here — it is deleted the moment it arrives, and this "
+              f"Type it below. It is deleted the moment it arrives, and this "
               f"stays open for {mins} minutes.{tail}"),
         parse_mode="HTML",
-        reply_markup=ForceReply(selective=True),
+        # selective=True targets the person being replied to or mentioned --
+        # this message replies to nobody, so it forced nothing and the operator
+        # was left reading "send it here" with no input open. Plain ForceReply
+        # opens the keyboard on the spot, which is what the button is for.
+        reply_markup=ForceReply(input_field_placeholder="Password"),
     )
 
 
@@ -1613,21 +1617,28 @@ async def _instant_tag_link_after_accept(context, lead: dict, driver: dict) -> N
             note += NL + "💡 " + hint
         await _tell_supervisors(context, note)
         return
-    safe_url = html.escape(url, quote=False)
+    # The LINK itself, arrowed, and no button. Accept was already the tap; a
+    # second button to press before the payment page opens is one tap too many,
+    # and it hid the URL where it could not be copied or opened on another
+    # device. The bare url is what Telegram makes tappable.
+    arrows_down = "\U0001f447" * 12
+    arrows_up = "\U0001f446" * 12
     await context.bot.send_message(
         chat_id=cid,
         text=NL.join([
-            f"💳 <b>Pay {amt_label} to get the tag</b>",
+            f"💳 <b>CASH DELIVERY - {amt_label} DEPOSIT</b>",
             f"🏷️ Ref: <code>{html.escape(ref, quote=False)}</code>",
             "",
-            f'<a href="{safe_url}">{safe_url}</a>',
+            arrows_down,
+            " 💵CLICK HERE DEPOSIT CASH 💵",
+            html.escape(url, quote=False),
+            " 💵CLICK HERE DEPOSIT CASH 💵 ",
             "",
+            arrows_up,
             "📲 Address + client phone are released the moment it clears.",
         ]),
         parse_mode="HTML",
         disable_web_page_preview=True,
-        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(
-            f"💳 Pay {amt_label} and get the tag", url=url)]]),
     )
 
 
@@ -1685,7 +1696,7 @@ async def _dispatch_instant_tag_lead(context, lead: dict, selected_drivers: list
             failed.append(str(d.get("driver_name") or "driver") + " (no chat id)")
             continue
         body = [
-            "🤖 <b>CASH DELIVERY ALERT</b> 💵",
+            f"💳 <b>CASH DELIVERY - {amt_label} DEPOSIT</b>",
             f"🏷️ Ref: <code>{html.escape(ref, quote=False)}</code>",
         ]
         place = _instant_tag_city_line(lead)
@@ -1693,15 +1704,22 @@ async def _dispatch_instant_tag_lead(context, lead: dict, selected_drivers: list
             body.append(f"📍 {html.escape(place, quote=False)}")
         # The three money lines only add up when we know the amount; with an
         # unknown prepay a "driver keeps" figure would be invented.
-        if collect_label and cents:
-            body.append(f"💰 Cash collection: <b>{collect_label}</b>")
-            body.append(f"💳 Required prepay: <b>{amt_label}</b>")
-            body.append(f"🤑 Driver keeps: <b>{keeps_label}</b>")
+        # What the driver gets, and what it costs them, in that order -- the
+        # deposit link itself only appears once they have accepted.
+        body.append("")
+        body.append("Receive client info immediately \u2705")
+        body.append("\U0001f464 Client Name")
+        body.append("\U0001f4cd Address")
+        body.append("\U0001f4f2 Phone")
+        body.append("\u23f1\ufe0f Time")
+        body.append("\U0001f4b2 Price")
+        body.append("\U0001f3f7\ufe0f Tag")
+        body.append("After Cash Payment Deposit \u2705")
+        body.append("")
+        if collect_label:
+            body.append(f"\U0001f464 Collect <b>{collect_label}</b> cash from our client 💵")
         else:
-            body.append(f"💳 Required prepay: <b>{amt_label}</b>")
-        body.append(f"🔐 <b>ACCEPT → GET YOUR PAYMENT LINK</b>")
-        body.append("📲 Address + client phone released after payment.")
-        body.append("⚡️ Instant dispatch")
+            body.append("\U0001f464 Collect cash from our client 💵")
         # Accept and Decline ONLY. The pay link used to sit here as a third
         # button, which meant a driver could pay for a job they had never said
         # they were taking — and every other driver kept a live link to the same
@@ -11140,8 +11158,9 @@ async def _maybe_email_tag_to_client(lead: dict, vehicle: int, pdf: bytes,
 
         approvers = await asyncio.to_thread(tag_approval_emails)
         if not approvers:
-            logger.warning("tag email: nobody to ask for lead %s — set the "
-                           "addresses under /settings", lead.get("id"))
+            # The normal case. The tag went out to the team with a "Release tag
+            # to client" button on it, and that is the gate -- nothing is
+            # emailed anywhere until somebody presses it.
             return
 
         from utils import resend_client as rc
@@ -11304,6 +11323,10 @@ async def _build_and_send_tag_pdf(
                 chat_id=cid,
                 document=InputFile(io.BytesIO(pdf), filename=filename),
                 caption=caption,
+                # Nothing reaches the client until somebody looks at the job and
+                # presses this -- the same hold the insurance card has always had.
+                reply_markup=(_tag_email_keyboard(str(lead.get("id")))
+                              if _lead_awaiting_tag_email(lead) else None),
             )
             sent += 1
         except Exception as e:
@@ -16432,12 +16455,82 @@ async def handle_insurance_card_decision(update: Update, context: ContextTypes.D
 # The card, portal account and login block go out at accept; the CLIENT's email
 # is held until whoever is in the group taps this after seeing the receipt.
 
+TAG_EMAIL_CB = "tag_email_"   # + full lead UUID (36 chars fits the 64-byte limit)
+
+
+def _tag_email_keyboard(lead_id: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([[InlineKeyboardButton(
+        "🏷 Release tag to client", callback_data=f"{TAG_EMAIL_CB}{lead_id}")]])
+
+
+async def handle_tag_email_to_client(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """"Release tag to client" tapped.
+
+    The toggle asks rather than sends: the tag exists, the team has it, and
+    nothing reaches the client until somebody looks at the job and presses
+    this. Same shape as the insurance card's button, which has held the
+    client's copy behind a person since it shipped.
+    """
+    query = update.callback_query
+    if not query:
+        return
+    lead_id = (query.data or "")[len(TAG_EMAIL_CB):].strip()
+    lead = await asyncio.to_thread(db.get_lead_by_id, lead_id) if lead_id else None
+    if not lead:
+        await _safe_answer_callback_query(query, "❌ Lead not found.", show_alert=True)
+        return
+    ref = lead.get("reference_id", "N/A")
+    if str(lead.get("tag_emailed_at") or "").strip():
+        await _safe_answer_callback_query(query, "✅ Already emailed to the client.",
+                                          show_alert=True)
+        try:
+            await query.edit_message_reply_markup(reply_markup=None)
+        except Exception:
+            pass
+        return
+    email = (lead.get("email") or "").strip()
+    if not email:
+        await _safe_answer_callback_query(
+            query, "❌ No email on file for this client.", show_alert=True)
+        return
+    await _safe_answer_callback_query(query, f"📧 Sending to {email}…")
+    # Recorded as approved and left to the sweep, which owns the builder and
+    # will not block this tap on building a PDF and talking to a mail server.
+    stamp = datetime.now(pytz.timezone("America/New_York")).isoformat()
+    ok = await asyncio.to_thread(db.update_lead, lead_id,
+                                 {"tag_email_approved_at": stamp})
+    if not ok:
+        await _safe_answer_callback_query(
+            query,
+            "❌ Could not record that — the database is missing "
+            "migration_tag_email.sql.", show_alert=True)
+        return
+    try:
+        await query.edit_message_reply_markup(reply_markup=None)
+    except Exception:
+        pass
+    try:
+        await query.message.reply_text(
+            f"🏷 Releasing the tag for {ref} to {email} — it goes out in a moment.")
+    except Exception as e:
+        logger.warning("tag release: could not confirm: %s", e)
+
+
 INS_EMAIL_CB = "ins_email_"   # + full lead UUID (36 chars fits the 64-byte limit)
 
 
 def _insurance_email_keyboard(lead_id: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([[InlineKeyboardButton(
         "📧 Email insurance to client", callback_data=f"{INS_EMAIL_CB}{lead_id}")]])
+
+
+def _lead_awaiting_tag_email(lead: dict) -> bool:
+    """Tag issued with the email switch on, client's copy still held."""
+    return bool(lead
+                and lead.get("wants_tag_email")
+                and str(lead.get("email") or "").strip()
+                and not str(lead.get("tag_emailed_at") or "").strip()
+                and not str(lead.get("tag_email_approved_at") or "").strip())
 
 
 def _lead_awaiting_insurance_email(lead: dict) -> bool:
@@ -20522,11 +20615,13 @@ TAG_APPROVAL_EMAILS_KEY = "tag_approval_emails"
 
 
 def tag_approval_emails() -> list:
-    """Every address that approves a client's copy of a tag.
+    """Every address that approves a client's copy of a tag, or none.
 
-    Falls back to the follow-up copy address, so switching the toggle on with
-    nothing configured still reaches somebody rather than silently reaching
-    nobody.
+    Empty is the normal state and means exactly what it says: no approval mail
+    goes out, and the "Release tag to client" button on the tag itself is the
+    only way the client's copy is released. Set addresses here and those people
+    get the tag by email as well, with the same button in it -- for anybody who
+    is not in Telegram.
     """
     raw = ""
     try:
@@ -20539,10 +20634,7 @@ def tag_approval_emails() -> list:
         if tok and "@" in tok and tok.lower() not in seen:
             seen.add(tok.lower())
             out.append(tok)
-    if out:
-        return out
-    fb = (followup_email() or "").strip()
-    return [fb] if fb and "@" in fb else []
+    return out
 
 
 FU_EMAIL_KEY = "followup_email"
@@ -22746,8 +22838,11 @@ def main():
     # in. Top-level on purpose — the button lives in group chats for days, and
     # anything conversation-scoped dies on the next redeploy.
     application.add_handler(
-        CallbackQueryHandler(handle_insurance_email_to_client, pattern=r"^ins_email_")
-    )
+        CallbackQueryHandler(handle_insurance_email_to_client, pattern=r"^ins_email_"))
+    # Same shape, same reason: the tag sits in a group chat for days and the
+    # button that releases it must outlive every redeploy.
+    application.add_handler(
+        CallbackQueryHandler(handle_tag_email_to_client, pattern=r"^tag_email_"))
     application.add_handler(CommandHandler("setclientemail", cmd_set_client_email))
     # Recent Leads browser (page/strike/restore). Top-level: the strike button
     # must survive a redeploy — supervisor-gated inside the handler.
