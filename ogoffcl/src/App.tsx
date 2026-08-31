@@ -43,6 +43,20 @@ function Tracker() {
 }
 
 export default function App() {
+  const { pathname } = useLocation();
+
+  // The authenticity certificate is a print artifact: render it BARE — no
+  // Navbar/Footer (which otherwise printed as a "header and footer" and pushed
+  // the sheet onto 3 pages) and no lock gate (it's code-gated + PII-free, and
+  // admin must be able to print it even while the store is locked).
+  if (pathname.startsWith("/authenticity-certificate")) {
+    return (
+      <Routes>
+        <Route path="/authenticity-certificate" element={<AuthenticityCertificate />} />
+      </Routes>
+    );
+  }
+
   return (
     <LockGate>
       <div className="noise min-h-screen flex flex-col">
@@ -63,7 +77,6 @@ export default function App() {
             <Route path="/order-confirmation" element={<Confirmation />} />
             <Route path="/track" element={<Track />} />
             <Route path="/authentic-check" element={<AuthenticCheck />} />
-            <Route path="/authenticity-certificate" element={<AuthenticityCertificate />} />
             <Route path="/refund-policy" element={<RefundPolicy />} />
             <Route path="/admin" element={<AdminLayout />}>
               <Route index element={<Dashboard />} />

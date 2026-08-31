@@ -46,12 +46,19 @@ export default function AuthenticityCertificate() {
   return (
     <>
       <style>{`
-        @page{ size:A4; margin:0 }
-        @media print{ .noprint{ display:none !important } body{ background:#fff } .sheet{ box-shadow:none !important } }
-        html,body{ -webkit-print-color-adjust:exact; print-color-adjust:exact }
         @import url('https://fonts.googleapis.com/css2?family=Archivo+Black&family=Space+Grotesk:wght@400;500;600;700&display=swap');
+        @page{ size:A4; margin:0 }
+        html,body{ -webkit-print-color-adjust:exact; print-color-adjust:exact }
+        @media print{
+          html,body{ margin:0 !important; padding:0 !important; background:#fff !important }
+          .noprint{ display:none !important }
+          /* flatten the dark on-screen preview wrapper so ONLY the sheet prints,
+             on a single page (no stray 2nd/3rd page from padding/min-height) */
+          .cert-body{ background:#fff !important; padding:0 !important; margin:0 !important; min-height:0 !important; display:block !important }
+          .sheet{ box-shadow:none !important; margin:0 !important; width:210mm !important; min-height:0 !important; height:296mm !important; overflow:hidden !important; break-inside:avoid; page-break-inside:avoid }
+        }
       `}</style>
-      <div style={S.body as any}>
+      <div className="cert-body" style={S.body as any}>
         <div className="noprint" style={S.bar as any}>
           <a href="/admin/orders" style={{ color: "#C8FF00", fontFamily: '"Space Grotesk"', fontWeight: 600, fontSize: "13px", textDecoration: "none" }}>← Back to orders</a>
           <button style={S.btn as any} onClick={() => window.print()}>⎙ Print / Save PDF (A4)</button>
