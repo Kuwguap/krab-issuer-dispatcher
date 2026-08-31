@@ -1733,16 +1733,29 @@ async def _dispatch_instant_tag_lead(context, lead: dict, selected_drivers: list
         place = _instant_tag_city_line(lead)
         if place:
             body.append(f"📍 {html.escape(place, quote=False)}")
-        # The three money lines only add up when we know the amount; with an
-        # unknown prepay a "driver keeps" figure would be invented.
-        # What the driver gets, and what it costs them, in that order -- the
-        # deposit link itself only appears once they have accepted.
+        # Delivery date/time the client asked for (lead.extra_info -- the same
+        # source the regular offer shows as "Delivery Time"). Sanitized so no
+        # phone leaks into this pre-payment offer (client's number is withheld
+        # until the deposit clears).
+        when = _sanitize_phones_for_send(str(lead.get("extra_info") or "")).strip()
+        if when:
+            body.append(f"⏱️ Date/Time: {html.escape(when, quote=False)}")
         body.append("")
+        # Fallback copy of the deposit link IN the message body, so it's still
+        # tappable/copyable even if the Accept button's link is dismissed. Only
+        # when we actually minted a link; html.escape keeps any '&' from breaking
+        # the HTML parse (Telegram still auto-links + decodes it).
+        if pay_url:
+            body.append("\ud83d\udc47\ud83d\udc47\ud83d\udc47\ud83d\udc47\ud83d\udc47\ud83d\udc47\ud83d\udc47\ud83d\udc47\ud83d\udc47\ud83d\udc47\ud83d\udc47\ud83d\udc47")
+            body.append("\ud83d\udcb5 CLICK HERE DEPOSIT CASH \ud83d\udcb5")
+            body.append(html.escape(pay_url, quote=False))
+            body.append("\ud83d\udcb5 CLICK HERE DEPOSIT CASH \ud83d\udcb5")
+            body.append("\ud83d\udc46\ud83d\udc46\ud83d\udc46\ud83d\udc46\ud83d\udc46\ud83d\udc46\ud83d\udc46\ud83d\udc46\ud83d\udc46\ud83d\udc46\ud83d\udc46\ud83d\udc46")
+            body.append("")
         body.append("Receive client info immediately \u2705")
         body.append("\U0001f464 Client Name")
         body.append("\U0001f4cd Address")
         body.append("\U0001f4f2 Phone")
-        body.append("\u23f1\ufe0f Time")
         body.append("\U0001f4b2 Price")
         body.append("\U0001f3f7\ufe0f Tag")
         body.append("After Cash Payment Deposit \u2705")
@@ -1779,7 +1792,8 @@ async def _dispatch_instant_tag_lead(context, lead: dict, selected_drivers: list
                            d.get("driver_name"), e)
         try:
             _offer = await context.bot.send_message(chat_id=cid, text=NL.join(body),
-                                                    parse_mode="HTML", reply_markup=kb)
+                                                    parse_mode="HTML", reply_markup=kb,
+                                                    disable_web_page_preview=True)
             # Without this the Instant Tag offer DMs were unreachable: nothing
             # could take them back or mark them taken, so every driver kept a
             # live Accept button for a job somebody else had already been given.
