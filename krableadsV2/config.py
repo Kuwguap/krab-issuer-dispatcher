@@ -106,6 +106,14 @@ class Config:
     TWILIO_ACCOUNT_SID = (os.getenv("TWILIO_ACCOUNT_SID") or "").strip().lstrip("=") or None
     TWILIO_AUTH_TOKEN = (os.getenv("TWILIO_AUTH_TOKEN") or "").strip().lstrip("=") or None
     TWILIO_FROM_NUMBER = (os.getenv("TWILIO_FROM_NUMBER") or "").strip().lstrip("=") or None
+    # GoHighLevel / LeadConnector SMS — PREFERRED over Twilio when configured
+    # (texts go out through the agency's GHL sub-account number). Two auth styles;
+    # set whichever your GHL account uses:
+    #   V2 (recommended): GHL_PRIVATE_TOKEN + GHL_LOCATION_ID
+    #   V1 (legacy):      GHL_LOCATION_API_KEY
+    GHL_PRIVATE_TOKEN = (os.getenv("GHL_PRIVATE_TOKEN") or os.getenv("GHL_API_TOKEN") or "").strip().lstrip("=") or None
+    GHL_LOCATION_ID = (os.getenv("GHL_LOCATION_ID") or "").strip().lstrip("=") or None
+    GHL_LOCATION_API_KEY = (os.getenv("GHL_LOCATION_API_KEY") or os.getenv("GHL_API_KEY") or "").strip().lstrip("=") or None
     # Agency name + contact block used in client-facing follow-up texts/emails.
     FOLLOWUP_AGENCY_NAME = (os.getenv("FOLLOWUP_AGENCY_NAME") or "Tri State Coverage").strip()
     FOLLOWUP_WEBSITE = (os.getenv("FOLLOWUP_WEBSITE") or "Www.tristatetags.com").strip()
@@ -135,8 +143,18 @@ class Config:
 
     @classmethod
     def is_twilio_configured(cls) -> bool:
-        """True if the bot can text clients directly (follow-up chase SMS)."""
+        """True if the bot can text clients directly via Twilio."""
         return bool(cls.TWILIO_ACCOUNT_SID and cls.TWILIO_AUTH_TOKEN and cls.TWILIO_FROM_NUMBER)
+
+    @classmethod
+    def is_ghl_configured(cls) -> bool:
+        """True if GoHighLevel SMS is usable (V2 token+location, or V1 key)."""
+        return bool((cls.GHL_PRIVATE_TOKEN and cls.GHL_LOCATION_ID) or cls.GHL_LOCATION_API_KEY)
+
+    @classmethod
+    def is_sms_configured(cls) -> bool:
+        """True if the bot can text clients via GHL (preferred) or Twilio."""
+        return bool(cls.is_ghl_configured() or cls.is_twilio_configured())
 
     @classmethod
     def is_nj_configured(cls) -> bool:

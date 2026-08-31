@@ -135,15 +135,123 @@ def build_renewal_email(
     return subject, body
 
 
-def send_client_sms(to_phone: str | None, body: str) -> tuple[bool, Optional[str]]:
-    """Send an SMS via Twilio. Returns (ok, error). Skips cleanly when unconfigured."""
-    creds = _twilio_credentials()
-    if creds is None:
-        return False, "SMS not configured (TWILIO_ACCOUNT_SID/TWILIO_AUTH_TOKEN/TWILIO_FROM_NUMBER)."
+# ── GoHighLevel / LeadConnector SMS ─────────────────────────────────────────
+# Preferred provider when configured. GHL sends to a CONTACT, so we upsert the
+# contact by phone to get its id, then post an outbound SMS conversation message
+# (which goes out through the agency's GHL number). Two auth styles are read from
+# Config; set whichever the account uses:
+#   V2 (recommended): GHL_PRIVATE_TOKEN + GHL_LOCATION_ID
+#   V1 (legacy):      GHL_LOCATION_API_KEY
+_GHL_V2_BASE = "https://services.leadconnectorhq.com"
+_GHL_V1_BASE = "https://rest.gohighlevel.com/v1"
+
+
+def _ghl_config() -> Optional[tuple[str, str, Optional[str]]]:
+    """(mode, token, location_id) where mode is 'v2' or 'v1', else None."""
+    try:
+        from config import Config
+    except Exception:
+        Config = None  # type: ignore
+
+    def g(name: str) -> str:
+        v = getattr(Config, name, None) if Config is not None else None
+        return (v or "").strip()
+
+    v2_token = g("GHL_PRIVATE_TOKEN")
+    v2_loc = g("GHL_LOCATION_ID")
+    v1_key = g("GHL_LOCATION_API_KEY")
+    if v2_token and v2_loc:
+        return "v2", v2_token, v2_loc
+    if v1_key:
+        return "v1", v1_key, None
+    return None
+
+
+def ghl_configured() -> bool:
+    return _ghl_config() is not None
+
+
+def _ghl_send(to_phone: str | None, body: str) -> tuple[bool, Optional[str]]:
+    """Send an SMS through GoHighLevel. Returns (ok, error)."""
+    cfg = _ghl_config()
+    if cfg is None:
+        return False, "GHL not configured"
     to = normalize_us_phone(to_phone)
     if not to:
         return False, f"Phone number not SMS-able: {to_phone!r}"
-    sid, token, from_num = creds
+    mode, token, location_id = cfg
+    try:
+        if mode == "v2":
+            headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+            up = requests.post(
+                f"{_GHL_V2_BASE}/contacts/upsert",
+                json={"locationId": location_id, "phone": to},
+                headers={**headers, "Version": "2021-07-28"},
+                timeout=15,
+            )
+            if up.status_code >= 400:
+                return False, f"GHL upsert {up.status_code}: {up.text[:180]}"
+            contact = (up.json() or {}).get("contact") or {}
+            contact_id = contact.get("id")
+            if not contact_id:
+                return False, "GHL upsert returned no contact id"
+            msg = requests.post(
+                f"{_GHL_V2_BASE}/conversations/messages",
+                json={"type": "SMS", "contactId": contact_id, "message": body},
+                headers={**headers, "Version": "2021-04-15"},
+                timeout=15,
+            )
+            if msg.status_code >= 400:
+                return False, f"GHL send {msg.status_code}: {msg.text[:180]}"
+            return True, None
+        # V1 (legacy) — Location API Key, Bearer auth.
+        headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+        up = requests.post(f"{_GHL_V1_BASE}/contacts/", json={"phone": to}, headers=headers, timeout=15)
+        if up.status_code >= 400:
+            return False, f"GHL upsert {up.status_code}: {up.text[:180]}"
+        j = up.json() or {}
+        contact_id = (j.get("contact") or {}).get("id") or j.get("id")
+        if not contact_id:
+            return False, "GHL upsert returned no contact id"
+        msg = requests.post(
+            f"{_GHL_V1_BASE}/conversations/messages",
+            json={"type": "SMS", "contactId": contact_id, "message": body},
+            headers=headers,
+            timeout=15,
+        )
+        if msg.status_code >= 400:
+            return False, f"GHL send {msg.status_code}: {msg.text[:180]}"
+        return True, None
+    except Exception as e:  # pragma: no cover — network paths exercised in prod
+        logger.warning("GHL SMS send failed: %s", e)
+        return False, str(e)
+
+
+def send_client_sms(to_phone: str | None, body: str) -> tuple[bool, Optional[str]]:
+    """Send an SMS. Prefers GoHighLevel when configured, falls back to Twilio.
+
+    Returns (ok, error). Skips cleanly (ok=False) when no SMS provider is set.
+    """
+    ghl = _ghl_config()
+    twilio = _twilio_credentials()
+
+    if ghl is not None:
+        ok, err = _ghl_send(to_phone, body)
+        if ok:
+            return True, None
+        if twilio is None:
+            return False, err  # GHL is the only provider — surface its error
+        logger.warning("GHL SMS failed (%s); falling back to Twilio", err)
+
+    if twilio is None:
+        return False, (
+            "SMS not configured (set GHL_PRIVATE_TOKEN + GHL_LOCATION_ID, or "
+            "TWILIO_ACCOUNT_SID/TWILIO_AUTH_TOKEN/TWILIO_FROM_NUMBER)."
+        )
+    to = normalize_us_phone(to_phone)
+    if not to:
+        return False, f"Phone number not SMS-able: {to_phone!r}"
+    sid, token, from_num = twilio
     try:
         resp = requests.post(
             _TWILIO_SMS_URL.format(sid=sid),
@@ -247,4 +355,4 @@ def send_client_email(
 
 
 def sms_configured() -> bool:
-    return _twilio_credentials() is not None
+    return ghl_configured() or (_twilio_credentials() is not None)

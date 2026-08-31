@@ -10018,7 +10018,7 @@ async def handle_fu_menu_callback(update: Update, context: ContextTypes.DEFAULT_
             await query.answer("Add a phone or email first 📞📧", show_alert=True)
             return STATE_FU_MENU
         has_channel = (
-            (fu.get("phone_number") and Config.is_twilio_configured())
+            (fu.get("phone_number") and Config.is_sms_configured())
             or (fu.get("email") and Config.is_resend_configured())
         )
         if not has_channel:

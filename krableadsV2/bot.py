@@ -800,6 +800,20 @@ def _dashboard_base() -> str:
             or "https://tristatetags.com/backend").strip().rstrip("/")
 
 
+def _dashboard_api_base() -> str:
+    """Direct base for server-to-server dashboard API calls (instant checkout).
+
+    RECEIPT_PORTAL_BASE points at the public proxy (tristatetags.com/backend),
+    which only works while that Vercel /backend/* rewrite is deployed. The bot's
+    own API calls don't need the pretty public URL, so they hit the backend
+    directly and keep working even when the proxy is missing (which returned the
+    static SPA for POST /backend/api/instant/checkout — i.e. a 405, the "no
+    payment link" error on accept). Override with DASHBOARD_API_BASE."""
+    return (os.getenv("DASHBOARD_API_BASE")
+            or os.getenv("ADMIN_DASHBOARD_URL")
+            or "https://krab-issuer-admin.onrender.com").strip().rstrip("/")
+
+
 async def request_instant_pdf_link(lead_id, driver_id, reference_id="",
                                    amount_cents: Optional[int] = None) -> tuple:
     """(url, error). Asks the dashboard to open a Stripe Checkout session.
@@ -817,7 +831,7 @@ async def request_instant_pdf_link(lead_id, driver_id, reference_id="",
 
     def _post():
         return requests.post(
-            f"{_dashboard_base()}/api/instant/checkout",
+            f"{_dashboard_api_base()}/api/instant/checkout",
             json=payload,
             headers={"Authorization": f"Bearer {key}"},
             timeout=20,
@@ -20337,7 +20351,7 @@ async def handle_fu_menu_callback(update: Update, context: ContextTypes.DEFAULT_
             await query.answer("Add a phone or email first 📞📧", show_alert=True)
             return STATE_FU_MENU
         has_channel = (
-            (fu.get("phone_number") and Config.is_twilio_configured())
+            (fu.get("phone_number") and Config.is_sms_configured())
             or (fu.get("email") and Config.is_resend_configured())
         )
         if not has_channel:
