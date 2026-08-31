@@ -2237,11 +2237,15 @@ def _tagsend_deliver(lead: dict, vehicle: int = 1):
     from datetime import datetime, timezone
     stamp = datetime.now(timezone.utc).isoformat()
     try:
-        ok = db.update_lead(lead_id, {"tag_email_approved_at": stamp,
-                                      "tag_email_error": None})
+        r = (db.client.table("leads")
+             .update({"tag_email_approved_at": stamp, "tag_email_error": None})
+             .eq("id", lead_id).execute())
+        ok = bool(getattr(r, "data", None))
     except Exception as e:
+        # An un-migrated column answers 42703 here rather than silently dropping.
         logger.error("tagsend: could not record the approval for %s: %s", lead_id, e)
-        return False, "Could not record the approval."
+        return False, ("Could not record the approval — the database may be "
+                       "missing migration_tag_email.sql.")
     if not ok:
         return False, ("Could not record the approval — the database may be "
                        "missing migration_tag_email.sql.")
@@ -2295,6 +2299,7 @@ def tagsend_portal(token: str):
     The recipient is read from the lead row, never from the URL. The token
     vouches for a (lead, car) and nothing else.
     """
+    from flask import Response as _Resp
     pair = tagsend_from_token(token)
     if not pair:
         return _Resp(render_template_string(
@@ -2302,8 +2307,14 @@ def tagsend_portal(token: str):
             reference_id="", done=False,
             error="That link is not valid."), status=404)
     lead_id, vehicle = pair
+    # Queried straight off the client, the way the receipt portal does:
+    # AdminDatabase is a reporting wrapper and has no get_lead_by_id.
     try:
-        lead = db.get_lead_by_id(lead_id)
+        row = (db.client.table("leads")
+               .select("id, reference_id, email, vehicle_details, "
+                       "tag_emailed_at, tag_email_approved_at")
+               .eq("id", lead_id).limit(1).execute())
+        lead = (row.data or [None])[0]
     except Exception as e:
         logger.error("tagsend: lead lookup failed: %s", e)
         lead = None
