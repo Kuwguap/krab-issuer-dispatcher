@@ -304,5 +304,41 @@ class TheReleaseButtonHoldsTheClientsCopyTest(unittest.IsolatedAsyncioTestCase):
                       'pattern=r"^tag_email_")', SRC)
 
 
+class SayingItWorksTooTest(unittest.TestCase):
+    """"activate voice command for all new features" — the tag-email switch had
+    none, so it was the only one of the three that could not be spoken."""
+
+    def test_the_phrases_turn_it_on(self):
+        for said in ("email tag to client", "tag email on", "email the tag",
+                     "send tag to client", "mail the tag", "email tag",
+                     "turn on email tag"):
+            self.assertIs(True, bot._tag_email_intent(said), said)
+
+    def test_the_phrases_turn_it_off(self):
+        for said in ("tag email off", "no tag email", "dont email the tag",
+                     "email tag off"):
+            self.assertIs(False, bot._tag_email_intent(said), said)
+
+    def test_ordinary_text_is_not_a_switch(self):
+        for said in ("email now", "client email is a@b.com", "name Email Tagger",
+                     "", "   ", None):
+            self.assertIsNone(bot._tag_email_intent(said), said)
+
+    def test_it_never_collides_with_the_instant_switch(self):
+        for said in ("email tag to client", "tag email on"):
+            self.assertIsNone(bot._instant_intent(said), said)
+        for said in ("cash payment", "instant tag on", "prepay"):
+            self.assertIsNone(bot._tag_email_intent(said), said)
+
+    def test_the_review_card_acts_on_it(self):
+        body = SRC.split("async def handle_phase1_review_message", 1)[1]
+        body = body.split("\nasync def ", 1)[0]
+        self.assertIn("_tmail = _tag_email_intent(text)", body)
+        self.assertIn('state_data["wants_tag_email"] = _tmail', body)
+        # Same paste guard as the other two switches.
+        self.assertIn("if _tmail is not None and not _looks_like_multifield_block(text):",
+                      body)
+
+
 if __name__ == "__main__":
     unittest.main()

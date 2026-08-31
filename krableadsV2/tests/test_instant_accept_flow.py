@@ -88,7 +88,7 @@ class TheOfferIsAcceptOrDeclineOnlyTest(unittest.IsolatedAsyncioTestCase):
     async def test_it_says_accept_gets_you_the_link(self):
         text, _b, _db, _link = await self._dispatch()
         self.assertIn("Receive client info immediately", text)
-        self.assertIn("After Cash Payment Deposit", text)
+        self.assertIn("After Cash Deposit", text)
         self.assertNotIn("PAY $200 →", text)
 
     async def test_a_driver_who_cannot_be_reached_is_not_recorded_as_offered(self):
@@ -117,16 +117,30 @@ class AcceptingHandsOverTheLinkTest(unittest.IsolatedAsyncioTestCase):
             await bot._instant_tag_link_after_accept(ctx, _lead(), DRIVER)
         return ctx.bot.send_message
 
-    async def test_the_link_itself_is_the_thing_that_opens(self):
-        """Accept was already the tap. A second button before the payment page
-        is one tap too many, and it hides the url where it cannot be copied."""
+    async def test_the_link_is_in_the_text_AND_on_a_button(self):
+        """The bare url is what can be copied, forwarded, or opened on the
+        phone the driver actually pays from; the button is the single tap."""
         send = await self._accept()
         kwargs = send.call_args.kwargs
         self.assertIn("https://pay.test/abc", kwargs["text"])
-        self.assertIsNone(kwargs.get("reply_markup"),
-                          "no second button to press after accepting")
         self.assertIn("CLICK HERE DEPOSIT CASH", kwargs["text"])
         self.assertIn("CASH DELIVERY - $200 DEPOSIT", kwargs["text"])
+        button = kwargs["reply_markup"].inline_keyboard[0][0]
+        self.assertEqual("https://pay.test/abc", button.url)
+        self.assertIn("Pay $200", button.text)
+
+    async def test_it_says_what_the_deposit_buys(self):
+        send = await self._accept()
+        text = send.call_args.kwargs["text"]
+        for needle in ("Receive client info immediately", "Client Name",
+                       "After Cash Deposit", "cash from our client"):
+            self.assertIn(needle, text, needle)
+
+    def test_the_offer_and_the_accept_share_one_list(self):
+        """Two copies of this wording would eventually tell the driver two
+        different things about what the deposit buys."""
+        self.assertEqual(3, SRC.count("_instant_tag_what_you_get"),
+                         "expected the definition plus both callers")
 
     async def test_it_goes_to_the_driver(self):
         send = await self._accept()

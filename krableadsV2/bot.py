@@ -1584,6 +1584,29 @@ def _instant_tag_when_line(lead: dict) -> str:
     return f"{dt.strftime('%b')} {dt.day}, {clock}"
 
 
+def _instant_tag_what_you_get(collect_label: str = "") -> list:
+    """What the deposit buys, and what to collect.
+
+    One list, used by the offer AND by the message after Accept, so the two can
+    never drift into telling the driver different things.
+    """
+    out = [
+        "",
+        "Receive client info immediately ✅",
+        "\U0001f464 Client Name",
+        "\U0001f4cd Address",
+        "\U0001f4f2 Phone",
+        "\U0001f4b2 Price",
+        "\U0001f3f7️ Tag",
+        "After Cash Deposit ✅",
+        "",
+    ]
+    out.append(f"\U0001f464 Collect <b>{collect_label}</b> cash from our client 💵"
+               if collect_label else
+               "\U0001f464 Collect cash from our client 💵")
+    return out
+
+
 async def _instant_tag_link_after_accept(context, lead: dict, driver: dict) -> None:
     """The driver said yes; now give them the way to pay.
 
@@ -1635,24 +1658,34 @@ async def _instant_tag_link_after_accept(context, lead: dict, driver: dict) -> N
     # second button to press before the payment page opens is one tap too many,
     # and it hid the URL where it could not be copied or opened on another
     # device. The bare url is what Telegram makes tappable.
+    # The link as itself AND on a button. The bare url is what can be copied,
+    # forwarded, or opened on whichever phone the driver actually pays from;
+    # the button is the single tap for everyone else.
+    collect_label = ""
+    _collect = _price_amount_str(lead.get("price") or "")
+    if _collect:
+        try:
+            collect_label = f"${int(round(float(_collect)))}"
+        except ValueError:
+            collect_label = ""
     arrows_down = "\U0001f447" * 12
     arrows_up = "\U0001f446" * 12
-    await context.bot.send_message(
-        chat_id=cid,
-        text=NL.join([
-            f"💳 <b>CASH DELIVERY - {amt_label} DEPOSIT</b>",
-            f"🏷️ Ref: <code>{html.escape(ref, quote=False)}</code>",
-            "",
-            arrows_down,
-            " 💵CLICK HERE DEPOSIT CASH 💵",
-            html.escape(url, quote=False),
-            " 💵CLICK HERE DEPOSIT CASH 💵 ",
-            "",
-            arrows_up,
-            "📲 Address + client phone are released the moment it clears.",
-        ]),
+    lines = [
+        f"💳 <b>CASH DELIVERY - {amt_label} DEPOSIT</b>",
+        f"🏷️ Ref: <code>{html.escape(ref, quote=False)}</code>",
+        "",
+        arrows_down,
+        " 💵CLICK HERE DEPOSIT CASH 💵",
+        html.escape(url, quote=False),
+        " 💵CLICK HERE DEPOSIT CASH 💵 ",
+        arrows_up,
+    ] + _instant_tag_what_you_get(collect_label)
+    await _send_message_resiliently(
+        context, cid, NL.join(lines),
         parse_mode="HTML",
         disable_web_page_preview=True,
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(
+            f"💳 Pay {amt_label} and get the tag", url=url)]]),
     )
 
 
@@ -1676,15 +1709,19 @@ async def _dispatch_instant_tag_lead(context, lead: dict, selected_drivers: list
                                      by_user_id=None) -> None:
     """🤖 Instant Tag dispatch: the offer, and only the offer.
 
-    Every chosen driver gets Accept/Decline (all-drivers only when supervisors
-    switched it on). The Stripe deposit link lives INSIDE that driver's ✅ Accept
-    button, minted up front for them alone — tapping Accept opens payment on the
-    spot. The money is the approval: the first card to clear releases the tag
-    (the webhook stamps the payer, the sweep delivers like Skip Dispatch), and
-    the issuer can still release it with the Skip Dispatch password, armed here.
+    Every chosen driver gets Accept and Decline (all-drivers only when
+    supervisors switched it on), and NO deposit link. Accepting is what mints
+    that driver's link, for them alone, and it arrives in their chat with a
+    button under it.
 
-    If a driver's link can't be minted (checkout down), that driver's Accept
-    falls back to the callback flow, which mints the link when they tap it."""
+    The link used to be minted here for everybody. That let a driver pay for a
+    job they had never claimed, left every driver holding a live link to the
+    same tag, and — because each mint overwrites instant_pdf_driver_id — handed
+    the payment to whichever driver was asked last.
+
+    The first card to clear still releases the tag (the webhook stamps the
+    payer, the sweep delivers like Skip Dispatch), and the issuer can still
+    release it with the Skip Dispatch password, armed here."""
     ref = str(lead.get("reference_id") or "N/A")
     cents = _driver_amount_cents(lead)
     # No invented number: "$100" here was a guess that could differ from both
@@ -1706,22 +1743,11 @@ async def _dispatch_instant_tag_lead(context, lead: dict, selected_drivers: list
             pass
     sent, sent_ids, failed = [], [], []
 
-    # Mint each driver's Stripe deposit link UP FRONT so it can live INSIDE their
-    # ✅ Accept button — tapping Accept opens payment directly. Minted
-    # concurrently so a room full of drivers doesn't wait link-by-link; a mint
-    # that fails yields (None, err) and that driver falls back to callback Accept.
-    async def _mint_link(d):
-        try:
-            return await request_instant_pdf_link(
-                str(lead.get("id")), str((d or {}).get("id")), ref, amount_cents=cents)
-        except Exception as e:  # never let one bad mint sink the whole dispatch
-            return None, str(e)
-
-    _links = (await asyncio.gather(*[_mint_link(d) for d in selected_drivers])
-              if selected_drivers else [])
-
-    for d, link in zip((selected_drivers or []), _links):
-        pay_url, link_err = link if isinstance(link, tuple) else (None, "mint error")
+    # No checkout is minted here. A link in the offer means a driver can pay
+    # for a job they never claimed, every driver holds a live link to the SAME
+    # tag, and each mint overwrites instant_pdf_driver_id -- so the last driver
+    # asked owns the payment. Accepting is what mints the link, for that driver.
+    for d in (selected_drivers or []):
         cid = _parse_chat_id((d or {}).get("driver_telegram_id"))
         if cid is None:
             failed.append(str(d.get("driver_name") or "driver") + " (no chat id)")
@@ -1740,43 +1766,19 @@ async def _dispatch_instant_tag_lead(context, lead: dict, selected_drivers: list
         when = _sanitize_phones_for_send(str(lead.get("extra_info") or "")).strip()
         if when:
             body.append(f"⏱️ Date/Time: {html.escape(when, quote=False)}")
-        body.append("")
-        # Fallback copy of the deposit link IN the message body, so it's still
-        # tappable/copyable even if the Accept button's link is dismissed. Only
-        # when we actually minted a link; html.escape keeps any '&' from breaking
-        # the HTML parse (Telegram still auto-links + decodes it).
-        if pay_url:
-            body.append("\ud83d\udc47\ud83d\udc47\ud83d\udc47\ud83d\udc47\ud83d\udc47\ud83d\udc47\ud83d\udc47\ud83d\udc47\ud83d\udc47\ud83d\udc47\ud83d\udc47\ud83d\udc47")
-            body.append("\ud83d\udcb5 CLICK HERE DEPOSIT CASH \ud83d\udcb5")
-            body.append(html.escape(pay_url, quote=False))
-            body.append("\ud83d\udcb5 CLICK HERE DEPOSIT CASH \ud83d\udcb5")
-            body.append("\ud83d\udc46\ud83d\udc46\ud83d\udc46\ud83d\udc46\ud83d\udc46\ud83d\udc46\ud83d\udc46\ud83d\udc46\ud83d\udc46\ud83d\udc46\ud83d\udc46\ud83d\udc46")
-            body.append("")
-        body.append("Receive client info immediately \u2705")
-        body.append("\U0001f464 Client Name")
-        body.append("\U0001f4cd Address")
-        body.append("\U0001f4f2 Phone")
-        body.append("\U0001f4b2 Price")
-        body.append("\U0001f3f7\ufe0f Tag")
-        body.append("After Cash Payment Deposit \u2705")
-        body.append("")
-        if collect_label:
-            body.append(f"\U0001f464 Collect <b>{collect_label}</b> cash from our client 💵")
-        else:
-            body.append("\U0001f464 Collect cash from our client 💵")
-        # The Stripe deposit link lives INSIDE the Accept button: one tap opens
-        # payment. If the link couldn't be minted, fall back to the callback
-        # Accept (which mints it on tap) so the offer still works.
-        if pay_url:
-            accept_btn = InlineKeyboardButton("✅ Accept", url=pay_url)
-        else:
-            logger.warning("instant tag: no deposit link for %s (%s) — callback Accept fallback",
-                           d.get("driver_name"), link_err)
-            accept_btn = InlineKeyboardButton(
-                "✅ Accept", callback_data=f"accept_lead_{lead.get('id')}")
+        # The same list the message after Accept uses, so the two cannot drift.
+        body += _instant_tag_what_you_get(collect_label)
+        # Accept is a CALLBACK, never a url. A url button opens Stripe without
+        # telling the bot anything: no accepted lead_assignments row, so the
+        # lead is never claimed (every other driver's Accept keeps working) and
+        # the receipt debt behind the suspension quota is never booked. The
+        # asked-for flow is also this one -- accept, and the deposit link
+        # arrives in the chat.
         rows = [[
-            accept_btn,
-            InlineKeyboardButton("❌ Decline", callback_data=f"decline_lead_{lead.get('id')}"),
+            InlineKeyboardButton("✅ Accept",
+                                 callback_data=f"accept_lead_{lead.get('id')}"),
+            InlineKeyboardButton("❌ Decline",
+                                 callback_data=f"decline_lead_{lead.get('id')}"),
         ]]
         kb = InlineKeyboardMarkup(rows)
         # The row Accept needs. db.accept_lead_assignment can only UPDATE a row
@@ -1791,9 +1793,9 @@ async def _dispatch_instant_tag_lead(context, lead: dict, selected_drivers: list
             logger.warning("instant tag: could not record the offer to %s: %s",
                            d.get("driver_name"), e)
         try:
-            _offer = await context.bot.send_message(chat_id=cid, text=NL.join(body),
-                                                    parse_mode="HTML", reply_markup=kb,
-                                                    disable_web_page_preview=True)
+            _offer = await _send_message_resiliently(
+                context, cid, NL.join(body), parse_mode="HTML", reply_markup=kb,
+                disable_web_page_preview=True)
             # Without this the Instant Tag offer DMs were unreachable: nothing
             # could take them back or mark them taken, so every driver kept a
             # live Accept button for a job somebody else had already been given.
@@ -3467,7 +3469,9 @@ async def _send_driver_requests_for_group(
             continue
         try:
             db.create_lead_assignment(lead["id"], driver["id"], group_id)
-            _offer = await context.bot.send_message(chat_id=cid, text=driver_request_message, parse_mode="Markdown", reply_markup=accept_keyboard)
+            _offer = await _send_message_resiliently(
+                context, cid, driver_request_message, parse_mode="Markdown",
+                reply_markup=accept_keyboard)
             # Remembered so the winner's Accept can close this copy. Without it
             # every driver on the team kept a live Accept button for a job that
             # was already gone.
@@ -4949,6 +4953,42 @@ _ITAG_OFF_RE = re.compile(
     r"^\s*(?:turn\s+off\s+|switch\s+off\s+)?"
     r"(?:" + "|".join(re.escape(p) for p in sorted(_ITAG_OFF_PHRASES, key=len, reverse=True))
     + r")\s*[.!]*$", re.I)
+
+
+# Turning "email the tag to the client" on out loud, beside Instant Tag and
+# insurance. Whole-message match for the same reason: "email" inside a pasted
+# lead is a field, not a switch.
+_TAGMAIL_ON_PHRASES = (
+    "email tag to client", "email the tag to the client", "email tag", "tag email",
+    "tag email on", "email the tag", "email client the tag", "mail the tag",
+    "send tag to client", "send the tag to the client", "email tag on",
+    "email the client the tag", "tag to email", "emailtag",
+)
+_TAGMAIL_OFF_PHRASES = (
+    "tag email off", "no tag email", "email tag off", "no email tag",
+    "do not email the tag", "dont email the tag", "don't email the tag",
+    "no tag to email",
+)
+_TAGMAIL_ON_RE = re.compile(
+    r"^\s*(?:turn\s+on\s+|switch\s+on\s+|please\s+)?"
+    r"(?:" + "|".join(re.escape(p) for p in sorted(_TAGMAIL_ON_PHRASES, key=len, reverse=True))
+    + r")\s*(?:on|please)?\s*[.!]*$", re.I)
+_TAGMAIL_OFF_RE = re.compile(
+    r"^\s*(?:turn\s+off\s+|switch\s+off\s+)?"
+    r"(?:" + "|".join(re.escape(p) for p in sorted(_TAGMAIL_OFF_PHRASES, key=len, reverse=True))
+    + r")\s*[.!]*$", re.I)
+
+
+def _tag_email_intent(text: str):
+    """True = email the client their tag, False = don't, None = not about it."""
+    t = (text or "").strip()
+    if not t:
+        return None
+    if _TAGMAIL_OFF_RE.match(t):
+        return False
+    if _TAGMAIL_ON_RE.match(t):
+        return True
+    return None
 
 
 def _instant_intent(text: str):
@@ -8579,6 +8619,30 @@ async def handle_phase1_review_message(update: Update, context: ContextTypes.DEF
         if handled is not None:
             return handled
 
+    # 0a. "Email the tag to the client", said rather than tapped. Before the
+    #     instant-tag rule below only because neither can match the other.
+    _tmail = _tag_email_intent(text)
+    if _tmail is not None and not _looks_like_multifield_block(text):
+        state_data["wants_tag_email"] = _tmail
+        db.set_user_state(user_id, "phase1", state_data)
+        chat_id = update.effective_chat.id if update.effective_chat else message.chat_id
+        try:
+            await message.delete()
+        except Exception:
+            pass
+        await _cleanup_voice_echo(context, chat_id)
+        await _update_review_message_text(context, state_data)
+        if _tmail and not (state_data.get("email") or "").strip():
+            note = ("\U0001f4e7 Tag email on \u2014 no address on this lead yet. "
+                    "Send the client's email and it goes with the tag.")
+        elif _tmail:
+            note = ("\U0001f4e7 Tag email on \u2014 the tag is held behind a "
+                    "\U0001f3f7 Release button until somebody sends it.")
+        else:
+            note = "\U0001f4e7 Tag email off."
+        await _send_vanishing(context, chat_id, note, delay=10.0)
+        return STATE_AI_REVIEW
+
     # 0. Instant Tag on/off by voice/text ("cash payment", "prepay", "instant
     #    dispatch") — said out loud instead of tapped, which is how the issuer
     #    works while driving. Same guard as insurance below: a whole pasted lead
@@ -10887,6 +10951,43 @@ def _build_driver_resend_request_message(lead: dict) -> str:
     return driver_request_message
 
 
+async def _send_message_resiliently(context, chat_id, text, *, tries: int = 3,
+                                    **kwargs):
+    """context.bot.send_message, but a busy moment is not a failed delivery.
+
+    "Could not reach {driver}" was being reported for drivers who were perfectly
+    reachable: one 429 or one dropped connection and the send was abandoned,
+    the driver was listed as unreachable, and on the instant-tag path they were
+    dropped from the offer entirely.
+
+    RetryAfter is obeyed for exactly as long as Telegram asks. A timeout or a
+    dropped connection backs off briefly and tries again. A BadRequest is NOT
+    retried -- bad HTML, a blocked bot or a dead chat id will fail identically
+    every time, and retrying only delays the honest answer.
+
+    Returns the Message, or raises the last error once the tries are spent.
+    """
+    from telegram.error import TimedOut, NetworkError
+    last = None
+    for attempt in range(max(1, tries)):
+        try:
+            return await context.bot.send_message(chat_id=chat_id, text=text, **kwargs)
+        except RetryAfter as e:
+            last = e
+            wait_s = min(int(getattr(e, "retry_after", 1) or 1), 30)
+            logger.warning("send to %s rate-limited; waiting %ss (try %d/%d)",
+                           chat_id, wait_s, attempt + 1, tries)
+            await asyncio.sleep(wait_s)
+        except BadRequest:
+            raise                       # deterministic — say so now
+        except (TimedOut, NetworkError) as e:
+            last = e
+            logger.warning("send to %s failed transiently: %s (try %d/%d)",
+                           chat_id, e, attempt + 1, tries)
+            await asyncio.sleep(1.5 * (attempt + 1))
+    raise last if last else RuntimeError("send failed")
+
+
 async def _send_full_group_lead_to_chat(
     context: ContextTypes.DEFAULT_TYPE,
     group: dict,
@@ -10944,11 +11045,13 @@ async def _send_full_group_lead_to_chat(
     async def _post_one(target_cid, label: str) -> None:
         try:
             try:
-                await context.bot.send_message(chat_id=target_cid, text=full_html, parse_mode="HTML")
+                await _send_message_resiliently(context, target_cid, full_html,
+                                                parse_mode="HTML")
             except Exception as html_err:
                 logger.warning("Full lead HTML failed for %s: %s", label, html_err)
                 try:
-                    await context.bot.send_message(chat_id=target_cid, text=body, parse_mode="HTML")
+                    await _send_message_resiliently(context, target_cid, body,
+                                                    parse_mode="HTML")
                 except Exception as e2:
                     logger.error("Could not send full lead to %s (retry body fallback): %s", label, e2)
         except Exception as e:

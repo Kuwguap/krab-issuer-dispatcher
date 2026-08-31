@@ -337,7 +337,10 @@ class TheBotWorksWithNoApiAtAllTest(unittest.TestCase):
         consult the model itself — that would be a second network hop for the
         same message and a second take on an already-consumed parked slot."""
         src = (ROOT / "bot.py").read_text(encoding="utf-8")
-        review = src.split("async def handle_phase1_review_message", 1)[1][:12000]
+        # The whole function, not a fixed window: a 12000-char slice cut the
+        # tail off the moment anything was added above it.
+        review = src.split("async def handle_phase1_review_message", 1)[1]
+        review = review.split("\nasync def ", 1)[0]
         ai = review.index("_ai_review_command(")
         self.assertLess(review.index("_chat_layer_enabled()"), ai)
         self.assertLess(ai, review.index("_insurance_intent("))

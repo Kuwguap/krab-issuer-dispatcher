@@ -67,15 +67,22 @@ class TheOfferMessageReadsLikeTheTicketTest(unittest.TestCase):
     being told the terms."""
 
     def _offer(self):
+        """The dispatch plus the shared list it appends.
+
+        The offer's words live in _instant_tag_what_you_get so the message
+        after Accept says exactly the same thing.
+        """
         body = SRC.split("async def _dispatch_instant_tag_lead", 1)[1]
-        return body.split("\nasync def ", 1)[0]
+        body = body.split("\nasync def ", 1)[0]
+        shared = SRC.split("def _instant_tag_what_you_get", 1)[1]
+        return body + shared.split("\nasync def ", 1)[0]
 
     def test_the_lines_are_all_there_in_order(self):
         """The cash-delivery offer, in the order the operator specified."""
         offer = self._offer()
         needles = ["CASH DELIVERY - ", "DEPOSIT", "Ref:", "_instant_tag_city_line",
                    "Receive client info immediately",
-                   "Client Name", "After Cash Payment Deposit",
+                   "Client Name", "After Cash Deposit",
                    "cash from our client"]
         positions = [offer.index(n) for n in needles]
         self.assertEqual(positions, sorted(positions), needles)
@@ -89,7 +96,7 @@ class TheOfferMessageReadsLikeTheTicketTest(unittest.TestCase):
 
     def test_the_collection_figure_is_dropped_when_it_is_unknown(self):
         offer = self._offer()
-        self.assertIn("if collect_label:", offer)
+        self.assertIn("if collect_label else", offer)
 
     def test_the_offer_never_prints_the_address_or_phone(self):
         """They are what the deposit buys."""
