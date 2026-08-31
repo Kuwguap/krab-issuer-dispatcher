@@ -91,10 +91,11 @@ export default function Home() {
     const tagged = products.filter((p) => /nine\s*dragon|dynasty/i.test(p.name));
     return (tagged.length ? tagged : products.slice(0, 2)).slice(0, 3);
   }, [products]);
-  const dynastyHero = useMemo(
-    () => dynasty.find((p) => /nine\s*dragon/i.test(p.name)) || dynasty[0],
-    [dynasty],
-  );
+  const dynastyHero = useMemo(() => {
+    const nines = dynasty.filter((p) => /nine\s*dragon/i.test(p.name));
+    // prefer the WHITE colorway as the hero, then any Nine Dragons, then newest
+    return nines.find((p) => /white/i.test(p.name)) || nines[0] || dynasty[0];
+  }, [dynasty]);
 
   const catBySlug = (slug: string) => cats.find((c) => c.slug === slug);
   const previewFor = (slug: string | null) => {
@@ -262,18 +263,18 @@ export default function Home() {
             </Reveal>
 
             <div className="grid lg:grid-cols-[1.5fr_1fr] gap-4">
-              {/* hero — Nine Dragons */}
+              {/* hero — Nine Dragons (white), shown uncropped */}
               <Reveal>
-                <Link to={`/product/${dynastyHero.id}`} className="group block relative">
-                  <div className="aspect-[4/3] lg:aspect-[16/13] bg-bone overflow-hidden border border-ash group-hover:border-acid transition-colors">
+                <Link to={`/product/${dynastyHero.id}`} className="group block">
+                  <div className="relative aspect-[4/3] lg:aspect-[16/13] bg-bone overflow-hidden border border-ash group-hover:border-acid transition-colors">
                     <img src={firstImage(dynastyHero)} alt={dynastyHero.name} loading="lazy"
-                      className="w-full h-full object-cover mix-blend-multiply transition-transform duration-700 ease-out group-hover:scale-[1.04]" />
+                      className="w-full h-full object-contain mix-blend-multiply p-4 sm:p-6" />
+                    <span className="absolute top-4 left-4 bg-acid text-ink font-display uppercase text-[10px] tracking-[0.15em] px-3 py-1.5">
+                      The single · Nine Dragons
+                    </span>
                   </div>
-                  <span className="absolute top-4 left-4 bg-acid text-ink font-display uppercase text-[10px] tracking-[0.15em] px-3 py-1.5">
-                    The single · Nine Dragons
-                  </span>
-                  <div className="absolute inset-x-0 bottom-0 bg-gradient-to-t from-ink via-ink/70 to-transparent p-5 pt-20 flex items-end justify-between gap-3">
-                    <p className="font-display uppercase text-bone text-lg sm:text-2xl leading-tight">{dynastyHero.name}</p>
+                  <div className="flex items-center justify-between gap-3 border-x border-b border-ash bg-smoke/40 px-5 py-3.5 group-hover:border-acid transition-colors">
+                    <p className="font-display uppercase text-bone text-base sm:text-xl leading-tight truncate">{dynastyHero.name}</p>
                     <p className="text-acid font-display text-lg whitespace-nowrap">{money(Number(dynastyHero.price || 0))}</p>
                   </div>
                 </Link>

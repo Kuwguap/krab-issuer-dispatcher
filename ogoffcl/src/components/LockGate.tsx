@@ -61,6 +61,7 @@ export default function LockGate({ children }: { children: ReactNode }) {
   // when locked, /tournament* can stay live (admin's choice in Site & Mail)
   const [tournamentOpen, setTournamentOpen] = useState(false);
   const [videoUrl, setVideoUrl] = useState<string | null>(null);
+  const [vidReady, setVidReady] = useState(false);
   const loc = useLocation();
 
   useEffect(() => {
@@ -141,9 +142,10 @@ export default function LockGate({ children }: { children: ReactNode }) {
               <>
                 <video
                   key={videoUrl}
-                  className="fixed inset-0 w-full h-full object-cover pointer-events-none"
+                  className={`fixed inset-0 w-full h-full object-cover pointer-events-none transition-opacity duration-[1200ms] ease-out ${vidReady ? "opacity-100" : "opacity-0"}`}
                   src={videoUrl}
                   autoPlay muted loop playsInline preload="auto"
+                  onCanPlay={() => setVidReady(true)}
                   aria-hidden
                 />
                 <div className="fixed inset-0 bg-gradient-to-b from-ink/80 via-ink/55 to-ink/85 pointer-events-none" aria-hidden />
