@@ -1261,7 +1261,8 @@ async def handle_skip_dispatch_password(update: Update, context: ContextTypes.DE
 
     context.user_data.pop(SKIP_DISPATCH_PENDING_KEY, None)
     ok = await _deliver_skip_dispatch(context, lead, driver,
-                                      notify_chat_id=chat_id, how="password")
+                                      notify_chat_id=chat_id, how="password",
+                                      released_by=update.effective_user)
     if ok:
         await _stamp_released_without_payment(lead, driver_id)
     raise ApplicationHandlerStop
@@ -1317,13 +1318,25 @@ async def handle_skip_dispatch_release_pick(update: Update, context: ContextType
     context.user_data.pop(SKIP_DISPATCH_PENDING_KEY, None)
     ok = await _deliver_skip_dispatch(context, lead, driver,
                                       notify_chat_id=query.message.chat_id,
-                                      how="password")
+                                      how="password",
+                                      released_by=query.from_user)
     if ok:
         await _stamp_released_without_payment(lead, driver_id)
 
 
+def _acting_user_label(user) -> str:
+    """@handle for a Telegram user, or their name when they have no username."""
+    if user is None:
+        return "someone"
+    handle = (getattr(user, "username", "") or "").strip()
+    if handle:
+        return "@" + handle
+    return (getattr(user, "full_name", "") or "").strip() or "someone"
+
+
 async def _deliver_skip_dispatch(context, lead: dict, driver: dict, *,
-                                 notify_chat_id=None, how: str = "password") -> bool:
+                                 notify_chat_id=None, how: str = "password",
+                                 released_by=None) -> bool:
     """The send itself: the driver first, then every group and supervisory chat.
 
     The driver is treated as a delivery target of the same shape as a group, so
@@ -1335,6 +1348,8 @@ async def _deliver_skip_dispatch(context, lead: dict, driver: dict, *,
     ref = str(lead.get("reference_id") or "N/A")
     dname = str(driver.get("driver_name") or "driver")
     label = f"SKIP DISPATCH — {dname}" + ("" if how == "password" else " (PAID)")
+    _ref_h = html.escape(ref, quote=False)
+    _dname_h = html.escape(dname, quote=False)
 
     # Like the main accept path: no insurer detected means TriState covers it —
     # arm the ride-along so the card + portal go out with the tag below. The
@@ -1409,6 +1424,18 @@ async def _deliver_skip_dispatch(context, lead: dict, driver: dict, *,
                                            parse_mode="HTML")
         except Exception as e:
             logger.warning("skip dispatch: could not confirm to the operator: %s", e)
+
+    # A tag that left without a card is the one event every supervisor should
+    # see, whoever released it -- including a supervisor releasing their own.
+    if driver_ok:
+        if how == "password":
+            note = (f"🤖 Instant tag released to <b>{_dname_h}</b> "
+                    f"by {html.escape(_acting_user_label(released_by), quote=False)}"
+                    f"\n📋 Ref: <code>{_ref_h}</code>")
+        else:
+            note = (f"🤖 Instant tag paid by <b>{_dname_h}</b>"
+                    f"\n📋 Ref: <code>{_ref_h}</code>")
+        await _tell_supervisors(context, note)
     return driver_ok
 
 
@@ -1448,14 +1475,99 @@ def _instant_tag_when_line(lead: dict) -> str:
     return f"{dt.strftime('%b')} {dt.day}, {clock}"
 
 
+async def _instant_tag_link_after_accept(context, lead: dict, driver: dict) -> None:
+    """The driver said yes; now give them the way to pay.
+
+    Sent as a fresh message rather than an edit of the offer, so the job details
+    stay on screen above it. The URL is in the text AND on a button: a button
+    alone cannot be copied, forwarded, or opened on a second device.
+    """
+    cid = _parse_chat_id(driver.get("driver_telegram_id"))
+    if cid is None:
+        return
+    ref = str(lead.get("reference_id") or "N/A")
+    cents = _driver_amount_cents(lead)
+    amt_label = f"${cents // 100}" if cents else "the agreed amount"
+    url, err = await request_instant_pdf_link(
+        str(lead.get("id")), str(driver.get("id")), ref, amount_cents=cents)
+    if not url:
+        logger.error("instant tag: no pay link on accept for lead %s driver %s — %s",
+                     lead.get("id"), driver.get("id"), err)
+        low = str(err or "").lower()
+        # Named explicitly: the office otherwise reads "no payment link" as an
+        # API-key problem and re-checks a key that was never wrong.
+        hint = ""
+        if "unauthor" in low:
+            hint = ("the bot's INTEGRATIONS_API_KEY does not match the admin "
+                    "dashboard's — set the same value on both Render services")
+        elif "stripe" in low:
+            hint = ("STRIPE_SECRET_KEY is not set on krab-issuer-admin — "
+                    "no checkout can be created until it is")
+        if "already paid" in low:
+            await context.bot.send_message(
+                chat_id=cid,
+                text="✅ This tag is already paid for — it is on its way to you.")
+            return
+        await context.bot.send_message(
+            chat_id=cid,
+            text=("⚠️ You have the job, but the payment page could not be opened.\n"
+                  "The office has been told — they can release the tag to you."))
+        # Every interpolation escaped: this goes out with parse_mode="HTML",
+        # and one "&" in a driver's name would suppress the whole alert.
+        _dn = html.escape(str(driver.get("driver_name") or "a driver"), quote=False)
+        note = (f"⚠️ Instant Tag {html.escape(ref, quote=False)}: {_dn} accepted "
+                f"but no payment link could be created "
+                f"({html.escape(str(err or 'unknown'), quote=False)}).")
+        if hint:
+            note += NL + "💡 " + hint
+        await _tell_supervisors(context, note)
+        return
+    safe_url = html.escape(url, quote=False)
+    await context.bot.send_message(
+        chat_id=cid,
+        text=NL.join([
+            f"💳 <b>Pay {amt_label} to get the tag</b>",
+            f"🏷️ Ref: <code>{html.escape(ref, quote=False)}</code>",
+            "",
+            f'<a href="{safe_url}">{safe_url}</a>',
+            "",
+            "📲 Address + client phone are released the moment it clears.",
+        ]),
+        parse_mode="HTML",
+        disable_web_page_preview=True,
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(
+            f"💳 Pay {amt_label} and get the tag", url=url)]]),
+    )
+
+
+async def _tell_supervisors(context, text: str, *, skip=None) -> None:
+    """One line to every supervisor. Best effort — never fails a caller."""
+    seen = set()
+    for sid in _global_supervisory_chat_ids():
+        key = _norm_chat_id(sid)
+        if key is None or key in seen or (skip is not None and key == _norm_chat_id(skip)):
+            continue
+        seen.add(key)
+        try:
+            await context.bot.send_message(chat_id=sid, text=text, parse_mode="HTML",
+                                           disable_web_page_preview=True)
+        except Exception as e:
+            logger.warning("could not tell supervisor %s: %s", sid, e)
+
+
 async def _dispatch_instant_tag_lead(context, lead: dict, selected_drivers: list,
                                      *, notify_chat_id=None, user_data=None,
                                      by_user_id=None) -> None:
-    """🤖 Instant Tag dispatch: no Accept/Decline round. Every chosen driver
-    gets a payment link for the AMOUNT (all-drivers only when supervisors
-    switched it on); the first card to clear releases the tag automatically
-    (webhook stamps the payer, the sweep delivers like Skip Dispatch). The
-    issuer can also release it with the Skip Dispatch password, armed here."""
+    """🤖 Instant Tag dispatch: the offer, and only the offer.
+
+    Every chosen driver gets Accept/Decline (all-drivers only when supervisors
+    switched it on). Accepting is what mints that driver's payment link -- the
+    link used to ride along here, which meant a driver could pay for a job they
+    had never claimed, and every other driver kept a live link to the same tag.
+
+    The first card to clear still releases the tag (webhook stamps the payer,
+    the sweep delivers like Skip Dispatch), and the issuer can still release it
+    with the Skip Dispatch password, armed here."""
     ref = str(lead.get("reference_id") or "N/A")
     cents = _driver_amount_cents(lead)
     # No invented number: "$100" here was a guess that could differ from both
@@ -1476,16 +1588,11 @@ async def _dispatch_instant_tag_lead(context, lead: dict, selected_drivers: list
         except ValueError:
             pass
     sent, sent_ids, failed = [], [], []
-    # Why the pay link could not be made, once — the drivers must not be shown
-    # config detail, but whoever dispatched needs to know it is broken.
-    link_error = None
     for d in (selected_drivers or []):
         cid = _parse_chat_id((d or {}).get("driver_telegram_id"))
         if cid is None:
             failed.append(str(d.get("driver_name") or "driver") + " (no chat id)")
             continue
-        url, err = await request_instant_pdf_link(
-            str(lead.get("id")), str(d.get("id")), ref, amount_cents=cents)
         body = [
             "🤖 <b>CASH DELIVERY ALERT</b> 💵",
             f"🏷️ Ref: <code>{html.escape(ref, quote=False)}</code>",
@@ -1501,31 +1608,29 @@ async def _dispatch_instant_tag_lead(context, lead: dict, selected_drivers: list
             body.append(f"🤑 Driver keeps: <b>{keeps_label}</b>")
         else:
             body.append(f"💳 Required prepay: <b>{amt_label}</b>")
-        body.append(f"🔐 <b>PAY {amt_label} → GET DELIVERY DETAILS</b>")
+        body.append(f"🔐 <b>ACCEPT → GET YOUR PAYMENT LINK</b>")
         body.append("📲 Address + client phone released after payment.")
         body.append("⚡️ Instant dispatch")
-        # Accept / Decline alongside the pay link. Paying is still what releases
-        # the tag, but a driver who cannot pay this second needs a way to say
-        # "mine, hold on" — and one who cannot take it at all needs a way to say
-        # so instead of the offer sitting unanswered.
-        rows = []
-        if url:
-            rows.append([InlineKeyboardButton(
-                f"💳 Pay {amt_label} and get the tag", url=url)])
-        else:
-            # The raw reason is config detail; drivers get the plain fact and
-            # the office gets the cause in the log and in the summary below.
-            logger.error(
-                "instant tag: no pay link for lead %s driver %s — %s",
-                lead.get("id"), d.get("id"), err,
-            )
-            link_error = link_error or str(err or "unknown")
-            body.append("<i>Payment page unavailable — the office has been told.</i>")
-        rows.append([
+        # Accept and Decline ONLY. The pay link used to sit here as a third
+        # button, which meant a driver could pay for a job they had never said
+        # they were taking — and every other driver kept a live link to the same
+        # tag. The link is now minted when this driver accepts, for them alone.
+        rows = [[
             InlineKeyboardButton("✅ Accept", callback_data=f"accept_lead_{lead.get('id')}"),
             InlineKeyboardButton("❌ Decline", callback_data=f"decline_lead_{lead.get('id')}"),
-        ])
+        ]]
         kb = InlineKeyboardMarkup(rows)
+        # The row Accept needs. db.accept_lead_assignment can only UPDATE a row
+        # that already exists, and this dispatch never wrote one -- which is why
+        # tapping Accept on an Instant Tag answered "Error accepting lead" and
+        # took the whole offer away with it.
+        try:
+            await asyncio.to_thread(db.create_lead_assignment,
+                                    str(lead.get("id")), str(d.get("id")),
+                                    lead.get("group_id"))
+        except Exception as e:
+            logger.warning("instant tag: could not record the offer to %s: %s",
+                           d.get("driver_name"), e)
         try:
             await context.bot.send_message(chat_id=cid, text=NL.join(body),
                                            parse_mode="HTML", reply_markup=kb)
@@ -1562,25 +1667,9 @@ async def _dispatch_instant_tag_lead(context, lead: dict, selected_drivers: list
         lines = [f"🤖 <b>Instant Tag — {html.escape(ref, quote=False)}</b>",
                  f"💵 Amount: {amt_label}"]
         if sent:
-            lines.append("📨 Payment link sent to: " + html.escape(", ".join(sent), quote=False))
+            lines.append("📨 Offered to: " + html.escape(", ".join(sent), quote=False))
         if failed:
             lines.append("⚠️ Could not reach: " + html.escape(", ".join(failed), quote=False))
-        if link_error:
-            low = link_error.lower()
-            hint = ""
-            if "unauthor" in low:
-                hint = ("the bot's INTEGRATIONS_API_KEY does not match the admin "
-                        "dashboard's — set the same value on both Render services")
-            elif "stripe" in low:
-                # The card reader itself is missing. Named explicitly because the
-                # office otherwise reads "no payment link" as the key problem
-                # again and re-checks a key that was never wrong.
-                hint = ("STRIPE_SECRET_KEY is not set on krab-issuer-admin — "
-                        "no checkout can be created until it is")
-            msg = "⚠️ No payment link: " + html.escape(link_error, quote=False)
-            if hint:
-                msg += NL + "💡 " + hint
-            lines.append(msg)
         if arm_release:
             lines.append(
                 "🔑 Or reply here with the password to release it without payment."
@@ -1707,9 +1796,19 @@ async def advance_timed_statuses(context: ContextTypes.DEFAULT_TYPE) -> None:
     try:
         # BOTH accept paths (the two-accepts race stores its timestamp in two
         # different tables) plus instant payments.
+        # An Instant Tag now HAS an accepted_at -- Accept had to start writing
+        # one for the button to work at all. Accepting it is not delivering it,
+        # though: its clock is instant_pdf_paid_at, added below. Without this the
+        # board would report "Tag printed" and "Driver on the way" for a tag
+        # still waiting to be paid for.
+        unpaid_instant = await asyncio.to_thread(db.get_unpaid_instant_lead_ids)
         for row in await asyncio.to_thread(db.get_recently_accepted_leads):
+            if str(row.get("lead_id") or "") in unpaid_instant:
+                continue
             pairs.append((str(row.get("lead_id") or ""), _when(row.get("accepted_at"))))
         for row in await asyncio.to_thread(db.get_recently_group_accepted_leads):
+            if str(row.get("lead_id") or "") in unpaid_instant:
+                continue
             pairs.append((str(row.get("lead_id") or ""), _when(row.get("accepted_at"))))
         for row in await asyncio.to_thread(db.get_recently_paid_instant_leads):
             pairs.append((str(row.get("id") or ""), _when(row.get("instant_pdf_paid_at"))))
@@ -16957,7 +17056,37 @@ async def handle_accept_lead(update: Update, context: ContextTypes.DEFAULT_TYPE)
         )
         return
 
+    # A tag that has already been paid for or released is finished. Without
+    # this, a second driver tapping Accept took over instant_pdf_driver_id and
+    # was told the tag was "on its way to you" -- for a job somebody else had
+    # already been sent.
+    if lead.get("instant_tag") and (
+            str(lead.get("instant_pdf_delivered_at") or "").strip()
+            or str(lead.get("instant_pdf_paid_at") or "").strip()):
+        await query.message.edit_text(
+            "❌ **This one is already settled** — it has been paid for or released.",
+            parse_mode="Markdown",
+            reply_markup=_EMPTY_INLINE_KB,
+        )
+        return
+
     accepted_row = db.accept_lead_assignment(lead_id, driver['id'])
+
+    if not accepted_row and lead.get("instant_tag"):
+        # Instant Tag offers made before this build recorded no lead_assignments
+        # row, and accept_lead_assignment can only UPDATE one that exists -- so
+        # every Accept on them answered "Error accepting lead" and took the offer
+        # away with it. Write the row this driver's offer should have had, once,
+        # and let the normal path continue. Only reachable by someone who was
+        # actually sent the offer: the button lives in their chat.
+        if not db.get_lead_assignment_status(lead_id):
+            created = await asyncio.to_thread(
+                db.create_lead_assignment, lead_id, str(driver["id"]),
+                lead.get("group_id"))
+            if created:
+                logger.info("instant tag: back-filled the offer row for lead %s driver %s",
+                            lead_id, driver.get("id"))
+                accepted_row = db.accept_lead_assignment(lead_id, driver['id'])
 
     if not accepted_row:
         st = db.get_lead_assignment_status(lead_id)
@@ -17059,16 +17188,28 @@ async def handle_accept_lead(update: Update, context: ContextTypes.DEFAULT_TYPE)
                 "✅ **You accepted this lead!**", parse_mode="Markdown")
         except Exception as e:
             logger.warning("could not confirm the acceptance to the driver: %s", e)
-    # Location gate: with tracking configured, the driver gets the tracking
-    # link now and the full details only after their location ping arrives.
-    await _start_tracking_gate_or_send_details(
-        context,
-        kind="lead",
-        lead=lead,
-        driver_id=str(driver.get("id")) if driver.get("id") else None,
-        driver_name=driver.get("driver_name"),
-        chat_id=query.message.chat_id,
-    )
+
+    if lead.get("instant_tag"):
+        # An Instant Tag is paid for, not dispatched. Now that this driver has
+        # actually claimed it, mint the checkout for them -- and DON'T send the
+        # details: the address and the client's phone are exactly what the
+        # payment buys. Everything after this point (renewal, notices) still runs.
+        try:
+            await _instant_tag_link_after_accept(context, lead, driver)
+        except Exception as e:
+            logger.error("instant tag: could not hand over the pay link for %s: %s",
+                         lead.get("reference_id"), e)
+    else:
+        # Location gate: with tracking configured, the driver gets the tracking
+        # link now and the full details only after their location ping arrives.
+        await _start_tracking_gate_or_send_details(
+            context,
+            kind="lead",
+            lead=lead,
+            driver_id=str(driver.get("id")) if driver.get("id") else None,
+            driver_name=driver.get("driver_name"),
+            chat_id=query.message.chat_id,
+        )
 
     # Issuer summary + supervisory "new lead" — before optional receipt strike / group posts so they always run
     lead = db.get_lead_by_id(lead_id) or lead
@@ -17178,7 +17319,20 @@ async def handle_accept_lead(update: Update, context: ContextTypes.DEFAULT_TYPE)
         except Exception as e:
             logger.warning("Could not check group offers for %s, sending tag anyway: %s",
                            lead_id, e)
-        if offered_to_a_team:
+        if lead.get("instant_tag"):
+            # On an Instant Tag the tag IS the product being sold, and Accept is
+            # only a claim on it. It leaves exactly two ways -- a card clearing
+            # (deliver_paid_instant_pdfs) or a supervisor typing the password --
+            # both of which go through _deliver_skip_dispatch.
+            #
+            # This branch exists because making Accept work at all made the rest
+            # of this block reachable for instant leads for the first time: it
+            # would have posted the PDF to the group, emailed it to the client,
+            # issued the insurance and stamped the lead "tag issued", all before
+            # a cent was paid.
+            logger.info("Lead %s is an Instant Tag: the tag waits for payment or a "
+                        "password release, not this Accept.", lead_id)
+        elif offered_to_a_team:
             logger.info("Lead %s was offered to a team; their Accept releases the tag, "
                         "not this driver's.", lead_id)
         else:
@@ -17392,12 +17546,14 @@ async def handle_accept_group_offer(update: Update, context: ContextTypes.DEFAUL
         accepted_group = db.get_group_by_id(win_gid) if win_gid else None
         gname = accepted_group.get("group_name") if accepted_group else "another group"
         ref_show = lead.get("reference_id", "N/A")
-        # "Accepted by" line should show the team member who actually tapped
-        # the button (not the lead creator).
+        # "Lead by" is the person who WROTE the lead (leads.user_id), not the
+        # team member who tapped Accept -- the line above already says who
+        # accepted it. The old label said "Issuer" and showed the acceptor.
         acceptor_handle = (query.from_user.username or "").strip() or (
             query.from_user.full_name or "Unknown"
         )
         acceptor_esc = _telegram_md1_escape(acceptor_handle)
+        lead_by_esc = _telegram_md1_escape(_lead_issuer_display_from_lead(lead or {}))
         for o in db.get_group_lead_offers(lead_id):
             ocid = _parse_chat_id(o.get("group_chat_id"))
             mid = o.get("group_message_id")
@@ -17411,8 +17567,8 @@ async def handle_accept_group_offer(update: Update, context: ContextTypes.DEFAUL
                         message_id=int(mid),
                         text=(
                             f"✅ **Accepted by {gname}**\n"
-                            f"Issuer: @{acceptor_esc}\n"
-                            f"Reference ID: `{ref_show}`"
+                            f"👤Lead by: {lead_by_esc}\n"
+                            f"📋Reference ID: `{ref_show}`"
                         ),
                         parse_mode="Markdown",
                         reply_markup=_EMPTY_INLINE_KB,
@@ -17460,6 +17616,10 @@ async def handle_accept_group_offer(update: Update, context: ContextTypes.DEFAUL
         query.from_user.full_name or "Unknown"
     )
     acceptor_esc = _telegram_md1_escape(acceptor_handle)
+    # "Lead by" is the person who WROTE the lead (leads.user_id). The line above
+    # already says who accepted it, so repeating the acceptor there -- which is
+    # what the old "Issuer:" label actually did -- said nothing twice.
+    lead_by_esc = _telegram_md1_escape(_lead_issuer_display_from_lead(lead or {}))
     accepted_by_label = f"{winner_name} (@{acceptor_handle})"
 
     # Update all group offer messages to reflect taken/accepted
@@ -17477,8 +17637,8 @@ async def handle_accept_group_offer(update: Update, context: ContextTypes.DEFAUL
                     message_id=int(mid),
                     text=(
                         f"✅ **Accepted by {winner_name}**\n"
-                        f"Issuer: @{acceptor_esc}\n"
-                        f"Reference ID: `{reference_id}`"
+                        f"👤Lead by: {lead_by_esc}\n"
+                        f"📋Reference ID: `{reference_id}`"
                     ),
                     parse_mode="Markdown",
                     reply_markup=_EMPTY_INLINE_KB,
@@ -21131,12 +21291,13 @@ async def _settings_view_instant():
     on = _instant_all_drivers_enabled()
     text = (
         "⚡ *Instant Tag*\n\n"
-        "🤖 A lead with Instant Tag ON sends the chosen driver a Stripe link for "
-        "the *Amount* (price − $50, editable); paying releases the tag "
-        "automatically, and the issuer's password still works.\n\n"
+        "🤖 A lead with Instant Tag ON is offered to the driver with *Accept* and "
+        "*Decline*. Accepting gets them a Stripe link for the *Amount* "
+        "(price − $50, editable); paying releases the tag automatically, and a "
+        "supervisor's password still releases it without payment.\n\n"
         f"📢 Send to All Drivers for instant leads: *{'ON' if on else 'OFF'}*\n"
-        "_ON means every driver gets their own payment link — the first card to "
-        "clear wins the tag; later links refuse with “already paid”._"
+        "_ON offers it to every driver — the first to accept and pay wins the "
+        "tag, and a second attempt is refused as already settled._"
     )
     kb = InlineKeyboardMarkup([
         [InlineKeyboardButton(

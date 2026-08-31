@@ -72,10 +72,13 @@ class NoInventedPriceTest(unittest.TestCase):
 
     def test_the_office_is_told_when_stripe_is_the_problem(self):
         """"No payment link" read as a key problem, and the key was fine."""
-        body = SRC.split("async def _dispatch_instant_tag_lead", 1)[1]
+        # The hint lives where a checkout is actually attempted, which is the
+        # driver's ACCEPT now rather than the dispatch.
+        body = SRC.split("async def _instant_tag_link_after_accept", 1)[1]
         body = body.split("\nasync def ", 1)[0]
         self.assertIn("STRIPE_SECRET_KEY is not set on krab-issuer-admin", body)
         self.assertIn('elif "stripe" in low:', body)
+        self.assertIn("_tell_supervisors", body, "the office is never told")
 
 
 if __name__ == "__main__":

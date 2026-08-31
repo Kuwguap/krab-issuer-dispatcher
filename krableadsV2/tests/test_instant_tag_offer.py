@@ -75,7 +75,7 @@ class TheOfferMessageReadsLikeTheTicketTest(unittest.TestCase):
         offer = self._offer()
         needles = ["CASH DELIVERY ALERT", "Ref:", "_instant_tag_city_line",
                    "Cash collection:", "Required prepay:", "Driver keeps:",
-                   "GET DELIVERY DETAILS",
+                   "ACCEPT → GET YOUR PAYMENT LINK",
                    "Address + client phone released after payment.",
                    "Instant dispatch"]
         positions = [offer.index(n) for n in needles]
