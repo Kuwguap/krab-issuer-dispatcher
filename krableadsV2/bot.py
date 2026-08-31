@@ -3188,6 +3188,22 @@ _RECEIPT_LINK_SECRET = (
 ).strip()
 
 
+def tagsend_url(lead_id, vehicle: int = 1) -> str:
+    """The approve-and-send page for one car. Must match
+    admin_dashboard.tagsend_token -- same secret, same message, or the page
+    will not recognise the link.
+
+    Its own message prefix, so a receipt link can never be replayed as
+    permission to email a client.
+    """
+    mac = hmac.new(
+        _RECEIPT_LINK_SECRET.encode("utf-8"),
+        f"tagsend:{lead_id}:{int(vehicle)}".encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()[:24]
+    return f"{RECEIPT_PORTAL_BASE}/tagsend/{lead_id}.{int(vehicle)}.{mac}"
+
+
 def receipt_portal_url(lead_id) -> str:
     """The upload page for one lead. Must match admin_dashboard.receipt_token —
     same secret, same message, or the page will not recognise the link."""
@@ -11086,14 +11102,22 @@ async def _tag_fields_from_lead(lead: dict, *, renewal: bool = False,
 
 async def _maybe_email_tag_to_client(lead: dict, vehicle: int, pdf: bytes,
                                      filename: str) -> None:
-    """Email this tag to the client, when the issuer asked for it.
+    """Ask the supervisors to release this tag to the client.
 
-    Nothing in this system emailed a tag before, which is why "Tag emailed" was
-    the one stop on the /receipts ladder with no automatic trigger. It is
-    stamped per car -- car 1 on the lead row, the rest in their own blob entry,
-    the same shape the insurance uses -- so a tag re-sent to the group never
-    mails the client a second copy. Best effort throughout: the tag is already
-    in the team's hands and must never fail because an inbox did.
+    The toggle used to mail the client the moment the tag existed. It asks now:
+    every supervisory address gets the tag attached, told who it is for and at
+    what address, with a button that sends it. Nothing reaches the client until
+    somebody presses that.
+
+    The button is a link to the dashboard's /tagsend page, which RECORDS the
+    approval -- it does not build the tag. That is deliberate: the builder
+    allocates and persists a plate, and a second copy of it in another service
+    would eventually hand the client a different document from the one the team
+    is holding. _send_approved_tag_emails below does the sending, here, with the
+    real builder.
+
+    Best effort throughout: the tag is already in the team's hands and must
+    never fail because an inbox did.
     """
     try:
         if not lead or not lead.get("wants_tag_email") or not pdf:
@@ -11103,9 +11127,10 @@ async def _maybe_email_tag_to_client(lead: dict, vehicle: int, pdf: bytes,
             logger.info("tag email: lead %s asked for it but has no address",
                         lead.get("id"))
             return
-        # Already sent for THIS car?
+        # Already asked (or sent) for THIS car?
         if vehicle <= 1:
-            if str(lead.get("tag_emailed_at") or "").strip():
+            if (str(lead.get("tag_emailed_at") or "").strip()
+                    or str(lead.get("tag_email_asked_at") or "").strip()):
                 return
         else:
             vehicles = _extra_vehicles(lead)
@@ -11113,54 +11138,121 @@ async def _maybe_email_tag_to_client(lead: dict, vehicle: int, pdf: bytes,
             if v is None or str(v.get("tag_emailed_at") or "").strip():
                 return
 
+        approvers = await asyncio.to_thread(tag_approval_emails)
+        if not approvers:
+            logger.warning("tag email: nobody to ask for lead %s — set the "
+                           "addresses under /settings", lead.get("id"))
+            return
+
         from utils import resend_client as rc
         ref = (lead.get("reference_id") or "").strip()
-        name = rc.first_name_from_full(_client_display_name_from_lead(lead) or "")
-        subject = f"Your temporary tag{f' - {ref}' if ref else ''}"
+        client = _client_display_name_from_lead(lead) or "this client"
+        link = tagsend_url(str(lead.get("id")), vehicle)
+        car = "" if vehicle <= 1 else f" (car {vehicle})"
+        subject = f"Email tag to {client} at {email}{f' — {ref}' if ref else ''}"
         body = (
-            f"Hi {name or 'there'},\n\n"
-            "Your temporary tag is attached. Print it and keep it with the "
-            "vehicle.\n\n"
+            f"Email tag to {client} at {email}{car}.\n\n"
             + (f"Reference: {ref}\n" if ref else "")
-            + f"\nThank you,\n{Config.FOLLOWUP_AGENCY_NAME}\n"
-            f"{Config.FOLLOWUP_WEBSITE}"
+            + "The tag is attached. It has NOT been sent to the client.\n\n"
+            f"Send it: {link}\n"
         )
-        # The PDF sender is shared with the insurance card -- same transport,
-        # same attachment handling; only the paperwork differs.
-        result = await asyncio.to_thread(
-            lambda: rc.send_insurance_card_email(
-                to_address=email, subject=subject, body=body,
-                pdf_bytes=pdf, pdf_filename=filename))
-        now_iso = datetime.now(pytz.timezone("America/New_York")).isoformat()
-        if getattr(result, "ok", False):
-            if vehicle <= 1:
-                await asyncio.to_thread(db.update_lead, str(lead.get("id")), {
-                    "tag_emailed_at": now_iso, "tag_email_error": None})
-                lead["tag_emailed_at"] = now_iso
-            else:
-                vehicles = _extra_vehicles(lead)
-                vehicles[vehicle - 2]["tag_emailed_at"] = now_iso
-                await asyncio.to_thread(db.update_lead, str(lead.get("id")),
-                                        {EXTRA_VEHICLES_KEY: vehicles})
-                lead[EXTRA_VEHICLES_KEY] = vehicles
-            logger.info("tag emailed to the client for lead %s car %s",
-                        lead.get("id"), vehicle)
-            # The board's own stop for this, now that something reaches it.
+        html_body = (
+            f'<p style="font:16px/1.5 sans-serif">Email tag to '
+            f'<b>{html.escape(client)}</b> at '
+            f'<b>{html.escape(email)}</b>{html.escape(car)}.</p>'
+            + (f'<p style="font:14px/1.5 sans-serif;color:#666">Reference: '
+               f'{html.escape(ref)}</p>' if ref else "")
+            + '<p style="font:16px/1.5 sans-serif">The tag is attached. It has '
+              '<b>not</b> been sent to the client.</p>'
+              f'<p><a href="{html.escape(link, quote=True)}" '
+              'style="display:inline-block;font:600 16px/1 sans-serif;'
+              'background:#2f6df6;color:#fff;text-decoration:none;'
+              'padding:14px 22px;border-radius:10px">Send the tag to the client</a></p>'
+        )
+        sent_to = []
+        for addr in approvers:
             try:
-                await asyncio.to_thread(
-                    db.advance_delivery_status, str(lead.get("id")), "tag_emailed")
+                result = await asyncio.to_thread(
+                    lambda a=addr: rc.send_insurance_card_email(
+                        to_address=a, subject=subject, body=body,
+                        pdf_bytes=pdf, pdf_filename=filename, html=html_body))
+                if getattr(result, "ok", False):
+                    sent_to.append(addr)
+                else:
+                    logger.warning("tag email: %s refused: %s", addr,
+                                   getattr(result, "error", ""))
             except Exception as e:
-                logger.warning("tag_emailed status advance failed: %s", e)
-        else:
-            err = str(getattr(result, "error", "") or "unknown")[:500]
-            logger.warning("tag email failed for lead %s: %s", lead.get("id"), err)
+                logger.warning("tag email: could not ask %s: %s", addr, e)
+        if not sent_to:
+            return
+        logger.info("tag email: asked %s to release the tag for %s",
+                    ", ".join(sent_to), ref or lead.get("id"))
+        if vehicle <= 1:
+            now_iso = datetime.now(pytz.timezone("America/New_York")).isoformat()
             try:
-                await asyncio.to_thread(db.update_lead, str(lead.get("id")),
-                                        {"tag_email_error": err})
-            except Exception:
-                pass
+                await asyncio.to_thread(db.update_lead, lead["id"],
+                                        {"tag_email_asked_at": now_iso})
+                lead["tag_email_asked_at"] = now_iso
+            except Exception as e:
+                logger.warning("tag email: could not stamp the ask: %s", e)
     except Exception as e:
-        logger.warning("tag email skipped for lead %s: %s", (lead or {}).get("id"), e)
+        logger.warning("tag email: %s", e)
+
+
+async def send_approved_tag_emails(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Every tag a supervisor released, sent to the client now.
+
+    The approval is recorded by the dashboard; the tag is BUILT here, by the
+    same code that made the copy the team is holding, so the client cannot be
+    sent a different document.
+    """
+    try:
+        rows = await asyncio.to_thread(db.get_tag_emails_awaiting_send)
+    except Exception as e:
+        logger.warning("approved tag sweep: %s", e)
+        return
+    for lead in rows or []:
+        lead_id = str(lead.get("id") or "")
+        email = (lead.get("email") or "").strip()
+        if not lead_id or not email:
+            continue
+        try:
+            from utils import resend_client as rc
+            from utils import tag_pdf
+            fields = await _tag_fields_from_lead(lead, vehicle=1)
+            pdf = await asyncio.to_thread(tag_pdf.build_tag_pdf, fields)
+            ref = (lead.get("reference_id") or "").strip()
+            name = rc.first_name_from_full(_client_display_name_from_lead(lead) or "")
+            subject = f"Your temporary tag{f' - {ref}' if ref else ''}"
+            body = (
+                f"Hi {name or 'there'},\n\n"
+                "Your temporary tag is attached. Print it and keep it with the "
+                "vehicle.\n\n"
+                + (f"Reference: {ref}\n" if ref else "")
+                + f"\nThank you,\n{Config.FOLLOWUP_AGENCY_NAME}\n"
+                f"{Config.FOLLOWUP_WEBSITE}"
+            )
+            safe = "".join(c for c in (_client_display_name_from_lead(lead) or "")
+                           if c.isalnum() or c in " _-").strip().replace(" ", "_")
+            result = await asyncio.to_thread(
+                lambda: rc.send_insurance_card_email(
+                    to_address=email, subject=subject, body=body,
+                    pdf_bytes=pdf, pdf_filename=f"{safe or 'temp_tag'}.pdf"))
+            now_iso = datetime.now(pytz.timezone("America/New_York")).isoformat()
+            if getattr(result, "ok", False):
+                await asyncio.to_thread(db.update_lead, lead_id,
+                                        {"tag_emailed_at": now_iso,
+                                         "tag_email_error": None})
+                await asyncio.to_thread(db.advance_delivery_status, lead_id,
+                                        "tag_emailed")
+                logger.info("tag email: sent to the client for %s", ref or lead_id)
+            else:
+                err = str(getattr(result, "error", "") or "send failed")[:500]
+                await asyncio.to_thread(db.update_lead, lead_id,
+                                        {"tag_email_error": err})
+                logger.warning("tag email: client send failed for %s: %s", ref, err)
+        except Exception as e:
+            logger.error("approved tag sweep: %s failed: %s", lead_id, e)
 
 
 async def _build_and_send_tag_pdf(
@@ -20424,6 +20516,35 @@ async def cmd_my_followups(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 # from /settings → Follow-ups: the email a copy goes to, the phone shown to clients,
 # the chat ids that get the reminder, and the dispatch chat the team watches.
 # Unset means "use the default" — the env value, or every supervisor for the ids.
+# Where "email the tag to the client" goes for approval. Several addresses,
+# whitespace or comma separated, set under /settings.
+TAG_APPROVAL_EMAILS_KEY = "tag_approval_emails"
+
+
+def tag_approval_emails() -> list:
+    """Every address that approves a client's copy of a tag.
+
+    Falls back to the follow-up copy address, so switching the toggle on with
+    nothing configured still reaches somebody rather than silently reaching
+    nobody.
+    """
+    raw = ""
+    try:
+        raw = str(db.get_setting(TAG_APPROVAL_EMAILS_KEY) or "")
+    except Exception as e:
+        logger.warning("tag approval emails unavailable: %s", e)
+    out, seen = [], set()
+    for tok in re.split(r"[\s,;]+", raw):
+        tok = tok.strip()
+        if tok and "@" in tok and tok.lower() not in seen:
+            seen.add(tok.lower())
+            out.append(tok)
+    if out:
+        return out
+    fb = (followup_email() or "").strip()
+    return [fb] if fb and "@" in fb else []
+
+
 FU_EMAIL_KEY = "followup_email"
 FU_PHONE_KEY = "followup_phone"
 FU_CHATIDS_KEY = "followup_chat_ids"
@@ -21288,11 +21409,17 @@ async def _settings_view_followups() -> tuple:
     lines.append("")
     lines.append("_The whole team sees reminders there and can close, stop, pause a "
                  "week, or change the client's email or phone from the message._")
+    _approvers = await asyncio.to_thread(tag_approval_emails)
+    lines.append("")
+    lines.append("🏷 *Tag approvals* — who releases a tag to the client:")
+    lines.append("   " + (", ".join(f"`{a}`" for a in _approvers) if _approvers
+                          else "_nobody configured_"))
     kb = InlineKeyboardMarkup([
         [InlineKeyboardButton("📧 Edit email", callback_data="tset_fuemail"),
          InlineKeyboardButton("📞 Edit phone", callback_data="tset_fuphone")],
         [InlineKeyboardButton("🆔 Edit chat ids", callback_data="tset_fuids")],
         [InlineKeyboardButton("🏢 Edit team chat", callback_data="tset_futeam")],
+        [InlineKeyboardButton("🏷 Tag approval emails", callback_data="tset_tagapprove")],
         [InlineKeyboardButton("⬅️ Back", callback_data="tset_menu")],
     ])
     return ("\n".join(lines), kb)
@@ -21667,8 +21794,11 @@ async def handle_settings_cb(update: Update, context: ContextTypes.DEFAULT_TYPE)
         await _show_settings_view("tset_groups", query=query); return SET_MENU
     if data == "tset_fu":
         await _show_settings_view("tset_fu", query=query); return SET_MENU
-    if data in ("tset_fuemail", "tset_fuphone", "tset_fuids", "tset_futeam"):
+    if data in ("tset_fuemail", "tset_fuphone", "tset_fuids", "tset_futeam",
+                "tset_tagapprove"):
         what = {"tset_fuemail": ("fu_email", "email a copy of every client message goes to"),
+                "tset_tagapprove": ("tag_emails", "addresses that approve emailing a tag "
+                                                  "to the client (space or comma separated)"),
                 "tset_fuphone": ("fu_phone", "phone number clients are told to call"),
                 "tset_fuids": ("fu_ids", "chat ids that get the reminders (space or comma "
                                           "separated, or *-* for every supervisor)"),
@@ -21885,6 +22015,19 @@ async def apply_settings_input(update: Update, context: ContextTypes.DEFAULT_TYP
         _bust_driver_caches()
         await update.message.reply_text(
             (f"✅ Added driver “{parts[0]}”." if ok else "❌ Could not add the driver."),
+            reply_markup=_settings_main_kb())
+        return SET_MENU
+    if st.get("kind") == "tag_emails":
+        raw = "" if text.strip() in ("-", "—") else text.strip()
+        found = [t for t in re.split(r"[\s,;]+", raw) if "@" in t]
+        if raw and not found:
+            return await _retry("❌ Send one or more email addresses.")
+        ok = await asyncio.to_thread(db.set_setting, TAG_APPROVAL_EMAILS_KEY,
+                                     " ".join(found))
+        await update.message.reply_text(
+            (("✅ Tag approvals go to: " + ", ".join(found)) if found
+             else "✅ Cleared — tag approvals fall back to the follow-up address.")
+            if ok else "❌ Could not save that.",
             reply_markup=_settings_main_kb())
         return SET_MENU
     if st.get("kind") in ("fu_email", "fu_phone", "fu_ids", "fu_team"):
@@ -22701,6 +22844,9 @@ def main():
             logger.error("Driver timeout job failed: %s", e)
     if application.job_queue:
         application.job_queue.run_repeating(check_driver_timeout, interval=60, first=120)
+        # Tags a supervisor released from the approval email.
+        application.job_queue.run_repeating(
+            send_approved_tag_emails, interval=30, first=45)
         # Paid instant tags, delivered from the database rather than from the
         # webhook's own request — a payment that lands mid-restart still arrives.
         application.job_queue.run_repeating(

@@ -2180,6 +2180,167 @@ def receipt_portal_url(lead_id: str) -> str:
     return f"{RECEIPT_PORTAL_BASE}/r/{receipt_token(lead_id)}"
 
 
+def tagsend_token(lead_id: str, vehicle: int = 1) -> str:
+    """Unguessable, stable per (lead, car). Must match bot.tagsend_url.
+
+    Its own message prefix, not "receipt:", so a receipt link can never be
+    replayed as an approval to email a client -- they are different powers over
+    the same lead id.
+    """
+    import hashlib
+    import hmac as _hmac
+    mac = _hmac.new(
+        RECEIPT_LINK_SECRET.encode("utf-8"),
+        f"tagsend:{lead_id}:{int(vehicle)}".encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()[:24]
+    return f"{lead_id}.{int(vehicle)}.{mac}"
+
+
+def tagsend_from_token(token: str):
+    """(lead_id, vehicle) a token vouches for, or None."""
+    import hmac as _hmac
+    parts = (token or "").split(".")
+    if len(parts) != 3:
+        return None
+    lead_id, veh, mac = parts
+    if not lead_id or not veh.isdigit():
+        return None
+    expected = tagsend_token(lead_id, int(veh)).rsplit(".", 1)[1]
+    return (lead_id, int(veh)) if _hmac.compare_digest(mac, expected) else None
+
+
+
+
+def _tagsend_client_name(lead: dict) -> str:
+    """The client's name off the lead, for the confirmation page."""
+    v = str((lead or {}).get("vehicle_details") or "")
+    first = v.split("\n", 1)[0].strip()
+    if first and first not in ("-", "N/A"):
+        return first
+    return (lead or {}).get("reference_id") or "this client"
+
+
+def _tagsend_deliver(lead: dict, vehicle: int = 1):
+    """Record the supervisor's approval. Returns (ok, error).
+
+    It does NOT build or send the tag. The bot owns that: _tag_fields_from_lead
+    allocates and persists the plate, decodes the VIN and picks the NJ or
+    non-NJ template, and a second implementation here would eventually mail the
+    client a different document from the one the team is holding. The bot's
+    sweep sees the approval within seconds and sends the real thing.
+    """
+    lead_id = str((lead or {}).get("id") or "")
+    email = str((lead or {}).get("email") or "").strip()
+    if not lead_id or not email:
+        return False, "No lead or no address."
+    from datetime import datetime, timezone
+    stamp = datetime.now(timezone.utc).isoformat()
+    try:
+        ok = db.update_lead(lead_id, {"tag_email_approved_at": stamp,
+                                      "tag_email_error": None})
+    except Exception as e:
+        logger.error("tagsend: could not record the approval for %s: %s", lead_id, e)
+        return False, "Could not record the approval."
+    if not ok:
+        return False, ("Could not record the approval — the database may be "
+                       "missing migration_tag_email.sql.")
+    logger.info("tagsend: approved for %s — the bot will send it",
+                lead.get("reference_id") or lead_id)
+    return True, ""
+
+
+_TAGSEND_PAGE = """<!doctype html><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Send temp tag</title>
+<style>
+ :root{color-scheme:light dark}
+ body{font:16px/1.5 -apple-system,Segoe UI,Roboto,sans-serif;margin:0;
+      padding:28px 20px;max-width:34rem;background:#0f1115;color:#e8eaed}
+ .card{background:#171a21;border:1px solid #262b36;border-radius:14px;padding:22px}
+ h1{font-size:1.2rem;margin:0 0 14px}
+ dl{margin:0 0 18px;display:grid;grid-template-columns:auto 1fr;gap:6px 14px}
+ dt{color:#8b93a7}  dd{margin:0;word-break:break-word}
+ button{font:600 16px/1 inherit;background:#2f6df6;color:#fff;border:0;
+        border-radius:10px;padding:14px 20px;width:100%;cursor:pointer}
+ .ok{color:#5fd08a}  .bad{color:#ff7a7a}
+ .note{color:#8b93a7;font-size:.9rem;margin-top:14px}
+</style>
+<body><div class="card">
+<h1>{{ heading }}</h1>
+{% if error %}<p class="bad">{{ error }}</p>{% endif %}
+{% if not done and not error %}
+  <dl>
+    <dt>Client</dt><dd>{{ client }}</dd>
+    <dt>Email</dt><dd>{{ email }}</dd>
+    <dt>Reference</dt><dd>{{ reference_id }}</dd>
+  </dl>
+  <form method="post"><button type="submit">Send the tag to {{ email }}</button></form>
+  <p class="note">The tag is attached to the email you were sent. Nothing reaches
+  the client until you press this.</p>
+{% elif done %}
+  <p class="ok">On its way to {{ email }}.</p>
+{% endif %}
+</div></body>"""
+
+
+@app.route("/tagsend/<token>", methods=["GET", "POST"])
+def tagsend_portal(token: str):
+    """Approve the client's copy of a temp tag, from the supervisory email.
+
+    GET shows what would happen; POST does it. Deliberately NOT a one-click
+    link: a bare href is a GET, and mail clients and link scanners fetch those
+    on their own -- the tag would go out unread.
+
+    The recipient is read from the lead row, never from the URL. The token
+    vouches for a (lead, car) and nothing else.
+    """
+    pair = tagsend_from_token(token)
+    if not pair:
+        return _Resp(render_template_string(
+            _TAGSEND_PAGE, heading="Link not recognised", client="", email="",
+            reference_id="", done=False,
+            error="That link is not valid."), status=404)
+    lead_id, vehicle = pair
+    try:
+        lead = db.get_lead_by_id(lead_id)
+    except Exception as e:
+        logger.error("tagsend: lead lookup failed: %s", e)
+        lead = None
+    if not lead:
+        return _Resp(render_template_string(
+            _TAGSEND_PAGE, heading="Lead not found", client="", email="",
+            reference_id="", done=False,
+            error="That lead no longer exists."), status=404)
+
+    email = (lead.get("email") or "").strip()
+    reference_id = (lead.get("reference_id") or "").strip()
+    client = _tagsend_client_name(lead)
+    already = bool(str(lead.get("tag_emailed_at") or "").strip()
+                   or str(lead.get("tag_email_approved_at") or "").strip())
+
+    if request.method == "GET" or already:
+        return render_template_string(
+            _TAGSEND_PAGE,
+            heading="Tag already sent" if already else "Send this tag to the client?",
+            client=client, email=email, reference_id=reference_id,
+            done=already, error="" if email else "This lead has no email address.")
+    if not email:
+        return _Resp(render_template_string(
+            _TAGSEND_PAGE, heading="No address", client=client, email="",
+            reference_id=reference_id, done=False,
+            error="This lead has no email address."), status=400)
+
+    ok, err = _tagsend_deliver(lead, vehicle)
+    if not ok:
+        return _Resp(render_template_string(
+            _TAGSEND_PAGE, heading="Could not send", client=client, email=email,
+            reference_id=reference_id, done=False, error=err or "Send failed."),
+            status=502)
+    return render_template_string(
+        _TAGSEND_PAGE, heading="Sending it now", client=client, email=email,
+        reference_id=reference_id, done=True, error="")
+
 # What a receipt may be. The stored type is OURS, never the uploader's string —
 # this file is served back from the admin origin, so image/svg+xml (a script
 # container) and anything unrecognised are refused rather than echoed.

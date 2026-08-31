@@ -119,6 +119,7 @@ def send_insurance_card_email(
     body: str,
     pdf_bytes: bytes,
     pdf_filename: str,
+    html: Optional[str] = None,
 ) -> InsuranceCardEmailResult:
     """Send the FS-20 PDF as an attachment via Resend.
 
@@ -146,7 +147,10 @@ def send_insurance_card_email(
         "from": from_addr,
         "to": [to],
         "subject": subject,
+        # text stays, always: it is what every existing caller sends, and it is
+        # the fallback for a client that will not render the html.
         "text": body,
+        **({"html": html} if html else {}),
         "attachments": [
             {
                 "filename": pdf_filename,

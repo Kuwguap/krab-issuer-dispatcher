@@ -40,6 +40,8 @@ _OPTIONAL_LEADS_WRITE_KEYS = frozenset({
     "wants_tag_email",
     "tag_emailed_at",
     "tag_email_error",
+    "tag_email_approved_at",
+    "tag_email_asked_at",
 })
 
 
@@ -424,6 +426,31 @@ class Database:
             # is only that an unpaid instant tag shows optimistic progress.
             logger.warning("get_unpaid_instant_lead_ids: %s", e)
             return set()
+
+    def get_tag_emails_awaiting_send(self, limit: int = 20) -> list:
+        """Tags a supervisor released that the client has not been sent yet.
+
+        Driven by the columns rather than by the approval request itself, so an
+        approval that lands while the bot is restarting is still honoured on the
+        next tick.
+        """
+        if not self._check_tables_exist():
+            return []
+        try:
+            r = (self.client.table("leads")
+                 .select("*")
+                 .not_.is_("tag_email_approved_at", "null")
+                 .is_("tag_emailed_at", "null")
+                 .order("tag_email_approved_at", desc=False)
+                 .limit(max(1, min(int(limit or 20), 100)))
+                 .execute())
+            return r.data or []
+        except Exception as e:
+            # Quiet about an un-migrated column: this runs every 30 seconds.
+            msg = str(e)
+            if "tag_email" not in msg and "42703" not in msg:
+                logger.warning("get_tag_emails_awaiting_send: %s", e)
+            return []
 
     def update_lead(self, lead_id: str, updates: Dict[str, Any]) -> bool:
         """Update a lead record."""

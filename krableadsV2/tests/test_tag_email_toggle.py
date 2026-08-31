@@ -105,31 +105,66 @@ class TheTagActuallyGetsEmailedTest(unittest.IsolatedAsyncioTestCase):
         lead.update(over)
         return lead
 
-    async def _send(self, lead, vehicle=1, ok=True, db=None):
+    async def _send(self, lead, vehicle=1, ok=True, db=None,
+                    approvers=("boss@example.com",)):
         db = db or mock.MagicMock()
         sent = {}
+        asked = []
 
         def _fake(**kw):
             sent.update(kw)
+            asked.append(kw.get("to_address"))
             return mock.MagicMock(ok=ok, error=None if ok else "mailbox full")
 
         with mock.patch.object(bot, "db", db), \
+                mock.patch.object(bot, "tag_approval_emails", lambda: list(approvers)), \
                 mock.patch.object(rc, "send_insurance_card_email", _fake):
             await bot._maybe_email_tag_to_client(lead, vehicle, b"%PDF-1.4", "tag.pdf")
+        self._asked = asked
         return sent, db
 
-    async def test_the_client_gets_the_pdf(self):
+    async def test_the_supervisors_are_asked_not_the_client(self):
+        """The toggle used to mail the client the moment the tag existed."""
         sent, db = await self._send(self._lead())
-        self.assertEqual("client@example.com", sent["to_address"])
-        self.assertEqual(b"%PDF-1.4", sent["pdf_bytes"])
-        self.assertEqual("tag.pdf", sent["pdf_filename"])
-        self.assertIn("REF1", sent["body"])
-        self.assertIn("temporary tag", sent["subject"].lower())
+        self.assertEqual("boss@example.com", sent["to_address"])
+        self.assertNotEqual("client@example.com", sent["to_address"])
+        self.assertEqual(b"%PDF-1.4", sent["pdf_bytes"], "the tag must be attached")
 
-    async def test_the_board_moves_to_tag_emailed(self):
+    async def test_the_ask_names_the_client_and_the_address(self):
+        sent, _ = await self._send(self._lead())
+        self.assertIn("Magnolia Diaz", sent["subject"])
+        self.assertIn("client@example.com", sent["subject"])
+        self.assertIn("Magnolia Diaz", sent["body"])
+        self.assertIn("client@example.com", sent["body"])
+
+    async def test_the_ask_carries_a_button_to_send(self):
+        sent, _ = await self._send(self._lead())
+        self.assertIn("html", sent)
+        self.assertIn("Send the tag to the client", sent["html"])
+        self.assertIn("/tagsend/", sent["html"])
+        self.assertIn("/tagsend/", sent["body"], "a plain-text client needs the link too")
+
+    async def test_it_says_the_client_has_NOT_had_it(self):
+        sent, _ = await self._send(self._lead())
+        self.assertIn("not been sent to the client", sent["body"].lower())
+
+    async def test_the_board_does_not_move_yet(self):
+        """Nothing has reached the client — only a question has been asked."""
         _, db = await self._send(self._lead())
-        db.advance_delivery_status.assert_called_once()
-        self.assertEqual("tag_emailed", db.advance_delivery_status.call_args.args[1])
+        db.advance_delivery_status.assert_not_called()
+
+    async def test_every_supervisor_is_asked(self):
+        await self._send(self._lead(), approvers=("a@x.com", "b@x.com", "c@x.com"))
+        self.assertEqual(["a@x.com", "b@x.com", "c@x.com"], self._asked)
+
+    async def test_nobody_configured_means_nothing_is_sent(self):
+        sent, _ = await self._send(self._lead(), approvers=())
+        self.assertEqual({}, sent)
+
+    async def test_asking_twice_about_one_car_does_not_happen(self):
+        lead = self._lead(tag_email_asked_at="2026-08-29T10:00:00-04:00")
+        sent, db = await self._send(lead)
+        self.assertEqual({}, sent, "the supervisors were asked twice")
 
     async def test_a_second_send_does_not_mail_a_second_copy(self):
         lead = self._lead(tag_emailed_at="2026-08-29T10:00:00-04:00")
@@ -145,13 +180,19 @@ class TheTagActuallyGetsEmailedTest(unittest.IsolatedAsyncioTestCase):
         sent, _ = await self._send(self._lead(email=""))
         self.assertEqual({}, sent)
 
-    async def test_a_failed_send_is_recorded_not_stamped(self):
-        lead = self._lead()
-        _, db = await self._send(lead, ok=False)
-        wrote = [c.args[1] for c in db.update_lead.call_args_list]
-        self.assertTrue(any("tag_email_error" in w for w in wrote))
+    async def test_an_ask_nobody_received_is_not_stamped(self):
+        """Otherwise the supervisors are never asked again."""
+        _, db = await self._send(self._lead(), ok=False)
+        wrote = [c.args[1] for c in db.update_lead.call_args_list if len(c.args) > 1]
+        self.assertFalse(any("tag_email_asked_at" in w for w in wrote))
+        self.assertFalse(any("tag_emailed_at" in w for w in wrote))
+
+    async def test_a_successful_ask_is_stamped_once(self):
+        _, db = await self._send(self._lead())
+        wrote = [c.args[1] for c in db.update_lead.call_args_list if len(c.args) > 1]
+        self.assertTrue(any("tag_email_asked_at" in w for w in wrote))
         self.assertFalse(any("tag_emailed_at" in w for w in wrote),
-                         "a failed send must stay retryable")
+                         "the client has not been sent anything yet")
 
     async def test_a_broken_mailer_never_takes_the_tag_down(self):
         with mock.patch.object(bot, "db", mock.MagicMock()), \
