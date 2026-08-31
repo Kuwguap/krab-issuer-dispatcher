@@ -196,12 +196,45 @@ class Database:
                 logger.error(f"Error clearing user state: {e}")
             return False
     
+    # Handles that are the BOT, never a person. Set once at startup from
+    # getMe; the literals are the fallback for a worker that has not called it.
+    _BOT_HANDLES = {"krabdispatchbot", "krabissuerbot"}
+
+    @classmethod
+    def set_bot_identity(cls, username: str) -> None:
+        """Tell the writer which handle is the bot's own."""
+        u = (username or "").strip().lstrip("@").lower()
+        if u:
+            cls._BOT_HANDLES = set(cls._BOT_HANDLES) | {u}
+
+    @classmethod
+    def _scrub_bot_entrant(cls, payload: Dict[str, Any]) -> None:
+        """A lead is never entered by the bot.
+
+        Some creation paths resolved the entrant from the message they were
+        handed, and a review-card Submit hands back the BOT's own message -- so
+        207 leads went onto the leaderboard as "KrabDispatchBot", every one of
+        them somebody's real work. Those paths are fixed, but this is the write
+        itself: nothing that reaches here can credit the bot again, whatever
+        resolved it. Blanked rather than guessed at, because user_id is still
+        correct and the readers fall back to it.
+        """
+        un = str(payload.get("telegram_username") or "").strip().lstrip("@")
+        if un and un.lower() in cls._BOT_HANDLES:
+            logger.warning("create_lead: refusing to credit the bot (@%s) as entrant "
+                           "for user_id=%s", un, payload.get("user_id"))
+            payload["telegram_username"] = "Unknown"
+            nm = str(payload.get("telegram_name") or "").strip()
+            if nm.lower() in cls._BOT_HANDLES or nm.lower().endswith("bot"):
+                payload.pop("telegram_name", None)
+
     def create_lead(self, lead_data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         """Create a new lead record."""
         if not self._check_tables_exist():
             return None
 
         payload = dict(lead_data)
+        self._scrub_bot_entrant(payload)
         for attempt in (0, 1, 2):
             try:
                 response = self.client.table("leads").insert(payload).execute()
@@ -2270,20 +2303,35 @@ class Database:
         if r is None:
             logger.error("get_lead_counts_by_sender: %s", last)
             return []
-        tally: Dict[str, int] = {}
+        # Grouped by user_id, NOT by what the row calls them. A person's display
+        # name and handle both change, and rows written at different times carry
+        # different ones — group by the label and the same human lands on the
+        # board twice, splitting their count. The id is the only stable identity
+        # a lead row has.
+        counts: Dict[str, int] = {}
+        labels: Dict[str, str] = {}
         for row in (r.data or []):
             if row.get("exclude_from_count"):
                 continue
-            # The NAME the operator goes by ("JB"), never the @handle — the
-            # board groups and displays by it. Older rows without one keep
-            # counting under their handle so history does not vanish.
-            who = (row.get("telegram_name") or "").strip()
-            if not who:
-                who = (row.get("telegram_username") or "").strip().lstrip("@")
-            if not who or who.lower() == "unknown":
-                who = f"id {row.get('user_id')}" if row.get("user_id") else "Unknown"
-            tally[who] = tally.get(who, 0) + 1
-        return sorted(tally.items(), key=lambda kv: (-kv[1], kv[0].lower()))
+            uid = str(row.get("user_id") or "").strip()
+            name = (row.get("telegram_name") or "").strip()
+            handle = (row.get("telegram_username") or "").strip().lstrip("@")
+            if handle.lower() == "unknown":
+                handle = ""
+            key = uid or (name or handle).lower() or "unknown"
+            counts[key] = counts.get(key, 0) + 1
+            # The NAME the operator goes by ("JB"), never the @handle. Best label
+            # seen for this id wins, so one named row names the whole group.
+            best = labels.get(key) or ""
+            if name and (not best or best == handle):
+                labels[key] = name
+            elif handle and not best:
+                labels[key] = handle
+        out: Dict[str, int] = {}
+        for key, n in counts.items():
+            who = labels.get(key) or (f"id {key}" if key != "unknown" else "Unknown")
+            out[who] = out.get(who, 0) + n
+        return sorted(out.items(), key=lambda kv: (-kv[1], kv[0].lower()))
 
     def list_recent_leads_for_review(self, offset: int = 0, limit: int = 10) -> tuple:
         """(rows, total) — newest leads first, for the supervisors' browser.

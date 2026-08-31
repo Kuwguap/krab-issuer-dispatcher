@@ -22023,6 +22023,13 @@ def main():
 
     # Create application
     async def _post_init_set_commands(app: Application) -> None:
+        # Tell the lead writer which handle is our own, so no creation path can
+        # ever credit the bot as the person who entered a lead.
+        try:
+            from utils.database import Database as _DB
+            _DB.set_bot_identity(getattr(app.bot, "username", "") or "")
+        except Exception as e:
+            logger.warning("could not register the bot identity: %s", e)
         try:
             from telegram import BotCommand
             await app.bot.set_my_commands([
