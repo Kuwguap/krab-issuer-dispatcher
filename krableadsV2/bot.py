@@ -1488,9 +1488,18 @@ async def _deliver_skip_dispatch(context, lead: dict, driver: dict, *,
         logger.error("skip dispatch: driver %s has no chat id", dname)
 
     if driver_ok:
-        # Whoever else was holding this offer must stop being able to work it.
+        # Whoever else was holding this offer must stop being able to work it --
+        # and so must the driver who got it. Their own copy still carried a live
+        # "Pay" button after they had already paid, which is an invitation to
+        # pay twice for the same tag.
         try:
-            await _revoke_other_driver_offers(context, lead.get("id"), driver_cid)
+            await _revoke_other_driver_offers(
+                context, lead.get("id"), driver_cid,
+                winner_text=("✅ Paid — this one is yours.\n"
+                             "The tag and the client's details are below."
+                             if how == "paid" else
+                             "✅ Released to you.\n"
+                             "The tag and the client's details are below."))
         except Exception as e:
             logger.warning("skip dispatch: could not close the other offers: %s", e)
 
@@ -17552,7 +17561,8 @@ def _book_delivery_against_driver(lead: dict, driver: dict) -> tuple:
     return True, None
 
 
-async def _revoke_other_driver_offers(context, lead_id, winner_chat_id=None) -> int:
+async def _revoke_other_driver_offers(context, lead_id, winner_chat_id=None,
+                                      winner_text: str = "") -> int:
     """Close every other driver's copy of this offer. Returns how many changed.
 
     An accepted lead used to leave every losing driver holding a live-looking
@@ -17575,7 +17585,8 @@ async def _revoke_other_driver_offers(context, lead_id, winner_chat_id=None) -> 
     closed, seen = 0, set()
     for cid, mid in targets:
         chat = _parse_chat_id(cid) or cid
-        if win is not None and _norm_chat_id(chat) == win:
+        is_winner = win is not None and _norm_chat_id(chat) == win
+        if is_winner and not winner_text:
             continue                      # the winner's own message says so already
         key = (str(chat), int(mid))
         if key in seen:
@@ -17584,7 +17595,8 @@ async def _revoke_other_driver_offers(context, lead_id, winner_chat_id=None) -> 
         try:
             await context.bot.edit_message_text(
                 chat_id=chat, message_id=int(mid),
-                text=("❌ Taken by another driver.\n\n"
+                text=(winner_text if is_winner else
+                      "❌ Taken by another driver.\n\n"
                       "Turn on notifications 🔔 and check back — the next one "
                       "goes to whoever answers first."),
                 reply_markup=_EMPTY_INLINE_KB,

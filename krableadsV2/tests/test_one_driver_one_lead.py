@@ -62,6 +62,26 @@ class TheLosingDriversOfferIsClosedTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(0, await bot._revoke_other_driver_offers(ctx, LEAD_ID, WINNER_CHAT))
         ctx.bot.edit_message_text.assert_not_awaited()
 
+    async def test_a_paid_offer_stops_offering_to_take_money(self):
+        """The payer's own copy kept a live Pay button after they had paid —
+        an invitation to pay twice for the same tag."""
+        ctx = self._ctx([(WINNER_CHAT, 10), (LOSER_CHAT, 11)])
+        closed = await bot._revoke_other_driver_offers(
+            ctx, LEAD_ID, WINNER_CHAT, winner_text="✅ Paid — this one is yours.")
+        self.assertEqual(2, closed)
+        said = {c.kwargs["chat_id"]: c.kwargs["text"]
+                for c in ctx.bot.edit_message_text.call_args_list}
+        self.assertIn("Paid", said[WINNER_CHAT])
+        self.assertIn("Taken by another driver", said[LOSER_CHAT])
+        for c in ctx.bot.edit_message_text.call_args_list:
+            self.assertFalse(c.kwargs["reply_markup"].inline_keyboard)
+
+    def test_the_paid_delivery_closes_it(self):
+        body = SRC.split("async def _deliver_skip_dispatch", 1)[1]
+        body = body.split("\nasync def ", 1)[0]
+        self.assertIn("winner_text=", body)
+        self.assertIn("Paid — this one is yours", body)
+
     async def test_ids_compare_across_str_and_int(self):
         ctx = self._ctx([(str(WINNER_CHAT), 10), (LOSER_CHAT, 11)])
         self.assertEqual(1, await bot._revoke_other_driver_offers(ctx, LEAD_ID, WINNER_CHAT))

@@ -41,6 +41,17 @@ def _admin_key() -> str:
     return (os.getenv("INTEGRATIONS_API_KEY") or os.getenv("ADMIN_API_KEY") or "").strip()
 
 
+def _telegram_deep_link() -> str:
+    """Where a driver goes when the payment page is done with them.
+
+    A Stripe redirect owns the tab, so window.close() is refused -- the browser
+    only lets a page close what it opened. Sending them back to the bot's chat
+    is the thing that actually works on a phone.
+    """
+    handle = (os.getenv("TELEGRAM_BOT_USERNAME") or "KrabDispatchBot").strip().lstrip("@")
+    return f"https://t.me/{handle}" if handle else "https://t.me"
+
+
 def _public_base() -> str:
     return (os.getenv("RECEIPT_PORTAL_BASE")
             or "https://tristatetags.com/backend").strip().rstrip("/")
@@ -89,14 +100,30 @@ _SUCCESS_PAGE = """<!doctype html>
  h1{font-size:1.3rem;margin:0 0 .5rem}
  .ok{color:#0a7;font-weight:650}
  .ref{font-family:ui-monospace,monospace}
+ .back{display:inline-block;margin-top:.4rem;padding:13px 20px;border-radius:10px;
+       background:#2f6df6;color:#fff;text-decoration:none;font-weight:650}
+ .tiny{color:#777;font-size:.88rem}
 </style></head><body>
 <div class="card">
   <h1>✅ Payment received</h1>
   <p class="ok">The tag is on its way to the driver now.</p>
   <p>Reference <span class="ref">{{ reference_id or "—" }}</span>. It arrives in
      their Telegram chat within a minute — no dispatch approval needed.</p>
-  <p>You can close this page.</p>
-</div></body></html>"""
+  <p><a class="back" href="{{ tg_deep }}">Back to Telegram</a></p>
+  <p class="tiny">This page closes itself. If it does not, the button above
+     takes you back to the chat — the tag is already on its way.</p>
+</div>
+<script>
+  // Straight back to the chat the driver came from. window.close() only works
+  // on a tab the page itself opened, which a Stripe redirect is not, so the
+  // deep link is the one that actually lands -- and the button is there for a
+  // browser that blocks both.
+  setTimeout(function () {
+    try { window.location.replace({{ tg_deep|tojson }}); } catch (e) {}
+    setTimeout(function () { try { window.close(); } catch (e) {} }, 900);
+  }, 1200);
+</script>
+</body></html>"""
 
 
 def register(app, db_provider):
@@ -277,7 +304,8 @@ def register(app, db_provider):
                 ref = ((r.data or [{}])[0].get("reference_id") or "").strip()
             except Exception:
                 ref = ""
-        return render_template_string(_SUCCESS_PAGE, reference_id=ref)
+        return render_template_string(_SUCCESS_PAGE, reference_id=ref,
+                                      tg_deep=_telegram_deep_link())
 
     @app.route("/instant/cancelled", methods=["GET"])
     def instant_cancelled():
@@ -288,6 +316,6 @@ def register(app, db_provider):
             .replace("It arrives in their Telegram chat within a minute — no "
                      "dispatch approval needed.",
                      "Send the lead the usual way, or ask for the link again."),
-            reference_id="")
+            reference_id="", tg_deep=_telegram_deep_link())
 
     logger.info("Instant-PDF endpoints mounted (amount: %d cents)", INSTANT_PDF_CENTS)
