@@ -56,6 +56,7 @@ type PayState =
   | { step: "failed"; playerId: string; error: string };
 
 interface BracketPlayer { id: string; gamertag: string; platform: string; photo: string | null; }
+interface Edition { edition: number; name: string | null; event_date: string | null; champion: string | null; champion_photo: string | null; player_count: number | null; players?: { gamertag: string; platform: string; photo: string | null }[]; }
 interface BracketMatch {
   id: string; round: number; slot: number;
   player1: string | null; player2: string | null;
@@ -117,10 +118,15 @@ export default function Tournament() {
   // ── live bracket / roster ────────────────────────────────────
   const [players, setPlayers] = useState<BracketPlayer[]>([]);
   const [matches, setMatches] = useState<BracketMatch[]>([]);
+  const [editions, setEditions] = useState<Edition[]>([]);
   useEffect(() => {
     fetch("/api/tournament?action=bracket")
       .then((r) => (r.ok ? r.json() : null))
       .then((j) => { if (j) { setPlayers(j.players || []); setMatches(j.matches || []); } })
+      .catch(() => {});
+    fetch("/api/tournament?action=editions")
+      .then((r) => (r.ok ? r.json() : null))
+      .then((j) => { if (j && Array.isArray(j.editions)) setEditions(j.editions); })
       .catch(() => {});
   }, []);
   const byId = useMemo(() => Object.fromEntries(players.map((p) => [p.id, p])), [players]);
@@ -389,6 +395,41 @@ export default function Tournament() {
           </div>
         </Reveal>
       </section>
+
+      {/* ── HALL OF CHAMPIONS (past editions) ──────────────────── */}
+      {editions.length > 0 && (
+        <section className="border-y border-ash bg-smoke/30 py-14">
+          <div className="max-w-7xl mx-auto px-4 sm:px-6">
+            <Reveal>
+              <p className="font-display uppercase text-acid tracking-[0.45em] text-[11px] mb-4">Hall of champions</p>
+              <h2 className="display-xl text-4xl sm:text-6xl text-bone mb-8">Past <span className="text-stroke-acid">editions</span></h2>
+            </Reveal>
+            <div className="grid sm:grid-cols-2 lg:grid-cols-3 gap-4">
+              {editions.map((e) => (
+                <Reveal key={e.edition}>
+                  <div className="border border-ash bg-ink overflow-hidden">
+                    <div className="aspect-[4/3] bg-smoke relative overflow-hidden">
+                      {e.champion_photo
+                        ? <img src={e.champion_photo} alt={e.champion || ""} loading="lazy" className="w-full h-full object-cover" />
+                        : <div className="w-full h-full flex items-center justify-center font-display text-6xl text-bone/10">{(e.champion || "?").slice(0, 2).toUpperCase()}</div>}
+                      <div className="absolute top-3 left-3 bg-acid text-ink font-display uppercase text-[10px] tracking-[0.15em] px-3 py-1">
+                        Edition {String(e.edition).padStart(2, "0")}
+                      </div>
+                    </div>
+                    <div className="p-4">
+                      <p className="font-display uppercase text-[10px] tracking-[0.3em] text-acid">Champion</p>
+                      <p className="display-xl text-2xl text-bone mt-1 truncate">{e.champion || "—"}</p>
+                      <p className="text-bone/40 text-xs uppercase tracking-[0.2em] mt-2">
+                        {e.player_count ? `${e.player_count} players` : ""}{e.event_date ? ` · ${e.event_date}` : ""}
+                      </p>
+                    </div>
+                  </div>
+                </Reveal>
+              ))}
+            </div>
+          </div>
+        </section>
+      )}
 
       {/* ── ROSTER WALL — the hype grid ────────────────────────── */}
       {players.length > 0 && (

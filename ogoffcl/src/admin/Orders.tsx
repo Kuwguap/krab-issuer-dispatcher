@@ -14,6 +14,7 @@ const STATUS_LABEL: Record<string, string> = {
 interface OrderRow {
   id: string; order_number: string; status: string; payment_status: string;
   payment_method?: string | null; payment_ref?: string | null; paid_at?: string | null;
+  authenticity_code?: string | null;
   momo_phone?: string | null; momo_channel?: string | null;
   total_amount: number; customer_name: string | null; customer_email: string | null;
   customer_phone: string | null; shipping_address: string | null;
@@ -198,6 +199,13 @@ export default function AdminOrders() {
                     </p>
                     {o.payment_ref && <p className="text-bone/40 text-xs">Ref: {o.payment_ref}</p>}
                     {o.paid_at && <p className="text-bone/40 text-xs">Paid {new Date(o.paid_at).toLocaleString()}</p>}
+                    {o.authenticity_code && (
+                      <p className="text-bone/40 text-xs flex flex-wrap items-center gap-2 mt-1">
+                        <span>Auth: <span className="text-acid break-all">{o.authenticity_code}</span></span>
+                        <a href={`/authenticity-certificate?code=${encodeURIComponent(o.authenticity_code)}`} target="_blank" rel="noreferrer"
+                          className="btn-og border border-acid/50 text-acid px-2.5 py-1 text-[10px] hover:bg-acid hover:text-ink">⎙ Certificate</a>
+                      </p>
+                    )}
                     {o.refund_status === "refunded" && (
                       <p className="text-blood text-xs">Refunded {money(o.refund_amount || 0)} · {o.refunded_at ? new Date(o.refunded_at).toLocaleString() : ""}</p>
                     )}

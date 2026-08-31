@@ -26,6 +26,9 @@ const env = {
   // if the env var is missing, admin auth fails closed.
   adminPassword: clean(process.env.ADMIN_API_PASSWORD || process.env.VITE_ADMIN_PASSWORD),
   siteUrl: clean(process.env.SITE_URL) || "https://ogoffcl.store",
+  // Shared secret + destination for the Telegram bot (INAIS). Fails closed like adminPassword.
+  botSecret: clean(process.env.BOT_SECRET),
+  botNotifyUrl: clean(process.env.BOT_NOTIFY_URL),  // bot's public URL + /store/events
 };
 
 function moolreConfigured() {
@@ -48,6 +51,34 @@ async function sb(method, path, body, headers = {}) {
   let data = null;
   try { data = text ? JSON.parse(text) : null; } catch { data = text; }
   return { ok: r.ok, status: r.status, data };
+}
+
+/** Exact row count via PostgREST's Content-Range (accurate past the 1000-row read cap). */
+async function sbCount(table, filter = "") {
+  try {
+    const url = `${env.supabaseUrl}/rest/v1/${table}?select=id${filter ? `&${filter}` : ""}`;
+    const r = await fetch(url, {
+      headers: {
+        apikey: env.supabaseKey, Authorization: `Bearer ${env.supabaseKey}`,
+        Prefer: "count=exact", Range: "0-0", "Range-Unit": "items",
+      },
+    });
+    const total = Number((r.headers.get("content-range") || "").split("/")[1]);
+    return Number.isFinite(total) ? total : 0;
+  } catch { return 0; }
+}
+
+/** Best-effort push to the INAIS Telegram bot. A failure here must NEVER affect the site,
+ *  so everything is swallowed — the bot's own /orders list is the fallback. */
+async function notifyBot(event, payload = {}) {
+  if (!env.botNotifyUrl || !env.botSecret) return;
+  try {
+    await fetch(env.botNotifyUrl, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "x-bot-secret": env.botSecret },
+      body: JSON.stringify({ event, ...payload }),
+    });
+  } catch { /* non-fatal */ }
 }
 
 async function getOrder(orderId) {
@@ -267,7 +298,7 @@ function orderItemsHtml(items) {
 }
 
 export {
-  env, moolreConfigured, sb, getOrder, getOrderByNumber, getOrderItems, updateOrder,
-  appendStatusHistory, moolrePay, moolrePaymentLink, moolreStatus, moolreTransfer, PAY_CHANNELS,
-  sendEmail, sendEmailBatch, emailShell, orderItemsHtml,
+  env, moolreConfigured, sb, sbCount, notifyBot, getOrder, getOrderByNumber, getOrderItems,
+  updateOrder, appendStatusHistory, moolrePay, moolrePaymentLink, moolreStatus, moolreTransfer,
+  PAY_CHANNELS, sendEmail, sendEmailBatch, emailShell, orderItemsHtml,
 };

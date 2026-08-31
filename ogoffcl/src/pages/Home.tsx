@@ -86,6 +86,16 @@ export default function Home() {
     [products],
   );
 
+  // DYNASTY drop — matched by name (Nine Dragons / Dynasty), else the 2 newest.
+  const dynasty = useMemo(() => {
+    const tagged = products.filter((p) => /nine\s*dragon|dynasty/i.test(p.name));
+    return (tagged.length ? tagged : products.slice(0, 2)).slice(0, 3);
+  }, [products]);
+  const dynastyHero = useMemo(
+    () => dynasty.find((p) => /nine\s*dragon/i.test(p.name)) || dynasty[0],
+    [dynasty],
+  );
+
   const catBySlug = (slug: string) => cats.find((c) => c.slug === slug);
   const previewFor = (slug: string | null) => {
     if (!slug) return firstImage(products[0] || ({} as Product));
@@ -233,6 +243,68 @@ export default function Home() {
           </div>
         </div>
       </section>
+
+      {/* ── DYNASTY drop ─────────────────────────────────────────── */}
+      {dynastyHero && (
+        <section className="border-b border-ash py-20 sm:py-28 relative overflow-hidden">
+          <div className="max-w-7xl mx-auto px-4 sm:px-6">
+            <Reveal>
+              <div className="flex flex-wrap items-end justify-between gap-6 mb-10">
+                <div>
+                  <p className="font-display uppercase text-acid tracking-[0.45em] text-[11px] mb-4">New drop</p>
+                  <h2 className="display-xl text-6xl sm:text-8xl text-bone">Dynasty<span className="text-acid">.</span></h2>
+                </div>
+                <p className="text-bone/50 text-sm max-w-xs leading-relaxed">
+                  The new chapter — led by the <span className="text-bone">Nine Dragons</span> polo.
+                  From big dreams to reality. Limited run, no restocks.
+                </p>
+              </div>
+            </Reveal>
+
+            <div className="grid lg:grid-cols-[1.5fr_1fr] gap-4">
+              {/* hero — Nine Dragons */}
+              <Reveal>
+                <Link to={`/product/${dynastyHero.id}`} className="group block relative">
+                  <div className="aspect-[4/3] lg:aspect-[16/13] bg-bone overflow-hidden border border-ash group-hover:border-acid transition-colors">
+                    <img src={firstImage(dynastyHero)} alt={dynastyHero.name} loading="lazy"
+                      className="w-full h-full object-cover mix-blend-multiply transition-transform duration-700 ease-out group-hover:scale-[1.04]" />
+                  </div>
+                  <span className="absolute top-4 left-4 bg-acid text-ink font-display uppercase text-[10px] tracking-[0.15em] px-3 py-1.5">
+                    The single · Nine Dragons
+                  </span>
+                  <div className="absolute inset-x-0 bottom-0 bg-gradient-to-t from-ink via-ink/70 to-transparent p-5 pt-20 flex items-end justify-between gap-3">
+                    <p className="font-display uppercase text-bone text-lg sm:text-2xl leading-tight">{dynastyHero.name}</p>
+                    <p className="text-acid font-display text-lg whitespace-nowrap">{money(Number(dynastyHero.price || 0))}</p>
+                  </div>
+                </Link>
+              </Reveal>
+
+              {/* other DYNASTY pieces + shop CTA */}
+              <div className="flex flex-col gap-4">
+                {dynasty.filter((p) => p.id !== dynastyHero.id).slice(0, 2).map((p, i) => (
+                  <Reveal key={p.id} delay={0.1 + i * 0.08}>
+                    <Link to={`/product/${p.id}`} className="group flex gap-4 border border-ash bg-smoke/40 p-3 hover:border-acid transition-colors">
+                      <div className="w-24 h-28 bg-bone overflow-hidden shrink-0">
+                        <img src={firstImage(p)} alt={p.name} loading="lazy" className="w-full h-full object-cover mix-blend-multiply transition-transform duration-700 group-hover:scale-105" />
+                      </div>
+                      <div className="flex-1 min-w-0 flex flex-col justify-center">
+                        <p className="font-display uppercase text-acid tracking-[0.2em] text-[9px] mb-1">Dynasty</p>
+                        <p className="font-display uppercase text-bone text-sm leading-tight">{p.name}</p>
+                        <p className="text-bone/60 text-sm mt-1">{money(Number(p.price || 0))}</p>
+                      </div>
+                    </Link>
+                  </Reveal>
+                ))}
+                <Reveal delay={0.2}>
+                  <Link to="/shop" className="btn-og bg-bone text-ink w-full py-5 text-sm hover:bg-acid mt-auto">
+                    Shop the drop →
+                  </Link>
+                </Reveal>
+              </div>
+            </div>
+          </div>
+        </section>
+      )}
 
       {/* ── GYE NYAME campaign strip ────────────────────────────── */}
       {jerseys.length >= 3 && (

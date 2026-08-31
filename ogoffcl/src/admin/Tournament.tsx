@@ -802,6 +802,21 @@ export default function AdminTournament() {
             <span className="font-display uppercase text-[10px] tracking-[0.3em] text-acid">Champion</span>
             <span className="display-xl text-2xl text-bone">{champion.gamertag}</span>
             <span className="text-bone/50 text-xs">GH₵1,000 + 2 merch pieces — settle up 🏆</span>
+            <button
+              onClick={async () => {
+                if (!confirm(`Archive this tournament (champion: ${champion.gamertag}) as a past edition, then CLEAR all players & fixtures to start the next one?`)) return;
+                const name = prompt("Edition name (optional):", "") || "";
+                const date = prompt("Event date (optional, e.g. 24 Oct 2026):", "") || "";
+                setBusy("archive");
+                const r = await adminApi("/api/tournament", { action: "admin", op: "archive", name: name.trim() || undefined, date: date.trim() || undefined });
+                setBusy(null);
+                say(r.ok ? `Edition ${r.edition} archived — panel cleared for the next tournament ✓` : `Failed: ${r.error}`);
+                load();
+              }}
+              disabled={busy === "archive"}
+              className="btn-og bg-acid text-ink px-4 py-2.5 text-[10px] hover:bg-bone ml-auto">
+              {busy === "archive" ? "Archiving…" : "🏆 Save edition & reset for next"}
+            </button>
           </div>
         )}
 

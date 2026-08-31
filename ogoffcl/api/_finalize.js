@@ -2,7 +2,7 @@
 // customer/store emails. Shared by status polling and the Moolre callback.
 import {
   sb, getOrderItems, updateOrder, appendStatusHistory,
-  sendEmail, emailShell, orderItemsHtml, env,
+  sendEmail, emailShell, orderItemsHtml, env, notifyBot,
 } from "./_lib.js";
 
 async function finalizePaidOrder(order, moolreTx) {
@@ -10,12 +10,18 @@ async function finalizePaidOrder(order, moolreTx) {
   if (order.payment_status === "paid") return { ok: true, already: true };
 
   const nowIso = new Date().toISOString();
+  // authenticity code — assigned once, when the order is paid (only real
+  // completed purchases are "authentic"). updateOrder drops the column
+  // gracefully if migration_oct_features.sql hasn't been run yet.
+  const authCode = order.authenticity_code ||
+    `OGA-${Date.now().toString(36).toUpperCase()}${Math.random().toString(36).slice(2, 8).toUpperCase()}`;
   await updateOrder(order.id, {
     payment_status: "paid",
     status: order.status === "pending" ? "confirmed" : order.status,
     paid_at: nowIso,
     payment_method: "moolre_momo",
     payment_ref: moolreTx?.transactionid ? String(moolreTx.transactionid) : (order.payment_ref || null),
+    authenticity_code: authCode,
   });
   await appendStatusHistory(order, { status: "confirmed", note: "Payment received (Moolre MoMo)" });
 
@@ -46,6 +52,9 @@ async function finalizePaidOrder(order, moolreTx) {
         <table style="width:100%;border-collapse:collapse;margin:16px 0;">${orderItemsHtml(items)}</table>
         <p style="font-size:16px;color:#F5F2EA;">Total paid: <strong style="color:#C8FF00;">GH₵${Number(order.total_amount || 0)}</strong></p>
         <p style="color:#8b877e;">Delivery: ${order.shipping_address || "—"}<br/>We'll reach you on ${order.customer_phone || "your phone"} when it's moving.</p>
+        <p style="margin:20px 0 6px;"><a href="${env.siteUrl}/track?id=${encodeURIComponent(order.order_number)}" style="display:inline-block;background:#C8FF00;color:#0A0A0A;font-weight:900;text-decoration:none;padding:13px 22px;text-transform:uppercase;letter-spacing:1px;">📦 Track your order</a></p>
+        <p style="color:#8b877e;font-size:13px;">Track anytime at <a href="${env.siteUrl}/track" style="color:#C8FF00;">${env.siteUrl.replace(/^https?:\/\//, "")}/track</a> with your order number <strong style="color:#F5F2EA;">${order.order_number}</strong>.<br/>
+        Authenticity code: <strong style="color:#F5F2EA;">${authCode}</strong> — verify any OG OFFCL piece at <a href="${env.siteUrl}/authentic-check" style="color:#C8FF00;">${env.siteUrl.replace(/^https?:\/\//, "")}/authentic-check</a>.</p>
       `),
     }).catch(() => {});
   }
@@ -62,6 +71,15 @@ async function finalizePaidOrder(order, moolreTx) {
       `),
     }).catch(() => {});
   }
+
+  // best-effort push to the Telegram bot (owner alert). Never affects the order.
+  await notifyBot("order.paid", {
+    id: order.id,
+    order_number: order.order_number,
+    total_amount: order.total_amount,
+    customer_name: order.customer_name,
+    item_count: items.length,
+  });
 
   return { ok: true };
 }

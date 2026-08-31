@@ -214,7 +214,7 @@ export default function ProductPage() {
           <div className="mt-10 border-t border-ash pt-6 space-y-2 text-bone/40 text-xs uppercase tracking-[0.2em]">
             <p>— Heavyweight quality, limited run</p>
             <p>— Ships from Accra · 1–3 days in Ghana</p>
-            <p>— Secure Paystack checkout (GHS)</p>
+            <p>— Secure mobile-money checkout via Moolre (GHS)</p>
           </div>
         </div>
       </div>

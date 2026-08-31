@@ -204,6 +204,12 @@ async function bracket(_req, res) {
   return res.json({ players, matches, count: players.length });
 }
 
+// Public: archived past editions (sanitized — gamertags/photos only, no PII).
+async function editions(_req, res) {
+  const { data } = await sb("GET", "tournament_editions?select=edition,name,event_date,champion,champion_photo,player_count,players,archived_at&order=edition.desc");
+  return res.json({ editions: Array.isArray(data) ? data : [] });
+}
+
 async function admin(req, res) {
   if (!env.adminPassword || String(req.headers["x-admin-password"] || "") !== env.adminPassword) {
     return res.status(401).json({ error: "unauthorized" });
@@ -354,6 +360,54 @@ async function admin(req, res) {
     await sb("DELETE", "tournament_matches?round=gte.0");
     return res.json({ ok: true });
   }
+  if (act === "archive") {
+    // Snapshot the finished tournament into tournament_editions (winner +
+    // players + final bracket), then clear players & matches for the next one.
+    const [pRes, mRes, eRes] = await Promise.all([
+      sb("GET", "tournament_players?payment_status=eq.paid&select=id,gamertag,platform,photo_path&order=created_at.asc"),
+      sb("GET", "tournament_matches?select=*&order=round.asc,slot.asc"),
+      sb("GET", "tournament_editions?select=edition&order=edition.desc&limit=1"),
+    ]);
+    const players = Array.isArray(pRes.data) ? pRes.data : [];
+    const matches = Array.isArray(mRes.data) ? mRes.data : [];
+    if (!players.length) return res.status(400).json({ error: "No paid players to archive." });
+    const byId = Object.fromEntries(players.map((p) => [p.id, p]));
+
+    let champId = null;
+    if (matches.length) {
+      const maxRound = Math.max.apply(null, matches.map((m) => m.round));
+      const finals = matches.filter((m) => m.round === maxRound);
+      const decided = finals.find((m) => m.winner);
+      champId = decided ? decided.winner : null;
+    }
+    const champ = champId ? byId[champId] : null;
+    const nextEd = (eRes.ok && Array.isArray(eRes.data) && eRes.data[0] ? Number(eRes.data[0].edition) : 0) + 1;
+    const edition = b.edition ? Number(b.edition) : nextEd;
+
+    const rec = {
+      edition,
+      name: b.name || `Edition ${edition}`,
+      event_date: b.date || null,
+      champion: champ ? champ.gamertag : (b.champion || null),
+      champion_photo: champ ? publicPhoto(champ.photo_path) : null,
+      player_count: players.length,
+      players: players.map((p) => ({ gamertag: p.gamertag, platform: p.platform, photo: publicPhoto(p.photo_path) })),
+      matches: matches.map((m) => ({
+        round: m.round, slot: m.slot,
+        player1: (byId[m.player1] || {}).gamertag || null, player2: (byId[m.player2] || {}).gamertag || null,
+        score1: m.score1, score2: m.score2, leg2_score1: m.leg2_score1, leg2_score2: m.leg2_score2,
+        pens1: m.pens1, pens2: m.pens2, winner: (byId[m.winner] || {}).gamertag || null,
+      })),
+    };
+    const ins = await sb("POST", "tournament_editions", rec, { Prefer: "return=minimal" });
+    if (!ins.ok) return res.status(500).json({ error: "Could not archive — run migration_oct_features.sql (tournament_editions)?", detail: JSON.stringify(ins.data).slice(0, 160) });
+
+    if (b.clear !== false) {
+      await sb("DELETE", "tournament_matches?round=gte.0");
+      await sb("DELETE", "tournament_players?id=neq.00000000-0000-0000-0000-000000000000");
+    }
+    return res.json({ ok: true, edition, champion: rec.champion, players: players.length, cleared: b.clear !== false });
+  }
   if (act === "linkdiag") {
     // probe /embed/link (admin-gated, no secrets returned): reports whether
     // hosted payment links are active. Optional b.user tries a candidate
@@ -391,6 +445,7 @@ export default async (req, res) => {
     if (action === "status") return await status(req, res);
     if (action === "player") return await playerInfo(req, res);
     if (action === "bracket") return await bracket(req, res);
+    if (action === "editions") return await editions(req, res);
     if (action === "admin" && req.method === "POST") return await admin(req, res);
     return res.status(400).json({ error: "unknown action" });
   } catch (e) {

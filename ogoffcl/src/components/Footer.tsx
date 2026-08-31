@@ -72,6 +72,8 @@ export default function Footer() {
           <p className="font-display uppercase text-xs tracking-[0.3em] text-bone/40 mb-1">Connect</p>
           <a href="https://instagram.com" target="_blank" rel="noreferrer" className="link-sweep w-fit text-bone/80 hover:text-bone uppercase text-sm font-display tracking-wider">Instagram</a>
           <a href="mailto:ogoffcl@gmail.com" className="link-sweep w-fit text-bone/80 hover:text-bone uppercase text-sm font-display tracking-wider">Email us</a>
+          <Link to="/track" className="link-sweep w-fit text-bone/80 hover:text-bone uppercase text-sm font-display tracking-wider">Track order</Link>
+          <Link to="/authentic-check" className="link-sweep w-fit text-bone/80 hover:text-bone uppercase text-sm font-display tracking-wider">Authenticity check</Link>
           <Link to="/refund-policy" className="link-sweep w-fit text-bone/80 hover:text-bone uppercase text-sm font-display tracking-wider">Refund policy</Link>
           <p className="text-bone/30 text-xs mt-4">Mobile money payments secured by Moolre · GHS</p>
         </div>

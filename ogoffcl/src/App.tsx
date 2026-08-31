@@ -13,6 +13,9 @@ import Fixtures from "./pages/Fixtures";
 import TournamentPay from "./pages/TournamentPay";
 import Checkout from "./pages/Checkout";
 import Confirmation from "./pages/Confirmation";
+import Track from "./pages/Track";
+import AuthenticCheck from "./pages/AuthenticCheck";
+import AuthenticityCertificate from "./pages/AuthenticityCertificate";
 import RefundPolicy from "./pages/RefundPolicy";
 import NotFound from "./pages/NotFound";
 import AdminLayout from "./admin/AdminLayout";
@@ -58,6 +61,9 @@ export default function App() {
             <Route path="/tournament/pay/:playerId" element={<TournamentPay />} />
             <Route path="/checkout" element={<Checkout />} />
             <Route path="/order-confirmation" element={<Confirmation />} />
+            <Route path="/track" element={<Track />} />
+            <Route path="/authentic-check" element={<AuthenticCheck />} />
+            <Route path="/authenticity-certificate" element={<AuthenticityCertificate />} />
             <Route path="/refund-policy" element={<RefundPolicy />} />
             <Route path="/admin" element={<AdminLayout />}>
               <Route index element={<Dashboard />} />

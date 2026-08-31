@@ -38,6 +38,7 @@ export default async (req, res) => {
           <p>${f[1]}</p>
           <p>Order: <strong style="color:#C8FF00;">${order.order_number}</strong></p>
           ${note ? `<p style="color:#8b877e;">${String(note)}</p>` : ""}
+          <p style="margin:18px 0 4px;"><a href="${env.siteUrl}/track?id=${encodeURIComponent(order.order_number)}" style="display:inline-block;background:#C8FF00;color:#0A0A0A;font-weight:900;text-decoration:none;padding:12px 20px;text-transform:uppercase;letter-spacing:1px;">📦 Track your order</a></p>
         `),
       });
       emailed = !!r.ok;

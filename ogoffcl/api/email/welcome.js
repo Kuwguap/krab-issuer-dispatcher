@@ -1,6 +1,6 @@
 // POST /api/email/welcome  { email, source: waitlist|newsletter }
 // Fired by the site right after a successful subscribe. Best-effort.
-import { sendEmail, emailShell } from "../_lib.js";
+import { sendEmail, emailShell, notifyBot, sbCount } from "../_lib.js";
 
 export default async (req, res) => {
   if (req.method !== "POST") return res.status(405).json({ error: "POST only" });
@@ -22,6 +22,11 @@ export default async (req, res) => {
              <p style="color:#8b877e;">Heavyweight fabric. Loud prints. Born in Accra.</p>`
       ),
     });
+
+    // best-effort push to the Telegram bot with the running list size
+    const count = await sbCount("subscribers");
+    await notifyBot("waitlist.joined", { email, source, count });
+
     return res.json({ ok: !!r.ok, skipped: !!r.skipped });
   } catch (e) {
     return res.status(500).json({ error: e && e.message ? e.message : "welcome failed" });
