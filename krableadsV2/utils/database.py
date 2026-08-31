@@ -1549,6 +1549,35 @@ class Database:
             logger.error(f"Error getting lead assignment status: {e}")
             return None
 
+    def get_lead_offered_driver_ids(self, lead_id: str) -> list:
+        """Driver ids this lead was offered to, the accepted one first.
+
+        Lets a password release be re-armed long after the fact: the offer that
+        armed it lives in RAM and does not survive a restart, but the
+        lead_assignments rows do.
+        """
+        if not self._check_tables_exist():
+            return []
+        try:
+            r = (self.client.table("lead_assignments")
+                 .select("driver_id, status")
+                 .eq("lead_id", str(lead_id))
+                 .limit(200).execute())
+        except Exception as e:
+            logger.warning("get_lead_offered_driver_ids: %s", e)
+            return []
+        rows = [x for x in (r.data or []) if x.get("driver_id")]
+        accepted = [str(x["driver_id"]) for x in rows if x.get("status") == "accepted"]
+        if accepted:
+            return accepted
+        out, seen = [], set()
+        for x in rows:
+            did = str(x["driver_id"])
+            if did not in seen:
+                seen.add(did)
+                out.append(did)
+        return out
+
     def _norm_paper_driver_id(self, driver_id: str) -> str:
         return str(driver_id).strip()
 

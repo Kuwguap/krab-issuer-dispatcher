@@ -355,7 +355,7 @@ class TheInstantTagArmsTheRightPeopleTest(unittest.IsolatedAsyncioTestCase):
     async def test_one_driver_arms_that_driver_directly(self):
         armed, said = await self._dispatch(self._drivers(1), SUPERVISOR)
         self.assertEqual(D1, armed["driver_id"])
-        self.assertIn("password to release it without payment", said)
+        self.assertIn("reply here with the password", said)
 
     async def test_an_ordinary_issuer_is_never_armed_or_told_about_it(self):
         """Offering a bypass they cannot take would only make the password

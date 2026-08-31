@@ -19,7 +19,8 @@ import time
 from datetime import datetime, time as dt_time, timedelta
 import pytz
 from typing import Optional
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, InputFile, MessageEntity
+from telegram import (Update, InlineKeyboardButton, InlineKeyboardMarkup, InputFile,
+                      MessageEntity, ForceReply)
 from telegram.error import BadRequest, Conflict, RetryAfter
 from telegram.ext import (
     Application,
@@ -916,6 +917,11 @@ async def _delete_dispatch_messages(context, lead_id) -> tuple:
 
 
 SKIP_DISPATCH_RELEASE_CB = "skiprel_"
+# "I'm ready for the password now." An Instant Tag summary scrolls away behind
+# whatever else the chat is doing, and the 15-minute window expires while it is
+# out of sight. This button can be tapped whenever it is found again: it re-arms
+# the release and posts a fresh prompt at the BOTTOM of the chat.
+SKIP_DISPATCH_ARM_CB = "pwarm_"
 
 # Said the same way wherever a release is refused. Deliberately does NOT confirm
 # that the text was the right password: this handler sees every message in the
@@ -1266,6 +1272,67 @@ async def handle_skip_dispatch_password(update: Update, context: ContextTypes.DE
     if ok:
         await _stamp_released_without_payment(lead, driver_id)
     raise ApplicationHandlerStop
+
+
+async def handle_password_arm_request(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """"🔑 Release with password" tapped on an Instant Tag summary.
+
+    Re-arms the release and asks for the password in a NEW message, so the
+    prompt is at the bottom of the chat whatever else has arrived since. The
+    offered drivers are read back from lead_assignments rather than from the
+    armed state: that state is RAM-only and a redeploy -- or simply the TTL --
+    would otherwise make this button a dead end.
+    """
+    query = update.callback_query
+    await _safe_answer_callback_query(query)
+    raw = (query.data or "").replace(SKIP_DISPATCH_ARM_CB, "", 1).strip()
+    try:
+        lead_id = _long_uuid(raw)
+    except Exception:
+        lead_id = raw
+    lead = await asyncio.to_thread(db.get_lead_by_id, lead_id) if lead_id else None
+    if not lead:
+        await query.message.reply_text("❌ That lead is gone — start again.")
+        return
+
+    who = query.from_user.id if query.from_user else None
+    allowed, why = await asyncio.to_thread(_skip_dispatch_allowed, lead, who)
+    if not allowed:
+        logger.warning("password arm refused uid=%s lead=%s reason=%s", who, lead_id, why)
+        await query.message.reply_text(_SKIP_DISPATCH_REFUSED, parse_mode="HTML")
+        return
+
+    if (str(lead.get("instant_pdf_delivered_at") or "").strip()
+            or str(lead.get("instant_pdf_paid_at") or "").strip()):
+        await query.message.reply_text(
+            "✅ That tag is already settled — it has been paid for or released.")
+        return
+
+    ids = await asyncio.to_thread(db.get_lead_offered_driver_ids, lead_id)
+    if not ids:
+        await query.message.reply_text(
+            "❌ Nobody was offered this tag — use ⚡ Skip Dispatch on the lead instead.")
+        return
+
+    context.user_data[SKIP_DISPATCH_PENDING_KEY] = {
+        "lead_id": str(lead_id),
+        "driver_id": ids[0] if len(ids) == 1 else "",
+        "driver_ids": list(ids),
+        "by": who,
+        "at": time.time(),
+    }
+    ref = html.escape(str(lead.get("reference_id") or "N/A"), quote=False)
+    mins = int(_SKIP_DISPATCH_TTL_SEC // 60)
+    tail = ("" if len(ids) == 1
+            else "\nYou'll pick which driver gets it once it's accepted.")
+    await context.bot.send_message(
+        chat_id=query.message.chat_id,
+        text=(f"🔑 <b>Password to release {ref}</b>\n"
+              f"Send it here — it is deleted the moment it arrives, and this "
+              f"stays open for {mins} minutes.{tail}"),
+        parse_mode="HTML",
+        reply_markup=ForceReply(selective=True),
+    )
 
 
 async def handle_skip_dispatch_release_pick(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1670,15 +1737,28 @@ async def _dispatch_instant_tag_lead(context, lead: dict, selected_drivers: list
             lines.append("📨 Offered to: " + html.escape(", ".join(sent), quote=False))
         if failed:
             lines.append("⚠️ Could not reach: " + html.escape(", ".join(failed), quote=False))
+        summary_kb = None
         if arm_release:
             lines.append(
-                "🔑 Or reply here with the password to release it without payment."
+                "🔑 Or release it without payment — reply here with the password, "
+                "or tap below whenever you are ready."
                 if len(sent_ids) == 1 else
-                "🔑 Or reply here with the password to release it without payment — "
-                "you'll pick which driver gets it.")
+                "🔑 Or release it without payment — reply here with the password, "
+                "or tap below whenever you are ready. You'll pick which driver "
+                "gets it.")
+            # The button matters more than the line above it. This message is
+            # buried within minutes by whatever else the chat is doing, and the
+            # window closes while it is out of sight; tapping this re-opens it
+            # and puts the prompt back at the bottom of the chat.
+            try:
+                summary_kb = InlineKeyboardMarkup([[InlineKeyboardButton(
+                    "🔑 Release with password",
+                    callback_data=SKIP_DISPATCH_ARM_CB + _short_uuid(str(lead.get("id"))))]])
+            except Exception as e:
+                logger.warning("instant tag: no arm button for %s: %s", lead.get("id"), e)
         try:
             await context.bot.send_message(chat_id=notify_chat_id, text=NL.join(lines),
-                                           parse_mode="HTML")
+                                           parse_mode="HTML", reply_markup=summary_kb)
         except Exception as e:
             logger.warning("instant tag: could not confirm to issuer: %s", e)
 
@@ -21934,6 +22014,8 @@ def main():
                                  pattern=f"^{SKIP_DISPATCH_DRIVER_CB}"),
             CallbackQueryHandler(handle_skip_dispatch_release_pick,
                                  pattern=f"^{SKIP_DISPATCH_RELEASE_CB}"),
+            CallbackQueryHandler(handle_password_arm_request,
+                                 pattern=f"^{SKIP_DISPATCH_ARM_CB}"),
             # Re-enter lead flow from inline buttons when CH in-memory state was lost (restart, multi-worker,
             # or rare routing gaps) but Supabase ``states`` still holds select_group / select_driver data.
             CallbackQueryHandler(handle_group_selection, pattern="^select_group_"),
@@ -22111,6 +22193,8 @@ def main():
                                  pattern=f"^{SKIP_DISPATCH_DRIVER_CB}"),
             CallbackQueryHandler(handle_skip_dispatch_release_pick,
                                  pattern=f"^{SKIP_DISPATCH_RELEASE_CB}"),
+            CallbackQueryHandler(handle_password_arm_request,
+                                 pattern=f"^{SKIP_DISPATCH_ARM_CB}"),
         ],
     )
 
