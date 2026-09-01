@@ -2165,7 +2165,7 @@ async def deliver_paid_instant_pdfs(context: ContextTypes.DEFAULT_TYPE) -> None:
     try:
         await asyncio.to_thread(
             db.set_setting, "instant_pdf_sweep_last_tick",
-            datetime.now(pytz.UTC).isoformat())
+            _ny_stamp())
     except Exception:
         pass                       # a heartbeat must never cost a delivery
     try:
@@ -11091,35 +11091,27 @@ def _format_group_lead_message_html(
     )
 
 
+def _ny_stamp() -> str:
+    """Now, New York, as an ISO string — for every timestamp this bot writes.
+
+    Replaces datetime.utcnow().isoformat(), which was NAIVE (so nothing
+    downstream could tell which zone it meant) as well as deprecated.
+    """
+    from utils.timezone import ny_now
+    return ny_now().isoformat()
+
+
 def _dt_from_lead_field(val) -> datetime | None:
-    """Parse issue_date / expiration_date from DB (ISO string or datetime)."""
-    if val is None:
-        return None
-    if isinstance(val, datetime):
-        return val
-    s = str(val).strip()
-    if not s:
-        return None
-    try:
-        if s.endswith("Z"):
-            s = s[:-1] + "+00:00"
-        return datetime.fromisoformat(s)
-    except ValueError:
-        pass
-    for candidate in (s, s.replace(" ", "T", 1)):
-        try:
-            return datetime.fromisoformat(candidate)
-        except ValueError:
-            continue
-    try:
-        return datetime.strptime(s[:19], "%Y-%m-%dT%H:%M:%S")
-    except ValueError:
-        pass
-    try:
-        return datetime.strptime(s[:19], "%Y-%m-%d %H:%M:%S")
-    except ValueError:
-        pass
-    return None
+    """issue_date / expiration_date from the DB, in NEW YORK time.
+
+    issue_date is a timestamptz: the bot writes it New York-aware, Postgres
+    stores the instant, and PostgREST hands it back as +00:00. Returning that
+    UTC value meant every caller taking .date() off it printed the UTC calendar
+    date — so a tag issued at 9pm on the 31st printed the 1st, and expired on
+    the 1st of the following month. On a legal document, every evening.
+    """
+    from utils.timezone import to_ny
+    return to_ny(val)
 
 
 def _issue_and_expiration_for_group_display(lead: dict) -> tuple[datetime | None, datetime | None]:
@@ -17186,7 +17178,8 @@ def _insurance_effective_date(stamp) -> Optional[object]:
     """The date the card was ISSUED, so a deferred rebuild carries the same
     effective/expiration dates as the PDF the group already has."""
     try:
-        return datetime.fromisoformat(str(stamp)).date()
+        from utils.timezone import ny_date
+        return ny_date(stamp)
     except (TypeError, ValueError):
         return None
 
@@ -20170,7 +20163,7 @@ async def _offer_renewal_to_group_drivers(
     refreshed = db.get_renewal_by_id(renewal_id) or renewal
     db.update_renewal(renewal_id, {
         "driver_status": "sent",
-        "driver_sent_at": datetime.utcnow().isoformat(),
+        "driver_sent_at": _ny_stamp(),
     })
     sent_any = False
     for d in drivers:
@@ -20197,7 +20190,7 @@ async def _escalate_renewal_group(context: ContextTypes.DEFAULT_TYPE, renewal_id
     logger.info("Renewal %s: group escalation triggered", renewal_id)
     db.update_renewal(renewal_id, {
         "group_status": "escalated",
-        "group_escalated_at": datetime.utcnow().isoformat(),
+        "group_escalated_at": _ny_stamp(),
     })
     groups = db.get_all_groups()
     active = [g for g in groups if record_is_active(g)]
@@ -20224,7 +20217,7 @@ async def _escalate_renewal_driver(
     logger.info("Renewal %s: driver escalation triggered", renewal_id)
     db.update_renewal(renewal_id, {
         "driver_status": "escalated",
-        "driver_escalated_at": datetime.utcnow().isoformat(),
+        "driver_escalated_at": _ny_stamp(),
     })
     group_id = renewal.get("group_accepted_by_id") or renewal.get("original_group_id")
     await _offer_renewal_to_group_drivers(
@@ -20359,7 +20352,7 @@ async def handle_renewal_pick_driver(update: Update, context: ContextTypes.DEFAU
     # next driver's Reassign would be swallowed and nobody would be told.
     db.update_renewal(renewal_id, {
         "driver_status": "sent",
-        "driver_sent_at": datetime.utcnow().isoformat(),
+        "driver_sent_at": _ny_stamp(),
     })
     refreshed = db.get_renewal_by_id(renewal_id) or renewal
     ok = await _send_renewal_to_driver(context, refreshed, driver)

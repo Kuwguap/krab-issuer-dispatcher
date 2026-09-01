@@ -49,14 +49,18 @@ def _issued_on(lead: dict) -> date:
         raw = str(lead.get(key) or "").strip()
         if not raw:
             continue
+        # In NEW YORK. These stamps come back from the database as UTC, so
+        # taking .date() off them dated an evening card to the following day.
+        from utils.timezone import ny_date, ny_today
+        got = ny_date(raw)
+        if got:
+            return got
         try:
-            return datetime.fromisoformat(raw.replace("Z", "+00:00")).date()
+            return date.fromisoformat(raw[:10])
         except Exception:
-            try:
-                return date.fromisoformat(raw[:10])
-            except Exception:
-                continue
-    return date.today()
+            continue
+    from utils.timezone import ny_today
+    return ny_today()
 
 
 def build_card_pdf_for_lead(lead: dict) -> tuple[Optional[bytes], Optional[str]]:

@@ -61,6 +61,13 @@ def _extract_vin_17(text: str) -> str | None:
 
 
 def _dt_from_lead_field(val) -> datetime | None:
+    """NEW YORK time — see utils.timezone. The web mirror prints the same tag
+    as the bot, so it has to agree with the bot about what day it is."""
+    from utils.timezone import to_ny
+    return to_ny(val)
+
+
+def _dt_from_lead_field_unused(val) -> datetime | None:
     """Parse issue_date / expiration_date from DB (ISO string or datetime)."""
     if val is None:
         return None

@@ -904,8 +904,10 @@ def build_tag_pdf(fields: Dict[str, Any]) -> bytes:
     control = str(fields.get("control_number") or "").strip()
     issued = fields.get("issued")
     if issued is None:  # a tag must always carry dates
-        from datetime import date as _date
-        issued = _date.today()
+        # NEW YORK today, not the server's. These run in UTC, where "today"
+        # turns over at 8pm Eastern — and this is the date printed on the tag.
+        from utils.timezone import ny_today
+        issued = ny_today()
     expires = fields.get("expires")
     if expires is None:
         expires = issued + timedelta(days=29)
