@@ -133,8 +133,8 @@ class OneDefinitionOfNoInsurerTest(unittest.TestCase):
     """The hand-written tuple compared case-SENSITIVELY and listed five spellings,
     so a car whose insurer read "none" counted as insured and never got a policy."""
 
-    def _lead(self, insurer):
-        return {"vehicle_details": "\n".join(["N"] * 8 + [insurer, "-", "-"])}
+    def _lead(self, insurer, policy="-"):
+        return {"vehicle_details": "\n".join(["N"] * 8 + [insurer, policy, "-"])}
 
     def test_every_way_of_writing_nothing(self):
         for v in ("-", "—", "N/A", "n/a", "NA", "na", "None", "none", "NONE",
@@ -144,9 +144,18 @@ class OneDefinitionOfNoInsurerTest(unittest.TestCase):
                                  f"{v!r} is not an insurer")
 
     def test_a_real_insurer_still_counts(self):
+        """With their policy number beside it. Both halves, or the tag has a box
+        it cannot fill."""
         for v in ("Geico", "Progressive", "State Farm", "Allstate"):
             with self.subTest(insurer=v):
-                self.assertTrue(bot._lead_already_insured(self._lead(v)))
+                self.assertTrue(bot._lead_already_insured(self._lead(v, "POL-9")))
+
+    def test_a_real_insurer_without_a_policy_number_does_not(self):
+        for v in ("Geico", "Progressive", "State Farm", "Allstate"):
+            with self.subTest(insurer=v):
+                self.assertFalse(bot._lead_already_insured(self._lead(v)),
+                                 "a carrier with no policy number is not cover "
+                                 "we can print")
 
     def test_it_agrees_with_the_per_car_rule(self):
         """Two definitions of "blank" drifting apart is how one car gets coverage

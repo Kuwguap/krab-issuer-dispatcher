@@ -431,8 +431,14 @@ class InsuranceFollowsTheMissingFieldTest(unittest.TestCase):
 
     def test_a_car_that_arrived_insured_needs_nothing(self):
         self.assertFalse(bot._vehicle_needs_coverage(CAR2))
-        self.assertFalse(bot._vehicle_needs_coverage(
+
+    def test_a_carrier_with_no_policy_number_still_needs_cover(self):
+        """Half an insurer is not an insurer. We cannot print a Geico policy
+        number we were never given, so the car goes on our own paper."""
+        self.assertTrue(bot._vehicle_needs_coverage(
             {"insurance_company": "Geico", "insurance_policy_number": ""}))
+        self.assertTrue(bot._vehicle_needs_coverage(
+            {"insurance_company": "", "insurance_policy_number": "POL-9"}))
 
     def test_a_car_with_no_insurer_needs_coverage(self):
         self.assertTrue(bot._vehicle_needs_coverage(bot._blank_vehicle()))

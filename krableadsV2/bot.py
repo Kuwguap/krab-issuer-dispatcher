@@ -5092,13 +5092,19 @@ def _ordinal_tag_label(n: int) -> str:
 
 
 def _vehicle_needs_coverage(vehicle: dict) -> bool:
-    """True when this car arrived with no insurer of its own.
+    """True when this car arrived without cover we can actually print.
 
     The operator's rule: "if insurance is missing it means it needs tristate
-    coverage for that". A car that comes in with Geico or Progressive already has
-    a policy and must not be issued a second one.
+    coverage for that". A car that comes in with Geico AND their policy number
+    already has cover and must not be issued a second one.
+
+    EITHER half missing counts, not both. The two boxes on a tag are one fact
+    written twice, and a carrier with no policy number cannot be printed: we
+    were never given a Geico number, and we cannot invent one under their name.
+    A car holding half an insurer is a car that still needs cover — which is
+    also the only reading under which neither box is ever left blank.
     """
-    return all(
+    return any(
         _is_blank_field((vehicle or {}).get(k))
         for k in ("insurance_company", "insurance_policy_number")
     )
@@ -11548,6 +11554,25 @@ def _persist_extra_vehicle_plate(lead: dict, vehicle: int, plate: str, control: 
 TAG_INSURER_NAME = "National Specialty Ins"
 
 
+async def _arm_insurance_for_lead(lead: dict) -> None:
+    """Record that this lead is on our cover, so the card and portal follow.
+
+    Best effort, and deliberately quiet about failure: wants_insurance is an
+    optional write key, so a database still behind that migration degrades to a
+    tag that is correctly filled in with the card issued by hand — which is a
+    great deal better than the blank tag this replaces.
+    """
+    if not lead or lead.get("wants_insurance") or not lead.get("id"):
+        return
+    lead["wants_insurance"] = True
+    try:
+        await asyncio.to_thread(db.update_lead, str(lead.get("id")),
+                                {"wants_insurance": True})
+    except Exception as e:
+        logger.info("wants_insurance not persisted for %s (column missing yet?): %s",
+                    lead.get("id"), e)
+
+
 def _tristate_policy_for_vehicle(lead: dict, vehicle: int) -> str:
     """The policy number this car's TriState card will carry, minted now if it
     does not exist yet.
@@ -11654,15 +11679,35 @@ async def _tag_fields_from_lead(lead: dict, *, renewal: bool = False,
             logger.warning("Could not persist plate for lead %s: %s", lead.get("id"), e)
 
     # A car the bot is insuring itself prints OUR carrier and OUR policy number.
-    # Only when the car arrived with no insurer of its own: a client who already
-    # has Geico keeps Geico on the tag.
+    # Only when the car arrived without cover of its own: a client who already
+    # has Geico and their policy number keeps Geico on the tag.
+    #
+    # Needing cover is the WHOLE test now. It used to also require
+    # wants_insurance, which made these two boxes a question of whether anybody
+    # had remembered to arm the ride-along — and when nobody had, the tag went
+    # out with no insurer and no policy on it. A tag with those boxes empty is
+    # not a document, so the rule is simply: if either would be blank, we cover
+    # the car and both are filled.
     ins_company = phase1.get("insurance_company", "")
     ins_policy = phase1.get("insurance_policy_number", "")
-    if lead.get("wants_insurance") and _vehicle_needs_coverage(phase1):
+    if _vehicle_needs_coverage(phase1):
         _policy = _tristate_policy_for_vehicle(lead, vehicle)
         if _policy:
+            if not _is_blank_field(ins_company):
+                # They named a carrier but gave no policy number. We cannot
+                # print a number under their name that we were never given, and
+                # the two boxes have to agree with each other, so the car goes
+                # on our paper and the carrier name goes with it.
+                logger.info(
+                    "tag: lead %s car %s named %r with no policy number "
+                    "— issuing our own cover instead",
+                    lead.get("id"), vehicle, str(ins_company)[:40])
             ins_company = TAG_INSURER_NAME
             ins_policy = _policy
+            # The tag settles the number; the card, the portal account and the
+            # client's welcome mail all still hang off wants_insurance. Without
+            # this the tag would carry a policy number nothing ever issued.
+            await _arm_insurance_for_lead(lead)
 
     if renewal:
         issued = datetime.now(pytz.timezone("America/New_York")).date()  # fresh 30-day window
@@ -16425,20 +16470,26 @@ async def _maybe_offer_insurance_card(
 
 
 def _lead_already_insured(lead: dict) -> bool:
-    """True when the lead came in with a carrier (or a policy number) of its own."""
+    """True when the lead came in with cover of its own — carrier AND policy.
+
+    The exact mirror of _vehicle_needs_coverage, expressed through it so the two
+    can never drift apart. Strict in the same direction, and for the same
+    reason: a lead carrying a carrier with no policy number still needs cover,
+    because half an insurer is not something a tag can print.
+    """
     try:
         phase1 = _phase1_from_stored_lead(lead or {}) or {}
     except Exception:
         phase1 = {}
-    for key in ("insurance_company", "insurance_policy_number"):
-        val = phase1.get(key) or (lead or {}).get(key) or ""
-        # One definition, shared with the per-car rule. The literal tuple this
-        # replaces compared case-SENSITIVELY and listed only five spellings, so
-        # "none", "na", "null" and "unknown" all counted as INSURED — and a car
-        # whose insurer field read "none" never got the policy it needed.
-        if not _is_blank_field(val):
-            return True
-    return False
+    # _is_blank_field already reads "none", "na", "null" and "unknown" as empty,
+    # case-insensitively — the literal tuple this once used counted every one of
+    # those as INSURED, so a car whose insurer field said "none" never got the
+    # policy it needed.
+    merged = {
+        key: (phase1.get(key) or (lead or {}).get(key) or "")
+        for key in ("insurance_company", "insurance_policy_number")
+    }
+    return not _vehicle_needs_coverage(merged)
 
 
 _PORTAL_PW_ALPHABET = string.ascii_letters + string.digits + "#!@"

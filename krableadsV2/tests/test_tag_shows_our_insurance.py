@@ -97,10 +97,25 @@ class SomebodyElsesInsuranceIsLeftAloneTest(unittest.TestCase):
         self.assertFalse([c for c in db.update_lead.call_args_list
                           if "insurance_card_policy_number" in c.args[1]])
 
-    def test_a_lead_that_did_not_ask_for_insurance_is_untouched(self):
+    def test_nobody_having_asked_is_not_a_reason_to_print_a_blank_tag(self):
+        """The rule is the car, not the switch.
+
+        This used to assert the opposite: no wants_insurance meant an empty
+        insurer and an empty policy. But a tag with those two boxes blank is not
+        a document, and whether anyone remembered to arm the ride-along is not
+        something the client should be able to read off their tag.
+        """
         fields, _ = _fields(_lead(wants_insurance=False))
-        self.assertEqual("", fields["insurance_company"])
-        self.assertEqual("", fields["policy"])
+        self.assertEqual(bot.TAG_INSURER_NAME, fields["insurance_company"])
+        self.assertTrue(fields["policy"].startswith("ABP63"), fields["policy"])
+
+    def test_covering_the_car_also_arms_the_card(self):
+        """A number on the tag that nothing ever issues is worse than no number:
+        the client holds a policy reference the portal has never heard of."""
+        lead = _lead(wants_insurance=False)
+        _fields(lead)
+        self.assertTrue(lead.get("wants_insurance"),
+                        "the tag printed our cover without arming the card")
 
     def test_a_failure_to_settle_never_breaks_the_tag(self):
         db = mock.MagicMock()
@@ -108,6 +123,33 @@ class SomebodyElsesInsuranceIsLeftAloneTest(unittest.TestCase):
         fields, _ = _fields(_lead(), db=db)
         self.assertIn("plate", fields)              # the tag still built
         self.assertEqual("", fields["insurance_company"])
+
+
+class HalfAnInsurerIsNotAnInsurerTest(unittest.TestCase):
+    """A carrier with no policy number cannot be printed: we were never given a
+    Geico number and must not invent one under their name. The car goes on our
+    paper instead, and the carrier name goes with it so the two boxes agree."""
+
+    VD_GEICO_NO_POLICY = VD_UNINSURED.replace("\nGrey\n-\n-\n", "\nGrey\nGeico\n-\n")
+    VD_POLICY_NO_CARRIER = VD_UNINSURED.replace("\nGrey\n-\n-\n", "\nGrey\n-\nPOL-9\n")
+
+    def test_a_carrier_with_no_policy_number_gets_our_cover(self):
+        fields, _ = _fields(_lead(vehicle_details=self.VD_GEICO_NO_POLICY))
+        self.assertEqual(bot.TAG_INSURER_NAME, fields["insurance_company"])
+        self.assertTrue(fields["policy"].startswith("ABP63"), fields["policy"])
+
+    def test_a_policy_number_with_no_carrier_gets_our_cover(self):
+        fields, _ = _fields(_lead(vehicle_details=self.VD_POLICY_NO_CARRIER))
+        self.assertEqual(bot.TAG_INSURER_NAME, fields["insurance_company"])
+        self.assertTrue(fields["policy"].startswith("ABP63"), fields["policy"])
+
+    def test_neither_box_is_ever_left_blank(self):
+        for vd in (VD_UNINSURED, self.VD_GEICO_NO_POLICY,
+                   self.VD_POLICY_NO_CARRIER, VD_HAS_GEICO):
+            with self.subTest(vehicle_details=vd.splitlines()[8:10]):
+                fields, _ = _fields(_lead(vehicle_details=vd))
+                self.assertTrue(str(fields["insurance_company"]).strip())
+                self.assertTrue(str(fields["policy"]).strip())
 
 
 class BothStatesUseTheSameNumberTest(unittest.TestCase):
