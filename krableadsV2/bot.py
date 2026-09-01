@@ -9749,6 +9749,12 @@ async def begin_lead_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
     msg = update.effective_message
     if not msg:
         return ConversationHandler.END
+    # /lead while the settings card is open means the operator has moved on.
+    # Leaving that conversation alive keeps it first in line for every message
+    # they type next, which is how a pasted lead opened the drivers screen.
+    if _end_settings_conversation(update):
+        logger.info("closed /settings for %s — a lead was started",
+                    update.effective_user.id)
     user_id = update.effective_user.id
     username = update.effective_user.username or "Unknown"
     prefill = " ".join(context.args).strip() if getattr(context, "args", None) else ""
@@ -10510,6 +10516,40 @@ def _user_in_active_conversation(update: Update, context: ContextTypes.DEFAULT_T
                 except Exception:
                     continue
     return False
+
+
+class _SettingsPhraseFilter(filters.MessageFilter):
+    """Let /settings claim a message only if it could be naming a screen.
+
+    A ConversationHandler consumes whatever its state matches, and this one is
+    registered before the lead flow — so the filter, not the callback, is where
+    this has to be decided. By the time handle_settings_text runs it is too late
+    to hand the message back.
+    """
+
+    def filter(self, message) -> bool:
+        return _looks_like_settings_phrase(getattr(message, "text", "") or "")
+
+
+def _end_settings_conversation(update: Update) -> bool:
+    """Drop this user out of /settings. True if they were in it.
+
+    Typing /lead is unambiguous: the operator has moved on. Without this the
+    settings conversation stays open behind the lead flow for the rest of the
+    session, quietly competing for every short message the operator types.
+    """
+    h = _SETTINGS_CONV_HANDLER
+    if h is None:
+        return False
+    try:
+        key = h._get_key(update)
+        if h._conversations.get(key) is None:
+            return False
+        h._conversations.pop(key, None)
+        return True
+    except Exception as e:
+        logger.warning("could not close the settings conversation: %s", e)
+        return False
 
 
 def _in_settings_conversation(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
@@ -22358,10 +22398,32 @@ _SETTINGS_HINT = (
 )
 
 
+# A screen is asked for in a few words — "drivers", "plate numbers", "close the
+# drivers list". The rules below search for their keyword ANYWHERE in the message,
+# which is right for a phrase and badly wrong for a paste: one "driver license"
+# line inside a whole pasted lead matched the drivers rule, so /settings opened
+# the drivers screen and ate the lead. Length is what separates the two.
+_SETTINGS_NAV_MAX_WORDS = 8
+
+
+def _looks_like_settings_phrase(text: str) -> bool:
+    """Could this plausibly be someone naming a settings screen?
+
+    Deliberately about SHAPE, not content: it decides whether /settings is even
+    allowed to claim the message, so it has to be judged before any keyword is
+    looked for. One line, a handful of words. Everything else belongs to whatever
+    flow the operator actually opened.
+    """
+    t = (text or "").strip()
+    if not t or "\n" in t or "\r" in t:
+        return False
+    return len(t.split()) <= _SETTINGS_NAV_MAX_WORDS
+
+
 def _settings_nav_target(text: str):
     """Which settings screen a spoken/typed phrase asks for, or None."""
     t = (text or "").strip()
-    if not t:
+    if not t or not _looks_like_settings_phrase(t):
         return None
     for rx, target in _SETTINGS_NAV:
         if rx.search(t):
@@ -23258,7 +23320,13 @@ def main():
                 CallbackQueryHandler(handle_settings_cb, pattern=r"^tset_"),
                 # Say or type "plate numbers" and that screen opens — the state had
                 # button handlers only, so text here used to be dropped entirely.
-                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_settings_text),
+                # Only PHRASE-shaped text, though. This conversation is registered
+                # ahead of the lead flow, so whatever it claims, the lead flow
+                # never sees: an operator who typed /lead with the settings card
+                # still open had their pasted lead swallowed here. Anything longer
+                # than a phrase falls through to the flow that wants it.
+                MessageHandler(filters.TEXT & ~filters.COMMAND & _SettingsPhraseFilter(),
+                               handle_settings_text),
             ],
             SET_INPUT: [
                 CallbackQueryHandler(handle_settings_cb, pattern=r"^tset_"),
