@@ -3024,14 +3024,22 @@ def _resolve_all_active_driver_ids() -> list[str]:
     ]
 
 
-async def process_pending_api_lead_dispatches(context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Poll Supabase for HTTP-ingested (website) leads and dispatch each to
-    ALL active groups (full tag post) plus ALL active drivers (Accept/Decline).
+# What public_form.py stamps on a lead a client filled in themselves. Those go
+# to the drivers at the same time as the groups, rather than waiting for a team
+# to accept first: nobody is standing behind a client's form to chase it.
+CLIENT_FORM_SOURCE = "Client Form"
 
-    Website leads skip the group-accept step: drivers are asked directly whether
-    they can deliver, exactly like the issuer driver flow. The lead is claimed
-    (ingest_dispatch_pending -> False) before sending so a slow send can't
-    double-fire on the next poll — no lead goes out twice.
+
+async def process_pending_api_lead_dispatches(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Poll Supabase for HTTP-ingested (website) leads and dispatch each one.
+
+    Every lead here goes to ALL active groups for first-accept. A lead from
+    tristatetags.com/form ALSO goes straight to every active driver, because a
+    client filling in a form has nobody chasing it on their behalf — the
+    ordinary API lead still waits for a team to accept before drivers see it.
+
+    The lead is claimed (ingest_dispatch_pending -> False) before sending so a
+    slow send can't double-fire on the next poll — no lead goes out twice.
     """
     rows = db.list_leads_pending_ingest_dispatch(limit=10)
     if not rows:
@@ -3074,6 +3082,34 @@ async def process_pending_api_lead_dispatches(context: ContextTypes.DEFAULT_TYPE
                 await _send_web_order_supervisory_notice(context, lead, active_groups)
             except Exception as e:
                 logger.warning("Web-order supervisory notice failed for %s: %s", lead_id, e)
+            # A client filled this in themselves, so there is nobody to chase a
+            # team that has not looked at their phone. Ask every driver now,
+            # beside the group offers, instead of after a first-accept that may
+            # be an hour away. The group offers stay live: whichever side moves
+            # first wins the lead, exactly as they do on the issuer's own flow.
+            if str(lead.get("contact_info_source") or "") == CLIENT_FORM_SOURCE:
+                try:
+                    sent, names, why, scope = await _send_driver_requests_for_group(
+                        context, lead, main_group,
+                    )
+                    if sent:
+                        logger.info("client form: lead %s ref %s offered to %d driver(s): %s",
+                                    lead_id, lead.get("reference_id"), sent, names)
+                    else:
+                        logger.error(
+                            "client form: lead %s ref %s reached NO drivers (%s, scope=%s)",
+                            lead_id, lead.get("reference_id"), why, scope)
+                        await _tell_supervisors(context, (
+                            f"\u26a0\ufe0f <b>A client form reached no drivers</b>"
+                            f"\n\U0001f4cb Ref: <code>"
+                            f"{html.escape(str(lead.get('reference_id') or 'N/A'), quote=False)}</code>"
+                            f"\n{html.escape(str(why or 'no reason given'), quote=False)}"
+                            f"\nThe dispatcher groups still have it."))
+                except Exception as e:
+                    # The groups already have it; a driver fan-out that failed
+                    # must not lose the lead or stop the poll.
+                    logger.error("client form: driver fan-out failed for %s: %s", lead_id, e)
+
             offers = db.get_group_lead_offers(lead_id) or []
             logger.info(
                 "API ingest: lead %s ref %s offered to %d/%d group(s) for first-accept",

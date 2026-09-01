@@ -1496,6 +1496,17 @@ def dashboard():
         return f"Error loading dashboard: {str(e)}", 500
 
 
+# tristatetags.com/form — the page a CLIENT fills in themselves. Public by
+# design (no login, no payment), which is why it lives in its own module with its
+# own honeypot, nonce and rate limit rather than borrowing dispatch_web's.
+try:
+    import public_form
+    public_form.register(app, lambda: db)
+    PUBLIC_FORM_MOUNTED, PUBLIC_FORM_MOUNT_ERROR = True, None
+except Exception as e:
+    PUBLIC_FORM_MOUNTED, PUBLIC_FORM_MOUNT_ERROR = False, f"{type(e).__name__}: {e}"
+    logger.error("Could not mount the public client form: %s", e)
+
 # The /receipts board — the transmissions list on a full page, with a status column
 # the whole team can move. Its own module: admin_dashboard is long enough.
 try:
