@@ -194,6 +194,9 @@ def register(app, db_provider):
             nonce=_mint_nonce(),
             max_len=_MAX_LEN,
             max_notes=_MAX_NOTES,
+            heading="Request your temp tag",
+            standfirst=("Fill this in and we will take it from here. "
+                        "No payment is taken on this page."),
         ), status
 
     @app.route("/form", methods=["GET"])
@@ -322,50 +325,131 @@ def register(app, db_provider):
     @app.route("/form/thanks", methods=["GET"])
     def public_form_thanks():
         ref = _clean(request.args.get("ref"), 16)
-        return render_template_string(_THANKS_PAGE, reference_id=ref)
+        return render_template_string(
+            _THANKS_PAGE, reference_id=ref,
+            heading="Thank you",
+            standfirst="Your request is on its way to our dispatch team.")
 
     logger.info("Public client form mounted at /form")
 
 
+# The site's own tokens, copied from speedy-tags-main/src/index.css. This page
+# is Flask-rendered and cannot import the React bundle's stylesheet, so the
+# values live here -- if the site's palette is ever retuned, retune these too.
 _STYLE = """
- :root{color-scheme:light dark;--bg:#f4f6f8;--card:#fff;--ink:#12161c;--muted:#6b7280;
-       --line:#dfe3e8;--accent:#2f6df6;--bad:#c0392b;--good:#0a7a4f}
- @media (prefers-color-scheme:dark){:root{--bg:#0f1115;--card:#171a21;--ink:#e8eaed;
-       --muted:#8b93a7;--line:#2a2f3a;--bad:#ff8a7a;--good:#5fd08a}}
+ /* Light only, like the rest of the site: the app defines its dark palette
+    under a .dark CLASS (tailwind darkMode:["class"]) and nothing ever adds it,
+    so honouring prefers-color-scheme made /form the one dark page a client
+    ever saw. */
+ :root{
+   color-scheme:light;
+   --background:220 14% 96%; --foreground:222 47% 11%;
+   --card:0 0% 100%; --card-foreground:222 47% 11%;
+   --primary:172 66% 38%; --primary-foreground:0 0% 100%;
+   --muted:220 14% 92%; --muted-foreground:220 9% 46%;
+   --accent:172 66% 96%; --accent-foreground:172 66% 32%;
+   --destructive:0 84% 60%; --border:220 13% 91%; --input:220 13% 91%;
+   --ring:172 66% 38%; --radius:0.75rem;
+   --success:152 60% 42%;
+   --hero-gradient:linear-gradient(135deg,hsl(172 66% 38% / 0.9),hsl(222 47% 11% / 0.85));
+   --card-shadow:0 1px 3px 0 rgb(0 0 0 / .04),0 1px 2px -1px rgb(0 0 0 / .04);
+   --card-shadow-hover:0 20px 40px -12px hsl(172 66% 38% / .15),0 8px 16px -8px rgb(0 0 0 / .08);
+ }
  *{box-sizing:border-box}
- body{font:16px/1.5 -apple-system,system-ui,Segoe UI,Roboto,sans-serif;margin:0;
-      padding:24px 16px 56px;background:var(--bg);color:var(--ink)}
- .wrap{max-width:34rem;margin:0 auto}
- .card{background:var(--card);border-radius:16px;padding:24px 20px;
-       box-shadow:0 6px 24px rgba(16,24,40,.08)}
- h1{font-size:1.4rem;margin:0 0 4px;letter-spacing:-.01em}
- .sub{color:var(--muted);margin:0 0 22px;font-size:.95rem}
- label{display:block;margin:14px 0 5px;font-weight:600;font-size:.92rem}
- .req{color:var(--bad)}
+ html{-webkit-text-size-adjust:100%}
+ body{margin:0;background:hsl(var(--background));color:hsl(var(--foreground));
+      font-family:"DM Sans",system-ui,-apple-system,Segoe UI,Roboto,sans-serif;
+      font-size:16px;line-height:1.55;-webkit-font-smoothing:antialiased}
+ h1,h2,.brand{font-family:"Outfit","DM Sans",system-ui,sans-serif}
+
+ /* The site's hero band, so the page opens the way every other page does. */
+ .hero{background:var(--hero-gradient);color:#fff;padding:26px 20px 30px}
+ .hero-in{max-width:38rem;margin:0 auto}
+ .brand{display:flex;align-items:center;gap:9px;font-weight:700;font-size:1.05rem;
+        letter-spacing:-.01em}
+ .brand .dot{width:9px;height:9px;border-radius:50%;background:#fff;opacity:.9;
+        flex:0 0 auto}
+ .brand small{display:block;font-weight:500;font-size:.72rem;opacity:.82;
+        letter-spacing:.02em;font-family:"DM Sans",sans-serif}
+ .hero h1{margin:18px 0 6px;font-size:1.55rem;line-height:1.2;letter-spacing:-.02em}
+ .hero p{margin:0;opacity:.9;font-size:.95rem;max-width:30rem}
+
+ .wrap{max-width:38rem;margin:-18px auto 0;padding:0 16px 56px}
+ .card{background:hsl(var(--card));color:hsl(var(--card-foreground));
+       border:1px solid hsl(var(--border));border-radius:var(--radius);
+       padding:26px 22px;box-shadow:var(--card-shadow-hover)}
+
+ .legend{font-size:.75rem;font-weight:700;letter-spacing:.09em;text-transform:uppercase;
+         color:hsl(var(--muted-foreground));margin:26px 0 2px}
+ .legend:first-of-type{margin-top:4px}
+
+ label{display:block;margin:15px 0 6px;font-weight:600;font-size:.9rem}
+ .req{color:hsl(var(--destructive))}
  input[type=text],input[type=tel],input[type=email],textarea{
-      width:100%;padding:12px 13px;border:1px solid var(--line);border-radius:10px;
-      background:transparent;color:var(--ink);font:inherit}
- input:focus,textarea:focus{outline:2px solid var(--accent);outline-offset:1px;
-      border-color:transparent}
- input:disabled{opacity:.45;cursor:not-allowed}
- textarea{min-height:78px;resize:vertical}
- .optin{display:flex;gap:10px;align-items:flex-start;margin:22px 0 4px;
-        padding:13px 14px;border:1px solid var(--line);border-radius:10px}
- .optin input{margin-top:3px;width:18px;height:18px;flex:0 0 auto}
- .optin span{font-size:.93rem}
- .optin small{display:block;color:var(--muted);margin-top:3px}
- button{width:100%;margin-top:24px;padding:15px;border:0;border-radius:11px;
-        background:var(--accent);color:#fff;font-weight:650;font-size:1rem;cursor:pointer}
- button:hover{filter:brightness(1.06)}
- .errors{border:1px solid var(--bad);border-radius:10px;padding:12px 14px;margin:0 0 18px}
- .errors p{margin:0 0 6px;font-weight:650;color:var(--bad)}
- .errors ul{margin:0;padding-left:18px}
+      width:100%;padding:12px 14px;border:1px solid hsl(var(--input));
+      border-radius:calc(var(--radius) - 3px);background:hsl(var(--background));
+      color:hsl(var(--foreground));font:inherit;transition:border-color .15s,box-shadow .15s}
+ input::placeholder,textarea::placeholder{color:hsl(var(--muted-foreground));opacity:.75}
+ input:focus,textarea:focus{outline:none;border-color:hsl(var(--ring));
+      box-shadow:0 0 0 3px hsl(var(--ring) / .18)}
+ input:disabled{opacity:.45;cursor:not-allowed;background:hsl(var(--muted))}
+ textarea{min-height:84px;resize:vertical}
+
+ .optin{display:flex;gap:11px;align-items:flex-start;margin:24px 0 2px;
+        padding:14px 15px;border:1px solid hsl(var(--border));
+        border-radius:calc(var(--radius) - 3px);background:hsl(var(--accent));
+        color:hsl(var(--accent-foreground));cursor:pointer}
+ .optin input{margin-top:2px;width:18px;height:18px;flex:0 0 auto;
+        accent-color:hsl(var(--primary));cursor:pointer}
+ .optin strong{font-weight:700}
+ .optin small{display:block;margin-top:3px;opacity:.85;line-height:1.45}
+
+ button{width:100%;margin-top:26px;padding:15px;border:0;
+        border-radius:calc(var(--radius) - 3px);background:hsl(var(--primary));
+        color:hsl(var(--primary-foreground));font:inherit;font-weight:700;
+        font-size:1rem;cursor:pointer;transition:filter .15s,transform .06s}
+ button:hover{filter:brightness(1.07)}
+ button:active{transform:translateY(1px)}
+
+ .errors{border:1px solid hsl(var(--destructive));background:hsl(var(--destructive) / .07);
+         border-radius:calc(var(--radius) - 3px);padding:13px 15px;margin:0 0 20px}
+ .errors p{margin:0 0 6px;font-weight:700;color:hsl(var(--destructive))}
+ .errors ul{margin:0;padding-left:19px}
+ .errors li{margin:2px 0}
+
  .hp{position:absolute;left:-9999px;width:1px;height:1px;overflow:hidden}
- .tick{width:70px;height:70px;border-radius:50%;margin:0 auto 16px;background:#e7f7ef;
-       color:var(--good);font-size:36px;line-height:70px;text-align:center}
- @media (prefers-color-scheme:dark){.tick{background:#12301f}}
- .ref{font-family:ui-monospace,SFMono-Regular,monospace;font-size:1.25rem;
-      font-weight:700;letter-spacing:.06em}
+ .foot{max-width:38rem;margin:0 auto;padding:22px 16px 0;text-align:center;
+       color:hsl(var(--muted-foreground));font-size:.82rem}
+
+ .tick{width:66px;height:66px;border-radius:50%;margin:0 auto 18px;
+       background:hsl(var(--success) / .13);color:hsl(var(--success));
+       font-size:32px;line-height:66px;text-align:center}
+ .ref{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:1.35rem;
+      font-weight:700;letter-spacing:.08em;color:hsl(var(--primary))}
+ .muted{color:hsl(var(--muted-foreground));font-size:.9rem}
+ .back{display:inline-block;margin-top:22px;color:hsl(var(--primary));
+       text-decoration:none;font-weight:600}
+ .back:hover{text-decoration:underline}
+"""
+
+
+# Loaded the way the site loads them; the stack falls back to system fonts if
+# Google is unreachable, so the page is never blank waiting on a font.
+_FONTS = """
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&family=Outfit:wght@600;700&display=swap" rel="stylesheet">
+"""
+
+
+_HERO = """
+<div class="hero"><div class="hero-in">
+  <div class="brand"><span class="dot"></span>
+    <span>TriStateTags<small>Licensed NJ Dealer</small></span>
+  </div>
+  <h1>{{ heading }}</h1>
+  <p>{{ standfirst }}</p>
+</div></div>
 """
 
 
@@ -373,12 +457,12 @@ _FORM_PAGE = """<!doctype html>
 <html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <meta name="robots" content="noindex">
-<title>Temp Tag Request — Tri State Tags</title>
-<style>""" + _STYLE + """</style></head><body>
+<meta name="theme-color" content="#0f172a">
+<link rel="icon" href="/favicon.ico" sizes="any">
+<title>Temp Tag Request | TriStateTags</title>
+""" + _FONTS + """<style>""" + _STYLE + """</style></head><body>
+""" + _HERO + """
 <div class="wrap"><div class="card">
-  <h1>Temp Tag Request</h1>
-  <p class="sub">Fill this in and we will take it from here. No payment is taken
-     on this page. Fields marked <span class="req">*</span> are required.</p>
 
   {% if errors %}
   <div class="errors">
@@ -395,19 +479,27 @@ _FORM_PAGE = """<!doctype html>
     </div>
 
     {% for name, label, required in fields %}
+      {% if name == 'first_name' %}<div class="legend">Your details</div>{% endif %}
+      {% if name == 'address' %}<div class="legend">Registration</div>{% endif %}
+      {% if name == 'delivery_address' %}<div class="legend">Delivery</div>{% endif %}
+      {% if name == 'vin' %}<div class="legend">Vehicle</div>{% endif %}
+
       {% if name == 'insurance_company' %}
-      <div class="optin">
+      <div class="legend">Insurance</div>
+      <label class="optin" for="wants_insurance">
         <input type="checkbox" id="wants_insurance" name="wants_insurance"
                {% if values.get('wants_insurance') %}checked{% endif %}>
         <span><strong>Opt in for insurance</strong>
-          <small>Tick this and we will arrange the insurance for you — leave the
-                 two boxes below alone.</small></span>
-      </div>
+          <small>Tick this and we will arrange the cover for you &mdash; leave the
+                 two boxes below blank.</small></span>
+      </label>
       {% endif %}
 
       {% if name == 'extra_info' %}
+      <div class="legend">Anything else</div>
       <label for="{{ name }}">{{ label }}</label>
       <textarea id="{{ name }}" name="{{ name }}" maxlength="{{ max_notes }}"
+                placeholder="e.g. tomorrow after 5pm, ring the top bell"
                 >{{ values.get(name, '') }}</textarea>
       {% else %}
       <label for="{{ name }}">{{ label }}{% if required %} <span class="req">*</span>{% endif %}</label>
@@ -415,6 +507,9 @@ _FORM_PAGE = """<!doctype html>
              value="{{ values.get(name, '') }}"
              {% if name == 'phone' %}type="tel" inputmode="tel" autocomplete="tel"
              {% elif name == 'email' %}type="email" inputmode="email" autocomplete="email"
+             {% elif name == 'first_name' %}type="text" autocomplete="given-name"
+             {% elif name == 'last_name' %}type="text" autocomplete="family-name"
+             {% elif name == 'vin' %}type="text" autocapitalize="characters" spellcheck="false"
              {% else %}type="text"{% endif %}
              {% if required %}required{% endif %}
              {% if name in ('insurance_company','insurance_policy_number') %}
@@ -424,7 +519,9 @@ _FORM_PAGE = """<!doctype html>
 
     <button type="submit">Submit request</button>
   </form>
-</div></div>
+</div>
+<p class="foot">No payment is taken on this page. We will call you to confirm.</p>
+</div>
 <script>
   // The opt-in owns the two insurance boxes: if we are arranging the cover,
   // there is nothing for the client to tell us about their own.
@@ -447,18 +544,22 @@ _THANKS_PAGE = """<!doctype html>
 <html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <meta name="robots" content="noindex">
-<title>Request received — Tri State Tags</title>
-<style>""" + _STYLE + """</style></head><body>
+<meta name="theme-color" content="#0f172a">
+<link rel="icon" href="/favicon.ico" sizes="any">
+<title>Request received | TriStateTags</title>
+""" + _FONTS + """<style>""" + _STYLE + """</style></head><body>
+""" + _HERO + """
 <div class="wrap"><div class="card" style="text-align:center">
   <div class="tick">&#10003;</div>
-  <h1>Thank you — we have your details</h1>
-  <p class="sub">Your request is with our dispatch team now. Someone will be in
-     touch shortly on the number you gave us.</p>
+  <h2 style="margin:0 0 8px;font-size:1.25rem">We have your details</h2>
+  <p class="muted" style="margin:0 0 22px">Your request is with our dispatch team
+     now. Someone will call you shortly on the number you gave us.</p>
   {% if reference_id %}
-  <p style="margin:0 0 4px;color:var(--muted);font-size:.9rem">Your reference</p>
+  <p class="muted" style="margin:0 0 4px">Your reference</p>
   <p class="ref">{{ reference_id }}</p>
-  <p class="sub" style="margin-top:14px">Keep this reference — quote it if you
-     call us about this request.</p>
+  <p class="muted" style="margin-top:14px">Keep this &mdash; quote it if you call
+     us about this request.</p>
   {% endif %}
+  <a class="back" href="https://tristatetags.com/">&larr; Back to TriStateTags</a>
 </div></div>
 </body></html>"""
