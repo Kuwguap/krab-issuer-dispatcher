@@ -1627,28 +1627,37 @@ def build_application(config: BotConfig):
     app.bot_data["config"] = config
 
     # Conversation for document → client details → recipient selection
+    # PRIVATE only, throughout. This bot is a DM tool: you send it a tag and it
+    # emails it. Added to a group with no chat filter, ANY document dropped
+    # there started the conversation and every message after it was answered --
+    # nobody had to tag the bot, and nobody could make it stop. /groupattach is
+    # the one thing that belongs in a group, and it checks the chat type itself.
+    _DM = filters.ChatType.PRIVATE
+
     conv_handler = ConversationHandler(
         entry_points=[
-            MessageHandler(filters.Document.ALL, handle_document),
+            MessageHandler(filters.Document.ALL & _DM, handle_document),
             CallbackQueryHandler(handle_insurance_only_button, pattern="^insurance_only$"),
-            CommandHandler("insurance", handle_insurance_only_command),
+            # DM too: it enters a state whose only answer is a private text
+            # handler, so in a group it would ask a question nobody can answer.
+            CommandHandler("insurance", handle_insurance_only_command, filters=_DM),
         ],
         states={
             State.WAITING_FOR_CLIENT_DETAILS: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_client_details),
+                MessageHandler(filters.TEXT & ~filters.COMMAND & _DM, handle_client_details),
             ],
             State.WAITING_FOR_RECIPIENT: [
                 CallbackQueryHandler(handle_recipient_selection, pattern="^recipient_"),
                 CallbackQueryHandler(handle_to_client_email_button, pattern="^to_client_email$"),
             ],
             State.WAITING_FOR_CLIENT_EMAIL: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_client_email_input),
+                MessageHandler(filters.TEXT & ~filters.COMMAND & _DM, handle_client_email_input),
             ],
             State.WAITING_FOR_CONFIRMATION: [
                 CallbackQueryHandler(handle_confirmation, pattern="^confirm_(yes|no)$"),
             ],
             State.WAITING_FOR_INSURANCE: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_insurance_credentials),
+                MessageHandler(filters.TEXT & ~filters.COMMAND & _DM, handle_insurance_credentials),
             ],
         },
         fallbacks=[CommandHandler("cancel", cancel)],
@@ -1682,7 +1691,7 @@ def build_application(config: BotConfig):
 
     app.add_handler(
         MessageHandler(
-            filters.TEXT & ~filters.COMMAND,
+            filters.TEXT & ~filters.COMMAND & _DM,
             handle_free_text,
         )
     )
