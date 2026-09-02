@@ -295,7 +295,14 @@ class AdminDatabase:
         # Which driver took each lead — with their reachable contacts, in one
         # query. drivers.email arrived by migration, so a database without it
         # must not lose the whole driver column: retry with names only.
+        # Accepted wins; a lead still waiting shows who it is waiting ON. A bare
+        # dash reads as "no driver involved", when in fact the offer is sitting
+        # with somebody -- and that somebody is exactly who the office wants to
+        # chase. Pending rows are flagged so the board can say which is which:
+        # showing an offered driver as though they had accepted would be worse
+        # than the dash it replaces.
         drivers_by_lead = {}
+        pending_by_lead = {}
         for cols in ("driver_name, phone_number, email, driver_telegram_id",
                      "driver_name"):
             try:
@@ -303,13 +310,20 @@ class AdminDatabase:
                     self.client.table("lead_assignments")
                     .select(f"lead_id, status, driver:drivers({cols})")
                     .in_("lead_id", lead_ids[:1000])
-                    .eq("status", "accepted")
+                    .in_("status", ["accepted", "pending"])
                     .execute()
                 )
                 for row in (a.data or []):
                     drv = row.get("driver") or {}
-                    if row.get("lead_id") and (drv.get("driver_name") or "").strip():
-                        drivers_by_lead[str(row["lead_id"])] = drv
+                    lid = str(row.get("lead_id") or "")
+                    if not lid or not (drv.get("driver_name") or "").strip():
+                        continue
+                    if (row.get("status") or "") == "accepted":
+                        drivers_by_lead[lid] = drv
+                    else:
+                        # First offer out is the one to name; a broadcast to six
+                        # drivers should not turn one column into a list.
+                        pending_by_lead.setdefault(lid, drv)
                 break
             except Exception as e:
                 logger.warning("transmissions: driver lookup (%s) failed: %s", cols, e)
@@ -418,6 +432,12 @@ class AdminDatabase:
                 )
                 car = f"{car or 'car 1'} + {more}"
             drv = drivers_by_lead.get(lid) or {}
+            # Nobody has taken it yet: name whoever is holding the offer, and
+            # say so, so the board never implies an acceptance that has not
+            # happened.
+            driver_pending = not drv
+            if driver_pending:
+                drv = pending_by_lead.get(lid) or {}
             grp = groups_by_id.get(str(r.get("group_id") or "")) or {}
             row = {
                 "lead_id": lid,
@@ -426,6 +446,8 @@ class AdminDatabase:
                 "car": car or "—",
                 "price": (r.get("price") or "").strip() or "—",
                 "driver_name": (drv.get("driver_name") or "").strip() or "—",
+                # True when that name is an OPEN OFFER, not an acceptance.
+                "driver_pending": bool(driver_pending and drv.get("driver_name")),
                 "group_name": (grp.get("group_name") or "").strip() or "—",
                 "issuer": (r.get("telegram_username") or "—").strip() or "—",
                 "tags": 1 + len(extra),

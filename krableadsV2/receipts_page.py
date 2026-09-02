@@ -808,6 +808,11 @@ BOARD_HTML = r"""<!doctype html>
  .phone a { font-weight:650; white-space:nowrap; }
  .party { min-width:158px; font-size:12.5px; }
  .pname { font-weight:650; margin-bottom:2px; }
+ /* An OPEN OFFER, not an acceptance. The name is worth showing -- it is who to
+    chase -- but it must never read like a driver who has taken the job. */
+ .pend { display:inline-block; margin-left:6px; padding:1px 6px; border-radius:9px;
+         font-size:10px; font-weight:700; letter-spacing:.04em; text-transform:uppercase;
+         background:#fde8b0; color:#7a5200; vertical-align:middle; }
  .cl { color:var(--ink); margin:1px 0; white-space:nowrap; overflow:hidden;
        text-overflow:ellipsis; max-width:210px; }
  .cl .ic { display:inline-block; width:15px; color:var(--muted); }
@@ -1178,7 +1183,13 @@ function contacts(r) {
       phone: r.client_phone || "", email: r.email || "",
     },
     driver: {
-      label: "Driver", name: r.driver_name === "—" ? "" : r.driver_name,
+      // r.driver_pending means this is an OPEN OFFER, not an acceptance. It is
+      // still the person the office wants to chase, so the name is shown --
+      // labelled, because a pending driver rendered like an accepted one would
+      // be worse than the dash this replaces.
+      label: r.driver_pending ? "Driver (offered)" : "Driver",
+      name: r.driver_name === "—" ? "" : r.driver_name,
+      pending: !!r.driver_pending,
       tg: r.driver_tg_id ? "id " + r.driver_tg_id : "", tgHref: "",
       phone: r.driver_phone || "", email: r.driver_email || "",
     },
@@ -1220,7 +1231,9 @@ function block(r, party) {
   if (c.email) btns.push(actButton(r, party, "email", "✉ Email"));
   if (c.phone) btns.push(actButton(r, party, "sms", "💬 SMS"));
   return `<div class="party">`
-    + `<div class="pname">${c.name ? esc(c.name) : '<span class="none">—</span>'}</div>`
+    + `<div class="pname">${c.name ? esc(c.name) : '<span class="none">—</span>'}`
+    + (c.pending && c.name ? ` <span class="pend" title="Offered — this driver has not accepted yet">offered</span>` : "")
+    + `</div>`
     + contactLine("✈", c.tg, c.tgHref)
     + contactLine("☎", c.phone, telHref(c.phone))
     + contactLine("✉", c.email, c.email ? "mailto:" + c.email : "")
