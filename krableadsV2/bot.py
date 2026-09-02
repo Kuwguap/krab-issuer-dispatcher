@@ -1479,6 +1479,34 @@ def _acting_user_label(user) -> str:
     return (getattr(user, "full_name", "") or "").strip() or "someone"
 
 
+async def _forward_lead_paperwork(context, lead: dict, chat_id) -> None:
+    """The issuer's uploaded images/PDFs, to one chat that is taking this lead.
+
+    Best effort and never fatal: the tag and the job ticket matter more than the
+    paperwork, and a chat that refuses documents must not fail the delivery.
+    Re-reads the lead when the caller's copy has no descriptors, because the
+    sweep's row and the review's row are not always the same object.
+    """
+    if not chat_id:
+        return
+    att = (lead or {}).get("phase1_attached_files")
+    if not (isinstance(att, list) and att):
+        try:
+            fresh = await asyncio.to_thread(db.get_lead_by_id, str((lead or {}).get("id") or ""))
+            att = (fresh or {}).get("phase1_attached_files")
+        except Exception as e:
+            logger.warning("skip dispatch: could not read the paperwork for %s: %s",
+                           (lead or {}).get("reference_id"), e)
+            return
+    if not (isinstance(att, list) and att):
+        return
+    try:
+        await _forward_phase1_attached_files_to_targets(context, att, chat_id)
+    except Exception as e:
+        logger.warning("skip dispatch: could not forward the paperwork to %s: %s",
+                       chat_id, e)
+
+
 async def _deliver_skip_dispatch(context, lead: dict, driver: dict, *,
                                  notify_chat_id=None, how: str = "password",
                                  released_by=None, paid_takeover: bool = False) -> bool:
@@ -1586,6 +1614,10 @@ async def _deliver_skip_dispatch(context, lead: dict, driver: dict, *,
             # failed plate allocation — all of them used to read as a delivery,
             # stamp the lead, and tell supervisors the tag had gone out.
             driver_ok = bool(bodies_ok) and tags_ok
+            # The title/registration/insurance shots the issuer uploaded follow
+            # the lead to whoever is doing the delivery, exactly as they do on
+            # the ordinary Accept. This path skips Accept, so it has to ask.
+            await _forward_lead_paperwork(context, lead, driver_cid)
             if not driver_ok:
                 logger.error("skip dispatch: %s — ticket=%s tag=%s for %s; NOT delivered",
                              ref, bodies_ok, tags_ok, dname)
@@ -1633,6 +1665,7 @@ async def _deliver_skip_dispatch(context, lead: dict, driver: dict, *,
                 mirror_supervisory=(i == 0),
                 accepted_by=label,
             )
+            await _forward_lead_paperwork(context, lead, g.get("group_telegram_id"))
             group_ok += 1
         except Exception as e:
             logger.warning("skip dispatch: group %s post failed: %s",
