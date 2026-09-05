@@ -47,6 +47,11 @@ class TheBoardStructureTest(unittest.TestCase):
     def setUp(self):
         ad.app.config["TESTING"] = True
         self.client = ad.app.test_client()
+        # /receipts now carries a password (receipts_page._receipts_password).
+        # Signing in here means these tests exercise the board the way a real
+        # operator reaches it, rather than around the gate.
+        self.client.post("/receipts/login",
+                         data={"password": receipts_page._receipts_password()})
         self.body = self.client.get("/receipts").get_data(as_text=True)
 
     def test_the_new_columns_exist_in_order(self):
@@ -103,6 +108,11 @@ class TheAssetsServeTest(unittest.TestCase):
     def setUp(self):
         ad.app.config["TESTING"] = True
         self.client = ad.app.test_client()
+        # /receipts now carries a password (receipts_page._receipts_password).
+        # Signing in here means these tests exercise the board the way a real
+        # operator reaches it, rather than around the gate.
+        self.client.post("/receipts/login",
+                         data={"password": receipts_page._receipts_password()})
 
     def test_every_view_module_serves(self):
         for name, must_contain in (("sheet.js", "renderSheetView"),
@@ -129,6 +139,11 @@ class TheVoiceEndpointTest(unittest.TestCase):
     def setUp(self):
         ad.app.config["TESTING"] = True
         self.client = ad.app.test_client()
+        # /receipts now carries a password (receipts_page._receipts_password).
+        # Signing in here means these tests exercise the board the way a real
+        # operator reaches it, rather than around the gate.
+        self.client.post("/receipts/login",
+                         data={"password": receipts_page._receipts_password()})
         # The endpoint throttles per client and caches the aggregates — a test
         # firing several commands in a row must reset that state between posts.
         receipts_page._voice_last_by_ip.clear()

@@ -57,6 +57,11 @@ class TheBigBoardRendersTest(unittest.TestCase):
     def setUp(self):
         ad.app.config["TESTING"] = True
         self.client = ad.app.test_client()
+        # /receipts now carries a password (receipts_page._receipts_password).
+        # Signing in here means these tests exercise the board the way a real
+        # operator reaches it, rather than around the gate.
+        self.client.post("/receipts/login",
+                         data={"password": receipts_page._receipts_password()})
         self.body = self.client.get("/receipts").get_data(as_text=True)
 
     def test_the_columns_come_in_the_asked_order(self):
@@ -162,6 +167,11 @@ class TheNotifyEndpointTest(unittest.TestCase):
     def setUp(self):
         ad.app.config["TESTING"] = True
         self.client = ad.app.test_client()
+        # /receipts now carries a password (receipts_page._receipts_password).
+        # Signing in here means these tests exercise the board the way a real
+        # operator reaches it, rather than around the gate.
+        self.client.post("/receipts/login",
+                         data={"password": receipts_page._receipts_password()})
         receipts_page._recent_sends.clear()
 
     def _post(self, payload, contact=None):

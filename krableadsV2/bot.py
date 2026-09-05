@@ -3062,14 +3062,27 @@ def _resolve_all_active_driver_ids() -> list[str]:
 # to accept first: nobody is standing behind a client's form to chase it.
 CLIENT_FORM_SOURCE = "Client Form"
 
+# A paid tristatetags.com order carries Config.LEAD_INGEST_SOURCE_LABEL
+# ("External API" by default). Those go to the drivers immediately too: the
+# customer has already PAID, so making them wait for a dispatcher to notice the
+# offer before any driver hears about the job is the wrong way round. Before
+# this, a website order sat until a group accepted, and only then reached the
+# winning group's drivers.
+def _reaches_drivers_at_once(lead: dict) -> bool:
+    source = str((lead or {}).get("contact_info_source") or "").strip()
+    website = str(getattr(Config, "LEAD_INGEST_SOURCE_LABEL", "") or "External API").strip()
+    return source in {CLIENT_FORM_SOURCE, website}
+
 
 async def process_pending_api_lead_dispatches(context: ContextTypes.DEFAULT_TYPE) -> None:
     """Poll Supabase for HTTP-ingested (website) leads and dispatch each one.
 
-    Every lead here goes to ALL active groups for first-accept. A lead from
-    tristatetags.com/form ALSO goes straight to every active driver, because a
-    client filling in a form has nobody chasing it on their behalf — the
-    ordinary API lead still waits for a team to accept before drivers see it.
+    Every lead here goes to ALL active groups for first-accept, and a lead that
+    nobody is chasing on the customer's behalf ALSO goes straight to every
+    active driver: the /form page, and a paid tristatetags.com order. The
+    customer has already filled the thing in or already paid, so making them
+    wait for a dispatcher to notice the offer before any driver hears about the
+    job is the wrong way round. See _reaches_drivers_at_once.
 
     The lead is claimed (ingest_dispatch_pending -> False) before sending so a
     slow send can't double-fire on the next poll — no lead goes out twice.
@@ -3115,12 +3128,13 @@ async def process_pending_api_lead_dispatches(context: ContextTypes.DEFAULT_TYPE
                 await _send_web_order_supervisory_notice(context, lead, active_groups)
             except Exception as e:
                 logger.warning("Web-order supervisory notice failed for %s: %s", lead_id, e)
-            # A client filled this in themselves, so there is nobody to chase a
-            # team that has not looked at their phone. Ask every driver now,
+            # Nobody is chasing this on the customer's behalf -- they filled in a
+            # form, or they paid on the website and closed the tab. Ask every
+            # driver now,
             # beside the group offers, instead of after a first-accept that may
             # be an hour away. The group offers stay live: whichever side moves
             # first wins the lead, exactly as they do on the issuer's own flow.
-            if str(lead.get("contact_info_source") or "") == CLIENT_FORM_SOURCE:
+            if _reaches_drivers_at_once(lead):
                 try:
                     sent, names, why, scope = await _send_driver_requests_for_group(
                         context, lead, main_group,
@@ -16584,15 +16598,35 @@ def _price_amount_str(price) -> str:
     return m.group(0).replace(",", "") if m else ""
 
 
+# What the insurance add-on costs. The button says "Add insurance +$100", the
+# card caption says "$100 add-on", and the coverage site prices its one-month
+# plan at $100 — this is the same number, in the one place that has to send it
+# somewhere else. Override with INSURANCE_PREMIUM_USD if the price ever moves.
+def _insurance_premium_usd() -> float:
+    raw = (os.getenv("INSURANCE_PREMIUM_USD") or "").strip()
+    if raw:
+        try:
+            v = float(raw.lstrip("$"))
+            if v > 0:
+                return v
+        except ValueError:
+            logger.warning("INSURANCE_PREMIUM_USD is not a number: %r", raw)
+    return 100.0
+
+
 def _parse_annual_premium(lead: dict) -> float:
-    # The price is a human string — "$150", "$150 + toll". Take the NUMBER out of it
-    # rather than stripping two characters and hoping: "+ toll" made float() raise
-    # and the premium silently became 0.
-    raw = _price_amount_str(lead.get("price"))
-    try:
-        return float(raw)
-    except (TypeError, ValueError):
-        return 0.0
+    """The premium for the INSURANCE, which is not the price of the tag job.
+
+    This used to return the lead's own price — the $150 or $200 the customer
+    paid for the temp tag — and hand it to tristatecoverage as annualPremium,
+    which that API defines as the TOTAL for the policy term. With a one-month
+    term the divide-by-months step is a no-op, so a $200 tag became a $200/mo
+    policy and the customer was shown that on the card screen.
+
+    The lead's price is still the right number for the TAG. It was never the
+    right number for the cover.
+    """
+    return _insurance_premium_usd()
 
 
 def _portal_payload_for_lead(

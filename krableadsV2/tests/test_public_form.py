@@ -388,8 +388,26 @@ class TheBotAndTheFormAgreeTest(unittest.TestCase):
         src = (ROOT / "bot.py").read_text(encoding="utf-8")
         body = src.split("async def process_pending_api_lead_dispatches", 1)[1]
         body = body.split("\nasync def ", 1)[0]
-        self.assertIn("CLIENT_FORM_SOURCE", body)
+        # The source check moved into _reaches_drivers_at_once, which now covers
+        # the /form page AND a paid website order. Assert the fan-out is still
+        # gated on that decision rather than on where the literal happens to sit.
+        self.assertIn("_reaches_drivers_at_once", body)
         self.assertIn("_send_driver_requests_for_group", body)
+
+    def test_a_paid_website_order_also_reaches_the_drivers(self):
+        """A customer who paid on tristatetags.com is not chasing anyone either,
+        so their order fans out the same way a /form submission does."""
+        import bot
+        website = str(getattr(bot.Config, "LEAD_INGEST_SOURCE_LABEL", "") or "External API")
+        self.assertTrue(bot._reaches_drivers_at_once(
+            {"contact_info_source": public_form.PUBLIC_FORM_SOURCE}))
+        self.assertTrue(bot._reaches_drivers_at_once({"contact_info_source": website}))
+
+    def test_an_ordinary_lead_still_waits_for_a_team(self):
+        import bot
+        for src in ("", None, "Telegram", "Dispatch Web"):
+            with self.subTest(source=src):
+                self.assertFalse(bot._reaches_drivers_at_once({"contact_info_source": src}))
 
     def test_the_groups_still_get_it_first(self):
         src = (ROOT / "bot.py").read_text(encoding="utf-8")

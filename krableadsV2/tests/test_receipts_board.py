@@ -48,6 +48,11 @@ class ThePageLoadsTest(unittest.TestCase):
     def setUp(self):
         ad.app.config["TESTING"] = True
         self.client = ad.app.test_client()
+        # /receipts now carries a password (receipts_page._receipts_password).
+        # Signing in here means these tests exercise the board the way a real
+        # operator reaches it, rather than around the gate.
+        self.client.post("/receipts/login",
+                         data={"password": receipts_page._receipts_password()})
 
     def test_the_board_is_served(self):
         r = self.client.get("/receipts")
@@ -89,6 +94,11 @@ class TheDataEndpointTest(unittest.TestCase):
     def setUp(self):
         ad.app.config["TESTING"] = True
         self.client = ad.app.test_client()
+        # /receipts now carries a password (receipts_page._receipts_password).
+        # Signing in here means these tests exercise the board the way a real
+        # operator reaches it, rather than around the gate.
+        self.client.post("/receipts/login",
+                         data={"password": receipts_page._receipts_password()})
 
     def test_it_returns_the_rows(self):
         db = mock.MagicMock()
@@ -130,6 +140,11 @@ class AnyoneCanMoveTheStatusTest(unittest.TestCase):
     def setUp(self):
         ad.app.config["TESTING"] = True
         self.client = ad.app.test_client()
+        # /receipts now carries a password (receipts_page._receipts_password).
+        # Signing in here means these tests exercise the board the way a real
+        # operator reaches it, rather than around the gate.
+        self.client.post("/receipts/login",
+                         data={"password": receipts_page._receipts_password()})
 
     def _post(self, status, by="kita"):
         db = mock.MagicMock()

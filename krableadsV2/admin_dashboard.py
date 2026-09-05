@@ -205,6 +205,78 @@ class AdminDatabase:
             logger.error("save_receipt_file failed for lead %s: %s", lead_id, e)
             return None
 
+    # ── Fixing a receipt ────────────────────────────────────────────────
+    # A driver photographs the wrong slip and the office is stuck with it.
+
+    def _supersede_receipt_files(self, lead_id: str, who: str, reason: str, keep_id=None):
+        """Mark the old rows replaced. The bytes are never deleted."""
+        try:
+            q = (self.client.table("receipt_files").update({
+                    "superseded_at": "now()",
+                    "superseded_by": (who or "board")[:64],
+                    "superseded_reason": (reason or "")[:200],
+                 }).eq("lead_id", str(lead_id)).is_("superseded_at", "null"))
+            if keep_id:
+                q = q.neq("id", str(keep_id))
+            q.execute()
+            return True
+        except Exception as e:
+            # The columns arrive by migration. Without them the swap still works
+            # -- the lead is repointed below -- but the old row is not marked.
+            logger.warning("could not supersede receipt_files for %s: %s "
+                           "(run database/migration_receipt_replace.sql)", lead_id, e)
+            return False
+
+    def _point_lead_at_receipt(self, lead_id: str, url: str, who: str, reason: str):
+        """Move leads.receipt_image_url, remembering what it used to say."""
+        try:
+            prev = (self.client.table("leads").select("receipt_image_url")
+                    .eq("id", str(lead_id)).limit(1).execute().data or [{}])[0]
+        except Exception as e:
+            return False, f"could not read that lead: {e}"
+        patch = {
+            "receipt_image_url": url,
+            "receipt_replaced_at": "now()",
+            "receipt_replaced_by": (who or "board")[:64],
+            "receipt_previous_url": str(prev.get("receipt_image_url") or "")[:2000],
+        }
+        try:
+            resp = self.client.table("leads").update(patch).eq("id", str(lead_id)).execute()
+        except Exception as e:
+            logger.warning("receipt swap for %s: audit columns absent (%s) — run "
+                           "database/migration_receipt_replace.sql", lead_id, e)
+            try:
+                resp = (self.client.table("leads")
+                        .update({"receipt_image_url": url})
+                        .eq("id", str(lead_id)).execute())
+            except Exception as e2:
+                return False, f"could not update that lead: {e2}"
+        if not getattr(resp, "data", None):
+            # 200 with an empty list: RLS refused it, or the lead is gone.
+            logger.error("receipt swap for %s affected NO rows", lead_id)
+            return False, ("nothing changed — the update affected no rows "
+                           "(row-level security on this key, or that lead is gone)")
+        return True, ""
+
+    def replace_receipt(self, lead_id: str, *, data: bytes, content_type: str,
+                        who: str, reason: str = "", reference_id: str = ""):
+        """Swap in a corrected receipt. Returns (ok, error_or_warning)."""
+        new_id = self.save_receipt_file(
+            lead_id, data=data, content_type=content_type,
+            reference_id=reference_id, source="board")
+        if not new_id:
+            return False, ("the replacement could not be stored — receipt_files "
+                           "refused the write (run database/migration_receipt_"
+                           "replace.sql, or give this service the service_role key)")
+        self._supersede_receipt_files(lead_id, who, reason or "replaced", keep_id=new_id)
+        url = f"{RECEIPT_PORTAL_BASE}/receipt/{lead_id}"
+        return self._point_lead_at_receipt(lead_id, url, who, reason)
+
+    def clear_receipt(self, lead_id: str, who: str, reason: str):
+        """Take a receipt OFF the board without destroying it."""
+        self._supersede_receipt_files(lead_id, who, reason or "cleared from the board")
+        return self._point_lead_at_receipt(lead_id, "", who, reason)
+
     def get_receipt_file(self, lead_id: str):
         """The newest stored receipt as {"data": bytes, "content_type": str}."""
         try:

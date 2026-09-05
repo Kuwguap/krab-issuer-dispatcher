@@ -34,13 +34,16 @@ point is behind a ``typeof`` guard in the page and a try/except here.
 Kept in its own module because admin_dashboard.py is already long, and because
 the board is self-contained: it needs ``db`` and ``app`` and nothing else.
 """
+import hashlib
+import hmac
 import json
 import logging
 import os
 import re
+import secrets
 import time
 
-from flask import Response, jsonify, request
+from flask import Response, jsonify, redirect, request
 
 logger = logging.getLogger(__name__)
 
@@ -810,6 +813,16 @@ BOARD_HTML = r"""<!doctype html>
  .pname { font-weight:650; margin-bottom:2px; }
  /* An OPEN OFFER, not an acceptance. The name is worth showing -- it is who to
     chase -- but it must never read like a driver who has taken the job. */
+ .fixrec{margin-top:12px;padding:10px 12px;border:1px dashed #dfe3e8;
+         border-radius:10px;display:flex;align-items:center;gap:10px;flex-wrap:wrap}
+ .fixrec b{font-size:12.5px}
+ .rfix{display:flex;gap:6px;margin-top:5px;justify-content:center;flex-wrap:wrap}
+ .rfix .fixbtn{font-size:11px;padding:3px 8px}
+ .nothumb.addrec{cursor:pointer;border:1px dashed #c9ced6;color:#6b7280}
+ .nothumb.addrec:hover{border-color:#2f6df6;color:#2f6df6}
+ .thumb{cursor:zoom-in}
+ .fixrec .fixbtn{cursor:pointer;border:1px solid #dfe3e8;border-radius:8px;padding:5px 10px;background:#fff;font:inherit;font-size:12px}
+ .fixrec .fixbtn.danger{border-color:#e0b4b4;color:#b3261e}
  .pend { display:inline-block; margin-left:6px; padding:1px 6px; border-radius:9px;
          font-size:10px; font-weight:700; letter-spacing:.04em; text-transform:uppercase;
          background:#fde8b0; color:#7a5200; vertical-align:middle; }
@@ -1210,6 +1223,51 @@ function contacts(r) {
   };
 }
 
+// Fixing a receipt. Destructive: it changes what a customer's proof of
+// delivery says. The board has a password in front of it now, and this asks for
+// the reference on top -- the server re-reads that reference from the DATABASE
+// and compares, so the page never supplies both sides of its own confirmation.
+function confirmRef(ref, what) {
+  const typed = (prompt(what + "\n\nType the reference id (" + ref + ") to confirm:") || "").trim();
+  return typed === String(ref).trim() ? typed : null;
+}
+
+async function receiptEdit(id, method, body) {
+  const r = await fetch(`${API}/transmissions/${encodeURIComponent(id)}/receipt`,
+                        { method, body });
+  const out = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(out.error || `HTTP ${r.status}`);
+  return out;
+}
+
+async function replaceReceipt(id, ref, file) {
+  const confirmed = confirmRef(ref, "Replace this receipt with the file you picked?");
+  if (!confirmed) return;
+  const reason = (prompt("Why? (kept with the record)",
+                         "driver uploaded the wrong receipt") || "").trim();
+  const fd = new FormData();
+  fd.append("receipt", file);
+  fd.append("confirm", confirmed);
+  fd.append("by", whoAmI(true));
+  fd.append("reason", reason);
+  try { await receiptEdit(id, "POST", fd); toast("Receipt replaced for " + ref, true); load(); }
+  catch (e) { toast("Could not replace it: " + e.message, false); }
+}
+
+async function clearReceipt(id, ref) {
+  const confirmed = confirmRef(ref,
+    "CLEAR this receipt from the board? The image is kept, but the lead will read as not handed in.");
+  if (!confirmed) return;
+  const reason = (prompt("Why? (required, kept with the record)") || "").trim();
+  if (!reason) { toast("A reason is required to clear a receipt.", false); return; }
+  const fd = new FormData();
+  fd.append("confirm", confirmed);
+  fd.append("by", whoAmI(true));
+  fd.append("reason", reason);
+  try { await receiptEdit(id, "DELETE", fd); toast("Receipt cleared for " + ref, true); load(); }
+  catch (e) { toast("Could not clear it: " + e.message, false); }
+}
+
 function contactLine(ic, val, href) {
   if (!val) return `<div class="cl none"><span class="ic">${ic}</span>—</div>`;
   const inner = href ? `<a href="${esc(href)}" target="_blank" rel="noopener">${esc(val)}</a>` : esc(val);
@@ -1242,13 +1300,32 @@ function block(r, party) {
 }
 
 function receiptCell(r) {
+  // The thumbnail opens the full image (the lightbox handler picks up
+  // [data-full]); the empty state is a button that opens the file picker, so
+  // the cell where you NOTICE a missing receipt is the cell where you fix it.
   const img = r.has_receipt
     ? `<img class="thumb" loading="lazy" src="${IMG + encodeURIComponent(r.lead_id)}"
          data-full="${IMG + encodeURIComponent(r.lead_id)}" alt="receipt"
+         title="Click to view full size"
          onerror="this.outerHTML='<div class=nothumb>no image</div>'">`
-    : `<div class="nothumb">no receipt</div>`;
+    : `<label class="nothumb addrec" title="Click to attach a receipt">no receipt
+         <input type="file" accept="image/*,application/pdf" hidden
+                class="rep" data-id="${esc(r.lead_id)}" data-ref="${esc(r.reference_id)}">
+       </label>`;
   const date = r.receipt_at ? when(r.receipt_at) : (r.has_receipt ? "on file" : "—");
-  return `${img}<div class="rinfo"><b>${esc(r.price)}</b> · ${esc(date)}<br>${esc(statusLabel(r.status))}</div>`;
+  // Change/Clear only once there is something to change. Both go through the
+  // same guarded endpoint as the detail row: typed reference, nothing deleted.
+  const fix = r.has_receipt
+    ? `<div class="rfix">
+         <label class="fixbtn" title="Replace this receipt">Change
+           <input type="file" accept="image/*,application/pdf" hidden
+                  class="rep" data-id="${esc(r.lead_id)}" data-ref="${esc(r.reference_id)}">
+         </label>
+         <button class="fixbtn danger clr" data-id="${esc(r.lead_id)}"
+                 data-ref="${esc(r.reference_id)}" title="Take it off the board">Clear</button>
+       </div>`
+    : "";
+  return `${img}<div class="rinfo"><b>${esc(r.price)}</b> · ${esc(date)}<br>${esc(statusLabel(r.status))}</div>${fix}`;
 }
 
 function statusBits(r) {
@@ -1339,7 +1416,17 @@ function detailBody(r) {
     </dl>
     ${insuranceBlock(r)}
     ${r.has_receipt ? `<img loading="lazy" src="${IMG + encodeURIComponent(r.lead_id)}"
-                         data-full="${IMG + encodeURIComponent(r.lead_id)}" alt="receipt">` : ""}`;
+                         data-full="${IMG + encodeURIComponent(r.lead_id)}" alt="receipt">` : ""}
+    <div class="fixrec">
+      <b>Wrong receipt?</b>
+      <label class="fixbtn">Replace&hellip;
+        <input type="file" accept="image/*,application/pdf" hidden
+               class="rep" data-id="${esc(r.lead_id)}" data-ref="${esc(r.reference_id)}">
+      </label>
+      ${r.has_receipt ? `<button class="fixbtn danger clr" data-id="${esc(r.lead_id)}"
+                                 data-ref="${esc(r.reference_id)}">Clear</button>` : ""}
+      <span class="counts">The old image is kept and marked replaced, never deleted.</span>
+    </div>`;
 }
 
 function rowHtml(r, idx) {
@@ -1565,6 +1652,8 @@ document.querySelector("main").addEventListener("click", e => {
     }
     return;
   }
+  const clr = e.target.closest(".clr");
+  if (clr) { clearReceipt(clr.dataset.id, clr.dataset.ref); return; }
   const act = e.target.closest(".act");
   if (act) {
     const row = ALL.find(r => r.lead_id === act.dataset.id);
@@ -1578,6 +1667,12 @@ document.querySelector("main").addEventListener("click", e => {
   }
 });
 document.querySelector("main").addEventListener("change", e => {
+  const rep = e.target.closest("input.rep");
+  if (rep && rep.files && rep.files[0]) {
+    replaceReceipt(rep.dataset.id, rep.dataset.ref, rep.files[0]);
+    rep.value = "";                 // so picking the same file again re-fires
+    return;
+  }
   const sel = e.target.closest("select.status");
   if (!sel) return;
   saveStatus(sel.dataset.id, sel.value, sel.closest("tr") || sel.closest(".card"));
@@ -1888,6 +1983,114 @@ setInterval(() => {                     // the board is shared — keep it fresh
 </body></html>"""
 
 
+# ── The password on the door ────────────────────────────────────────────────
+# This board shows every customer's name, phone, address and a photo of their
+# receipt, on a public domain, and it had nothing in front of it.
+
+RECEIPTS_COOKIE = "krab_receipts"
+_SESSION_DAYS = 14
+# The login page and the assets it needs are the only things reachable signed out.
+_OPEN_PATHS = ("/receipts/login", "/receipts/logout")
+
+
+def _receipts_password() -> str:
+    """The board's password. Rotate it with RECEIPTS_PASSWORD, no deploy needed."""
+    return (os.getenv("RECEIPTS_PASSWORD") or "AdminPassword123!").strip()
+
+
+def _session_secret() -> bytes:
+    """Signs the session cookie.
+
+    Falls back to a per-process value so a service with nothing configured still
+    gets a REAL signature -- the cost is that a restart signs everyone out,
+    which is a great deal better than a forgeable cookie.
+    """
+    raw = (os.getenv("RECEIPTS_SESSION_SECRET")
+           or os.getenv("RECEIPT_LINK_SECRET")
+           or os.getenv("SUPABASE_KEY") or "").strip()
+    if not raw:
+        global _EPHEMERAL_SESSION_SECRET
+        try:
+            raw = _EPHEMERAL_SESSION_SECRET
+        except NameError:
+            raw = _EPHEMERAL_SESSION_SECRET = secrets.token_hex(32)
+    return raw.encode("utf-8")
+
+
+def _mint_session() -> str:
+    """`<expires_at>.<signature>` — no server-side session store to keep."""
+    exp = str(int(time.time()) + _SESSION_DAYS * 86400)
+    sig = hmac.new(_session_secret(), exp.encode("ascii"), hashlib.sha256).hexdigest()
+    return f"{exp}.{sig}"
+
+
+def _session_ok(raw) -> bool:
+    exp, _, sig = str(raw or "").partition(".")
+    if not exp.isdigit() or not sig:
+        return False
+    want = hmac.new(_session_secret(), exp.encode("ascii"), hashlib.sha256).hexdigest()
+    # Constant time: this is the check that stands between a guess and the board.
+    if not hmac.compare_digest(want, sig):
+        return False
+    return time.time() < int(exp)
+
+
+def _logged_in() -> bool:
+    return _session_ok(request.cookies.get(RECEIPTS_COOKIE))
+
+
+def _guarded_path(path: str) -> bool:
+    """Everything this board serves, and nothing else on the dashboard.
+
+    Deliberately explicit rather than a catch-all: admin_dashboard mounts a
+    great deal more than the board, and a guard that reached too far would lock
+    the bot's own integrations out of endpoints that have their own auth.
+    """
+    p = (path or "").rstrip("/")
+    if any(p.startswith(o) for o in _OPEN_PATHS):
+        return False
+    return (
+        p == "/receipts"
+        or p.startswith("/receipts/")
+        or p == "/api/transmissions"
+        or p.startswith("/api/transmissions/")
+    )
+
+
+_LOGIN_PAGE = """<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="robots" content="noindex">
+<title>Receipts \u2014 sign in</title>
+<style>
+ :root{color-scheme:light}
+ body{margin:0;min-height:100vh;display:flex;align-items:center;justify-content:center;
+      background:#f4f6f8;color:#12161c;
+      font:16px/1.5 -apple-system,system-ui,Segoe UI,Roboto,sans-serif}
+ form{background:#fff;padding:30px 26px;border-radius:16px;width:min(22rem,92vw);
+      box-shadow:0 6px 24px rgba(16,24,40,.10)}
+ h1{margin:0 0 4px;font-size:1.2rem}
+ p{margin:0 0 20px;color:#6b7280;font-size:.9rem}
+ input{width:100%;box-sizing:border-box;padding:12px 13px;font:inherit;
+       border:1px solid #dfe3e8;border-radius:10px;background:#fff}
+ input:focus{outline:2px solid #2f6df6;outline-offset:1px;border-color:transparent}
+ button{width:100%;margin-top:14px;padding:13px;border:0;border-radius:10px;
+        background:#2f6df6;color:#fff;font:inherit;font-weight:650;cursor:pointer}
+ .err{margin:0 0 14px;padding:10px 12px;border-radius:9px;background:#fdecea;
+      color:#b3261e;font-size:.88rem}
+</style></head><body>
+<form method="post" action="/receipts/login">
+  <h1>Receipts board</h1>
+  <p>This board carries customer names, phone numbers and receipts. Sign in to open it.</p>
+  __ERROR__
+  <input type="password" name="password" placeholder="Password" autofocus
+         autocomplete="current-password" required>
+  <input type="hidden" name="next" value="__NEXT__">
+  <button type="submit">Sign in</button>
+</form>
+</body></html>"""
+
+
 def register(app, db_provider):
     """Attach the board and its endpoints to the dashboard app.
 
@@ -1900,6 +2103,63 @@ def register(app, db_provider):
     tristatetags.com/api/* already belongs to the checkout proxy and must not
     be fought over."""
     _resolve = db_provider if callable(db_provider) else (lambda: db_provider)
+
+    @app.before_request
+    def _receipts_login_gate():
+        """Nothing on this board is served to a stranger.
+
+        Scoped to the board's own paths (see _guarded_path): this runs for every
+        request the dashboard receives, and the rest of the service has its own
+        arrangements. A browser gets the login page; anything expecting JSON gets
+        a 401 rather than an HTML page it cannot parse.
+        """
+        if not _guarded_path(request.path) or _logged_in():
+            return None
+        wants_json = (
+            request.path.startswith("/api/")
+            or "/api/" in request.path
+            or "application/json" in (request.headers.get("Accept") or "")
+        )
+        if wants_json:
+            return jsonify({"error": "sign in at /receipts/login"}), 401
+        nxt = request.full_path if request.query_string else request.path
+        return redirect("/receipts/login?next=" + nxt, code=302)
+
+    @app.route("/receipts/login", methods=["GET", "POST"])
+    def receipts_login():
+        nxt = (request.values.get("next") or "/receipts").strip()
+        # Only ever bounce back INSIDE this board -- an open redirect here would
+        # hand somebody a tristatetags.com link that lands anywhere they like.
+        if not nxt.startswith("/receipts") and not nxt.startswith("/api/transmissions"):
+            nxt = "/receipts"
+        if request.method == "GET":
+            page = _LOGIN_PAGE.replace("__ERROR__", "").replace("__NEXT__", nxt)
+            return Response(page, mimetype="text/html")
+        supplied = (request.form.get("password") or "").strip()
+        if not hmac.compare_digest(supplied, _receipts_password()):
+            logger.warning("receipts board: failed sign-in from %s",
+                           (request.headers.get("X-Forwarded-For") or
+                            request.remote_addr or "?").split(",")[0].strip())
+            page = (_LOGIN_PAGE
+                    .replace("__ERROR__", '<p class="err">That password is not right.</p>')
+                    .replace("__NEXT__", nxt))
+            return Response(page, mimetype="text/html"), 401
+        resp = redirect(nxt, code=302)
+        resp.set_cookie(
+            RECEIPTS_COOKIE, _mint_session(),
+            max_age=_SESSION_DAYS * 86400,
+            httponly=True,          # the board's own JS never needs to read it
+            samesite="Lax",
+            secure=bool(request.is_secure or
+                        (request.headers.get("X-Forwarded-Proto") == "https")),
+        )
+        return resp
+
+    @app.route("/receipts/logout", methods=["GET", "POST"])
+    def receipts_logout():
+        resp = redirect("/receipts/login", code=302)
+        resp.set_cookie(RECEIPTS_COOKIE, "", max_age=0)
+        return resp
 
     @app.route("/receipts", methods=["GET"])
     def receipts_board():
@@ -2113,6 +2373,63 @@ def register(app, db_provider):
         except Exception:
             status_col = False
         return jsonify({"email": email_ok, "sms": sms, "status_column": status_col})
+
+    # ── Fixing a receipt ────────────────────────────────────────────────
+    # Behind the board's password (see the sign-in gate above), and behind a
+    # typed confirmation on top of it: this changes what a customer's proof of
+    # delivery says, so a stray click must not be enough.
+    _MAX_REPLACE_BYTES = 12 * 1024 * 1024
+
+    @app.route("/receipts/api/transmissions/<lead_id>/receipt", methods=["POST", "DELETE"])
+    @app.route("/api/transmissions/<lead_id>/receipt", methods=["POST", "DELETE"])
+    def api_fix_receipt(lead_id):
+        db = _resolve()
+        who = (request.form.get("by") or "").strip()[:64]
+        if not who:
+            return jsonify({"error": "say who you are first (the 👤 button)"}), 400
+        reason = (request.form.get("reason") or "").strip()[:200]
+
+        contact = _party_contact(db, lead_id, "client")
+        if contact is None:
+            return jsonify({"error": "lead not found"}), 404
+        # The reference is re-read from the DATABASE and compared with what the
+        # operator typed. The page supplies one side of that, never both.
+        ref = (contact.get("reference_id") or "").strip()
+        typed = (request.form.get("confirm") or "").strip()
+        if not ref or typed != ref:
+            return jsonify({"error": "type the reference id exactly to confirm"}), 400
+
+        if request.method == "DELETE":
+            if not reason:
+                return jsonify({"error": "a reason is required to clear a receipt"}), 400
+            ok, err = db.clear_receipt(str(lead_id), who, reason)
+            if not ok:
+                return jsonify({"error": err}), 500
+            logger.info("receipts board: receipt CLEARED for %s (%s) by %s — %s",
+                        lead_id, ref, who, reason)
+            return jsonify({"ok": True, "lead_id": lead_id, "cleared": True})
+
+        up = request.files.get("receipt")
+        data = up.read() if up else b""
+        if not data:
+            return jsonify({"error": "no file arrived"}), 400
+        if len(data) > _MAX_REPLACE_BYTES:
+            return jsonify({"error": "that file is too large — send a photo"}), 413
+        claimed = (getattr(up, "mimetype", "") or "").split(";")[0].strip().lower()
+        content_type = RECEIPT_MIME.get(claimed)
+        if not content_type:
+            # An allowlist, not "anything image/*": these bytes are served back
+            # from this origin, and image/svg+xml is a script container.
+            return jsonify({"error": "send a JPEG, PNG, HEIC, WEBP or PDF"}), 415
+
+        ok, err = db.replace_receipt(
+            str(lead_id), data=data, content_type=content_type,
+            who=who, reason=reason or "replaced from the board", reference_id=ref)
+        if not ok:
+            return jsonify({"error": err}), 500
+        logger.info("receipts board: receipt REPLACED for %s (%s) by %s — %s",
+                    lead_id, ref, who, reason or "no reason given")
+        return jsonify({"ok": True, "lead_id": lead_id, "replaced": True})
 
     @app.route("/receipts/insurance/<lead_id>", methods=["GET"])
     def receipts_insurance_card(lead_id):
