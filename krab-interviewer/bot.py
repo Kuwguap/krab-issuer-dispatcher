@@ -383,7 +383,7 @@ def _shipping_address_line(name: str, address: str) -> str:
 
 
 _PAPER_SHIP_FOOTER = (
-    "⚡️🏷📬 Priority Order — Ship ASAP, preferably first thing in the morning.\n\n"
+    "⚡️🏷📬 Priority Order — Ship ASAP, preferably first thing in the morning.\n"
     "⏳ All paper orders should be shipped within 24 hours.\n\n"
     "🏁Automated🏎Automotive💨"
 )
@@ -399,10 +399,13 @@ def _format_paper_ship_message(
     receipt_line: str,
     include_recipient: bool = True,
 ) -> str:
+    # Header and quantity read as one line of fact; the person and the
+    # instructions are held apart from it, so a paper girl scanning the channel
+    # finds the address without reading a paragraph.
     parts = [
         "➕🚗 New Driver Hired ✅🎉",
-        "",
         ship_intro,
+        "",
         "",
     ]
     if include_recipient:
@@ -412,8 +415,9 @@ def _format_paper_ship_message(
             f"📍 {addr}",
             f"📞 {phone}",
             "",
+            "",
         ])
-    parts.extend([receipt_line, "", _PAPER_SHIP_FOOTER])
+    parts.extend([receipt_line, _PAPER_SHIP_FOOTER])
     return "\n".join(parts)
 
 
@@ -440,8 +444,8 @@ def _format_driver_paper_ship_notice(
         name=name,
         address=(interview.get("mailing_address") or "").strip(),
         phone=(interview.get("phone_number") or "-").strip(),
-        ship_intro=f"📦 Your {qty} temp tag papers are being prepared & shipped today to:",
-        receipt_line="🧾 Tracking number & shipping receipt coming once sent.",
+        ship_intro=f"📦 {qty} temp tag papers",
+        receipt_line="🧾 Tracking number & shipping receipt",
         include_recipient=include_recipient,
     )
 
@@ -1413,36 +1417,19 @@ async def _deliver_hired_driver_onboarding(
 
 
 def _build_hire_announcement_message(interview: dict, driver_name: str) -> str:
-    welcome_first, _ = ai_vision.split_full_name(driver_name)
-    if not welcome_first:
-        welcome_first = (interview.get("first_name") or "").strip() or driver_name.split()[0] or "Driver"
+    """What the drivers channel is told when somebody is hired.
 
-    interviewer_bot = Config.KRAB_INTERVIEWER_BOT_USERNAME.lstrip("@")
-    dispatch_bot = Config.KRAB_DISPATCH_BOT_USERNAME.lstrip("@")
+    Just the shipment. The welcome, the onboarding steps, the printer link, the
+    house rules and the training intro all reach the new driver as their own
+    DMs (see _send_driver_onboarding_messages) -- posting a second copy to the
+    channel addressed it to nobody and buried the one line the channel exists to
+    act on: a driver was hired, their papers need to go out.
 
-    return (
-        "🎉 DRIVER HIRED ✅\n\n"
-        f"Welcome to the team, {welcome_first}!\n\n"
-        "📲 Start these bots now:\n"
-        f"@{interviewer_bot}\n"
-        f"@{dispatch_bot}\n\n"
-        "🖨 Please have a LaserJet printer ready to print temp tags. 1 click Purchase here:\n"
-        "https://shorturl.at/gvOrb\n\n"
-        "⚡️ You are now ACTIVE and ready to receive deliveries.\n\n"
-        "Important:\n"
-        "• All clients belong to the dealership.\n"
-        "• Every client phone number must be recorded.\n"
-        "• No off-platform deals or private servicing of clients.\n\n"
-        "💰 Every successful delivery pays $50.\n"
-        "🔄 Many clients renew monthly, creating repeat opportunities.\n\n"
-        "📢 Want more deliveries?\n"
-        "Stay active, keep notifications ON, and bring in new clients whenever possible.\n\n"
-        "🚀 Welcome aboard. Let's get to work!\n\n"
-        "━━━━━━━━━━━━━━━\n\n"
-        + _format_driver_paper_ship_notice(interview, include_recipient=False)
-        + "\n\n━━━━━━━━━━━━━━━\n\n"
-        + _DRIVER_TRAINING_INTRO
-    )
+    The recipient block is deliberately left off here. The paper girls get the
+    name, address and phone in their own request; the channel does not need a
+    new colleague's home address.
+    """
+    return _format_driver_paper_ship_notice(interview, include_recipient=False)
 
 
 async def _run_hire_side_effects(
