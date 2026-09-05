@@ -238,6 +238,76 @@ def _user_can_manage_shipments(user_id) -> bool:
     return _user_is_global_supervisor(user_id) or _user_is_paper_girl(user_id)
 
 
+# Telegram membership statuses that mean "currently on the team". "left" and
+# "kicked" deliberately absent: someone removed from the channel is removed.
+_TEAM_MEMBER_STATUSES = {"creator", "owner", "administrator", "member"}
+
+
+def _team_membership_chat_ids() -> List[int]:
+    """Chats whose current members count as team for the purpose of hiring."""
+    out: List[int] = []
+    seen: set = set()
+    cid = _parse_chat_id(Config.DRIVER_CHANNEL_ID)
+    if cid is not None:
+        seen.add(cid)
+        out.append(cid)
+    for cid in _paper_girl_group_notify_ids():
+        if cid is not None and cid not in seen:
+            seen.add(cid)
+            out.append(cid)
+    return out
+
+
+def _user_is_hired_driver(user_id) -> bool:
+    """The Issuer drivers table is this bot's roster of people it has hired."""
+    if not db:
+        return False
+    try:
+        return bool(db.get_driver_by_telegram_id(str(user_id)))
+    except Exception as e:
+        logger.warning("_user_is_hired_driver lookup failed: %s", e)
+        return False
+
+
+async def _user_can_hire(context: ContextTypes.DEFAULT_TYPE, user_id) -> bool:
+    """Everyone on the team may hire: supervisors, paper girls, drivers we have
+    already hired, and current members of the drivers channel or the notify
+    group. Deliberately NOT everyone alive — see this module's note on what
+    a hire sets in motion.
+
+    The cheap local checks come first so the common case costs no API call.
+    """
+    if _user_is_global_supervisor(user_id) or _user_is_paper_girl(user_id):
+        return True
+    if _user_is_hired_driver(user_id):
+        return True
+    uid = _parse_chat_id(user_id)
+    if uid is None:
+        return False
+    for cid in _team_membership_chat_ids():
+        try:
+            member = await context.bot.get_chat_member(chat_id=cid, user_id=uid)
+        except Exception as e:
+            # Not a member, or the bot cannot see that chat. Neither is proof of
+            # membership, so both simply fail to grant it.
+            logger.debug("get_chat_member(%s, %s): %s", cid, uid, e)
+            continue
+        if str(getattr(member, "status", "")).lower() in _TEAM_MEMBER_STATUSES:
+            return True
+    return False
+
+
+def _is_own_application(interview: dict, user_id) -> bool:
+    """True when this person is the applicant on, or the submitter of, the row."""
+    target = _norm_chat_id(user_id)
+    if target is None:
+        return False
+    for key in ("telegram_id", "created_by_telegram_id"):
+        if _norm_chat_id((interview or {}).get(key)) == target:
+            return True
+    return False
+
+
 def _paper_girl_group_notify_ids() -> List[int]:
     """Group/supergroup chats from PAPER_GIRL_NOTIFY_CHAT_IDS (not personal DMs)."""
     seen: set = set()
@@ -313,9 +383,9 @@ def _shipping_address_line(name: str, address: str) -> str:
 
 
 _PAPER_SHIP_FOOTER = (
-    "⚡️🏷️📬 Priority Order — Ship ASAP, preferably first thing in the morning.\n\n"
+    "⚡️🏷📬 Priority Order — Ship ASAP, preferably first thing in the morning.\n\n"
     "⏳ All paper orders should be shipped within 24 hours.\n\n"
-    "🏁Automated🏎️Automotive💨"
+    "🏁Automated🏎Automotive💨"
 )
 
 
@@ -327,17 +397,24 @@ def _format_paper_ship_message(
     phone: str,
     ship_intro: str,
     receipt_line: str,
+    include_recipient: bool = True,
 ) -> str:
-    addr = _shipping_address_line(name, address)
-    return (
-        "➕🚗 New Driver Hired ✅🎉\n\n"
-        f"{ship_intro}\n\n"
-        f"👤 {name}\n"
-        f"📍 {addr}\n"
-        f"📞 {phone}\n\n"
-        f"{receipt_line}\n\n"
-        f"{_PAPER_SHIP_FOOTER}"
-    )
+    parts = [
+        "➕🚗 New Driver Hired ✅🎉",
+        "",
+        ship_intro,
+        "",
+    ]
+    if include_recipient:
+        addr = _shipping_address_line(name, address)
+        parts.extend([
+            f"👤 {name}",
+            f"📍 {addr}",
+            f"📞 {phone}",
+            "",
+        ])
+    parts.extend([receipt_line, "", _PAPER_SHIP_FOOTER])
+    return "\n".join(parts)
 
 
 def _format_paper_girl_ship_request(shipment: dict) -> str:
@@ -353,7 +430,9 @@ def _format_paper_girl_ship_request(shipment: dict) -> str:
     )
 
 
-def _format_driver_paper_ship_notice(interview: dict) -> str:
+def _format_driver_paper_ship_notice(
+    interview: dict, *, include_recipient: bool = True
+) -> str:
     qty = Config.DEFAULT_PAPER_QTY
     name = _driver_display_name(interview)
     return _format_paper_ship_message(
@@ -363,6 +442,7 @@ def _format_driver_paper_ship_notice(interview: dict) -> str:
         phone=(interview.get("phone_number") or "-").strip(),
         ship_intro=f"📦 Your {qty} temp tag papers are being prepared & shipped today to:",
         receipt_line="🧾 Tracking number & shipping receipt coming once sent.",
+        include_recipient=include_recipient,
     )
 
 
@@ -1282,6 +1362,56 @@ async def _send_driver_onboarding_messages(
     return warnings
 
 
+def _resolve_hired_driver_interview(telegram_id: str) -> Optional[dict]:
+    """Latest hired interview for this Telegram user, if any."""
+    if not db:
+        return None
+    tid = str(telegram_id or "").strip()
+    if not tid:
+        return None
+    interview = db.get_hired_interview_for_telegram_id(tid)
+    if interview:
+        return interview
+    driver = db.get_driver_by_telegram_id(tid)
+    if not driver:
+        return None
+    latest = db.get_latest_interview_for_telegram_id(tid)
+    if latest and (latest.get("status") or "") == "hired":
+        return latest
+    return {
+        "telegram_id": tid,
+        "full_name": driver.get("driver_name"),
+        "first_name": driver.get("driver_name"),
+        "phone_number": driver.get("phone_number"),
+        "mailing_address": "",
+        "status": "hired",
+    }
+
+
+async def _deliver_hired_driver_onboarding(
+    context: ContextTypes.DEFAULT_TYPE,
+    interview: dict,
+    *,
+    source: str = "start",
+) -> List[str]:
+    """Send full hire onboarding DMs (welcome, steps, paper notice, training)."""
+    driver_name = _driver_display_name(interview)
+    channel_invite = await _create_driver_channel_invite(context, driver_name)
+    warnings = await _send_driver_onboarding_messages(
+        context,
+        interview,
+        channel_invite=channel_invite,
+    )
+    if warnings:
+        logger.warning(
+            "Hired driver onboarding (%s, %s): %s",
+            source,
+            interview.get("telegram_id"),
+            "; ".join(warnings),
+        )
+    return warnings
+
+
 def _build_hire_announcement_message(interview: dict, driver_name: str) -> str:
     welcome_first, _ = ai_vision.split_full_name(driver_name)
     if not welcome_first:
@@ -1296,9 +1426,9 @@ def _build_hire_announcement_message(interview: dict, driver_name: str) -> str:
         "📲 Start these bots now:\n"
         f"@{interviewer_bot}\n"
         f"@{dispatch_bot}\n\n"
-        "🖨️ Please have a LaserJet printer ready to print temp tags. 1 click Purchase here:\n"
+        "🖨 Please have a LaserJet printer ready to print temp tags. 1 click Purchase here:\n"
         "https://shorturl.at/gvOrb\n\n"
-        "⚡ You are now ACTIVE and ready to receive deliveries.\n\n"
+        "⚡️ You are now ACTIVE and ready to receive deliveries.\n\n"
         "Important:\n"
         "• All clients belong to the dealership.\n"
         "• Every client phone number must be recorded.\n"
@@ -1309,7 +1439,7 @@ def _build_hire_announcement_message(interview: dict, driver_name: str) -> str:
         "Stay active, keep notifications ON, and bring in new clients whenever possible.\n\n"
         "🚀 Welcome aboard. Let's get to work!\n\n"
         "━━━━━━━━━━━━━━━\n\n"
-        + _format_driver_paper_ship_notice(interview)
+        + _format_driver_paper_ship_notice(interview, include_recipient=False)
         + "\n\n━━━━━━━━━━━━━━━\n\n"
         + _DRIVER_TRAINING_INTRO
     )
@@ -1690,6 +1820,10 @@ async def _begin_questionnaire(
         return ConversationHandler.END
     context.user_data["is_supervisor_created"] = supervisor_created
     context.user_data.pop("active_interview_id", None)
+    # The card ids belong to the previous applicant's message. Left behind, the
+    # first update for the NEW driver would edit the OLD driver's card.
+    context.user_data.pop("understanding_chat_id", None)
+    context.user_data.pop("understanding_message_id", None)
     msg = update.effective_message
     if msg:
         sent = await msg.reply_text(INTERVIEW_QUESTIONNAIRE_PROMPT)
@@ -1738,6 +1872,59 @@ async def _process_interview_input(
         await msg.reply_text("❌ Could not parse interview data. Try again with clearer text or image.")
         return STATE_INTERVIEW_INPUT
 
+    # What this message actually told us. Only non-blank values count: a photo
+    # the AI could not read must never wipe details an earlier message got right.
+    normalized = ai_vision.normalize_interview_data(fields)
+    new_values = {
+        k: normalized[k]
+        for k in INTERVIEW_FIELD_KEYS
+        if str(normalized.get(k) or "").strip()
+    }
+    if not new_values:
+        # Previously this inserted a completely blank interview row.
+        await msg.reply_text(
+            "\U0001f914 I couldn't read any driver details in that message. "
+            "Send it again as clearer text or a sharper photo."
+        )
+        return STATE_INTERVIEW_INPUT
+
+    # A continuation, not a new person. This is the whole fix: the handler wrote
+    # active_interview_id and then never read it, so every extra message about
+    # the SAME driver started another entry. Finished records are excluded --
+    # a stray message must not reopen somebody already hired or cancelled.
+    active_id = context.user_data.get("active_interview_id")
+    active = db.get_interview_by_id(active_id) if active_id else None
+    if active and str(active.get("status") or "pending") in ("pending", "scheduled"):
+        db.update_interview(active["id"], new_values)
+        active = db.get_interview_by_id(active["id"]) or active
+        if not context.user_data.get("understanding_message_id"):
+            context.user_data["understanding_chat_id"] = (
+                active.get("understanding_chat_id") or msg.chat_id
+            )
+            context.user_data["understanding_message_id"] = active.get(
+                "understanding_message_id"
+            )
+        if context.user_data.get("understanding_message_id"):
+            await _refresh_understanding_card(context, active)
+        else:
+            # The card was lost (a restart, a deleted message). Post a fresh one
+            # rather than leaving the operator with no way to act on the entry.
+            card = await msg.reply_text(
+                _format_interview_understanding(active),
+                reply_markup=_review_keyboard(active["id"]),
+            )
+            context.user_data["understanding_chat_id"] = card.chat_id
+            context.user_data["understanding_message_id"] = card.message_id
+            db.update_interview(
+                active["id"],
+                {
+                    "understanding_chat_id": card.chat_id,
+                    "understanding_message_id": card.message_id,
+                },
+            )
+        return STATE_INTERVIEW_INPUT
+
+    context.user_data.pop("active_interview_id", None)
     interview = db.create_interview(
         fields,
         created_by_telegram_id=str(user.id),
@@ -1816,11 +2003,23 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
 
     interviewer_bot = (getattr(Config, "KRAB_INTERVIEWER_BOT_USERNAME", None) or "krabinterviewerbot").lstrip("@")
     args = context.args or []
+    hired_interview = _resolve_hired_driver_interview(str(user.id))
+
     if args and args[0].startswith("web"):
+        if hired_interview:
+            await _deliver_hired_driver_onboarding(
+                context, hired_interview, source="start_web"
+            )
         await msg.reply_text(
             "✅ Your Telegram is linked for the driver application.\n\n"
             "Return to the application form — your Telegram ID will appear automatically.\n\n"
             f"When you're hired, start taking leads with @{dispatch}."
+        )
+        return ConversationHandler.END
+
+    if hired_interview:
+        await _deliver_hired_driver_onboarding(
+            context, hired_interview, source="start"
         )
         return ConversationHandler.END
 
@@ -2097,6 +2296,12 @@ async def handle_interview_callbacks(update: Update, context: ContextTypes.DEFAU
         if query.message:
             await _safe_delete_chat_message(context, chat_id, query.message.message_id)
         context.user_data["is_supervisor_created"] = True
+        # A NEW driver. Without this the first message about them would be folded
+        # into the previous applicant's entry -- the exact bug just fixed, only
+        # now in the other direction.
+        context.user_data.pop("active_interview_id", None)
+        context.user_data.pop("understanding_chat_id", None)
+        context.user_data.pop("understanding_message_id", None)
         if query.message:
             await query.message.reply_text(INTERVIEW_QUESTIONNAIRE_PROMPT)
         return STATE_INTERVIEW_INPUT
@@ -2187,8 +2392,22 @@ async def handle_interview_callbacks(update: Update, context: ContextTypes.DEFAU
         iid = iid or _resolve_interview_id_from_callback(data, "int_hire_")
         if not iid:
             return STATE_INTERVIEW_INPUT
-        if not _user_is_global_supervisor(user.id):
-            await query.message.reply_text("⛔ Only supervisors can hire.")
+        if not await _user_can_hire(context, user.id):
+            await query.message.reply_text(
+                "⛔ Only people on the team can hire. Ask a supervisor to add "
+                "you to the drivers channel first."
+            )
+            return STATE_INTERVIEW_INPUT
+        # Nobody approves themselves. Supervisors are exempt so the existing
+        # supervisor-created flow, where they enter the driver themselves, keeps
+        # working exactly as it did.
+        _pending = db.get_interview_by_id(iid)
+        if (_pending and not _user_is_global_supervisor(user.id)
+                and _is_own_application(_pending, user.id)):
+            await query.message.reply_text(
+                "⛔ You can't hire your own application — a teammate has to "
+                "approve it."
+            )
             return STATE_INTERVIEW_INPUT
         interview, errors = hire_driver_records(db, iid)
         if not interview:
@@ -2196,6 +2415,15 @@ async def handle_interview_callbacks(update: Update, context: ContextTypes.DEFAU
                 f"❌ {errors[0] if errors else 'Hire failed.'}"
             )
             return STATE_INTERVIEW_INPUT
+        # Who approved this. Nothing recorded it before, which mattered less
+        # when only supervisors could; with the team able to hire it is the
+        # difference between an accountable action and an anonymous one.
+        # Fail-soft: the column may not exist yet, and a hire must not be undone
+        # by an audit write.
+        try:
+            db.update_interview(iid, {"hired_by_telegram_id": str(user.id)})
+        except Exception as e:
+            logger.info("hired_by not recorded for %s (column missing?): %s", iid, e)
         await _clear_pending_prompts(context, chat_id)
         await _refresh_understanding_card(context, interview)
         hire_msg, warnings = await _run_hire_side_effects(
@@ -3285,23 +3513,10 @@ async def handle_chat_join_request(update: Update, context: ContextTypes.DEFAULT
         return
 
     tid = str(req.from_user.id)
-    interview = db.get_latest_interview_for_telegram_id(tid)
-    if not interview or (interview.get("status") or "") != "hired":
+    interview = _resolve_hired_driver_interview(tid)
+    if not interview:
         return
-    channel_invite = await _create_driver_channel_invite(
-        context, _driver_display_name(interview)
-    )
-    dm_warnings = await _send_driver_onboarding_messages(
-        context,
-        interview,
-        channel_invite=channel_invite,
-    )
-    if dm_warnings:
-        logger.warning(
-            "Driver onboarding on channel join (%s): %s",
-            tid,
-            "; ".join(dm_warnings),
-        )
+    await _deliver_hired_driver_onboarding(context, interview, source="channel_join")
 
 
 async def cancel_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:

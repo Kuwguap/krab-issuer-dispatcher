@@ -451,6 +451,29 @@ class Database:
             logger.error("get_all_drivers: %s", e)
             return []
 
+    def get_hired_interview_for_telegram_id(self, telegram_id: str) -> Optional[Dict[str, Any]]:
+        for inv in self.list_interviews_for_telegram_id(telegram_id, limit=20):
+            if (inv.get("status") or "") == "hired":
+                return inv
+        return None
+
+    def get_driver_by_telegram_id(self, telegram_id: str) -> Optional[Dict[str, Any]]:
+        tid = str(telegram_id or "").strip()
+        if not tid:
+            return None
+        try:
+            r = (
+                self.client.table("drivers")
+                .select("*")
+                .eq("driver_telegram_id", tid)
+                .limit(1)
+                .execute()
+            )
+            return r.data[0] if r.data else None
+        except Exception as e:
+            logger.error("get_driver_by_telegram_id: %s", e)
+            return None
+
     def get_driver_by_id(self, driver_id: str) -> Optional[Dict[str, Any]]:
         try:
             r = (
