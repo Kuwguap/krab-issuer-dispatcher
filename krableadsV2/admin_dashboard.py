@@ -118,6 +118,26 @@ SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 if not SUPABASE_URL or not SUPABASE_KEY:
     raise ValueError("SUPABASE_URL and SUPABASE_KEY must be set in environment variables")
 
+def _price_number(raw) -> float:
+    """A lead's price as a number. "$150.00", "150", "150 cash" all read 150.0.
+
+    ``price`` is free text on the lead — whatever the issuer typed. Summing it
+    means deciding what an unparseable value is worth, and the only safe answer
+    is nothing: a stray "TBD" counted as anything but zero silently moves an
+    issuer's takings.
+    """
+    t = str(raw or "").strip()
+    if not t:
+        return 0.0
+    m = re.search(r"-?\d+(?:[\d,]*\d)?(?:\.\d+)?", t.replace(" ", ""))
+    if not m:
+        return 0.0
+    try:
+        return float(m.group(0).replace(",", ""))
+    except ValueError:
+        return 0.0
+
+
 def _insurance_fields(ins: dict) -> dict:
     """The insurance half of a board row.
 
@@ -324,12 +344,136 @@ class AdminDatabase:
                          "tag_printed", "on_the_way", "delivered", "paid",
                          "receipt_uploaded")
 
-    def get_transmissions(self, limit: int = 300, status: str = "", search: str = "") -> list:
+    @staticmethod
+    def normalize_issuer(raw) -> str:
+        """A Telegram username as the URL and the database both spell it.
+
+        Leads carry the handle with or without its "@" depending on which path
+        wrote them, and the CRM is addressed by a bare name in a URL. One shape
+        in, one shape out — lowercase, no "@", nothing that is not a legal
+        Telegram username character. Anything else returns "" and the caller
+        must treat that as "no such issuer" rather than as "no filter".
+        """
+        t = str(raw or "").strip().lstrip("@").lower()
+        if not t or len(t) > 64:
+            return ""
+        return t if all(c.isalnum() or c == "_" for c in t) else ""
+
+    @staticmethod
+    def _scope_to_issuer(query, who: str):
+        """Restrict a leads query to one issuer's own rows.
+
+        Matched on the handle both ways round because both are in the table:
+        the bot writes what Telegram gave it ("KingKrab"), older rows carry the
+        "@". ``ilike`` with no wildcard is an exact, case-insensitive match —
+        a wildcard here would quietly hand @krab's tags to @krab2.
+        """
+        return query.or_(
+            f"telegram_username.ilike.{who},telegram_username.ilike.@{who}"
+        )
+
+    def get_issuer_directory(self, limit: int = 4000) -> list:
+        """Every issuer who has ever raised a tag, with what it came to.
+
+        One sweep, aggregated here rather than in the database: PostgREST has no
+        GROUP BY, and a per-issuer round trip on a list of unknown length is how
+        a directory page becomes a minute of queries.
+        """
+        if not self._check_tables_exist():
+            return []
+        cap = max(1, min(int(limit or 4000), 10000))
+        rows = []
+        for cols in ("id, telegram_username, price, receipt_image_url, created_at, "
+                     "extra_vehicles",
+                     "id, telegram_username, price, created_at"):
+            try:
+                rows = (
+                    self.client.table("leads").select(cols)
+                    .order("created_at", desc=True).limit(cap).execute().data
+                ) or []
+                break
+            except Exception as e:
+                logger.warning("issuer directory (%s) failed: %s", cols[:40], e)
+        if not rows:
+            return []
+
+        # Which leads have a receipt filed in the database. Same durable test
+        # the board itself uses -- "has a URL" is not the same as "handed in".
+        stored = set()
+        try:
+            rf = self.client.table("receipt_files").select("lead_id").limit(10000).execute()
+            stored = {str(r.get("lead_id") or "") for r in (rf.data or [])}
+        except Exception:
+            pass
+
+        book = {}
+        for r in rows:
+            who = self.normalize_issuer(r.get("telegram_username"))
+            if not who:
+                continue
+            e = book.setdefault(who, {
+                "issuer": who,
+                "display": (str(r.get("telegram_username") or "").strip().lstrip("@") or who),
+                "leads": 0, "tags": 0, "gross": 0.0, "receipted": 0.0,
+                "with_receipt": 0, "last_at": "", "prices": {},
+            })
+            amount = _price_number(r.get("price"))
+            extra = r.get("extra_vehicles")
+            if isinstance(extra, str):
+                try:
+                    extra = json.loads(extra)
+                except Exception:
+                    extra = None
+            n_tags = 1 + (len([v for v in extra if isinstance(v, dict)])
+                          if isinstance(extra, list) else 0)
+            has = (str(r.get("id") or "") in stored
+                   or bool((r.get("receipt_image_url") or "").strip()))
+            e["leads"] += 1
+            e["tags"] += n_tags
+            e["gross"] += amount
+            if has:
+                e["with_receipt"] += 1
+                e["receipted"] += amount
+            at = str(r.get("created_at") or "")
+            if at > e["last_at"]:
+                e["last_at"] = at
+            # Their own price list, straight off their own tags: what they
+            # charge and how often, rather than one house rate for everybody.
+            if amount > 0:
+                key = f"{amount:.2f}"
+                e["prices"][key] = e["prices"].get(key, 0) + 1
+
+        out = []
+        for e in book.values():
+            e["prices"] = sorted(
+                ({"price": float(k), "count": v} for k, v in e["prices"].items()),
+                key=lambda p: (-p["count"], -p["price"]),
+            )
+            e["typical_price"] = e["prices"][0]["price"] if e["prices"] else 0.0
+            out.append(e)
+        out.sort(key=lambda e: (-e["gross"], -e["leads"], e["issuer"]))
+        return out
+
+    def get_transmissions(self, limit: int = 300, status: str = "", search: str = "",
+                          issuer: str = "") -> list:
         """Leads as the board shows them: newest first, with driver, team, receipt
-        and status. Batched — no per-row queries."""
+        and status. Batched — no per-row queries.
+
+        ``issuer`` scopes the board to one person's own tags. It is applied in
+        the QUERY, not afterwards: the board reads the newest N leads, so
+        filtering the result would show a quiet issuer almost nothing of their
+        own work while a busy colleague filled the window.
+        """
         if not self._check_tables_exist():
             return []
         cap = max(1, min(int(limit or 300), 1000))
+        who = self.normalize_issuer(issuer) if issuer else ""
+        if issuer and not who:
+            # A name that cannot be an issuer must return nothing. Dropping the
+            # filter instead would answer a request for one person's CRM with
+            # everybody's leads.
+            logger.warning("get_transmissions: refusing unusable issuer %r", issuer)
+            return []
         try:
             q = self.client.table("leads").select(
                 "id, reference_id, price, phone_number, receipt_image_url, "
@@ -343,20 +487,24 @@ class AdminDatabase:
                     q = q.is_("delivery_status", "null")
                 else:
                     q = q.eq("delivery_status", status)
+            if who:
+                q = self._scope_to_issuer(q, who)
             rows = (q.order("created_at", desc=True).limit(cap).execute().data) or []
         except Exception as e:
             # delivery_status may not exist yet (migration not run). Fall back to the
             # columns that certainly do, so the board still works.
             logger.warning("get_transmissions full select failed (%s) — retrying lean", e)
             try:
-                rows = (
+                lean = (
                     self.client.table("leads")
                     .select("id, reference_id, price, phone_number, receipt_image_url, "
                             "created_at, updated_at, group_id, telegram_username, "
                             "vehicle_details, delivery_details, extra_info, email, "
                             "user_id, issue_date")
-                    .order("created_at", desc=True).limit(cap).execute().data
-                ) or []
+                )
+                if who:
+                    lean = self._scope_to_issuer(lean, who)
+                rows = (lean.order("created_at", desc=True).limit(cap).execute().data) or []
             except Exception as e2:
                 logger.error("get_transmissions: %s", e2)
                 return []

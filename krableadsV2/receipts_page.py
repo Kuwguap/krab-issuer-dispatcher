@@ -36,6 +36,7 @@ the board is self-contained: it needs ``db`` and ``app`` and nothing else.
 """
 import hashlib
 import hmac
+from html import escape as html_escape
 import json
 import logging
 import os
@@ -65,6 +66,16 @@ STATUS_ORDER = ("new", "followup", "tag_issued", "tag_emailed",
 STATUS_ALIAS = {"paid": "receipt_uploaded"}
 ACCEPTED_STATUSES = STATUS_ORDER + ("paid",)
 PARTIES = ("client", "driver", "issuer", "dispatcher")
+
+# /receipts/<issuer> is a catch-all one segment deep, so every OTHER thing the
+# board serves at that depth has to be spoken for. Flask matches a static rule
+# ahead of a converter, so these already win -- the list is what stops a future
+# endpoint being shadowed by an issuer whose handle happens to match it, and
+# what lets the CRM say "no such issuer" instead of rendering an empty board.
+RESERVED_SEGMENTS = frozenset({
+    "login", "logout", "api", "asset", "assets", "tag", "insurance", "receipt",
+    "issuers", "game.js", "favicon.ico", "robots.txt", "static",
+})
 
 # Receipt bytes are served straight back from this origin — an allowlist, never
 # the row's own claim (image/svg+xml is a script container).
@@ -935,11 +946,18 @@ BOARD_HTML = r"""<!doctype html>
    footer { display:none; }
  }
  @media (max-width:760px) { .hide-sm { display:none; } }
+ .taglink { display:inline-block; margin:1px 3px 1px 0; padding:1px 7px;
+            border:1px solid var(--line); border-radius:7px; font-size:12px;
+            font-weight:650; white-space:nowrap; text-decoration:none; }
+ .taglink:hover { border-color:var(--accent); color:var(--accent); }
+ .tagset { display:flex; flex-wrap:wrap; }
+ .rate { display:inline-block; margin-right:10px; }
+ .rate b { font-variant-numeric:tabular-nums; }
 </style></head><body>
 <header>
   <div>
-    <h1>🧾 Receipts &amp; Transmissions</h1>
-    <div class="sub">Every transmission, its receipt, every party — and where it has got to.</div>
+    <h1 id="boardTitle">🧾 Receipts &amp; Transmissions</h1>
+    <div class="sub" id="boardSub">Every transmission, its receipt, every party — and where it has got to.</div>
   </div>
   <div class="tabs" id="tabs"></div>
   <span class="grow"></span>
@@ -952,6 +970,8 @@ BOARD_HTML = r"""<!doctype html>
     <button data-view="crm" title="Pipeline">📌 CRM</button>
   </div>
   <button class="hbtn" id="csv" title="Download everything as a CSV file">⬇ CSV</button>
+  <a class="hbtn" id="issuersLink" href="/receipts/issuers"
+     title="Every issuer and their own pricing">👥 Issuers</a>
   <span id="themeMount"></span>
   <button class="hbtn" id="gamechip" title="Ambient game mode">🎮 off</button>
   <button class="who" id="who" title="Shown next to everything you change or send">👤 …</button>
@@ -1023,6 +1043,11 @@ const LABELS = __LABELS__;
 const AGENCY = __AGENCY__;
 const API = "/receipts/api";
 const IMG = "/receipts/receipt/";
+const TAG = "/receipts/tag/";
+// "" on the shared board, a handle on /receipts/<issuer>. Everything that reads
+// it treats "" as "everybody" -- one page, two jobs.
+const ISSUER = __ISSUER__;
+const SCOPED = !!ISSUER;
 let ALL = [], filter = "", q = "";
 let CFG = {email: true, sms: "unknown"};   // refreshed from /receipts/api/sendconfig
 let COMPOSE = null;                        // {row, party, channel}
@@ -1179,7 +1204,31 @@ function renderStats(rows) {
   let mAll = 0, mRec = 0, mN = 0;
   rows.forEach(r => { if (monthKey(r.created_at) === nowKey) {
     const a = moneyNum(r.price); mAll += a; mN += 1; if (r.has_receipt) mRec += a; } });
+  // What THIS issuer charges, read off their own tags rather than assumed.
+  // Two issuers selling the same tag at different money is the normal case
+  // here, so a single house rate described nobody's month.
+  let rateCard = "";
+  if (SCOPED) {
+    const byPrice = new Map();
+    let tags = 0;
+    rows.forEach(r => {
+      tags += Math.max(1, r.tags || 1);
+      const a = moneyNum(r.price);
+      if (a > 0) byPrice.set(a, (byPrice.get(a) || 0) + 1);
+    });
+    const book = [...byPrice.entries()].sort((x, y) => y[1] - x[1] || y[0] - x[0]);
+    const rates = book.slice(0, 6).map(([p, n]) =>
+      `<span class="rate"><b>${fmtMoney(p)}</b> <span class="counts">×${n}</span></span>`);
+    if (book.length > 6) rates.push(`<span class="counts">+${book.length - 6} more</span>`);
+    rateCard =
+      `<span class="stat">🏷 Tags issued<b>${tags}</b> <span class="counts">(${rows.length} lead${rows.length === 1 ? "" : "s"})</span></span>`
+      + `<span class="stat">💵 Their pricing<b style="font-weight:400">`
+      + (rates.length ? rates.join("") : '<span class="none">nothing priced yet</span>')
+      + `</b></span>`;
+  }
+
   document.getElementById("stats").innerHTML = [
+    rateCard,
     `<span class="stat">🧾 With receipts<b>${fmtMoney(sumRec)}</b> <span class="counts">(${nRec})</span></span>`,
     `<span class="stat">💰 All<b>${fmtMoney(sumAll)}</b> <span class="counts">(${rows.length})</span></span>`,
     `<span class="stat warn">⚠ Missing<b>${fmtMoney(sumAll - sumRec)}</b> <span class="counts">(${rows.length - nRec})</span></span>`,
@@ -1429,6 +1478,28 @@ function detailBody(r) {
     </div>`;
 }
 
+// The tag the client was issued, openable. Rebuilt from the lead with the
+// plate and control number the bot already assigned, so this IS the document in
+// their hands -- not a lookalike minted fresh on the way to the browser.
+function tagLink(r, car, label, title) {
+  const href = TAG + encodeURIComponent(r.lead_id) + (car > 1 ? `?car=${car}` : "");
+  return `<a class="taglink" href="${href}" target="_blank" rel="noopener"
+    title="${esc(title)}">🏷 ${esc(label)}</a>`;
+}
+
+function tagCell(r) {
+  const n = Math.max(1, r.tags || 1);
+  const ref = r.reference_id || "";
+  if (n === 1) return tagLink(r, 1, "Tag", `Open the tag issued for ${ref}`);
+  // One tag per car, and each one is its own document -- a single link would
+  // quietly be car 1 only.
+  const links = [];
+  for (let c = 1; c <= n; c++) {
+    links.push(tagLink(r, c, String(c), `Tag for car ${c} of ${n} — ${ref}`));
+  }
+  return `<div class="tagset" title="one tag per car">${links.join("")}</div>`;
+}
+
 function rowHtml(r, idx) {
   const s = statusBits(r);
   const phone = r.client_phone
@@ -1442,7 +1513,7 @@ function rowHtml(r, idx) {
         <div class="carline">${esc(r.car)}</div></td>
     <td>${receiptCell(r)}</td>
     <td class="phone">${phone}</td>
-    <td>${(r.tags || 1) > 1 ? `<b title="one tag per car">${esc(r.tags)}×</b>` : ""}</td>
+    <td>${tagCell(r)}</td>
     <td>${block(r, "client")}</td>
     <td>${block(r, "driver")}</td>
     <td>${block(r, "issuer")}</td>
@@ -1495,7 +1566,8 @@ function cardHtml(r, idx) {
     <div class="c-top">
       <div class="c-id">
         <div class="cname"><span class="idx">#${idx}</span> ${esc(r.client_name)}</div>
-        <div class="ref">${esc(r.reference_id)} · ${esc(r.car)}${(r.tags || 1) > 1 ? ` · <b>${esc(r.tags)}× tags</b>` : ""}</div>
+        <div class="ref">${esc(r.reference_id)} · ${esc(r.car)}</div>
+        <div class="tagset">${tagCell(r)}</div>
       </div>
       <div style="text-align:right">${s.pill}<div style="margin-top:5px">${renewalChip(r)}</div></div>
     </div>
@@ -1942,7 +2014,8 @@ async function loadConfig() {
 
 async function load() {
   try {
-    const res = await fetch(`${API}/transmissions?limit=500`);
+    const res = await fetch(`${API}/transmissions?limit=500`
+      + (SCOPED ? `&issuer=${encodeURIComponent(ISSUER)}` : ""));
     if (!res.ok) throw new Error(await res.text());
     ALL = await res.json();
     emitDiffs(ALL);
@@ -1969,6 +2042,20 @@ if (typeof initVoice === "function") initVoice({
   getContext: () => ({view: VIEW, theme: localStorage.getItem("krab_theme") || "auto"}),
   onAction: (a, g) => window.krabVoiceAction(a, g),
 });
+// A scoped board says whose it is, in the tab and on the page. Without this
+// two CRMs open side by side are indistinguishable, and the wrong one gets
+// acted on.
+if (SCOPED) {
+  const handle = "@" + ISSUER;
+  document.title = handle + " — tags & receipts";
+  const t = document.getElementById("boardTitle");
+  const sub = document.getElementById("boardSub");
+  if (t) t.innerHTML = "🧾 " + esc(handle);
+  if (sub) sub.innerHTML =
+    "Only the tags " + esc(handle) + " issued — their clients, their receipts, their pricing. "
+    + '<a href="/receipts">All issuers</a>';
+}
+
 updateGameChip();
 setView(VIEW);
 loadConfig();
@@ -1981,6 +2068,127 @@ setInterval(() => {                     // the board is shared — keep it fresh
 <script defer src="/receipts/asset/tetris.js"></script>
 <script defer src="/receipts/game.js"></script>
 </body></html>"""
+
+
+
+ISSUERS_HTML = r"""<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="robots" content="noindex">
+<title>Issuers &mdash; tags &amp; pricing</title>
+<style>
+ :root{color-scheme:light dark;
+   --bg:#f4f6f8; --card:#fff; --ink:#12161c; --muted:#6b7280; --line:#e3e7ec;
+   --accent:#2f6df6; --ok:#0b8a4a; --warn:#b3261e; --soft:#f8fafc;}
+ @media (prefers-color-scheme:dark){:root{
+   --bg:#12161c; --card:#1a1f27; --ink:#e6edf3; --muted:#9aa4b2; --line:#262d36;
+   --soft:#161b22;}}
+ *{box-sizing:border-box}
+ body{margin:0;background:var(--bg);color:var(--ink);
+      font:15px/1.5 -apple-system,system-ui,Segoe UI,Roboto,sans-serif}
+ header{display:flex;flex-wrap:wrap;gap:12px;align-items:center;
+        padding:16px 20px;border-bottom:1px solid var(--line);background:var(--card)}
+ h1{margin:0;font-size:1.15rem}
+ .sub{color:var(--muted);font-size:.86rem}
+ .grow{flex:1}
+ .hbtn{display:inline-block;padding:6px 11px;border:1px solid var(--line);
+       border-radius:9px;background:var(--soft);color:inherit;font:inherit;
+       font-size:.86rem;font-weight:600;text-decoration:none;cursor:pointer}
+ .hbtn:hover{border-color:var(--accent);color:var(--accent)}
+ main{padding:18px 20px;max-width:1100px;margin:0 auto}
+ .grid{display:grid;gap:14px;grid-template-columns:repeat(auto-fill,minmax(280px,1fr))}
+ .card{background:var(--card);border:1px solid var(--line);border-radius:14px;
+       padding:14px 16px;text-decoration:none;color:inherit;display:block}
+ .card:hover{border-color:var(--accent)}
+ .who{font-weight:700;font-size:1.02rem}
+ .facts{display:flex;flex-wrap:wrap;gap:10px 18px;margin-top:10px}
+ .f{font-size:.82rem;color:var(--muted)}
+ .f b{display:block;font-size:1rem;color:var(--ink);font-variant-numeric:tabular-nums}
+ .f.warn b{color:var(--warn)}
+ .rates{margin-top:10px;padding-top:10px;border-top:1px dashed var(--line);
+        font-size:.82rem;color:var(--muted)}
+ .rate{display:inline-block;margin-right:9px}
+ .rate b{color:var(--ink);font-variant-numeric:tabular-nums}
+ .none{color:var(--muted)}
+ .empty{padding:40px 0;text-align:center;color:var(--muted)}
+</style></head><body>
+<header>
+  <div>
+    <h1>&#128101; Issuers</h1>
+    <div class="sub">Each one&rsquo;s own tags, and their own pricing. Open a card for their CRM.</div>
+  </div>
+  <span class="grow"></span>
+  <a class="hbtn" href="/receipts">&#129534; All transmissions</a>
+</header>
+<main><div class="grid" id="grid"></div></main>
+<script>
+const PEOPLE = __PEOPLE__;
+const AGENCY = __AGENCY__;
+const esc = s => String(s == null ? "" : s)
+  .replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;");
+const money = n => "$" + (Number(n) || 0).toLocaleString("en-US",
+  {minimumFractionDigits:2, maximumFractionDigits:2});
+const when = iso => {
+  if (!iso) return "\u2014";
+  const d = new Date(iso);
+  return isNaN(d) ? "\u2014" : d.toLocaleDateString("en-US",
+    {month:"short", day:"numeric", year:"numeric"});
+};
+
+// Their own price list, off their own tags. The house has no single rate, so
+// showing one would have been a number that described nobody.
+function rates(p) {
+  const book = (p.prices || []).slice(0, 5);
+  if (!book.length) return '<span class="none">nothing priced yet</span>';
+  const out = book.map(x =>
+    `<span class="rate"><b>${money(x.price)}</b> \u00d7${x.count}</span>`);
+  if ((p.prices || []).length > 5) out.push(`<span>+${p.prices.length - 5} more</span>`);
+  return out.join("");
+}
+
+function card(p) {
+  const missing = Math.max(0, (p.gross || 0) - (p.receipted || 0));
+  return `<a class="card" href="/receipts/${encodeURIComponent(p.issuer)}">
+    <div class="who">@${esc(p.display || p.issuer)}</div>
+    <div class="sub">last tag ${esc(when(p.last_at))}</div>
+    <div class="facts">
+      <span class="f">Tags<b>${p.tags || 0}</b></span>
+      <span class="f">Leads<b>${p.leads || 0}</b></span>
+      <span class="f">Billed<b>${money(p.gross)}</b></span>
+      <span class="f">Receipted<b>${money(p.receipted)}</b></span>
+      <span class="f${missing > 0 ? " warn" : ""}">Missing<b>${money(missing)}</b></span>
+    </div>
+    <div class="rates">${rates(p)}</div>
+  </a>`;
+}
+
+document.getElementById("grid").innerHTML = PEOPLE.length
+  ? PEOPLE.map(card).join("")
+  : '<div class="empty">No issuer has raised a tag yet.</div>';
+</script>
+</body></html>"""
+
+
+def _issuer_not_found(seg: str) -> str:
+    """A handle that cannot be an issuer.
+
+    Rendered rather than 404-ing bare, because the usual way to land here is a
+    typo in a URL somebody was given, and an empty board would read as "this
+    issuer has sold nothing" -- which is a different and much worse answer.
+    """
+    safe = html_escape(str(seg or "")[:64])
+    return ("<!doctype html><meta charset=utf-8>"
+            "<meta name=viewport content='width=device-width,initial-scale=1'>"
+            "<title>No such issuer</title>"
+            "<style>body{margin:0;min-height:100vh;display:flex;align-items:center;"
+            "justify-content:center;background:#f4f6f8;color:#12161c;text-align:center;"
+            "font:16px/1.6 -apple-system,system-ui,Segoe UI,Roboto,sans-serif}"
+            "div{max-width:32rem;padding:28px}a{color:#2f6df6}</style>"
+            f"<div><h1>No such issuer</h1><p><code>{safe}</code> is not a Telegram "
+            "handle we can look up, so this is not an empty board \u2014 it is the "
+            "wrong address.</p>"
+            "<p><a href='/receipts/issuers'>See every issuer</a> \u00b7 "
+            "<a href='/receipts'>All transmissions</a></p></div>")
 
 
 # ── The password on the door ────────────────────────────────────────────────
@@ -2166,8 +2374,98 @@ def register(app, db_provider):
         html = (BOARD_HTML
                 .replace("__STATUSES__", json.dumps(list(STATUS_ORDER)))
                 .replace("__LABELS__", json.dumps(STATUS_LABELS))
+                .replace("__AGENCY__", json.dumps(_agency()))
+                # Everybody's tags. The per-issuer CRMs fill this in.
+                .replace("__ISSUER__", json.dumps("")))
+        return Response(html, mimetype="text/html")
+
+    @app.route("/receipts/issuers", methods=["GET"])
+    def receipts_issuer_index():
+        """Who issues tags here, and what their own work comes to.
+
+        The way into the per-issuer CRMs, and a standing answer to "who is
+        selling what" -- each issuer prices their own tags, so a single house
+        figure never described anybody's month.
+        """
+        try:
+            people = _resolve().get_issuer_directory()
+        except Exception as e:
+            logger.error("receipts board: issuer directory failed: %s", e)
+            people = []
+        html = (ISSUERS_HTML
+                .replace("__PEOPLE__", json.dumps(people))
                 .replace("__AGENCY__", json.dumps(_agency())))
         return Response(html, mimetype="text/html")
+
+    @app.route("/receipts/api/issuers", methods=["GET"])
+    def receipts_api_issuers():
+        try:
+            return jsonify(_resolve().get_issuer_directory())
+        except Exception as e:
+            return jsonify({"error": str(e)}), 500
+
+    @app.route("/receipts/tag/<lead_id>", methods=["GET"])
+    def receipts_tag_pdf(lead_id):
+        """The temp tag this client was actually issued, rebuilt for viewing.
+
+        Same generator and the same stored plate/control number the bot sent on
+        Telegram, through dispatch_web.tagpdf — so the PDF opened from the board
+        is the document in the client's hands, not a lookalike with a fresh
+        plate on it. ``?car=N`` picks the car on a multi-vehicle lead.
+        """
+        raw = (request.args.get("car") or "1").strip()
+        try:
+            car = int(raw)
+        except ValueError:
+            return jsonify({"error": "car must be a number"}), 400
+
+        try:
+            from dispatch_web import tagpdf as _tagpdf
+            from dispatch_web.core import get_db as _bot_db
+            from utils import tag_pdf as _tag_pdf
+        except Exception as e:
+            logger.error("receipts board: tag rendering unavailable: %s", e)
+            return jsonify({"error": "tag rendering is unavailable on this service"}), 503
+
+        # The bot's own Database, not the board's AdminDatabase: the tag builder
+        # calls get_lead_by_id / update_lead / allocate_temp_plate, and the board
+        # handle has none of them. Same Supabase either way — this is about
+        # which wrapper, not which data.
+        try:
+            db = _bot_db()
+        except Exception as e:
+            logger.error("receipts board: bot database unavailable for tags: %s", e)
+            return jsonify({"error": "tag rendering is unavailable on this service"}), 503
+
+        try:
+            lead = db.get_lead_by_id(str(lead_id))
+        except Exception as e:
+            logger.error("receipts board: tag lead read failed for %s: %s", lead_id, e)
+            return jsonify({"error": "could not read the lead"}), 500
+        if not lead:
+            return jsonify({"error": "lead not found"}), 404
+
+        total = _tagpdf._vehicle_count(lead)
+        if not (1 <= car <= total):
+            return jsonify({"error": f"this lead has {total} car(s)"}), 404
+
+        try:
+            fields = _tagpdf._tag_fields_from_lead(db, lead, vehicle=car)
+            pdf = _tag_pdf.build_tag_pdf(fields)
+        except Exception as e:
+            # The lead id is enough to replay it; client values never go to the log.
+            logger.error("receipts board: tag build failed for %s car %s: %s", lead_id, car, e)
+            return jsonify({"error": "the tag could not be generated"}), 500
+
+        name = _tagpdf._tag_filename(fields, car, total)
+        return Response(pdf, mimetype="application/pdf", headers={
+            # Inline: the point is to LOOK at it from the board.
+            "Content-Disposition": f'inline; filename="{name}"',
+            # A legal document with the client's address on it, and a first
+            # view can mint and persist a plate. Never cached anywhere.
+            "Cache-Control": "no-store",
+            "X-Content-Type-Options": "nosniff",
+        })
 
     @app.route("/receipts/asset/<name>", methods=["GET"])
     def receipts_asset(name):
@@ -2197,6 +2495,32 @@ def register(app, db_provider):
             return Response("/* game layer not installed */",
                             mimetype="application/javascript")
 
+    @app.route("/receipts/<issuer>", methods=["GET"])
+    def receipts_issuer_board(issuer):
+        """One issuer's own CRM: tristatetags.com/receipts/KINGKRAB.
+
+        The same board, scoped to the tags that person raised, with their own
+        pricing on top of it. Two issuers charging different money for the same
+        work is the normal case here, so a shared board's totals belonged to
+        nobody.
+        """
+        seg = (issuer or "").strip()
+        if seg.lower() in RESERVED_SEGMENTS:
+            # Flask would have matched the real endpoint first; this is the
+            # belt-and-braces answer if one is ever removed.
+            return jsonify({"error": "not found"}), 404
+        db = _resolve()
+        who = db.normalize_issuer(seg)
+        if not who:
+            return Response(
+                _issuer_not_found(seg), mimetype="text/html", status=404)
+        html = (BOARD_HTML
+                .replace("__STATUSES__", json.dumps(list(STATUS_ORDER)))
+                .replace("__LABELS__", json.dumps(STATUS_LABELS))
+                .replace("__AGENCY__", json.dumps(_agency()))
+                .replace("__ISSUER__", json.dumps(who)))
+        return Response(html, mimetype="text/html")
+
     @app.route("/receipts/api/transmissions", methods=["GET"])
     @app.route("/api/transmissions", methods=["GET"])
     def api_transmissions():
@@ -2207,6 +2531,10 @@ def register(app, db_provider):
                 limit=limit,
                 status=(request.args.get("status") or "").strip(),
                 search=(request.args.get("q") or "").strip(),
+                # Scoped in the QUERY. A CRM that filtered in the browser would
+                # show a quiet issuer almost none of their own work, because the
+                # newest 300 leads overall are mostly somebody else's.
+                issuer=(request.args.get("issuer") or "").strip(),
             ))
         except Exception as e:
             return jsonify({"error": str(e)}), 500
