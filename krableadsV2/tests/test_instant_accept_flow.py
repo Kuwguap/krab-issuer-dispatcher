@@ -246,7 +246,10 @@ class TheAcceptErrorIsFixedTest(unittest.TestCase):
         i_guard = body.index('if lead.get("instant_tag"):\n            # On an Instant Tag')
         i_send = body.index("_send_all_tag_pdfs")
         self.assertLess(i_guard, i_send, "the tag block is not guarded")
-        self.assertIn("elif offered_to_a_team:", body)
+        # The instant branch must RETURN without sending: it logs and falls
+        # through to the end of the block. What it must never do is reach
+        # _send_all_tag_pdfs, which the ordering above already pins.
+        self.assertIn("waits for payment or a", body)
 
 
 class ASettledInstantTagCannotBeAcceptedAgainTest(unittest.IsolatedAsyncioTestCase):

@@ -689,8 +689,10 @@ async def _send_driver_lead_details(
     """DM the full accepted-lead details (HTML with plain-text fallback)."""
     confirmation_message = _build_driver_lead_accepted_message_html(lead)
     add_lead_kb = _driver_keyboard_after_accept(lead.get("reference_id"), reassign_lead_id)
+    # Remembered so a reassign can take it back: this card carries the client's
+    # name, address and the one-time phone link.
     try:
-        await context.bot.send_message(
+        _sent = await context.bot.send_message(
             chat_id=chat_id,
             text=confirmation_message,
             reply_markup=add_lead_kb,
@@ -699,7 +701,10 @@ async def _send_driver_lead_details(
         )
     except BadRequest:
         plain = re.sub(r"<[^>]+>", "", confirmation_message)
-        await context.bot.send_message(chat_id=chat_id, text=plain, reply_markup=add_lead_kb)
+        _sent = await context.bot.send_message(
+            chat_id=chat_id, text=plain, reply_markup=add_lead_kb)
+    _remember_dispatch_message(context, str(lead.get("id") or ""), chat_id,
+                               getattr(_sent, "message_id", None))
     # Everything the issuer sent for parsing (title/registration/insurance shots and
     # PDFs) follows the lead to the driver who accepted it — they are the one who
     # needs the paperwork on the delivery.
@@ -917,6 +922,52 @@ def _remember_dispatch_message(context, lead_id, chat_id, message_id) -> None:
         book.setdefault(str(lead_id), []).append((str(chat_id), int(message_id)))
     except Exception as e:
         logger.warning("could not remember dispatch message for %s: %s", lead_id, e)
+
+
+async def _delete_lead_messages_in_chat(context, lead_id, chat_id) -> tuple:
+    """Unsend this lead's messages from ONE chat. Returns (gone, left).
+
+    Used when a lead is taken off a driver: the details card, the paperwork and
+    the tag PDF all go back, and only that driver's chat is touched — the team
+    still has its copy, and the new driver is about to get theirs.
+
+    Best effort by nature. Telegram refuses to delete anything older than 48
+    hours, and the ids live in bot_data so a restart forgets them. Whatever
+    cannot be unsent is COUNTED and reported, never silently assumed gone: the
+    difference matters when what is left behind is a customer's home address.
+    """
+    want = _norm_chat_id(chat_id)
+    if want is None:
+        return 0, 0
+    targets = []
+    try:
+        book = context.application.bot_data.get(_DISPATCH_MSGS_KEY, {})
+        for cid, mid in book.get(str(lead_id), []):
+            if _norm_chat_id(cid) == want:
+                targets.append(int(mid))
+    except Exception as e:
+        logger.warning("could not read remembered messages for %s: %s", lead_id, e)
+        return 0, 0
+
+    gone = left = 0
+    for mid in sorted(set(targets)):
+        try:
+            await context.bot.delete_message(chat_id=chat_id, message_id=mid)
+            gone += 1
+        except Exception as e:
+            left += 1
+            logger.info("reassign: could not unsend %s/%s: %s", chat_id, mid, e)
+
+    # Forget only what we actually removed, so a later sweep can retry the rest.
+    try:
+        book = context.application.bot_data.get(_DISPATCH_MSGS_KEY, {})
+        book[str(lead_id)] = [
+            (cid, mid) for cid, mid in book.get(str(lead_id), [])
+            if _norm_chat_id(cid) != want
+        ]
+    except Exception:
+        pass
+    return gone, left
 
 
 async def _delete_dispatch_messages(context, lead_id) -> tuple:
@@ -12026,7 +12077,7 @@ async def _build_and_send_tag_pdf(
             sent += 1
             continue
         try:
-            await context.bot.send_document(
+            _doc = await context.bot.send_document(
                 chat_id=cid,
                 document=InputFile(io.BytesIO(pdf), filename=filename),
                 caption=caption,
@@ -12035,6 +12086,10 @@ async def _build_and_send_tag_pdf(
                 reply_markup=(_tag_email_keyboard(str(lead.get("id")))
                               if _lead_awaiting_tag_email(lead) else None),
             )
+            # Remembered so a reassign can withdraw it: this is a printable temp
+            # tag for a car that may become somebody else's job.
+            _remember_dispatch_message(context, str(lead.get("id") or ""), cid,
+                                       getattr(_doc, "message_id", None))
             sent += 1
             if once:
                 book[_book_key] = True
@@ -18463,19 +18518,35 @@ async def handle_accept_lead(update: Update, context: ContextTypes.DEFAULT_TYPE)
             # a cent was paid.
             logger.info("Lead %s is an Instant Tag: the tag waits for payment or a "
                         "password release, not this Accept.", lead_id)
-        elif offered_to_a_team:
-            logger.info("Lead %s was offered to a team; their Accept releases the tag, "
-                        "not this driver's.", lead_id)
         else:
-            tag_targets = [_parse_chat_id((group or {}).get("group_telegram_id"))]
-            tag_targets = [c for c in tag_targets if c]
-            if tag_targets:
-                await _send_all_tag_pdfs(
-                    context, lead, tag_targets,
-                    accepted_by=driver.get("driver_name") or "driver",
-                )
+            # The driver who accepted ALWAYS gets the tag. They are the one
+            # driving to the client; a temp tag that goes only to a group chat
+            # is a document in the wrong hands.
+            #
+            # This used to defer to the team whenever one had also been offered
+            # ("their Accept releases the tag, not this driver's"), which on a
+            # normal lead -- team offer and driver offers posted together -- meant
+            # the accepting driver got a details card and no tag, indefinitely,
+            # until somebody on a team happened to tap a button. The two accepts
+            # are independent triggers now.
+            tag_targets = [query.message.chat_id]
+            if offered_to_a_team:
+                # Their own Accept posts the tag to their chat, through
+                # _send_full_group_lead_to_chat. Sending it here as well would
+                # put two copies in the same group.
+                logger.info("Lead %s: tag released to the accepting driver; the team "
+                            "offer stands on its own.", lead_id)
             else:
-                logger.warning("Driver accepted %s but no group chat to send the tag to.", lead_id)
+                gcid = _parse_chat_id((group or {}).get("group_telegram_id"))
+                if gcid:
+                    tag_targets.append(gcid)
+                else:
+                    logger.info("Driver accepted %s with no group chat — tag to the "
+                                "driver only.", lead_id)
+            await _send_all_tag_pdfs(
+                context, lead, tag_targets,
+                accepted_by=driver.get("driver_name") or "driver",
+            )
     except Exception as e:
         # Never abort the acceptance over the document: the renewal schedule and
         # the driver's own confirmation are below this and matter more.
@@ -18574,21 +18645,37 @@ async def handle_reassign_lead(update: Update, context: ContextTypes.DEFAULT_TYP
         parse_mode="Markdown",
     )
 
-    # Tell the old driver if someone else pulled it.
-    if not is_the_driver:
-        old_cid = _parse_chat_id(old_driver.get("driver_telegram_id"))
-        if old_cid:
-            try:
-                await context.bot.send_message(
-                    chat_id=old_cid,
-                    text=(
-                        f"🔄 Delivery `{ref}` was reassigned by dispatch — "
-                        "you're no longer on it."
-                    ),
-                    parse_mode="Markdown",
-                )
-            except Exception as e:
-                logger.warning("Could not notify old driver of reassign: %s", e)
+    # Take the lead back out of the old driver's chat. They were handed the
+    # client's name, home address, the one-time phone link and a printable temp
+    # tag; someone taken off a delivery should not still be holding all of it
+    # for a car that is now somebody else's job.
+    #
+    # Best effort by nature: Telegram refuses to delete anything older than 48
+    # hours, and a restart forgets the message ids (they live in bot_data). What
+    # cannot be unsent is reported rather than quietly assumed gone.
+    old_cid = _parse_chat_id(old_driver.get("driver_telegram_id"))
+    pulled_back, left_behind = 0, 0
+    if old_cid:
+        try:
+            pulled_back, left_behind = await _delete_lead_messages_in_chat(
+                context, lead_id, old_cid)
+        except Exception as e:
+            logger.warning("reassign: could not clear %s from the old driver: %s", ref, e)
+        try:
+            await context.bot.send_message(
+                chat_id=old_cid,
+                text=(
+                    f"🔄 Delivery `{ref}` was reassigned by dispatch — "
+                    "you're no longer on it."
+                    + ("\n\nThe client's details and the tag have been withdrawn."
+                       if pulled_back else "")
+                    + ("\n\n⚠️ Please delete the details and tag you were sent "
+                       "for this one." if left_behind else "")
+                ),
+                parse_mode="Markdown",
+            )
+        except Exception as e:
+            logger.warning("Could not notify old driver of reassign: %s", e)
 
     # Re-offer to the rest of the pool (same machinery as dispatch).
     group = db.get_group_by_id(lead.get("group_id")) if lead.get("group_id") else None
@@ -18621,11 +18708,22 @@ async def handle_reassign_lead(update: Update, context: ContextTypes.DEFAULT_TYP
 
     # Alert issuer + supervisors.
     presser_name = update.effective_user.full_name or "someone"
+    # Who moved what, and to whom. The old line named only the person who
+    # pressed the button, which is the least useful third of the event.
+    _moved_by = old_driver_name if is_the_driver else presser_name
     note = (
-        f"🔄 Lead `{ref}` was reassigned"
-        + (f" by {old_driver_name}" if is_the_driver else f" by {presser_name}")
-        + f" — re-offered to {assigned_count} driver(s)."
+        f"🔄 *Lead reassigned* — `{ref}`\n"
+        f"🚗 From: {old_driver_name}\n"
+        f"📤 Re-offered to: {assigned_count} driver(s)\n"
+        f"👤 By: {_moved_by}"
+        + (" (the driver themselves)" if is_the_driver else "")
     )
+    if old_cid:
+        note += ("\n\n🧹 Their copy was withdrawn."
+                 if pulled_back and not left_behind else
+                 "\n\n⚠️ Some of their copy could not be withdrawn "
+                 "(older than 48h) — they were asked to delete it."
+                 if left_behind else "")
     initiator_id = lead.get("user_id")
     if initiator_id and str(initiator_id) != str(presser_id):
         try:

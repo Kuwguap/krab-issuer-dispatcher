@@ -344,8 +344,13 @@ class TagPdfReachesTheGroup(unittest.TestCase):
                 await self.app.process_update(_driver_accept_update(self.app, 7008))
         asyncio.run(go())
         docs = [d for e, d in TRANSPORT.calls if e == "sendDocument"]
-        self.assertEqual(len(docs), 1,
-                         f"driver accepted, no tag went out; calls={TRANSPORT.endpoints()}")
+        chats = {str(d.get("chat_id")) for d in docs}
+        # The driver who accepted is the one driving to the client, so the tag
+        # goes to them; the dispatcher group gets it too when no team was asked.
+        self.assertIn(str(DRIVER_TG), chats,
+                      f"the accepting driver got no tag; calls={TRANSPORT.endpoints()}")
+        self.assertIn(str(GROUP_CHAT), chats,
+                      f"the group got no tag; calls={TRANSPORT.endpoints()}")
 
     def test_that_driver_gets_both_tags_on_a_two_car_lead(self):
         """One client, one receipt, two tags — released by the driver's Accept."""
@@ -363,14 +368,20 @@ class TagPdfReachesTheGroup(unittest.TestCase):
         asyncio.run(go())
         FAKE_DB.lead.pop("extra_vehicles", None)
         docs = [d for e, d in TRANSPORT.calls if e == "sendDocument"]
-        self.assertEqual(len(docs), 2,
-                         f"second car got no tag; calls={TRANSPORT.endpoints()}")
+        to_driver = [d for d in docs if str(d.get("chat_id")) == str(DRIVER_TG)]
+        # Two cars is one client and one receipt, but two tags -- and the driver
+        # delivering both needs both.
+        self.assertEqual(2, len(to_driver),
+                         f"the driver did not get a tag per car; calls={TRANSPORT.endpoints()}")
 
-    def test_a_driver_defers_when_a_team_was_asked(self):
-        """The other half of "exactly one".
+    def test_a_driver_is_served_even_when_a_team_was_asked(self):
+        """A team having been OFFERED the lead used to silence this entirely:
+        the accepting driver got a details card and no tag, indefinitely, until
+        somebody on a team happened to tap a button. The two accepts are
+        independent triggers now.
 
-        A team was offered this lead, so their Accept releases the tag whenever
-        it comes. This driver must not put a second copy in the group.
+        The group still must not get a second copy from this path -- their own
+        Accept posts one through _send_full_group_lead_to_chat.
         """
         FAKE_DB.lead.pop("extra_vehicles", None)
         FAKE_DB.group_accepted = False
@@ -385,8 +396,11 @@ class TagPdfReachesTheGroup(unittest.TestCase):
                 await self.app.process_update(_driver_accept_update(self.app, 7010))
         asyncio.run(go())
         docs = [d for e, d in TRANSPORT.calls if e == "sendDocument"]
-        self.assertEqual(len(docs), 0,
-                         f"tag sent twice for one lead; calls={TRANSPORT.endpoints()}")
+        chats = [str(d.get("chat_id")) for d in docs]
+        self.assertIn(str(DRIVER_TG), chats,
+                      f"the accepting driver got no tag; calls={TRANSPORT.endpoints()}")
+        self.assertNotIn(str(GROUP_CHAT), chats,
+                         f"the group got a duplicate; calls={TRANSPORT.endpoints()}")
 
     def test_two_cars_send_two_tags(self):
         docs = self._accept(EXTRA)
