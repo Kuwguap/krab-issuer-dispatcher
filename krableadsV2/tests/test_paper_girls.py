@@ -297,8 +297,19 @@ class NoAutomaticFanOutReachesThemTest(_RosterCase):
         self.assertIn("_only_drivers(active_drivers)", body)
 
     def test_the_no_group_reassign_uses_the_driver_roster(self):
-        body = SRC.split("async def handle_reassign_lead", 1)[1]
+        """The reassign moved out of handle_reassign_lead (which now only asks
+        WHO takes it) into _reassign_lead_to. Both the pool loop and the
+        named-driver lookup must filter."""
+        body = SRC.split("async def _reassign_lead_to", 1)[1]
         body = body.split("\nasync def ", 1)[0]
+        self.assertEqual(2, body.count("_only_drivers(_get_all_drivers_cached())"),
+                         "the pool loop and the named-driver lookup must both filter")
+
+    def test_the_reassign_picker_only_lists_drivers(self):
+        """The keyboard is where a supervisor's finger lands, so a paper girl on
+        it is a paper girl one tap from a client's address."""
+        body = SRC.split("def _reassign_target_keyboard", 1)[1]
+        body = body.split("\ndef ", 1)[0]
         self.assertIn("_only_drivers(_get_all_drivers_cached())", body)
 
     def test_the_dispatch_fallback_pool_uses_the_driver_roster(self):

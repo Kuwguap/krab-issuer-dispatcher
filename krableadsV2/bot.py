@@ -711,6 +711,62 @@ async def _send_driver_lead_details(
     await _forward_accepted_lead_files(context, lead, chat_id)
 
 
+async def _send_group_card_to_chat(
+    context: ContextTypes.DEFAULT_TYPE, lead: dict, chat_id, *, accepted_by: str | None = None
+) -> None:
+    """Send the group's "NEW CLIENT" card — the one with the VIN, the car, the
+    colour, the insurer, the policy number and the issue/expiry dates.
+
+    The driver who accepts gets this as well as their own job ticket. The ticket
+    is built for driving (phone, address, price, payment rails); this is what
+    they need to hand the client and to check the tag against. Before, it only
+    ever went to a group, so a driver working a lead had the address and not the
+    VIN of the car they were putting a plate on.
+
+    Formatted exactly as _send_full_group_lead_to_chat formats it, so what the
+    driver reads and what the group reads are the same message.
+    """
+    try:
+        reference_id = (lead.get("reference_id") or "N/A").strip()
+        phase1 = _phase1_from_stored_lead(lead)
+        link = (lead.get("encrypted_link") or "").strip()
+        issuer_note = _lead_issuer_note(lead)
+        issue_dt, exp_dt = _issue_and_expiration_for_group_display(lead)
+        body = _format_group_lead_message_html(
+            reference_id, phase1, link, issue_dt, exp_dt, issuer_note,
+        )
+        accept_line = (
+            f"\u2705 <b>Accepted by {html.escape(accepted_by, quote=False)}</b>\n\n"
+            if accepted_by else ""
+        )
+        full_html = f"{accept_line}{body}"
+    except Exception as e:
+        logger.warning("could not build the client card for %s: %s", lead.get("id"), e)
+        return
+
+    try:
+        _sent = await context.bot.send_message(
+            chat_id=chat_id, text=full_html, parse_mode="HTML",
+            disable_web_page_preview=True,
+        )
+    except BadRequest:
+        try:
+            _sent = await context.bot.send_message(
+                chat_id=chat_id, text=re.sub(r"<[^>]+>", "", full_html),
+                disable_web_page_preview=True,
+            )
+        except Exception as e:
+            logger.warning("could not send the client card to %s: %s", chat_id, e)
+            return
+    except Exception as e:
+        logger.warning("could not send the client card to %s: %s", chat_id, e)
+        return
+
+    # Remembered so a reassign can take it back with the rest.
+    _remember_dispatch_message(context, str(lead.get("id") or ""), chat_id,
+                               getattr(_sent, "message_id", None))
+
+
 async def _start_tracking_gate_or_send_details(
     context: ContextTypes.DEFAULT_TYPE,
     *,
@@ -3883,6 +3939,41 @@ async def _notify_initiator_lead_accepted_summary(
         await context.bot.send_message(chat_id=cid, text=text, parse_mode=None, reply_markup=kb)
     except Exception as e:
         logger.warning("Could not send initiator lead summary to %s: %s", cid, e)
+
+
+REASSIGN_PICK_CB = "rsp_"
+REASSIGN_ALL_CB = "rsa_"
+
+
+def _reassign_target_keyboard(lead_id) -> InlineKeyboardMarkup:
+    """Who a supervisor is moving this lead to: one driver, or the whole pool.
+
+    Paired ids are short-encoded (22 chars each). Two raw UUIDs behind a prefix
+    is 81 bytes against the Bot API's 64-byte callback_data limit, and Telegram
+    rejects the WHOLE keyboard for one bad button — the message never arrives
+    at all, which looks exactly like the bot ignoring the tap.
+    """
+    try:
+        short_lead = _short_uuid(str(lead_id))
+    except Exception:
+        return InlineKeyboardMarkup([])
+    rows = [[InlineKeyboardButton(
+        "\U0001f4e4 All drivers", callback_data=REASSIGN_ALL_CB + short_lead)]]
+    suspended = _get_suspended_driver_ids()
+    for d in _only_drivers(_get_all_drivers_cached()) or []:
+        if not d or not record_is_active(d) or str(d.get("id")) in suspended:
+            continue
+        if not _parse_chat_id(d.get("driver_telegram_id")):
+            continue
+        name = str(d.get("driver_name") or "Driver").strip()
+        try:
+            data = REASSIGN_PICK_CB + short_lead + _short_uuid(str(d.get("id")))
+        except Exception:
+            continue
+        rows.append([InlineKeyboardButton(f"\U0001f697 {name}", callback_data=data)])
+    # "All drivers" on its own is not a choice, it is an extra tap. With nobody
+    # to offer it to, the caller falls through to the direct re-offer instead.
+    return InlineKeyboardMarkup(rows if len(rows) > 1 else [])
 
 
 def _driver_offer_message_text(lead: dict) -> str:
@@ -18529,6 +18620,15 @@ async def handle_accept_lead(update: Update, context: ContextTypes.DEFAULT_TYPE)
             # the accepting driver got a details card and no tag, indefinitely,
             # until somebody on a team happened to tap a button. The two accepts
             # are independent triggers now.
+            # The same card the group gets, to the driver who accepted. Their
+            # own ticket carries the address and the price; this carries the VIN,
+            # the car, the colour, the insurer and the policy number — the
+            # details they need in front of the client.
+            await _send_group_card_to_chat(
+                context, lead, query.message.chat_id,
+                accepted_by=driver.get("driver_name") or "driver",
+            )
+
             tag_targets = [query.message.chat_id]
             if offered_to_a_team:
                 # Their own Accept posts the tag to their chat, through
@@ -18597,12 +18697,16 @@ async def handle_decline_lead(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 
 async def handle_reassign_lead(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Reassign an ACCEPTED lead: driver changed their mind, or dispatch pulls it.
+    """Reassign tapped: work out who may move this lead, and where it goes.
 
     Allowed: the accepted driver, the lead's issuer (dispatcher), and global
-    supervisors. Releases the assignment, cancels open tracking sessions, and
-    re-offers the lead to the other drivers (issuer alerts fire again when the
-    new driver accepts, via the normal accept flow).
+    supervisors. A supervisor may move ANY lead at ANY time -- including one
+    nobody has accepted, which used to answer "nothing to reassign" -- and is
+    asked whether it goes to one driver or back to the pool. The driver handing
+    a lead back and the dispatcher who raised it keep the one-tap re-offer:
+    they are letting go of it, not choosing a successor.
+
+    The move itself is _reassign_lead_to.
     """
     query = update.callback_query
     await query.answer()
@@ -18614,22 +18718,117 @@ async def handle_reassign_lead(update: Update, context: ContextTypes.DEFAULT_TYP
     ref = lead.get("reference_id", "N/A")
 
     assignment = db.get_lead_assignment_status(lead_id)
-    if not assignment:
+    old_driver = (assignment or {}).get("driver") or {}
+
+    presser_id = update.effective_user.id
+    is_the_driver = str(old_driver.get("driver_telegram_id") or "") == str(presser_id)
+    is_issuer = str(lead.get("user_id") or "") == str(presser_id)
+    is_supervisor = _user_is_global_supervisor(presser_id)
+    if not (is_the_driver or is_issuer or is_supervisor):
+        await query.message.reply_text("⛔ Only the assigned driver, the dispatcher, or a supervisor can reassign.")
+        return
+
+    # A supervisor may move ANY lead at ANY time, including one nobody has
+    # accepted — an offer sitting untouched is exactly the one worth moving, and
+    # "nothing to reassign" left them no way to do it.
+    if not assignment and not is_supervisor:
         await query.message.reply_text(
             f"ℹ️ `{ref}` has no accepted driver right now — nothing to reassign.",
             parse_mode="Markdown",
         )
         return
-    old_driver = assignment.get("driver") or {}
-    old_driver_id = assignment.get("driver_id")
-    old_driver_name = old_driver.get("driver_name", "the driver")
+
+    # Supervisors choose who takes it. The driver handing it back and the
+    # dispatcher who raised it are not choosing a person, they are letting go of
+    # it, so they keep the one-tap re-offer to everyone.
+    if is_supervisor and not is_the_driver:
+        kb = _reassign_target_keyboard(lead_id)
+        if kb.inline_keyboard:
+            who = old_driver.get("driver_name")
+            await query.message.reply_text(
+                f"🔄 *Reassign* `{ref}`"
+                + (f"\n🚗 Currently with {who}" if who
+                   else "\n📭 Nobody has accepted it yet")
+                + "\n\nWho takes it?",
+                parse_mode="Markdown",
+                reply_markup=kb,
+            )
+            return
+        logger.info("Reassign %s: no driver to offer to, falling back to the pool.", ref)
+
+    await _reassign_lead_to(update, context, lead, to_driver_id=None)
+
+
+async def handle_reassign_pick(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """A supervisor picked one driver off the reassign keyboard."""
+    query = update.callback_query
+    await _safe_answer_callback_query(query)
+    lead_id, driver_id = _skip_dispatch_ids(query.data or "", REASSIGN_PICK_CB)
+    if not lead_id or not driver_id:
+        await query.message.reply_text("❌ That button is stale — open the lead again.")
+        return
+    lead = db.get_lead_by_id(lead_id)
+    if not lead:
+        await query.message.reply_text("❌ Lead not found or expired.")
+        return
+    if not _user_is_global_supervisor(update.effective_user.id):
+        await query.message.reply_text("⛔ Only a supervisor can choose who takes a lead.")
+        return
+    try:
+        await query.edit_message_reply_markup(reply_markup=None)
+    except Exception:
+        pass
+    await _reassign_lead_to(update, context, lead, to_driver_id=driver_id)
+
+
+async def handle_reassign_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """A supervisor chose to put the lead back in front of everyone."""
+    query = update.callback_query
+    await _safe_answer_callback_query(query)
+    body = (query.data or "").replace(REASSIGN_ALL_CB, "", 1).strip()
+    try:
+        lead_id = _long_uuid(body)
+    except Exception:
+        lead_id = body
+    lead = db.get_lead_by_id(lead_id)
+    if not lead:
+        await query.message.reply_text("❌ Lead not found or expired.")
+        return
+    if not _user_is_global_supervisor(update.effective_user.id):
+        await query.message.reply_text("⛔ Only a supervisor can choose who takes a lead.")
+        return
+    try:
+        await query.edit_message_reply_markup(reply_markup=None)
+    except Exception:
+        pass
+    await _reassign_lead_to(update, context, lead, to_driver_id=None)
+
+
+async def _reassign_lead_to(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    lead: dict,
+    *,
+    to_driver_id: str | None,
+):
+    """Move a lead: take it off whoever has it, and offer it on.
+
+    ``to_driver_id`` names one driver; ``None`` puts it back in front of the
+    pool. Everything the old driver was handed is withdrawn from their chat
+    first, and supervisors are told who moved what, from whom, to whom.
+    """
+    query = update.callback_query
+    lead_id = str(lead.get("id") or "")
+    ref = lead.get("reference_id", "N/A")
+
+    assignment = db.get_lead_assignment_status(lead_id)
+    old_driver = (assignment or {}).get("driver") or {}
+    old_driver_id = (assignment or {}).get("driver_id")
+    old_driver_name = old_driver.get("driver_name") or (
+        "the driver" if assignment else "nobody (it was still on offer)")
 
     presser_id = update.effective_user.id
     is_the_driver = str(old_driver.get("driver_telegram_id") or "") == str(presser_id)
-    is_issuer = str(lead.get("user_id") or "") == str(presser_id)
-    if not (is_the_driver or is_issuer or _user_is_global_supervisor(presser_id)):
-        await query.message.reply_text("⛔ Only the assigned driver, the dispatcher, or a supervisor can reassign.")
-        return
 
     if not db.reopen_lead_for_reassign(lead_id, old_driver_id):
         await query.message.reply_text("❌ Could not reassign. Please try again.")
@@ -18641,7 +18840,9 @@ async def handle_reassign_lead(update: Update, context: ContextTypes.DEFAULT_TYP
     except Exception:
         pass
     await query.message.reply_text(
-        f"🔄 **Reassigning** `{ref}` — offering it to the other drivers now.",
+        f"🔄 **Reassigning** `{ref}` — "
+        + ("handing it to the driver you picked now."
+           if to_driver_id else "offering it to the other drivers now."),
         parse_mode="Markdown",
     )
 
@@ -18677,14 +18878,52 @@ async def handle_reassign_lead(update: Update, context: ContextTypes.DEFAULT_TYP
         except Exception as e:
             logger.warning("Could not notify old driver of reassign: %s", e)
 
-    # Re-offer to the rest of the pool (same machinery as dispatch).
+    # Re-offer. One named driver goes straight to them; otherwise the whole
+    # pool, through the same machinery as dispatch.
     group = db.get_group_by_id(lead.get("group_id")) if lead.get("group_id") else None
     assigned_count = 0
-    if group:
+    new_driver_name = ""
+    if to_driver_id:
+        # Filtered, not just looked up: _get_all_drivers_cached() holds paper
+        # girls as well as drivers, and a lead must never be offered to one.
+        target = next(
+            (d for d in (_only_drivers(_get_all_drivers_cached()) or [])
+             if str(d.get("id")) == str(to_driver_id)),
+            None,
+        )
+        cid = _parse_chat_id((target or {}).get("driver_telegram_id"))
+        if not target or not cid:
+            # The lead is already released at this point. Falling through to the
+            # pool below is the only honest outcome: stopping here would leave it
+            # belonging to nobody, reported as handled.
+            await query.message.reply_text(
+                "❌ That driver has no Telegram chat on file — offering it to "
+                "everyone instead."
+            )
+            to_driver_id = None
+        else:
+            new_driver_name = str(target.get("driver_name") or "Driver").strip()
+            try:
+                db.create_lead_assignment(lead_id, target["id"], lead.get("group_id"))
+                await context.bot.send_message(
+                    chat_id=cid,
+                    text=_driver_offer_message_text(lead),
+                    parse_mode="Markdown",
+                    reply_markup=_keyboard_lead_accept_decline(str(lead_id)),
+                )
+                assigned_count = 1
+            except Exception as e:
+                logger.error("Reassign offer to %s failed: %s", new_driver_name, e)
+                await query.message.reply_text(
+                    f"❌ Could not reach {new_driver_name}. The lead is released — "
+                    "reassign it again to somebody else."
+                )
+
+    if not to_driver_id and group:
         assigned_count, _names, reason, _scope = await _send_driver_requests_for_group(
             context, lead, group, exclude_driver_id=old_driver_id
         )
-    else:
+    elif not to_driver_id:
         offer_text = _driver_offer_message_text(lead)
         kb = _keyboard_lead_accept_decline(str(lead_id))
         suspended = _get_suspended_driver_ids()
@@ -18711,10 +18950,14 @@ async def handle_reassign_lead(update: Update, context: ContextTypes.DEFAULT_TYP
     # Who moved what, and to whom. The old line named only the person who
     # pressed the button, which is the least useful third of the event.
     _moved_by = old_driver_name if is_the_driver else presser_name
+    _to_line = (
+        f"📥 To: {new_driver_name}" if new_driver_name
+        else f"📤 Re-offered to: {assigned_count} driver(s)"
+    )
     note = (
         f"🔄 *Lead reassigned* — `{ref}`\n"
         f"🚗 From: {old_driver_name}\n"
-        f"📤 Re-offered to: {assigned_count} driver(s)\n"
+        f"{_to_line}\n"
         f"👤 By: {_moved_by}"
         + (" (the driver themselves)" if is_the_driver else "")
     )
@@ -23711,6 +23954,12 @@ def main():
     application.add_handler(CallbackQueryHandler(handle_decline_lead, pattern="^decline_lead_"))
     # Post-accept reassign (driver changed their mind / dispatch pulls it back)
     application.add_handler(CallbackQueryHandler(handle_reassign_lead, pattern="^reassign_lead_"))
+    # Who a supervisor is moving it to. Registered as entry points in their own
+    # right: a redeploy drops PTB's in-memory conversation state, and a button
+    # that is only reachable from inside a conversation goes dead the moment the
+    # process restarts.
+    application.add_handler(CallbackQueryHandler(handle_reassign_pick, pattern="^" + REASSIGN_PICK_CB))
+    application.add_handler(CallbackQueryHandler(handle_reassign_all, pattern="^" + REASSIGN_ALL_CB))
     
     # Add accept/decline handlers for group broadcast offers
     application.add_handler(CallbackQueryHandler(handle_accept_group_offer, pattern="^ag_"))

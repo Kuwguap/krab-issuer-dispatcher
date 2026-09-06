@@ -66,11 +66,49 @@ class TheDriverWhoAcceptsGetsTheTagTest(unittest.TestCase):
     def test_the_tag_still_goes_out_exactly_once_per_audience(self):
         self.assertEqual(1, self.body.count("_send_all_tag_pdfs("))
 
+    def test_the_driver_also_gets_the_clients_card(self):
+        """The office asked for the same message the group gets. The driver's own
+        ticket has the address and the price and none of the vehicle detail -- no
+        VIN, no car, no colour, no insurer, no policy number."""
+        self.assertIn("_send_group_card_to_chat(", self.body)
+        i_card = self.body.index("_send_group_card_to_chat(")
+        i_tag = self.body.index("_send_all_tag_pdfs(")
+        self.assertLess(i_card, i_tag, "the card should arrive before the tag, as in a group")
+
+    def test_the_card_goes_to_the_driver_not_the_group(self):
+        after = self.body.split("_send_group_card_to_chat(", 1)[1][:200]
+        self.assertIn("query.message.chat_id", after)
+
+
+class TheClientCardIsTheSameOneTest(unittest.TestCase):
+    """Same builder as the group's, or it is not the same message."""
+
+    def setUp(self):
+        self.body = _fn("_send_group_card_to_chat")
+
+    def test_it_uses_the_group_formatter(self):
+        self.assertIn("_format_group_lead_message_html(", self.body)
+        self.assertIn("_issue_and_expiration_for_group_display(", self.body)
+
+    def test_it_names_who_accepted(self):
+        self.assertIn("Accepted by", self.body)
+
+    def test_it_falls_back_to_plain_text(self):
+        """A card that trips Telegram's HTML parser must still arrive."""
+        self.assertIn("except BadRequest:", self.body)
+        self.assertIn('re.sub(r"<[^>]+>", "", full_html)', self.body)
+
+    def test_it_is_remembered_for_a_reassign(self):
+        self.assertIn("_remember_dispatch_message", self.body)
+
+    def test_a_dead_chat_does_not_stop_the_accept(self):
+        self.assertGreaterEqual(self.body.count("return"), 2)
+
 
 class AReassignTakesTheLeadBackTest(unittest.TestCase):
 
     def setUp(self):
-        self.body = _fn("handle_reassign_lead")
+        self.body = _fn("_reassign_lead_to")
 
     def test_the_old_drivers_copy_is_withdrawn(self):
         self.assertIn("_delete_lead_messages_in_chat", self.body)
@@ -93,7 +131,98 @@ class AReassignTakesTheLeadBackTest(unittest.TestCase):
         self.assertIn("_global_supervisory_chat_ids()", self.body)
 
     def test_a_supervisor_may_reassign_anything(self):
-        self.assertIn("_user_is_global_supervisor(presser_id)", self.body)
+        """The permission check lives on the entry point now; the move itself is
+        only ever reached through it."""
+        self.assertIn("_user_is_global_supervisor(presser_id)", _fn("handle_reassign_lead"))
+
+
+class ASupervisorMovesAnyLeadToAnyoneTest(unittest.TestCase):
+    """"any lead any time to any driver or all driver".
+
+    Reassign used to do exactly one thing: throw an ACCEPTED lead back to the
+    whole pool. A lead nobody had accepted answered "nothing to reassign", and
+    there was no way to hand one to a named person.
+    """
+
+    def setUp(self):
+        self.entry = _fn("handle_reassign_lead")
+        self.move = _fn("_reassign_lead_to")
+
+    def test_an_unaccepted_lead_can_still_be_moved_by_a_supervisor(self):
+        self.assertIn("if not assignment and not is_supervisor:", self.entry)
+
+    def test_the_supervisor_is_asked_who_takes_it(self):
+        self.assertIn("_reassign_target_keyboard(lead_id)", self.entry)
+        self.assertIn("Who takes it?", self.entry)
+
+    def test_the_driver_handing_it_back_is_not_asked(self):
+        """They are letting go of it, not choosing a successor."""
+        self.assertIn("if is_supervisor and not is_the_driver:", self.entry)
+
+    def test_a_named_driver_gets_it_directly(self):
+        self.assertIn("if to_driver_id:", self.move)
+        self.assertIn("db.create_lead_assignment(lead_id, target[\"id\"]", self.move)
+
+    def test_the_pool_is_not_also_spammed_when_one_driver_was_named(self):
+        self.assertIn("if not to_driver_id and group:", self.move)
+        self.assertIn("elif not to_driver_id:", self.move)
+
+    def test_an_unreachable_driver_really_does_fall_back_to_the_pool(self):
+        """The lead is already released by this point. A chained elif here meant
+        the fallback branch could not run: the lead ended up belonging to nobody
+        while the supervisor was told it had gone back to the pool.
+
+        So the clearing of to_driver_id must come BEFORE the pool branches, and
+        those branches must test it rather than being an elif of the named-driver
+        block.
+        """
+        i_clear = self.move.index("to_driver_id = None")
+        i_pool = self.move.index("if not to_driver_id and group:")
+        self.assertLess(i_clear, i_pool,
+                        "the fallback is unreachable — the lead would be lost")
+
+    def test_supervisors_are_told_who_it_went_to(self):
+        self.assertIn("To: {new_driver_name}", self.move)
+        self.assertIn("From: {old_driver_name}", self.move)
+        self.assertIn("By: {_moved_by}", self.move)
+
+
+class TheReassignPickerFitsInACallbackTest(unittest.TestCase):
+    """Two raw UUIDs behind a prefix is 81 bytes against a 64-byte limit, and
+    Telegram drops the WHOLE keyboard — the message never arrives at all."""
+
+    def setUp(self):
+        self.body = SRC.split("def _reassign_target_keyboard(", 1)[1].split("\ndef ", 1)[0]
+
+    def test_the_ids_are_short_encoded(self):
+        self.assertIn("_short_uuid(str(lead_id))", self.body)
+        self.assertIn('_short_uuid(str(d.get("id")))', self.body)
+
+    def test_the_prefixes_are_short(self):
+        self.assertIn('REASSIGN_PICK_CB = "rsp_"', SRC)
+        self.assertIn('REASSIGN_ALL_CB = "rsa_"', SRC)
+        # 4 + 22 + 22 = 48 bytes, inside the 64 the Bot API allows.
+        self.assertLessEqual(len("rsp_") + 22 + 22, 64)
+
+    def test_suspended_and_chatless_drivers_are_left_out(self):
+        self.assertIn("suspended", self.body)
+        self.assertIn('_parse_chat_id(d.get("driver_telegram_id"))', self.body)
+
+    def test_all_drivers_alone_is_not_offered_as_a_choice(self):
+        self.assertIn("len(rows) > 1", self.body)
+
+
+class ThePickersSurviveARestartTest(unittest.TestCase):
+    """No PTB persistence here: a button only reachable from inside a
+    conversation goes dead the moment the process restarts."""
+
+    def test_both_pickers_are_registered_at_the_top_level(self):
+        self.assertIn('CallbackQueryHandler(handle_reassign_pick, pattern="^" + REASSIGN_PICK_CB)', SRC)
+        self.assertIn('CallbackQueryHandler(handle_reassign_all, pattern="^" + REASSIGN_ALL_CB)', SRC)
+
+    def test_only_a_supervisor_may_use_them(self):
+        for name in ("handle_reassign_pick", "handle_reassign_all"):
+            self.assertIn("_user_is_global_supervisor(update.effective_user.id)", _fn(name), name)
 
 
 class TheWithdrawalOnlyTouchesThatChatTest(unittest.TestCase):
