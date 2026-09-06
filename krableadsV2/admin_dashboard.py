@@ -2,6 +2,7 @@
 from flask import Flask, render_template_string, request, jsonify, redirect, url_for
 from flask_cors import CORS
 import base64
+import time
 import hmac
 import json
 import os
@@ -190,6 +191,9 @@ class AdminDatabase:
         self.client: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
         self._tables_checked = False
         self._tables_exist = False
+        # When a failed probe may be retried. Never latch a FAILURE — see
+        # _check_tables_exist.
+        self._tables_retry_at = 0.0
     
     # ── Receipts, stored in the database ─────────────────────────────────
     # These mirror utils/database.py: the dashboard has its own client, so a method
@@ -729,18 +733,38 @@ class AdminDatabase:
             logger.error("set_lead_status(%s, %s) failed: %s%s", lead_id, status, e, hint)
             return False
 
+    # A failed probe is retried no more often than this. A genuinely missing
+    # table then costs one query every half minute, not one per request.
+    _TABLES_RETRY_SECONDS = 30.0
+
     def _check_tables_exist(self) -> bool:
-        """Check if required tables exist."""
-        if self._tables_checked:
-            return self._tables_exist
+        """Are the tables there? Success is remembered; failure is not.
+
+        This used to latch BOTH answers on the first call — which lands on a cold
+        start, over a pooled HTTP/2 connection that can come back as a
+        RemoteProtocolError. One blip there returned [] from every guarded method
+        for the life of the process: no leads on the board, no groups, no
+        drivers, no stats, and no way back but a redeploy. Meanwhile the database
+        was fine, which is exactly what made it so hard to see.
+        """
+        if self._tables_exist:
+            return True
+        now = time.monotonic()
+        if self._tables_checked and now < getattr(self, "_tables_retry_at", 0.0):
+            return False
         try:
             self.client.table("groups").select("id").limit(1).execute()
             self._tables_checked = True
             self._tables_exist = True
             return True
-        except Exception:
+        except Exception as e:
+            # Logged, because the symptom (everything empty) says nothing at all
+            # about the cause.
+            logger.warning("table probe failed, retrying in %ss: %s",
+                           int(self._TABLES_RETRY_SECONDS), e)
             self._tables_checked = True
             self._tables_exist = False
+            self._tables_retry_at = now + self._TABLES_RETRY_SECONDS
             return False
     
     def get_all_groups(self) -> list:
