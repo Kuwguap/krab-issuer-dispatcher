@@ -3175,10 +3175,40 @@ CLIENT_FORM_SOURCE = "Client Form"
 # offer before any driver hears about the job is the wrong way round. Before
 # this, a website order sat until a group accepted, and only then reached the
 # winning group's drivers.
+# What utils/lead_ingest.py falls back to when LEAD_INGEST_SOURCE_LABEL is unset.
+# Kept here as well because the label is written by the ADMIN service and read by
+# THIS one: see _reaches_drivers_at_once.
+_DEFAULT_INGEST_SOURCE = "External API"
+
+
 def _reaches_drivers_at_once(lead: dict) -> bool:
+    """Should this lead go to every driver now, beside the group offers?
+
+    Yes for the two cases where nobody is chasing it on the customer's behalf:
+    the /form page, and a paid tristatetags.com order. They have already filled
+    it in or already paid, so waiting on a dispatcher to notice an offer before
+    any driver hears about the job is the wrong way round.
+
+    The website label is matched BOTH ways on purpose. The source string is
+    written by the admin service from its own LEAD_INGEST_SOURCE_LABEL and
+    compared here, in the worker, against this process's copy — and render.yaml
+    only ever declared that variable on the admin. Two services, one string, one
+    of them unconfigured: set a custom label on the admin and every website order
+    quietly stops reaching drivers, with nothing logged and nothing to see. So a
+    lead labelled with either the configured value or the built-in default counts.
+
+    A blank or unrecognised source still returns False. That is deliberate:
+    fanning a lead nobody can account for out to seventy drivers is worse than
+    making it wait for a dispatcher.
+    """
     source = str((lead or {}).get("contact_info_source") or "").strip()
-    website = str(getattr(Config, "LEAD_INGEST_SOURCE_LABEL", "") or "External API").strip()
-    return source in {CLIENT_FORM_SOURCE, website}
+    if not source:
+        return False
+    configured = str(getattr(Config, "LEAD_INGEST_SOURCE_LABEL", "") or "").strip()
+    allowed = {CLIENT_FORM_SOURCE, _DEFAULT_INGEST_SOURCE}
+    if configured:
+        allowed.add(configured)
+    return source.casefold() in {a.casefold() for a in allowed}
 
 
 async def process_pending_api_lead_dispatches(context: ContextTypes.DEFAULT_TYPE) -> None:

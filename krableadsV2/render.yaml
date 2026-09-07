@@ -76,6 +76,12 @@ services:
         sync: false
       - key: API_LEAD_USER_ID
         sync: false
+      # Must match the admin service EXACTLY. The admin writes this string onto
+      # every ingested lead; the bot compares against it to decide whether a
+      # website order fans out to drivers immediately. Configure them as a pair
+      # or website orders quietly wait for a dispatcher instead.
+      - key: LEAD_INGEST_SOURCE_LABEL
+        sync: false
       - key: DRIVER_TELEGRAM_ID
         sync: false
       - key: GROUP_TELEGRAM_ID

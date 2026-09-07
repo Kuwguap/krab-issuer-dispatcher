@@ -139,6 +139,33 @@ def _price_number(raw) -> float:
         return 0.0
 
 
+def _delivery_moment(lead: dict, stamped) -> dict:
+    """When this lead was delivered, and how sure we are of it.
+
+    `delivered_at` is the real answer once the migration is in and the lead has
+    been delivered since. Before that there is one thing worth salvaging: a lead
+    sitting at `delivered` right now has had no status change since, so
+    `status_updated_at` IS the delivery moment. That inference is marked
+    ``delivered_exact: False`` rather than passed off as a record — the board
+    shows it with a "~", because a time the office reads out to a customer
+    should say whether it was measured or worked out.
+
+    A lead that was delivered and has since moved on (receipt uploaded) cannot
+    be recovered this way, and is left blank instead of being given a
+    plausible-looking wrong answer.
+    """
+    at = str(stamped or "").strip()
+    if at:
+        return {"delivered_at": at, "delivered_exact": True}
+    status = str(lead.get("delivery_status") or "")
+    if status == "delivered":
+        return {
+            "delivered_at": lead.get("status_updated_at"),
+            "delivered_exact": False,
+        }
+    return {"delivered_at": None, "delivered_exact": True}
+
+
 def _insurance_fields(ins: dict) -> dict:
     """The insurance half of a board row.
 
@@ -628,6 +655,25 @@ class AdminDatabase:
             except Exception as e:
                 logger.warning("transmissions: insurance lookup (%s) failed: %s", cols[:40], e)
 
+        # Its own query, like the insurance block above and for the same reason:
+        # delivered_at arrives by migration, and folding it into the main select
+        # would drop the WHOLE board back to the lean fallback (losing
+        # delivery_status) on any database that has not run it. A missing column
+        # here costs one column, not the board.
+        delivered_by_lead = {}
+        try:
+            dl = (
+                self.client.table("leads").select("id, delivered_at")
+                .in_("id", lead_ids[:1000]).execute()
+            )
+            for row in (dl.data or []):
+                at = row.get("delivered_at")
+                if at:
+                    delivered_by_lead[str(row.get("id"))] = at
+        except Exception as e:
+            logger.warning("transmissions: delivered_at lookup failed "
+                           "(run migration_lead_delivered_at.sql): %s", e)
+
         needle = (search or "").strip().lower()
         out = []
         for r in rows:
@@ -679,6 +725,7 @@ class AdminDatabase:
                 "status_updated_at": r.get("status_updated_at"),
                 "status_updated_by": r.get("status_updated_by") or "",
                 "created_at": r.get("created_at"),
+                **_delivery_moment(r, delivered_by_lead.get(lid)),
                 "issue_date": r.get("issue_date"),
                 "renewal_due_at": renewal_due.get(lid),
                 "has_receipt": lid in stored or bool((r.get("receipt_image_url") or "").strip()),
@@ -714,12 +761,19 @@ class AdminDatabase:
         """Move one transmission along the board. Anyone may — that is the point."""
         if status not in self.DELIVERY_STATUSES:
             return False
+        patch = {
+            "delivery_status": status,
+            "status_updated_at": "now()",
+            "status_updated_by": (who or "board")[:64],
+        }
+        # The moment of delivery, kept apart from the moment of the last edit.
+        # Re-stamped if a lead is walked back and delivered again — that is the
+        # honest answer to "when was this delivered" — but never touched by the
+        # statuses that come after, which is what used to lose it.
+        if status == "delivered":
+            patch["delivered_at"] = "now()"
         try:
-            resp = self.client.table("leads").update({
-                "delivery_status": status,
-                "status_updated_at": "now()",
-                "status_updated_by": (who or "board")[:64],
-            }).eq("id", str(lead_id)).execute()
+            resp = self.client.table("leads").update(patch).eq("id", str(lead_id)).execute()
             if not resp.data:
                 # RLS (anon key) or a vanished row swallows the write silently —
                 # zero affected rows must not read as success.
@@ -728,6 +782,22 @@ class AdminDatabase:
                 return False
             return True
         except Exception as e:
+            # The delivered_at column arrives by migration. Until it is run, the
+            # status change itself must still land — losing the whole move
+            # because we could not record a nicety would be the worse trade.
+            if "delivered_at" in str(e):
+                logger.warning(
+                    "set_lead_status: no delivered_at column yet — run "
+                    "database/migration_lead_delivered_at.sql; saving the status only")
+                try:
+                    patch.pop("delivered_at", None)
+                    resp = self.client.table("leads").update(patch).eq(
+                        "id", str(lead_id)).execute()
+                    return bool(resp.data)
+                except Exception as e2:
+                    logger.error("set_lead_status(%s, %s) retry failed: %s",
+                                 lead_id, status, e2)
+                    return False
             hint = (" — run database/migration_lead_delivery_status.sql"
                     if "delivery_status" in str(e) else "")
             logger.error("set_lead_status(%s, %s) failed: %s%s", lead_id, status, e, hint)

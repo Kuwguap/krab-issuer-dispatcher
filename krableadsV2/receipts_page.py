@@ -952,6 +952,15 @@ BOARD_HTML = r"""<!doctype html>
  .taglink:hover { border-color:var(--accent); color:var(--accent); }
  .tagset { display:flex; flex-wrap:wrap; }
  .rate { display:inline-block; margin-right:10px; }
+ .stamp { line-height:1.25; white-space:nowrap; }
+ .stamp .sday { font-size:12px; }
+ .stamp .sclock { font-size:12px; font-variant-numeric:tabular-nums; opacity:.85; }
+ .stamp .tz { font-size:10px; opacity:.6; }
+ .approx { opacity:.8; cursor:help; }
+ .stamps { display:grid; grid-template-columns:max-content 1fr; gap:2px 8px;
+           align-items:center; margin-top:6px; }
+ .stamps .slab { font-size:10px; letter-spacing:.05em; text-transform:uppercase;
+                 opacity:.6; }
  .rate b { font-variant-numeric:tabular-nums; }
 </style></head><body>
 <header>
@@ -990,6 +999,8 @@ BOARD_HTML = r"""<!doctype html>
       <th>Client</th>
       <th>Receipt</th>
       <th>Client phone</th>
+      <th>Entered</th>
+      <th>Delivered</th>
       <th>Tags</th>
       <th>Client contact</th>
       <th>Driver</th>
@@ -1000,7 +1011,7 @@ BOARD_HTML = r"""<!doctype html>
       <th>Insurance</th>
       <th class="hide-sm">Updated</th>
     </tr></thead>
-    <tbody id="rows"><tr><td colspan="14" class="none">Loading…</td></tr></tbody>
+    <tbody id="rows"><tr><td colspan="16" class="none">Loading…</td></tr></tbody>
   </table>
   </div>
   </div>
@@ -1062,11 +1073,46 @@ const MQ = window.matchMedia("(max-width: 860px)");
 const esc = s => String(s == null ? "" : s).replace(/[&<>"']/g,
   c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
 
+// The office runs on New York time and so does the bot (utils/timezone.py).
+// Leaving these to the viewer's clock meant a laptop set to anything else read
+// every timestamp on the board wrong, with nothing on the page to say so.
+const NY = "America/New_York";
+
 function when(iso) {
   if (!iso) return "—";
   const d = new Date(iso);
-  return isNaN(d) ? "—" : d.toLocaleString([], {month:"short", day:"numeric",
-                                               hour:"2-digit", minute:"2-digit"});
+  return isNaN(d) ? "—" : d.toLocaleString([], {timeZone: NY, month:"short",
+                                               day:"numeric", hour:"2-digit",
+                                               minute:"2-digit"});
+}
+
+// To the second, with the date, for the columns somebody reads out loud to a
+// customer. Seconds are not decoration here: two leads entered in the same
+// minute is normal on a busy morning, and "which came first" is the question.
+function exactWhen(iso) {
+  if (!iso) return "—";
+  const d = new Date(iso);
+  if (isNaN(d)) return "—";
+  return d.toLocaleString([], {timeZone: NY, year:"numeric", month:"short",
+                               day:"numeric", hour:"2-digit", minute:"2-digit",
+                               second:"2-digit"});
+}
+
+/** A stamp cell: the date, the clock under it, and ET said out loud. */
+function stampCell(iso, opts) {
+  const o = opts || {};
+  if (!iso) return `<span class="none">${esc(o.empty || "—")}</span>`;
+  const d = new Date(iso);
+  if (isNaN(d)) return `<span class="none">—</span>`;
+  const day = d.toLocaleString([], {timeZone: NY, month:"short", day:"numeric", year:"numeric"});
+  const clock = d.toLocaleString([], {timeZone: NY, hour:"2-digit", minute:"2-digit",
+                                      second:"2-digit"});
+  // "~" means the time was inferred from the last status change, not recorded
+  // when the delivery happened. A time read out to a customer should say which.
+  const approx = o.approx ? '<span class="approx" title="Worked out from the last status change, not recorded at delivery">~</span>' : "";
+  return `<div class="stamp" title="${esc(exactWhen(iso))} ET">`
+    + `<div class="sday">${esc(day)}</div>`
+    + `<div class="sclock">${approx}${esc(clock)} <span class="tz">ET</span></div></div>`;
 }
 const digits = s => String(s || "").replace(/\D/g, "");
 const telHref = p => { const d = digits(p); return d.length >= 10 ? "tel:+1" + d.slice(-10) : ""; };
@@ -1453,6 +1499,11 @@ function detailBody(r) {
   return `<dl>
       <dt>Reference</dt><dd class="ref">${esc(r.reference_id)}</dd>
       <dt>Car</dt><dd>${esc(r.car)} ${(r.tags || 1) > 1 ? `— <b>${esc(r.tags)} tags owed</b>` : ""}</dd>
+      <dt>Entered</dt><dd>${esc(exactWhen(r.created_at))} ET</dd>
+      <dt>Delivered</dt><dd>${r.delivered_at
+        ? esc(exactWhen(r.delivered_at)) + " ET" + (r.delivered_exact === false
+            ? ' <span class="approx" title="Worked out from the last status change, not recorded at delivery">~ approximate</span>' : "")
+        : '<span class="none">not yet</span>'}</dd>
       <dt>Price</dt><dd>${esc(r.price)}</dd>
       <dt>Delivery</dt><dd>${esc(r.delivery) || "—"}</dd>
       <dt>Notes</dt><dd>${esc(r.notes) || "—"}</dd>
@@ -1513,6 +1564,9 @@ function rowHtml(r, idx) {
         <div class="carline">${esc(r.car)}</div></td>
     <td>${receiptCell(r)}</td>
     <td class="phone">${phone}</td>
+    <td>${stampCell(r.created_at)}</td>
+    <td>${stampCell(r.delivered_at, {approx: r.delivered_exact === false,
+                                     empty: "not yet"})}</td>
     <td>${tagCell(r)}</td>
     <td>${block(r, "client")}</td>
     <td>${block(r, "driver")}</td>
@@ -1524,12 +1578,12 @@ function rowHtml(r, idx) {
     <td class="hide-sm">${esc(when(r.status_updated_at))}<br>
         <span class="counts">${esc(r.status_updated_by || "")}</span></td>
   </tr>
-  <tr class="detail" id="d-${esc(r.lead_id)}" hidden><td colspan="14">${detailBody(r)}</td></tr>`;
+  <tr class="detail" id="d-${esc(r.lead_id)}" hidden><td colspan="16">${detailBody(r)}</td></tr>`;
 }
 
 function monthRowHtml(g) {
   const closed = !!COLLAPSED[g.key];
-  return `<tr class="mrow" data-mk="${esc(g.key)}"><td colspan="14">
+  return `<tr class="mrow" data-mk="${esc(g.key)}"><td colspan="16">
     ${closed ? "📁" : "📂"} ${esc(g.label)}
     <span class="msum">${g.rows.length} lead${g.rows.length === 1 ? "" : "s"}
       · ${fmtMoney(g.sumAll)} total · ${fmtMoney(g.sumRec)} with receipts (${g.nRec})
@@ -1568,6 +1622,10 @@ function cardHtml(r, idx) {
         <div class="cname"><span class="idx">#${idx}</span> ${esc(r.client_name)}</div>
         <div class="ref">${esc(r.reference_id)} · ${esc(r.car)}</div>
         <div class="tagset">${tagCell(r)}</div>
+        <div class="stamps">
+          <span class="slab">Entered</span>${stampCell(r.created_at)}
+          <span class="slab">Delivered</span>${stampCell(r.delivered_at, {approx: r.delivered_exact === false, empty: "not yet"})}
+        </div>
       </div>
       <div style="text-align:right">${s.pill}<div style="margin-top:5px">${renewalChip(r)}</div></div>
     </div>
@@ -1625,7 +1683,7 @@ function draw() {
 
   if (VIEW === "table") {
     if (!rows.length) {
-      tb.innerHTML = '<tr><td colspan="14" class="none">Nothing here yet.</td></tr>';
+      tb.innerHTML = '<tr><td colspan="16" class="none">Nothing here yet.</td></tr>';
       return;
     }
     let idx = 0;
@@ -1898,7 +1956,8 @@ document.addEventListener("keydown", e => {
 function fallbackCsv(rows) {
   const cols = ["reference_id","client_name","client_phone","email","car","tags","price",
                 "has_receipt","receipt_at","status","driver_name","group_name","issuer",
-                "created_at","issue_date","delivery","notes","status_updated_by"];
+                "created_at","delivered_at","issue_date","delivery","notes",
+                "status_updated_by"];
   const cell = v => { v = String(v == null ? "" : v);
     // A leading = + - @ (or tab/CR) executes as a formula in Excel — neutralize.
     if (/^[=+\-@\t\r]/.test(v)) v = "'" + v;

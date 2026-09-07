@@ -403,6 +403,45 @@ class TheBotAndTheFormAgreeTest(unittest.TestCase):
             {"contact_info_source": public_form.PUBLIC_FORM_SOURCE}))
         self.assertTrue(bot._reaches_drivers_at_once({"contact_info_source": website}))
 
+    def test_the_default_label_is_recognised_whatever_this_process_is_set_to(self):
+        """The source string is written by the ADMIN service and compared here in
+        the WORKER. render.yaml declared LEAD_INGEST_SOURCE_LABEL on the admin
+        only, so a custom label there and nothing here means every paid website
+        order quietly stops reaching drivers -- no error, nothing logged. The
+        built-in default must always count."""
+        import bot
+        self.assertTrue(bot._reaches_drivers_at_once(
+            {"contact_info_source": "External API"}))
+
+    def test_the_configured_label_is_recognised_too(self):
+        import bot
+        from unittest import mock
+        with mock.patch.object(bot.Config, "LEAD_INGEST_SOURCE_LABEL",
+                               "tristatetags.com", create=True):
+            self.assertTrue(bot._reaches_drivers_at_once(
+                {"contact_info_source": "tristatetags.com"}))
+            # ...and the default still does, so the two services can disagree
+            # about the label without dropping the customer's order.
+            self.assertTrue(bot._reaches_drivers_at_once(
+                {"contact_info_source": "External API"}))
+
+    def test_the_match_ignores_case_and_padding(self):
+        import bot
+        for v in ("external api", "  External API  ", "EXTERNAL API"):
+            with self.subTest(value=v):
+                self.assertTrue(bot._reaches_drivers_at_once({"contact_info_source": v}))
+
+    def test_both_services_declare_the_label(self):
+        """The blueprint is where this divergence starts. If the worker stops
+        declaring it, the admin can be given a custom value and nothing will
+        say the fan-out has stopped."""
+        blueprint = (ROOT / "render.yaml").read_text(encoding="utf-8")
+        admin = blueprint.split("name: krab-issuer-admin", 1)[1].split("- type:", 1)[0]
+        worker = blueprint.split("name: krab-issuer-bot", 1)[1].split("- type:", 1)[0]
+        self.assertIn("LEAD_INGEST_SOURCE_LABEL", admin)
+        self.assertIn("LEAD_INGEST_SOURCE_LABEL", worker,
+                      "the bot worker no longer declares the label it compares against")
+
     def test_an_ordinary_lead_still_waits_for_a_team(self):
         import bot
         for src in ("", None, "Telegram", "Dispatch Web"):
