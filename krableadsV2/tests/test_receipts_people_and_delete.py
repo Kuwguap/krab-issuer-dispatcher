@@ -64,6 +64,12 @@ def _fake_db(**over):
     db.soft_delete_lead.return_value = True
     db.get_lead_assignment_status.return_value = {
         "driver": {"driver_name": "Kita"}}
+    db.get_deleted_leads.return_value = [
+        {"id": LEAD, "reference_id": "LAB4CDVZ",
+         "vehicle_details": LEAD_ROW["vehicle_details"], "price": "$150",
+         "deleted_at": "2026-09-08T10:00:00+00:00",
+         "deleted_reason": "duplicate", "deleted_by": "kita"}]
+    db.restore_lead.return_value = True
     db.get_all_groups.return_value = [
         {"group_telegram_id": "-1001", "is_active": True, "group_name": "HighKage"},
         {"group_telegram_id": "-1002", "is_active": True, "group_name": "Second"},
@@ -397,6 +403,58 @@ class DeletingALeadTest(_Signed):
         self.assertIn("A &amp; B", text)
 
 
+class PuttingADeletedLeadBackTest(_Signed):
+    """A flag that cannot be cleared from the office is a delete."""
+
+    def test_the_office_can_see_what_was_deleted(self):
+        r = self.call("get", "/receipts/api/deleted")
+        self.assertEqual(200, r.status_code)
+        row = r.get_json()["rows"][0]
+        self.assertEqual("LAB4CDVZ", row["reference_id"])
+        self.assertEqual("John Damian", row["client_name"])
+        self.assertEqual("duplicate", row["reason"])
+        self.assertEqual("kita", row["by"])
+
+    def test_an_unmigrated_database_shows_nothing_rather_than_an_error(self):
+        db = _fake_db()
+        db.get_deleted_leads.return_value = []
+        r = self.call("get", "/receipts/api/deleted", db=db)
+        self.assertEqual(200, r.status_code)
+        self.assertEqual([], r.get_json()["rows"])
+
+    def test_one_can_be_put_back(self):
+        db = _fake_db()
+        r = self.call("post", "/receipts/api/transmissions/%s/restore" % LEAD, db=db)
+        self.assertEqual(200, r.status_code)
+        db.restore_lead.assert_called_once_with(LEAD)
+
+    def test_putting_one_back_tells_nobody(self):
+        """The teams were told not to work it. Telling them it is back is only
+        useful if somebody is about to work it, and the office re-sends it the
+        normal way when that is what it wants."""
+        db = _fake_db()
+        with mock.patch("requests.post") as post:
+            self.call("post", "/receipts/api/transmissions/%s/restore" % LEAD, db=db)
+        post.assert_not_called()
+
+    def test_a_refused_restore_is_reported(self):
+        db = _fake_db()
+        db.restore_lead.return_value = False
+        r = self.call("post", "/receipts/api/transmissions/%s/restore" % LEAD, db=db)
+        self.assertEqual(500, r.status_code)
+
+    def test_both_are_behind_the_password(self):
+        fresh = ad.app.test_client()
+        self.assertEqual(401, fresh.get("/receipts/api/deleted").status_code)
+        self.assertEqual(401, fresh.post(
+            "/receipts/api/transmissions/%s/restore" % LEAD).status_code)
+
+    def test_the_tab_offers_it(self):
+        body = self.client.get("/receipts").get_data(as_text=True)
+        for needle in ("Deleted leads", "p-undel", "/restore", "Put it back"):
+            self.assertIn(needle, body, needle)
+
+
 class TheBoardAndTheBotAgreeTest(unittest.TestCase):
     """The two Database classes are separate. These are the seams that must match."""
 
@@ -437,6 +495,17 @@ class TheBoardAndTheBotAgreeTest(unittest.TestCase):
         for cls in (ad.AdminDatabase,):
             src = inspect.getsource(cls.delete_driver)
             self.assertIn("count_driver_assignments", src)
+
+    def test_both_handles_can_undo_a_deletion(self):
+        """The bot has to be able to undo one too — it is the same flag."""
+        import importlib.util
+        spec = importlib.util.spec_from_file_location(
+            "_people_real_udb2", str(ROOT / "utils" / "database.py"))
+        udb = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(udb)
+        for cls in (ad.AdminDatabase, udb.Database):
+            src = inspect.getsource(cls.restore_lead)
+            self.assertIn('"deleted_at": None', src, cls.__name__)
 
     def test_the_migration_says_what_it_adds(self):
         sql = (ROOT / "database" / "migration_lead_deleted.sql").read_text(

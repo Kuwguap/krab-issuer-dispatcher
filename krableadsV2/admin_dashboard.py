@@ -1117,6 +1117,38 @@ class AdminDatabase:
             logger.error("soft_delete_lead %s: %s", lead_id, e)
             return False
 
+    def get_deleted_leads(self, limit: int = 50) -> list:
+        """The most recently deleted leads, newest first.
+
+        Empty when the columns are not there yet -- the board shows nothing
+        rather than an error, because nothing IS what a database without the
+        migration has deleted.
+        """
+        try:
+            r = (self.client.table("leads")
+                 .select("id, reference_id, vehicle_details, price, "
+                         "deleted_at, deleted_reason, deleted_by")
+                 .not_.is_("deleted_at", "null")
+                 .order("deleted_at", desc=True)
+                 .limit(max(1, min(int(limit or 50), 200))).execute())
+            return r.data or []
+        except Exception as e:
+            if not self._missing_column(e, "deleted_at"):
+                logger.warning("get_deleted_leads: %s", e)
+            return []
+
+    def restore_lead(self, lead_id: str) -> bool:
+        """Undo a deletion. The whole reason it is a flag."""
+        try:
+            r = (self.client.table("leads")
+                 .update({"deleted_at": None, "deleted_reason": None,
+                          "deleted_by": None})
+                 .eq("id", str(lead_id)).execute())
+            return bool(getattr(r, "data", None))
+        except Exception as e:
+            logger.error("restore_lead %s: %s", lead_id, e)
+            return False
+
     def count_driver_assignments(self, driver_id: str) -> int:
         try:
             r = (self.client.table("lead_assignments").select("id", count="exact")

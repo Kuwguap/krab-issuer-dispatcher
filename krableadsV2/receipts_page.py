@@ -1828,11 +1828,15 @@ let PEOPLE = null;
 async function loadPeople(force) {
   if (PEOPLE && !force) return PEOPLE;
   try {
-    const res = await fetch(`${API}/people`);
+    const [res, del] = await Promise.all([
+      fetch(`${API}/people`),
+      fetch(`${API}/deleted`).catch(() => null),
+    ]);
     if (!res.ok) throw new Error(await res.text());
     PEOPLE = await res.json();
+    PEOPLE.deleted = (del && del.ok ? (await del.json()).rows : []) || [];
   } catch (e) {
-    PEOPLE = {drivers: [], supervisors: [], error: e.message};
+    PEOPLE = {drivers: [], supervisors: [], deleted: [], error: e.message};
   }
   return PEOPLE;
 }
@@ -1917,6 +1921,7 @@ function renderPeople() {
       <p class="note">Supervisors set here are the same list the bot reads in
         /settings. Anyone on it can open /settings and release a tag.</p>
     </section>
+    ${delSection(p.deleted || [])}
   </div>`;
   // The board keeps the Delete button either way -- a button that says why it
   // cannot work beats one that quietly is not there. This is where the office
@@ -1945,6 +1950,11 @@ function renderPeople() {
     peopleAction(`${API}/drivers/${encodeURIComponent(b.dataset.d)}`,
                  {method: "DELETE"}, b);
   });
+  D(".p-undel").forEach(b => b.onclick = () => {
+    if (!confirm(`Put ${b.dataset.n} back on the boards?`)) return;
+    peopleAction(`${API}/transmissions/${encodeURIComponent(b.dataset.l)}/restore`,
+                 {method: "POST"}, b).then(ok => { if (ok) load(); });
+  });
   D(".p-dels").forEach(b => b.onclick = () => {
     if (!confirm(`Remove ${b.dataset.n} as a supervisor?`)) return;
     peopleAction(`${API}/supervisors/${encodeURIComponent(b.dataset.s)}`,
@@ -1965,6 +1975,28 @@ function renderPeople() {
       label: document.getElementById("ns-label").value.trim(),
       id: document.getElementById("ns-tg").value.trim(),
     })}, sadd);
+}
+
+// Nothing here is destroyed, so everything here can come back. Payments and
+// receipts owed stay against the row either way -- restoring only puts it back
+// on the boards.
+function delSection(rows) {
+  if (!rows.length) return "";
+  const body = rows.map(r => `<tr>
+      <td><b>${esc(r.reference_id)}</b>
+          <div class="counts">${esc(r.client_name)} · ${esc(r.price)}</div></td>
+      <td>${esc(r.reason || "—")}
+          <div class="counts">${esc(r.by || "—")} · ${esc(when(r.at))}</div></td>
+      <td><button class="fixbtn p-undel" data-l="${esc(r.lead_id)}"
+                  data-n="${esc(r.reference_id)}">Put it back</button></td>
+    </tr>`).join("");
+  return `<section>
+    <h3>🗑 Deleted leads</h3>
+    <table><thead><tr><th>Lead</th><th>Why, and who</th><th></th></tr></thead>
+      <tbody>${body}</tbody></table>
+    <p class="note">Deleted leads are hidden from every board and every count.
+      Nothing was destroyed — anything paid against them is still on record.</p>
+  </section>`;
 }
 
 // ── Deleting a lead ───────────────────────────────────────────────────────
@@ -3423,6 +3455,40 @@ def register(app, db_provider):
                                      "deleted."}), 409
         told = _broadcast_lead_deleted(db, lead, reason, by)
         return jsonify({"ok": True, "groups_notified": told})
+
+    @app.route("/receipts/api/deleted", methods=["GET"])
+    def api_deleted_leads():
+        """What has been deleted, so it can be put back."""
+        db = _resolve()
+        try:
+            rows = db.get_deleted_leads(50) or []
+        except Exception as e:
+            return jsonify({"error": str(e)}), 500
+        return jsonify({"rows": [{
+            "lead_id": str(r.get("id") or ""),
+            "reference_id": str(r.get("reference_id") or "N/A"),
+            "client_name": _client_name_from_lead(r) or "—",
+            "price": str(r.get("price") or "").strip() or "—",
+            "reason": str(r.get("deleted_reason") or ""),
+            "by": str(r.get("deleted_by") or ""),
+            "at": str(r.get("deleted_at") or ""),
+        } for r in rows]})
+
+    @app.route("/receipts/api/transmissions/<lead_id>/restore", methods=["POST"])
+    def api_restore_lead(lead_id):
+        """Put a deleted lead back on every board.
+
+        No broadcast: the teams were told it was gone, and a second message
+        saying it is back is only useful if somebody was about to work it --
+        which is exactly what the delete notice told them not to do. The office
+        re-sends it the normal way if it needs working.
+        """
+        try:
+            ok = _resolve().restore_lead(lead_id)
+        except Exception as e:
+            return jsonify({"error": str(e)}), 500
+        return (jsonify({"ok": True}) if ok
+                else (jsonify({"error": "Could not restore that."}), 500))
 
     @app.route("/receipts/insurance/<lead_id>", methods=["GET"])
     def receipts_insurance_card(lead_id):
