@@ -269,14 +269,34 @@ def _user_is_hired_driver(user_id) -> bool:
         return False
 
 
-async def _user_can_hire(context: ContextTypes.DEFAULT_TYPE, user_id) -> bool:
-    """Everyone on the team may hire: supervisors, paper girls, drivers we have
-    already hired, and current members of the drivers channel or the notify
-    group. Deliberately NOT everyone alive — see this module's note on what
-    a hire sets in motion.
+def _hiring_requires_team() -> bool:
+    """Is the team-membership gate on? Off by default, by request.
 
-    The cheap local checks come first so the common case costs no API call.
+    The office asked for anybody to be able to hire, having been told what that
+    allows: a hire creates a driver who then receives real client leads —
+    names, home addresses, phone links. That is their call to make, and this is
+    the switch that makes it. Set KRAB_HIRE_REQUIRES_TEAM=1 to put the gate back
+    without a code change.
     """
+    raw = str(os.getenv("KRAB_HIRE_REQUIRES_TEAM") or "").strip().lower()
+    return raw in ("1", "true", "yes", "on")
+
+
+async def _user_can_hire(context: ContextTypes.DEFAULT_TYPE, user_id) -> bool:
+    """Who may press Hire. By default: anyone.
+
+    The membership check below is kept whole and simply not consulted unless
+    KRAB_HIRE_REQUIRES_TEAM is set. Deleting it would have thrown away the
+    awkward part — resolving the drivers channel and the notify group, and
+    reading a member's status out of Telegram — which is the bit worth keeping
+    if the door is ever closed again.
+
+    When the gate IS on: supervisors, paper girls, drivers we have already
+    hired, and current members of the drivers channel or the notify group. The
+    cheap local checks come first so the common case costs no API call.
+    """
+    if not _hiring_requires_team():
+        return True
     if _user_is_global_supervisor(user_id) or _user_is_paper_girl(user_id):
         return True
     if _user_is_hired_driver(user_id):
@@ -2381,8 +2401,9 @@ async def handle_interview_callbacks(update: Update, context: ContextTypes.DEFAU
             return STATE_INTERVIEW_INPUT
         if not await _user_can_hire(context, user.id):
             await query.message.reply_text(
-                "⛔ Only people on the team can hire. Ask a supervisor to add "
-                "you to the drivers channel first."
+                "⛔ Hiring is restricted on this deployment "
+                "(KRAB_HIRE_REQUIRES_TEAM). Ask a supervisor to add you to the "
+                "drivers channel, or to turn the restriction off."
             )
             return STATE_INTERVIEW_INPUT
         # Nobody approves themselves. Supervisors are exempt so the existing
