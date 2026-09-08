@@ -337,6 +337,23 @@ class SupervisorOperationsTest(_Signed):
         self.assertEqual(409, r.status_code)
         db.set_setting.assert_not_called()
 
+    def test_the_tab_warns_when_a_deletion_would_tell_nobody(self):
+        """Before the delete, not after. The board sends the notice itself, and
+        without a token on THIS service a deletion is silent."""
+        db = _fake_db()
+        with mock.patch("config.Config.TELEGRAM_BOT_TOKEN", ""):
+            got = self.call("get", "/receipts/api/people", db=db).get_json()
+        self.assertFalse(got["can_broadcast"])
+        with mock.patch("config.Config.TELEGRAM_BOT_TOKEN", "t"):
+            got = self.call("get", "/receipts/api/people", db=db).get_json()
+        self.assertTrue(got["can_broadcast"])
+
+    def test_the_warning_reaches_the_screen(self):
+        body = self.client.get("/receipts").get_data(as_text=True)
+        for needle in ("can_broadcast", "TELEGRAM_BOT_TOKEN", "No team will be told",
+                       "SUPERVISORY_TELEGRAM_ID"):
+            self.assertIn(needle, body, needle)
+
     def test_the_list_is_never_empty_when_the_environment_has_one(self):
         """The bug: the tab read only the extras, which are empty on this system,
         so a board with a supervisor showed none."""

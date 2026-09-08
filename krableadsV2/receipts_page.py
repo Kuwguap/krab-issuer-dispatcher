@@ -1891,6 +1891,11 @@ function renderPeople() {
       </td></tr>`;
   }).join("") || `<tr><td colspan="3" class="none">No drivers yet.</td></tr>`;
 
+  // An empty table is a lie on a system that has supervisors — say where the
+  // ones it cannot see are kept, and what to do about it.
+  const supEmpty = `<tr><td colspan="2" class="none">Nobody here yet. Standing
+    supervisors set in the bot's own SUPERVISORY_TELEGRAM_ID are not visible to
+    this service — add them below and the bot will read the same list.</td></tr>`;
   const sRows = sups.map(s => `<tr>
       <td><b>${esc(s.label || (s.fixed ? "Supervisor" : "(no name)"))}</b>
           ${s.fixed ? '<span class="pflag">from the environment</span>' : ""}
@@ -1899,7 +1904,7 @@ function renderPeople() {
               ? '<span class="none" title="SUPERVISORY_TELEGRAM_ID on the service">set in the service settings</span>'
               : `<button class="fixbtn danger p-dels" data-s="${esc(s.id)}"
                          data-n="${esc(s.label || s.id)}">Remove</button>`}</td>
-    </tr>`).join("") || `<tr><td colspan="2" class="none">Nobody yet.</td></tr>`;
+    </tr>`).join("") || supEmpty;
 
   el.innerHTML = `<div class="ppl">
     <div id="ppl-err"></div>
@@ -1939,6 +1944,10 @@ function renderPeople() {
   if (p.can_delete_lead === false) notes.push(`<div class="err">Deleting a lead is
     not available yet — run <b>database/migration_lead_deleted.sql</b>. Until then
     the Delete button will refuse rather than half-delete anything.</div>`);
+  if (p.can_broadcast === false) notes.push(`<div class="err">This service has no
+    <b>TELEGRAM_BOT_TOKEN</b>, so deleting a lead will <b>not</b> tell any team.
+    The deletion itself still works. Set it on the krab-issuer-admin service.</div>`);
+  CAN_BROADCAST = p.can_broadcast !== false;
   if (notes.length) document.getElementById("ppl-err").innerHTML = notes.join("");
 
   const D = q => el.querySelectorAll(q);
@@ -2021,6 +2030,7 @@ function delSection(rows) {
 
 // ── Deleting a lead ───────────────────────────────────────────────────────
 let DEL_ID = null;
+let CAN_BROADCAST = null;       // null until the People feed has been read once
 
 function openDelete(id) {
   const r = ALL.find(x => x.lead_id === id);
@@ -2030,6 +2040,14 @@ function openDelete(id) {
     `<b>${esc(r.reference_id)}</b> · ${esc(r.client_name || "this client")}`;
   document.getElementById("del-result").textContent = "";
   document.getElementById("del-go").disabled = false;
+  // Ask once, quietly, so the warning is on the screen the office is looking at
+  // when it decides — not in the result afterwards.
+  loadPeople(false).then(p => {
+    const note = document.getElementById("del-note");
+    if (note && p && p.can_broadcast === false) note.innerHTML =
+      `<b>No team will be told</b> — this service has no TELEGRAM_BOT_TOKEN. The
+       lead is still removed from every board and count, and can be put back.`;
+  });
   document.getElementById("del").hidden = false;
 }
 
@@ -2694,6 +2712,20 @@ def record_is_active(row) -> bool:
     """A driver row counts as active unless it says otherwise."""
     v = (row or {}).get("is_active")
     return True if v is None else bool(v)
+
+
+def _can_broadcast() -> bool:
+    """Whether THIS service can send the lead-deleted notice.
+
+    The notice goes out from here, with this service's own token. Without it a
+    deletion is silent and nobody on any team hears -- so the board warns before
+    the delete rather than reporting it afterwards.
+    """
+    try:
+        from config import Config
+        return bool((getattr(Config, "TELEGRAM_BOT_TOKEN", "") or "").strip())
+    except Exception:
+        return bool((os.getenv("TELEGRAM_BOT_TOKEN") or "").strip())
 
 
 def _env_supervisors() -> list:
@@ -3424,6 +3456,8 @@ def register(app, db_provider):
             # and says so on the People tab: the columns arrive with a migration
             # and a missing button would look like a missing feature.
             "can_delete_lead": bool(db.lead_deletion_ready()),
+            # False = a deletion will be recorded and no team will hear about it.
+            "can_broadcast": _can_broadcast(),
         })
 
     @app.route("/receipts/api/drivers", methods=["POST"])

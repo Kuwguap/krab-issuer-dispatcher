@@ -147,7 +147,16 @@ services:
         sync: false
       - key: ONETIMESECRET_PASSPHRASE
         sync: false
+      # The board sends the lead-deleted notice itself, with this token. Declared
+      # since the beginning and never filled in, which is why deleting a lead
+      # told nobody -- /api/health now reports telegram_bot_token so it cannot go
+      # unnoticed again.
       - key: TELEGRAM_BOT_TOKEN
+        sync: false
+      # The standing supervisors. Only the BOT service had this, so the board's
+      # Supervisors list could show nothing but the extras added from /settings --
+      # an empty table on a system that has a supervisor. Same value as the bot.
+      - key: SUPERVISORY_TELEGRAM_ID
         sync: false
       # Allow the new unified admin page to embed the Flask admin in an iframe.
       - key: ADMIN_FRAME_ANCESTORS
