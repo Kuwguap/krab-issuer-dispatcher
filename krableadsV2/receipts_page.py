@@ -849,6 +849,8 @@ BOARD_HTML = r"""<!doctype html>
  .pflag.off{color:#b3261e;border-color:#e0b4b4}
  .pflag.susp{color:#8a5a00;border-color:#e4c98a}
  .owe{display:flex;gap:6px;flex-wrap:wrap;margin-top:4px}
+ .ppl .tblwrap{overflow-x:auto}
+ .ppl .tblwrap table{min-width:44rem}
  .pend { display:inline-block; margin-left:6px; padding:1px 6px; border-radius:9px;
          font-size:10px; font-weight:700; letter-spacing:.04em; text-transform:uppercase;
          background:#fde8b0; color:#7a5200; vertical-align:middle; }
@@ -1890,11 +1892,14 @@ function renderPeople() {
   }).join("") || `<tr><td colspan="3" class="none">No drivers yet.</td></tr>`;
 
   const sRows = sups.map(s => `<tr>
-      <td><b>${esc(s.label || "(no name)")}</b>
+      <td><b>${esc(s.label || (s.fixed ? "Supervisor" : "(no name)"))}</b>
+          ${s.fixed ? '<span class="pflag">from the environment</span>' : ""}
           <div class="counts">${esc(s.id)}</div></td>
-      <td><button class="fixbtn danger p-dels" data-s="${esc(s.id)}"
-                  data-n="${esc(s.label || s.id)}">Remove</button></td>
-    </tr>`).join("") || `<tr><td colspan="2" class="none">Nobody added here.</td></tr>`;
+      <td>${s.fixed
+              ? '<span class="none" title="SUPERVISORY_TELEGRAM_ID on the service">set in the service settings</span>'
+              : `<button class="fixbtn danger p-dels" data-s="${esc(s.id)}"
+                         data-n="${esc(s.label || s.id)}">Remove</button>`}</td>
+    </tr>`).join("") || `<tr><td colspan="2" class="none">Nobody yet.</td></tr>`;
 
   el.innerHTML = `<div class="ppl">
     <div id="ppl-err"></div>
@@ -1918,8 +1923,11 @@ function renderPeople() {
         <input id="ns-tg" placeholder="Telegram id (from /whoami)" autocomplete="off">
         <button class="btn primary" id="ns-add">Add supervisor</button>
       </div>
-      <p class="note">Supervisors set here are the same list the bot reads in
-        /settings. Anyone on it can open /settings and release a tag.</p>
+      <p class="note">Anyone on this list can open the bot's /settings and release
+        a tag. The ones marked <b>from the environment</b> are set in
+        SUPERVISORY_TELEGRAM_ID on the service itself — they cannot be removed from
+        here, because a web page cannot edit a service's environment. Anyone added
+        below goes into the same list the bot reads in /settings.</p>
     </section>
     ${delSection(p.deleted || [])}
   </div>`;
@@ -1982,18 +1990,30 @@ function renderPeople() {
 // on the boards.
 function delSection(rows) {
   if (!rows.length) return "";
+  const dash = v => (v === undefined || v === null || v === "" || v === "—") ? "—" : v;
   const body = rows.map(r => `<tr>
       <td><b>${esc(r.reference_id)}</b>
-          <div class="counts">${esc(r.client_name)} · ${esc(r.price)}</div></td>
-      <td>${esc(r.reason || "—")}
-          <div class="counts">${esc(r.by || "—")} · ${esc(when(r.at))}</div></td>
+          <div class="counts">${esc(dash(r.client_name))}</div>
+          <div class="counts">${esc(dash(r.car))} · ${esc(dash(r.price))}</div>
+          ${r.vin ? `<div class="counts">VIN ${esc(r.vin)}</div>` : ""}</td>
+      <td>${esc(dash(r.issuer))}
+          <div class="counts">${esc(dash(r.group_name))}</div></td>
+      <td>${esc(dash(r.driver_name))}${r.driver_pending ? " <i>(offered)</i>" : ""}
+          <div class="counts">${r.has_receipt ? "receipt in" : "no receipt"}</div></td>
+      <td>${esc(dash(r.status))}
+          <div class="counts">made ${esc(when(r.created_at))}</div></td>
+      <td><b>${esc(dash(r.reason))}</b>
+          <div class="counts">by ${esc(dash(r.by))}</div>
+          <div class="counts">${esc(when(r.at))}</div></td>
       <td><button class="fixbtn p-undel" data-l="${esc(r.lead_id)}"
                   data-n="${esc(r.reference_id)}">Put it back</button></td>
     </tr>`).join("");
   return `<section>
-    <h3>🗑 Deleted leads</h3>
-    <table><thead><tr><th>Lead</th><th>Why, and who</th><th></th></tr></thead>
-      <tbody>${body}</tbody></table>
+    <h3>🗑 Deleted leads <span class="counts">${rows.length}</span></h3>
+    <div class="tblwrap">
+    <table><thead><tr><th>Lead</th><th>Issuer / team</th><th>Driver</th>
+      <th>Was at</th><th>Deleted</th><th></th></tr></thead>
+      <tbody>${body}</tbody></table></div>
     <p class="note">Deleted leads are hidden from every board and every count.
       Nothing was destroyed — anything paid against them is still on record.</p>
   </section>`;
@@ -2042,9 +2062,19 @@ document.getElementById("del-go").onclick = async () => {
     ALL = ALL.filter(x => x.lead_id !== DEL_ID);
     document.getElementById("del").hidden = true;
     DEL_ID = null;
+    PEOPLE = null;              // the Deleted list has a new row in it
     draw();
-    document.getElementById("err").innerHTML =
-      `<div class="ok">Deleted — ${body.groups_notified || 0} team(s) told.</div>`;
+    // Say what actually happened. "0 team(s) told" was the same message for a
+    // broadcast that worked and one that reached nobody.
+    const told = body.groups_notified || 0;
+    const bad = body.groups_failed || [];
+    let note = told
+      ? `<div class="ok">Deleted — ${told} team${told === 1 ? "" : "s"} told.</div>`
+      : `<div class="err">Deleted, but <b>no team was told</b>.</div>`;
+    if (body.broadcast_error) note += `<div class="err">${esc(body.broadcast_error)}</div>`;
+    if (bad.length) note += `<div class="err">Could not tell: ` +
+      bad.map(f => `${esc(f.name)} (${esc(f.why)})`).join("; ") + `</div>`;
+    document.getElementById("err").innerHTML = note;
   } catch (e) {
     document.getElementById("del-result").textContent = "";
     document.getElementById("err").innerHTML =
@@ -2666,8 +2696,36 @@ def record_is_active(row) -> bool:
     return True if v is None else bool(v)
 
 
-def _board_supervisors(db) -> list:
-    """[{id, label}, …] as the bot stores them."""
+def _env_supervisors() -> list:
+    """The supervisors set in the service environment.
+
+    SUPERVISORY_TELEGRAM_ID is where the standing supervisors live -- on this
+    system it is the ONLY place they live, because nobody has ever added an
+    extra one from /settings. Reading only the extras is why the board showed
+    an empty Supervisors table for a system that has supervisors.
+
+    They are marked fixed: a web page cannot edit a service environment
+    variable, and a Remove button that silently did nothing would be worse than
+    saying where to change it.
+    """
+    raw = ""
+    try:
+        from config import Config
+        raw = getattr(Config, "SUPERVISORY_TELEGRAM_ID", "") or ""
+    except Exception:
+        raw = os.getenv("SUPERVISORY_TELEGRAM_ID") or ""
+    out, seen = [], set()
+    for tok in str(raw).split(","):
+        t = tok.strip()
+        if not t or t in seen:
+            continue
+        seen.add(t)
+        out.append({"id": t, "label": "", "fixed": True})
+    return out
+
+
+def _extra_supervisors(db) -> list:
+    """The ones added from /settings — the bot's EXTRA_SUPERVISORS_KEY."""
     try:
         raw = db.get_setting(_SUPERVISORS_KEY)
     except Exception as e:
@@ -2678,9 +2736,21 @@ def _board_supervisors(db) -> list:
         for r in (json.loads(raw) if raw else []):
             if isinstance(r, dict) and str(r.get("id") or "").strip():
                 out.append({"id": str(r["id"]).strip(),
-                            "label": str(r.get("label") or "").strip()})
+                            "label": str(r.get("label") or "").strip(),
+                            "fixed": False})
     except Exception as e:
         logger.warning("supervisors parse failed: %s", e)
+    return out
+
+
+def _board_supervisors(db) -> list:
+    """Everyone in charge: the environment's, then the ones added from /settings."""
+    out = _env_supervisors()
+    have = {r["id"] for r in out}
+    for r in _extra_supervisors(db):
+        if r["id"] not in have:
+            have.add(r["id"])
+            out.append(r)
     return out
 
 
@@ -2726,28 +2796,39 @@ def _deleted_lead_driver_name(db, lead: dict) -> str:
     return name
 
 
-def _broadcast_lead_deleted(db, lead: dict, reason: str, by: str) -> int:
-    """Tell every active team. Returns how many were reached.
+def _broadcast_lead_deleted(db, lead: dict, reason: str, by: str) -> dict:
+    """Tell every active team. Says exactly what happened, per team.
 
     Sent straight from this service with the bot token, the way the dashboard
     already attaches documents -- the alternative is a column the bot polls, and
     a deletion that nobody hears about until the next sweep is a deletion
     somebody keeps working in the meantime.
+
+    It returns a report rather than a count because there are four different
+    ways to reach nobody -- no token on THIS service, no groups, every group
+    switched off, or Telegram refusing the chat -- and as a bare 0 they were
+    indistinguishable. "0 team(s) told" is what a deletion that worked and a
+    deletion that told nobody both looked like.
     """
     import requests as _rq
     from config import Config
+    out = {"told": 0, "failed": [], "error": ""}
     token = (getattr(Config, "TELEGRAM_BOT_TOKEN", "") or "").strip()
     if not token:
+        out["error"] = ("This service has no TELEGRAM_BOT_TOKEN, so no team could "
+                        "be told. Set it on krab-issuer-admin and the notice will "
+                        "send next time.")
         logger.error("lead %s deleted but TELEGRAM_BOT_TOKEN is not set here — "
                      "no team was told", lead.get("reference_id"))
-        return 0
+        return out
     text = _deleted_lead_notice(lead, reason, by, _deleted_lead_driver_name(db, lead))
     try:
         groups = db.get_all_groups() or []
     except Exception as e:
+        out["error"] = "Could not read the teams: %s" % e
         logger.error("lead deleted: could not read the groups: %s", e)
-        return 0
-    told, seen = 0, set()
+        return out
+    seen = set()
     for g in groups:
         if not record_is_active(g):
             continue
@@ -2755,19 +2836,31 @@ def _broadcast_lead_deleted(db, lead: dict, reason: str, by: str) -> int:
         if not cid or cid in seen:
             continue
         seen.add(cid)
+        name = str((g or {}).get("group_name") or cid).strip() or cid
         try:
             r = _rq.post(f"https://api.telegram.org/bot{token}/sendMessage",
                          json={"chat_id": cid, "text": text, "parse_mode": "HTML"},
                          timeout=20)
-            if r.ok and (r.json() or {}).get("ok"):
-                told += 1
+            body = {}
+            try:
+                body = r.json() or {}
+            except Exception:
+                pass
+            if r.ok and body.get("ok"):
+                out["told"] += 1
             else:
-                logger.warning("lead deleted: %s refused: %s", cid, r.text[:160])
+                why = str(body.get("description") or r.text or r.status_code)[:160]
+                out["failed"].append({"name": name, "chat_id": cid, "why": why})
+                logger.warning("lead deleted: %s refused: %s", cid, why)
         except Exception as e:
+            out["failed"].append({"name": name, "chat_id": cid, "why": str(e)[:160]})
             logger.warning("lead deleted: could not tell %s: %s", cid, e)
-    logger.info("lead %s deleted by %s (%s) — told %d group(s)",
-                lead.get("reference_id"), by, reason, told)
-    return told
+    if not seen:
+        out["error"] = ("No active team has a Telegram chat id, so there was "
+                        "nobody to tell.")
+    logger.info("lead %s deleted by %s (%s) — told %d group(s), %d refused",
+                lead.get("reference_id"), by, reason, out["told"], len(out["failed"]))
+    return out
 
 
 def _guarded_path(path: str) -> bool:
@@ -3410,7 +3503,10 @@ def register(app, db_provider):
             return jsonify({"error": "A numeric Telegram id is required — "
                                      "they can get theirs from /whoami."}), 400
         db = _resolve()
-        rows = [r for r in _board_supervisors(db) if str(r.get("id")) != tg]
+        if any(str(r.get("id")) == tg for r in _env_supervisors()):
+            return jsonify({"error": "Already a supervisor — they are set in "
+                                     "SUPERVISORY_TELEGRAM_ID."}), 409
+        rows = [r for r in _extra_supervisors(db) if str(r.get("id")) != tg]
         rows.append({"id": tg, "label": label})
         return (jsonify({"ok": True, "supervisors": rows})
                 if _save_board_supervisors(db, rows)
@@ -3419,7 +3515,12 @@ def register(app, db_provider):
     @app.route("/receipts/api/supervisors/<sup_id>", methods=["DELETE"])
     def api_remove_supervisor(sup_id):
         db = _resolve()
-        rows = [r for r in _board_supervisors(db) if str(r.get("id")) != str(sup_id)]
+        if any(str(r.get("id")) == str(sup_id) for r in _env_supervisors()):
+            return jsonify({"error": "That supervisor is set in the service's own "
+                                     "SUPERVISORY_TELEGRAM_ID. Change it on "
+                                     "krab-issuer-admin (and the bot) — a web page "
+                                     "cannot edit an environment variable."}), 409
+        rows = [r for r in _extra_supervisors(db) if str(r.get("id")) != str(sup_id)]
         return (jsonify({"ok": True, "supervisors": rows})
                 if _save_board_supervisors(db, rows)
                 else (jsonify({"error": "Could not save that."}), 500))
@@ -3453,8 +3554,11 @@ def register(app, db_provider):
         if not db.soft_delete_lead(lead_id, reason, by):
             return jsonify({"error": "Could not delete that — it may already be "
                                      "deleted."}), 409
-        told = _broadcast_lead_deleted(db, lead, reason, by)
-        return jsonify({"ok": True, "groups_notified": told})
+        report = _broadcast_lead_deleted(db, lead, reason, by)
+        return jsonify({"ok": True,
+                        "groups_notified": report.get("told", 0),
+                        "groups_failed": report.get("failed", []),
+                        "broadcast_error": report.get("error", "")})
 
     @app.route("/receipts/api/deleted", methods=["GET"])
     def api_deleted_leads():
@@ -3464,15 +3568,13 @@ def register(app, db_provider):
             rows = db.get_deleted_leads(50) or []
         except Exception as e:
             return jsonify({"error": str(e)}), 500
-        return jsonify({"rows": [{
-            "lead_id": str(r.get("id") or ""),
-            "reference_id": str(r.get("reference_id") or "N/A"),
-            "client_name": _client_name_from_lead(r) or "—",
-            "price": str(r.get("price") or "").strip() or "—",
-            "reason": str(r.get("deleted_reason") or ""),
-            "by": str(r.get("deleted_by") or ""),
-            "at": str(r.get("deleted_at") or ""),
-        } for r in rows]})
+        # Board rows already: reference, client, car, price, issuer, driver,
+        # dispatcher, receipt and dates. Only the deletion itself is renamed, so
+        # the tab can read it without knowing the column names.
+        return jsonify({"rows": [dict(r, reason=str(r.get("deleted_reason") or ""),
+                                      by=str(r.get("deleted_by") or ""),
+                                      at=str(r.get("deleted_at") or ""))
+                                 for r in rows]})
 
     @app.route("/receipts/api/transmissions/<lead_id>/restore", methods=["POST"])
     def api_restore_lead(lead_id):

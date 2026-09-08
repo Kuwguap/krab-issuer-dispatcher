@@ -50,6 +50,19 @@ DRIVERS = [
 LEAD_ROW = {"id": LEAD, "reference_id": "LAB4CDVZ",
             "vehicle_details": "John Damian\n2017 M Benz\nVIN 1HG"}
 
+# What get_transmissions(deleted=True) hands back: a whole board row, plus the
+# deletion. The Deleted list is meant to answer "was this right?", which needs
+# the issuer and the driver, not just a reference.
+DELETED_ROW = {
+    "lead_id": LEAD, "reference_id": "LAB4CDVZ", "client_name": "John Damian",
+    "car": "2017 M Benz", "price": "$150", "issuer": "kingkrab",
+    "group_name": "HighKage", "driver_name": "Marco", "driver_pending": False,
+    "status": "new", "created_at": "2026-09-01T09:00:00+00:00",
+    "has_receipt": True, "vin": "1HG",
+    "deleted_at": "2026-09-08T10:00:00+00:00",
+    "deleted_reason": "duplicate", "deleted_by": "kita",
+}
+
 
 def _fake_db(**over):
     db = mock.MagicMock()
@@ -64,11 +77,8 @@ def _fake_db(**over):
     db.soft_delete_lead.return_value = True
     db.get_lead_assignment_status.return_value = {
         "driver": {"driver_name": "Kita"}}
-    db.get_deleted_leads.return_value = [
-        {"id": LEAD, "reference_id": "LAB4CDVZ",
-         "vehicle_details": LEAD_ROW["vehicle_details"], "price": "$150",
-         "deleted_at": "2026-09-08T10:00:00+00:00",
-         "deleted_reason": "duplicate", "deleted_by": "kita"}]
+    # Board rows, because get_deleted_leads reads through get_transmissions.
+    db.get_deleted_leads.return_value = [DELETED_ROW]
     db.restore_lead.return_value = True
     db.get_all_groups.return_value = [
         {"group_telegram_id": "-1001", "is_active": True, "group_name": "HighKage"},
@@ -84,6 +94,13 @@ class _Signed(unittest.TestCase):
     """A signed-in board client. Everything below /receipts needs the gate."""
 
     def setUp(self):
+        # SUPERVISORY_TELEGRAM_ID is read live, so pin it: these tests must not
+        # depend on whoever's .env happens to be loaded.
+        self._env = mock.patch.object(receipts_page, "_env_supervisors",
+                                      return_value=[{"id": "1253370362", "label": "",
+                                                     "fixed": True}])
+        self._env.start()
+        self.addCleanup(self._env.stop)
         ad.app.config["TESTING"] = True
         self.client = ad.app.test_client()
         self.client.post("/receipts/login",
@@ -156,7 +173,10 @@ class ThePeopleFeedTest(_Signed):
                          kita["owed"])
         self.assertFalse(marco["active"])
         self.assertTrue(marco["suspended"])
-        self.assertEqual([{"id": "999888777", "label": "Boss"}], got["supervisors"])
+        self.assertEqual(
+            [{"id": "1253370362", "label": "", "fixed": True},
+             {"id": "999888777", "label": "Boss", "fixed": False}],
+            got["supervisors"])
         self.assertTrue(got["can_delete_lead"])
 
     def test_a_broken_suspension_read_does_not_take_the_tab_down(self):
@@ -290,7 +310,8 @@ class SupervisorOperationsTest(_Signed):
         self.assertEqual(200, r.status_code, r.get_data(as_text=True))
         key, raw = db.set_setting.call_args[0]
         self.assertEqual(receipts_page._SUPERVISORS_KEY, key)
-        self.assertEqual([{"id": "999888777", "label": "Boss"},
+        # Only the extras are written back — the environment's are not ours to save.
+        self.assertEqual([{"id": "999888777", "label": "Boss", "fixed": False},
                           {"id": "555444333", "label": "Nana"}], json.loads(raw))
 
     def test_adding_the_same_id_twice_replaces_rather_than_duplicates(self):
@@ -299,6 +320,31 @@ class SupervisorOperationsTest(_Signed):
                   json={"id": "999888777", "label": "Boss renamed"})
         self.assertEqual([{"id": "999888777", "label": "Boss renamed"}],
                          json.loads(db.set_setting.call_args[0][1]))
+
+    def test_a_supervisor_the_environment_owns_cannot_be_removed_here(self):
+        """A web page cannot edit a service environment variable. Saying where to
+        change it beats a Remove button that appears to work and does not."""
+        db = _fake_db()
+        r = self.call("delete", "/receipts/api/supervisors/1253370362", db=db)
+        self.assertEqual(409, r.status_code)
+        self.assertIn("SUPERVISORY_TELEGRAM_ID", r.get_json()["error"])
+        db.set_setting.assert_not_called()
+
+    def test_adding_one_the_environment_already_has_is_refused(self):
+        db = _fake_db()
+        r = self.call("post", "/receipts/api/supervisors", db=db,
+                      json={"id": "1253370362", "label": "Boss"})
+        self.assertEqual(409, r.status_code)
+        db.set_setting.assert_not_called()
+
+    def test_the_list_is_never_empty_when_the_environment_has_one(self):
+        """The bug: the tab read only the extras, which are empty on this system,
+        so a board with a supervisor showed none."""
+        db = _fake_db()
+        db.get_setting.return_value = None
+        got = self.call("get", "/receipts/api/people", db=db).get_json()
+        self.assertEqual([{"id": "1253370362", "label": "", "fixed": True}],
+                         got["supervisors"])
 
     def test_a_supervisor_needs_a_numeric_id(self):
         r = self.call("post", "/receipts/api/supervisors",
@@ -337,7 +383,7 @@ class DeletingALeadTest(_Signed):
 
     def test_it_flags_the_lead_and_never_deletes_the_row(self):
         db = _fake_db()
-        with mock.patch("requests.post") as post:
+        with mock.patch("requests.post") as post,                 mock.patch("config.Config.TELEGRAM_BOT_TOKEN", "test-token"):
             post.return_value = mock.MagicMock(ok=True, json=lambda: {"ok": True})
             r = self.call("post", "/receipts/api/transmissions/%s/delete" % LEAD,
                           db=db, json={"reason": "duplicate", "by": "kita"})
@@ -347,11 +393,64 @@ class DeletingALeadTest(_Signed):
         for name in ("delete_lead", "hard_delete_lead"):
             self.assertFalse(getattr(db, name).called, name)
 
+    def test_a_broadcast_that_reached_nobody_says_why(self):
+        """"nothing happened no telegram broadcast" — because a bare 0 was all
+        four failures at once. Each one now names itself."""
+        db = _fake_db()
+        with mock.patch("config.Config.TELEGRAM_BOT_TOKEN", ""):
+            report = receipts_page._broadcast_lead_deleted(db, LEAD_ROW, "test", "kita")
+        self.assertEqual(0, report["told"])
+        self.assertIn("TELEGRAM_BOT_TOKEN", report["error"])
+
+    def test_a_team_that_refuses_the_message_is_named(self):
+        db = _fake_db()
+        def _send(url, **kw):
+            cid = kw["json"]["chat_id"]
+            ok = cid == "-1001"
+            return mock.MagicMock(
+                ok=ok, status_code=200 if ok else 400, text="",
+                json=lambda: ({"ok": True} if ok
+                              else {"ok": False, "description": "Bad Request: chat not found"}))
+        with mock.patch("requests.post", side_effect=_send),                 mock.patch("config.Config.TELEGRAM_BOT_TOKEN", "test-token"):
+            report = receipts_page._broadcast_lead_deleted(db, LEAD_ROW, "test", "kita")
+        self.assertEqual(1, report["told"])
+        self.assertEqual(1, len(report["failed"]))
+        self.assertEqual("Second", report["failed"][0]["name"])
+        self.assertIn("chat not found", report["failed"][0]["why"])
+
+    def test_no_team_has_a_chat_id_at_all(self):
+        db = _fake_db()
+        db.get_all_groups.return_value = [{"group_name": "Nowhere", "is_active": True}]
+        with mock.patch("requests.post") as post,                 mock.patch("config.Config.TELEGRAM_BOT_TOKEN", "test-token"):
+            report = receipts_page._broadcast_lead_deleted(db, LEAD_ROW, "test", "kita")
+        post.assert_not_called()
+        self.assertIn("nobody to tell", report["error"])
+
+    def test_the_delete_answer_carries_the_report(self):
+        db = _fake_db()
+        def _send(url, **kw):
+            return mock.MagicMock(ok=False, status_code=403, text="",
+                                  json=lambda: {"ok": False, "description": "bot was kicked"})
+        with mock.patch("requests.post", side_effect=_send),                 mock.patch("config.Config.TELEGRAM_BOT_TOKEN", "test-token"):
+            r = self.call("post", "/receipts/api/transmissions/%s/delete" % LEAD,
+                          db=db, json={"reason": "duplicate", "by": "kita"})
+        body = r.get_json()
+        self.assertEqual(200, r.status_code)
+        self.assertEqual(0, body["groups_notified"])
+        self.assertEqual(2, len(body["groups_failed"]))
+        self.assertIn("kicked", body["groups_failed"][0]["why"])
+
+    def test_the_board_shows_what_the_report_said(self):
+        body = self.client.get("/receipts").get_data(as_text=True)
+        for needle in ("no team was told", "broadcast_error", "groups_failed",
+                       "Could not tell"):
+            self.assertIn(needle, body, needle)
+
     def test_every_active_team_is_told_once(self):
         db = _fake_db()
         with mock.patch("requests.post") as post:
             post.return_value = mock.MagicMock(ok=True, json=lambda: {"ok": True})
-            with mock.patch.object(receipts_page, "Config", create=True):
+            with mock.patch("config.Config.TELEGRAM_BOT_TOKEN", "test-token"):
                 r = self.call("post", "/receipts/api/transmissions/%s/delete" % LEAD,
                               db=db, json={"reason": "test", "by": "kita"})
         sent = [c for c in post.call_args_list if "sendMessage" in c[0][0]]
@@ -414,6 +513,21 @@ class PuttingADeletedLeadBackTest(_Signed):
         self.assertEqual("John Damian", row["client_name"])
         self.assertEqual("duplicate", row["reason"])
         self.assertEqual("kita", row["by"])
+        self.assertEqual("2026-09-08T10:00:00+00:00", row["at"])
+
+    def test_a_deleted_lead_keeps_everything_needed_to_judge_the_deletion(self):
+        """"show who it was assigned to the refrence id and name of client" — and
+        the rest of it, because "was this right?" is not answerable from a
+        reference and a reason alone."""
+        row = self.call("get", "/receipts/api/deleted").get_json()["rows"][0]
+        self.assertEqual("kingkrab", row["issuer"])
+        self.assertEqual("Marco", row["driver_name"])
+        self.assertEqual("HighKage", row["group_name"])
+        self.assertEqual("2017 M Benz", row["car"])
+        self.assertEqual("$150", row["price"])
+        self.assertEqual("new", row["status"])
+        self.assertTrue(row["has_receipt"])
+        self.assertIn("created_at", row)
 
     def test_an_unmigrated_database_shows_nothing_rather_than_an_error(self):
         db = _fake_db()
@@ -506,6 +620,22 @@ class TheBoardAndTheBotAgreeTest(unittest.TestCase):
         for cls in (ad.AdminDatabase, udb.Database):
             src = inspect.getsource(cls.restore_lead)
             self.assertIn('"deleted_at": None', src, cls.__name__)
+
+    def test_health_says_whether_this_service_can_broadcast(self):
+        """The notice is sent from THIS service with THIS token. Whether the token
+        landed was unanswerable from outside, which is why a delete that told
+        nobody looked identical to one that worked."""
+        r = ad.app.test_client().get("/api/health")
+        self.assertEqual(200, r.status_code)
+        self.assertIn("telegram_bot_token", r.get_json())
+
+    def test_the_deleted_view_never_answers_with_live_leads(self):
+        """The lean fallback cannot name deleted_at. Answering a deleted query
+        with it would file every live lead under Deleted leads."""
+        src = inspect.getsource(ad.AdminDatabase.get_transmissions)
+        self.assertIn("if deleted:", src)
+        self.assertIn("return []", src)
+        self.assertIn('not_.is_("deleted_at", "null")', src)
 
     def test_the_migration_says_what_it_adds(self):
         sql = (ROOT / "database" / "migration_lead_deleted.sql").read_text(

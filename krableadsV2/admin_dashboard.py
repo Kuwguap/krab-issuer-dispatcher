@@ -78,6 +78,11 @@ def api_health():
         # rather than a dashboard login. The DSN is deliberately NOT echoed --
         # it permits event submission, and this endpoint is public.
         "sentry": bool((os.environ.get("SENTRY_DSN") or "").strip()),
+        # The board sends the lead-deleted notice from THIS service, with this
+        # token. Without it the delete still happens and no team ever hears --
+        # which is exactly what it looked like from the outside. A boolean, so
+        # "can the board broadcast?" is a curl and not a guess.
+        "telegram_bot_token": bool((os.environ.get("TELEGRAM_BOT_TOKEN") or "").strip()),
         "environment": os.environ.get("SENTRY_ENVIRONMENT") or "unset",
         # The instant-tag payment chain, checkable without spending $100. Stripe's
         # webhook authenticates itself with a signature rather than a header we
@@ -511,7 +516,7 @@ class AdminDatabase:
         return out
 
     def get_transmissions(self, limit: int = 300, status: str = "", search: str = "",
-                          issuer: str = "") -> list:
+                          issuer: str = "", deleted: bool = False) -> list:
         """Leads as the board shows them: newest first, with driver, team, receipt
         and status. Batched — no per-row queries.
 
@@ -536,14 +541,15 @@ class AdminDatabase:
                 "delivery_status, status_updated_at, status_updated_by, "
                 "created_at, updated_at, group_id, telegram_username, "
                 "vehicle_details, delivery_details, extra_info, email, "
-                "extra_vehicles, user_id, issue_date, deleted_at"
+                "extra_vehicles, user_id, issue_date, "
+                "deleted_at, deleted_reason, deleted_by"
             )
             # A deleted lead is gone from the board. Asked for in the QUERY so a
             # deletion also shrinks the newest-N window rather than occupying a
             # slot invisibly. A database without the column raises here and the
             # lean fallback below answers instead -- correct, because nothing can
             # have been deleted yet on such a database.
-            q = q.is_("deleted_at", "null")
+            q = q.not_.is_("deleted_at", "null") if deleted else q.is_("deleted_at", "null")
             if status and status in self.DELIVERY_STATUSES:
                 if status == "new":
                     q = q.is_("delivery_status", "null")
@@ -551,11 +557,17 @@ class AdminDatabase:
                     q = q.eq("delivery_status", status)
             if who:
                 q = self._scope_to_issuer(q, who)
-            rows = (q.order("created_at", desc=True).limit(cap).execute().data) or []
+            order_on = "deleted_at" if deleted else "created_at"
+            rows = (q.order(order_on, desc=True).limit(cap).execute().data) or []
         except Exception as e:
             # delivery_status may not exist yet (migration not run). Fall back to the
             # columns that certainly do, so the board still works.
             logger.warning("get_transmissions full select failed (%s) — retrying lean", e)
+            if deleted:
+                # The lean select cannot name deleted_at, and without it every
+                # row looks undeleted. Answering with the whole board would put
+                # every live lead under "Deleted leads".
+                return []
             try:
                 lean = (
                     self.client.table("leads")
@@ -823,6 +835,10 @@ class AdminDatabase:
                 "issuer_tg_id": str(r.get("user_id") or "").strip(),
                 "group_tg_id": str(grp.get("group_telegram_id") or "").strip(),
                 "dispatcher_tg_id": str(grp.get("supervisory_telegram_id") or "").strip(),
+                # Blank on a live lead; the whole story on a deleted one.
+                "deleted_at": r.get("deleted_at"),
+                "deleted_reason": (r.get("deleted_reason") or "").strip(),
+                "deleted_by": (r.get("deleted_by") or "").strip(),
             }
             if needle:
                 hay = " ".join(str(v).lower() for v in row.values())
@@ -1118,24 +1134,15 @@ class AdminDatabase:
             return False
 
     def get_deleted_leads(self, limit: int = 50) -> list:
-        """The most recently deleted leads, newest first.
+        """The deleted leads, most recently deleted first — as full board rows.
 
-        Empty when the columns are not there yet -- the board shows nothing
-        rather than an error, because nothing IS what a database without the
-        migration has deleted.
+        The same reader the board itself uses, so a deleted lead keeps every
+        detail the office needs to decide whether the deletion was right:
+        reference, client, car, price, issuer, driver, dispatcher, receipt and
+        dates, plus who deleted it and why. Empty when the columns are not there
+        yet, because nothing IS what an un-migrated database has deleted.
         """
-        try:
-            r = (self.client.table("leads")
-                 .select("id, reference_id, vehicle_details, price, "
-                         "deleted_at, deleted_reason, deleted_by")
-                 .not_.is_("deleted_at", "null")
-                 .order("deleted_at", desc=True)
-                 .limit(max(1, min(int(limit or 50), 200))).execute())
-            return r.data or []
-        except Exception as e:
-            if not self._missing_column(e, "deleted_at"):
-                logger.warning("get_deleted_leads: %s", e)
-            return []
+        return self.get_transmissions(limit=limit, deleted=True)
 
     def restore_lead(self, lead_id: str) -> bool:
         """Undo a deletion. The whole reason it is a flag."""
