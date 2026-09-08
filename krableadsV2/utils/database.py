@@ -974,6 +974,35 @@ class Database:
             logger.error(f"Error toggling group status: {e}")
             return False
     
+    def rename_group(self, group_id: str, new_name: str) -> bool:
+        """Rename a dispatcher. False when nothing was written.
+
+        The name reaches the settings list, the review card, the receipts board
+        and every supervisory notice, so a rename that silently did nothing
+        would look like it worked everywhere except where it mattered. The row
+        is read back rather than trusting the update: on the anon key an RLS
+        refusal comes back as a cheerful 200 with an empty list.
+        """
+        name = str(new_name or "").strip()
+        if not name or not str(group_id or "").strip():
+            return False
+        if not self._check_tables_exist():
+            return False
+        try:
+            resp = (
+                self.client.table("groups")
+                .update({"group_name": name[:120]})
+                .eq("id", str(group_id))
+                .execute()
+            )
+            if not resp.data:
+                logger.warning("rename_group(%s): update affected no rows", group_id)
+                return False
+            return True
+        except Exception as e:
+            logger.error("Error renaming group %s: %s", group_id, e)
+            return False
+
     # Group assistants: Telegram IDs that send leads into this group
     def get_group_by_assistant_telegram_id(self, telegram_id: str) -> Optional[Dict[str, Any]]:
         """Return the group that has this telegram_id as an assistant (first if multiple)."""

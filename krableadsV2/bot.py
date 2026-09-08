@@ -22726,9 +22726,13 @@ async def _settings_view_groups() -> tuple:
         # the dispatch path, and reading it raw showed those rows here as disabled.
         active = record_is_active(g)
         lines.append(f"{'✅' if active else '⛔'} {g.get('group_name') or '(unnamed)'} `{g.get('group_telegram_id')}`")
-        rows.append([InlineKeyboardButton(
-            f"{'Disable' if active else 'Enable'} {g.get('group_name') or 'dispatcher'}"[:40],
-            callback_data=f"tset_gtog:{g.get('id')}")])
+        rows.append([
+            InlineKeyboardButton(
+                f"{'Disable' if active else 'Enable'} {g.get('group_name') or 'dispatcher'}"[:28],
+                callback_data=f"tset_gtog:{g.get('id')}"),
+            InlineKeyboardButton(
+                "\u270f\ufe0f Rename", callback_data=f"tset_gren:{g.get('id')}"),
+        ])
     if not groups:
         lines.append("_No dispatchers yet._")
     rows.append([InlineKeyboardButton("➕ Add Dispatcher", callback_data="tset_gadd")])
@@ -23039,6 +23043,19 @@ async def handle_settings_cb(update: Update, context: ContextTypes.DEFAULT_TYPE)
     if data.startswith("tset_gtog:"):
         await asyncio.to_thread(db.toggle_group_status, data.split(":", 1)[1])
         await _show_settings_view("tset_groups", query=query); return SET_MENU
+    if data.startswith("tset_gren:"):
+        gid = data.split(":", 1)[1]
+        grp = await asyncio.to_thread(db.get_group_by_id, gid)
+        if not grp:
+            await query.message.reply_text("\u274c That dispatcher is gone \u2014 refresh the list.")
+            return SET_MENU
+        current = grp.get("group_name") or "(unnamed)"
+        context.user_data["tset_await"] = {"kind": "rename_group", "group_id": gid,
+                                           "old_name": current}
+        await query.message.reply_text(
+            f"Renaming *{_telegram_md1_escape(current)}*.\n\nSend the new name.",
+            parse_mode="Markdown")
+        return SET_INPUT
     if data == "tset_fu":
         await _show_settings_view("tset_fu", query=query); return SET_MENU
     if data in ("tset_fuemail", "tset_fuphone", "tset_fuids", "tset_futeam",
@@ -23336,6 +23353,27 @@ async def apply_settings_input(update: Update, context: ContextTypes.DEFAULT_TYP
         await update.message.reply_text(
             (f"✅ {_PLATE_SET_LABELS.get(st['field'], st['field'])} set to {int(digits)}." if ok
              else "❌ Could not update."), reply_markup=_settings_main_kb())
+        return SET_MENU
+    if st.get("kind") == "rename_group":
+        name = " ".join(text.split())
+        if not name:
+            return await _retry("\u274c Send a name.")
+        if len(name) > 120:
+            return await _retry("\u274c That is too long \u2014 120 characters at most.")
+        ok = await asyncio.to_thread(db.rename_group, st["group_id"], name)
+        old_name = st.get("old_name") or "it"
+        if not ok:
+            await update.message.reply_text(
+                "\u274c Could not rename it \u2014 nothing was changed.",
+                reply_markup=_settings_main_kb())
+            return SET_MENU
+        await update.message.reply_text(
+            f"\u2705 \u201c{old_name}\u201d is now \u201c{name}\u201d.")
+        # Then the list itself, carrying the new name. Showing it is the proof
+        # the rename landed, and it is what they were looking at anyway -- the
+        # confirmation deliberately has no keyboard of its own, or two live
+        # menus end up stacked with the stale one still tappable.
+        await _show_settings_view("tset_groups", message=update.message)
         return SET_MENU
     if st.get("kind") == "add_group":
         parts = [p.strip() for p in text.split("|")]
