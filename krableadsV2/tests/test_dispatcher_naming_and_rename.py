@@ -148,5 +148,82 @@ class RenamingADispatcherTest(unittest.TestCase):
         self.assertLessEqual(len("tset_gren:") + 36, 64)
 
 
+class AddingADispatcherSaysWhyItFailedTest(unittest.TestCase):
+    """Supervisors reported being unable to add a dispatcher and got "Could not
+    add the dispatcher" and nothing else. Reproduced against production: the
+    chat id was already on another row and groups_group_telegram_id_key refused
+    the insert. The reason existed the whole time, in a log nobody on Telegram
+    can read."""
+
+    def setUp(self):
+        self.body = SRC_DB.split("def create_group_reporting(", 1)[1]
+        self.body = self.body.split("\n    def ", 1)[0]
+
+    def test_a_duplicate_names_the_dispatcher_already_using_the_id(self):
+        self.assertIn("get_group_by_telegram_id", self.body)
+        self.assertIn("already belongs to", self.body)
+
+    def test_a_disabled_owner_is_called_out(self):
+        """"Already exists" is baffling when the thing is nowhere in the visible
+        list. The fix there is Enable, not Add."""
+        self.assertIn("DISABLED", self.body)
+        self.assertIn("record_is_active(owner)", self.body)
+
+    def test_an_unreachable_database_is_not_reported_as_a_bad_id(self):
+        self.assertIn("not reachable", self.body)
+
+    def test_the_bool_contract_is_kept_for_the_dashboard(self):
+        """admin_dashboard has two callers expecting True/False."""
+        old = SRC_DB.split("def create_group(", 1)[1].split("\n    def ", 1)[0]
+        self.assertIn("create_group_reporting", old)
+        self.assertIn("return ok", old)
+
+
+class TheChatIdIsCheckedBeforeItIsStoredTest(unittest.TestCase):
+    """Nothing validated it. A group NAME or a t.me link inserted cleanly and
+    produced a dispatcher that can never receive a message -- a failure that
+    only surfaces later, as leads going nowhere."""
+
+    def setUp(self):
+        self.step = SRC_BOT.split('if st.get("kind") == "add_group":', 1)[1]
+        self.step = self.step.split("return SET_MENU", 1)[0]
+
+    def test_it_uses_the_strict_check_not_the_tolerant_one(self):
+        """_parse_chat_id hands a non-numeric string straight back on purpose --
+        it resolves @channel handles elsewhere -- so `is None` only ever caught
+        an empty string."""
+        self.assertIn("_delivery_chat_id(parts[1])", self.step)
+        self.assertNotIn("_parse_chat_id(parts[1])", self.step)
+
+    def test_the_strict_check_really_refuses_what_people_type(self):
+        import bot
+        for bad in ("Sensei Team", "https://t.me/joinchat/abc", "not a number",
+                    "0", "@bob", "12345.7", ""):
+            with self.subTest(value=bad):
+                self.assertIsNone(bot._delivery_chat_id(bad))
+
+    def test_a_real_chat_id_still_passes(self):
+        import bot
+        self.assertEqual(-1001420556250, bot._delivery_chat_id("-1001420556250"))
+        # A pasted value with the spreadsheet "=" and stray spaces still works.
+        self.assertEqual(-971636706, bot._delivery_chat_id("  = -971636706 "))
+
+    def test_the_supervisor_is_its_own_optional_field(self):
+        """The handler passed the group id twice, so every dispatcher added from
+        Telegram had its supervisory notices pointed back at the group."""
+        self.assertIn("sup_raw", self.step)
+        self.assertIn("_delivery_chat_id(sup_raw)", self.step)
+        self.assertNotIn("db.create_group, parts[0], parts[1], parts[1]", SRC_BOT)
+
+    def test_the_reason_reaches_the_operator(self):
+        self.assertIn("create_group_reporting", self.step)
+        self.assertIn("why or", self.step)
+
+    def test_the_prompt_explains_what_a_chat_id_is(self):
+        prompt = SRC_BOT.split('if data == "tset_gadd":', 1)[1][:800]
+        self.assertIn("whoami", prompt)
+        self.assertIn("not its name", prompt)
+
+
 if __name__ == "__main__":
     unittest.main()

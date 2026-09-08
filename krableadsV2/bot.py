@@ -23086,7 +23086,13 @@ async def handle_settings_cb(update: Update, context: ContextTypes.DEFAULT_TYPE)
     if data == "tset_gadd":
         context.user_data["tset_await"] = {"kind": "add_group"}
         await query.message.reply_text(
-            "Send the new dispatcher as: *Name | -100xxxxxxxxxx*", parse_mode="Markdown")
+            "Send the new dispatcher as:\n"
+            "*Name | -100xxxxxxxxxx*\n\n"
+            "To point its notices at a supervisor, add a third field:\n"
+            "*Name | -100xxxxxxxxxx | 123456789*\n\n"
+            "_The second field is the group's chat id, not its name. Add "
+            "this bot to the group and send /whoami there to read it._",
+            parse_mode="Markdown")
         return SET_INPUT
     # --- drivers -------------------------------------------------------
     if data == "tset_drivers":
@@ -23379,10 +23385,38 @@ async def apply_settings_input(update: Update, context: ContextTypes.DEFAULT_TYP
         parts = [p.strip() for p in text.split("|")]
         if len(parts) < 2 or not parts[0] or not parts[1]:
             return await _retry("❌ Format: Name | -100xxxxxxxxxx")
-        ok = await asyncio.to_thread(db.create_group, parts[0], parts[1], parts[1])
-        await update.message.reply_text(
-            (f"✅ Added dispatcher “{parts[0]}”." if ok else "❌ Could not add the dispatcher."),
-            reply_markup=_settings_main_kb())
+        # A chat id, not whatever was typed. Nothing checked this before, so a
+        # group NAME or a t.me link inserted cleanly and produced a dispatcher
+        # that can never receive a message -- a failure that only surfaces
+        # later, as leads going nowhere.
+        chat_id = _delivery_chat_id(parts[1])
+        if chat_id is None:
+            return await _retry(
+                "❌ “" + parts[1][:40] + "” is not a chat id. It is a number, "
+                "usually negative, like -1001234567890 — add this bot to the "
+                "group and send /whoami there to read it.")
+        # A supervisor to notify, when given. Passing the group's own id here
+        # is what every dispatcher added from Telegram used to get, which
+        # pointed its supervisory notices back at the group itself.
+        sup_raw = parts[2] if len(parts) > 2 and parts[2] else ""
+        if sup_raw:
+            sup_id = _delivery_chat_id(sup_raw)
+            if sup_id is None:
+                return await _retry(
+                    "❌ “" + sup_raw[:40] + "” is not a telegram id. Leave "
+                    "it off to notify the group itself.")
+            supervisory = str(sup_id)
+        else:
+            supervisory = str(chat_id)
+        ok, why = await asyncio.to_thread(
+            db.create_group_reporting, parts[0], str(chat_id), supervisory)
+        if not ok:
+            await update.message.reply_text(
+                "❌ " + (why or "Could not add the dispatcher."),
+                reply_markup=_settings_main_kb())
+            return SET_MENU
+        await update.message.reply_text(f"✅ Added dispatcher “{parts[0]}”.")
+        await _show_settings_view("tset_groups", message=update.message)
         return SET_MENU
     return ConversationHandler.END
 

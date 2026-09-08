@@ -914,20 +914,71 @@ class Database:
 
     # Group management methods
     def create_group(self, group_name: str, group_telegram_id: str, supervisory_telegram_id: str) -> bool:
-        """Create a new group."""
+        """Create a new group. True on success.
+
+        Kept as a bool for the dashboard's two callers; anything that has to
+        TELL somebody why it failed should call create_group_reporting instead.
+        """
+        ok, _ = self.create_group_reporting(
+            group_name, group_telegram_id, supervisory_telegram_id)
+        return ok
+
+    def create_group_reporting(self, group_name: str, group_telegram_id: str,
+                               supervisory_telegram_id: str) -> tuple:
+        """Create a dispatcher, returning (ok, reason).
+
+        The reason is for a human on Telegram. Supervisors reported being unable
+        to add a dispatcher and got "Could not add the dispatcher" — the actual
+        cause (the chat id already belonged to another row) was sitting in a
+        server log they cannot see, so there was no way to tell a duplicate from
+        a typo from an outage.
+        """
         if not self._check_tables_exist():
-            return False
-        
+            return False, ("The database is not reachable right now — try again "
+                           "in a moment.")
         try:
             self.client.table("groups").insert({
                 "group_name": group_name,
                 "group_telegram_id": group_telegram_id,
                 "supervisory_telegram_id": supervisory_telegram_id
             }).execute()
-            return True
+            return True, ""
         except Exception as e:
             logger.error(f"Error creating group: {e}")
-            return False
+            msg = str(e)
+            if "group_telegram_id" in msg and ("duplicate" in msg.lower()
+                                               or "23505" in msg):
+                owner = self.get_group_by_telegram_id(group_telegram_id)
+                if owner:
+                    name = owner.get("group_name") or "another dispatcher"
+                    if not record_is_active(owner):
+                        # "Already exists" is baffling when it is nowhere in the
+                        # visible list. The fix here is Enable, not Add.
+                        return False, (f"That chat id already belongs to \u201c{name}\u201d, "
+                                       f"which is currently DISABLED. Enable it instead "
+                                       f"of adding it again.")
+                    return False, (f"That chat id already belongs to \u201c{name}\u201d. "
+                                   f"Use Rename if you want to change its name.")
+                return False, "That chat id is already used by another dispatcher."
+            if "duplicate" in msg.lower() or "23505" in msg:
+                return False, "A dispatcher with those details already exists."
+            return False, ("The database refused it. Check the chat id and try "
+                           "again; the server log has the detail.")
+
+    def get_group_by_telegram_id(self, group_telegram_id: str):
+        """The dispatcher using this chat id, or None. Used to explain a clash."""
+        if not self._check_tables_exist():
+            return None
+        try:
+            resp = (
+                self.client.table("groups").select("*")
+                .eq("group_telegram_id", str(group_telegram_id))
+                .limit(1).execute()
+            )
+            return (resp.data or [None])[0]
+        except Exception as e:
+            logger.warning("get_group_by_telegram_id(%s): %s", group_telegram_id, e)
+            return None
     
     def get_all_groups(self) -> list:
         """Get all groups."""
