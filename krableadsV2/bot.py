@@ -389,6 +389,11 @@ _EMPTY_INLINE_KB = InlineKeyboardMarkup([])
 _DRIVER_ADD_LEAD_BTN = InlineKeyboardButton("➕ Add new lead", callback_data="driver_add_lead")
 _DRIVER_ADD_RECEIPT_BTN = InlineKeyboardButton("🧾 Add new receipt", callback_data="driver_add_receipt")
 _DRIVER_HELP_BTN = InlineKeyboardButton("❓ Help", callback_data="bot_help")
+# Same action as _DRIVER_ADD_RECEIPT_BTN and as /receipts -- the owed list, with
+# an upload on each. Named for what the driver came to do ("show me my
+# receipts") rather than for the flow it happens to open, because on the hub
+# that is the question being asked.
+_DRIVER_RECEIPTS_BTN = InlineKeyboardButton("🧾 Receipts", callback_data="driver_add_receipt")
 
 
 def _help_guide_text() -> str:
@@ -600,6 +605,19 @@ async def handle_help_callback(update: Update, context: ContextTypes.DEFAULT_TYP
 def _driver_add_lead_keyboard_only() -> InlineKeyboardMarkup:
     """Default driver follow-up keyboard (single action — not receipt on every message)."""
     return InlineKeyboardMarkup([[_DRIVER_ADD_LEAD_BTN], [_DRIVER_HELP_BTN]])
+
+
+def _driver_hub_keyboard() -> InlineKeyboardMarkup:
+    """The three things a driver opens the bot to do, on the hub screen.
+
+    Only the hub: the follow-up keyboard above stays a single action on purpose,
+    so a receipt button does not ride along on every message the bot sends.
+    """
+    return InlineKeyboardMarkup([
+        [_DRIVER_ADD_LEAD_BTN],
+        [_DRIVER_RECEIPTS_BTN],
+        [_DRIVER_HELP_BTN],
+    ])
 
 
 def _driver_keyboard_lead_and_receipt() -> InlineKeyboardMarkup:
@@ -11087,14 +11105,14 @@ async def _restart_bot_from_top(update: Update, context: ContextTypes.DEFAULT_TY
             lines.append(
                 f"\n⚠️ You owe {n} receipt(s). At {SUSPENSION_THRESHOLD} unpaid you will be temporarily suspended."
             )
-        lines.append("\nTo add a lead, type /lead or /client.")
-        lines.append("\nTo view all receipts type /receipts.")
+        lines.append("\nTap a button below, or type /lead to add a lead "
+                     "and /receipts to see what you owe.")
         lines.append("\nTap ❓ Help below or type /help for a full guide.")
         lines.append(f"\n{motivation.get_random_quote()}")
         lines.append("\n🏁Automated🏎Automotive")
         await msg.reply_text(
             "\n".join(lines),
-            reply_markup=_driver_add_lead_keyboard_only(),
+            reply_markup=_driver_hub_keyboard(),
         )
         return ConversationHandler.END
 

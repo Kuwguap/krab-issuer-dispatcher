@@ -763,7 +763,7 @@ BOARD_HTML = r"""<!doctype html>
         display:none; }
  .err { background:var(--bad-bg); color:var(--bad-ink); padding:10px 14px;
         border-radius:8px; margin:10px 18px; }
- main { padding:12px 18px 80px; }
+ main { padding:12px 18px 18px; }
  .view { display:none; }
  .view.on { display:block; }
  .wrap { overflow:auto; background:var(--card); border:1px solid var(--line);
@@ -849,6 +849,21 @@ BOARD_HTML = r"""<!doctype html>
  .pflag.off{color:#b3261e;border-color:#e0b4b4}
  .pflag.susp{color:#8a5a00;border-color:#e4c98a}
  .owe{display:flex;gap:6px;flex-wrap:wrap;margin-top:4px}
+ /* The board's main is full width with 18px sides — match it, so the section
+    reads as the end of the same page rather than a card floating under it. */
+ .checkin{margin:0 18px 90px;padding:16px 18px;
+          border:1px solid var(--line);border-radius:14px;background:var(--card)}
+ .checkin h2{margin:0 0 4px;font-size:1.05rem}
+ .checkin .note{margin:0 0 12px}
+ .ci-do{display:flex;gap:8px;flex-wrap:wrap;align-items:center}
+ .ci-do input{flex:1 1 16rem;min-width:0}
+ .ci-list{margin-top:14px;display:grid;gap:8px}
+ .ci-row{display:flex;gap:10px;align-items:baseline;flex-wrap:wrap;
+         padding:8px 10px;border:1px solid var(--line);border-radius:10px}
+ .ci-row b{white-space:nowrap}
+ .ci-when{color:var(--muted);font-size:.85rem;white-space:nowrap}
+ .ci-what{color:var(--muted);font-size:.85rem}
+ .ci-note{flex:1 1 12rem}
  .ppl .tblwrap{overflow-x:auto}
  .ppl .tblwrap table{min-width:44rem}
  .pend { display:inline-block; margin-left:6px; padding:1px 6px; border-radius:9px;
@@ -948,6 +963,7 @@ BOARD_HTML = r"""<!doctype html>
    h1 { font-size:16px; }
    .sub { display:none; }
    main { padding:10px 8px 90px; }
+   .checkin { margin:0 8px 90px; }
    #stats { padding:8px 8px 0; }
    .wrap { max-height:none; }
    .tabs { width:100%; order:3; overflow-x:auto; flex-wrap:nowrap;
@@ -1043,6 +1059,22 @@ BOARD_HTML = r"""<!doctype html>
   <div class="view" id="vw-crm"></div>
   <div class="view" id="vw-people"></div>
 </main>
+
+<!-- The very end of the board: who has been through it, and when. Outside
+     <main> so it stays put whichever view is open — a cross-check is of the
+     board, not of one way of looking at it. -->
+<section class="checkin" id="checkin">
+  <h2>✅ Check in</h2>
+  <p class="note">Checking in records that you have cross-checked the
+    transactions above — everyone signed in here can see who has, and when.</p>
+  <div class="ci-do">
+    <input id="ci-note" maxlength="200" autocomplete="off"
+           placeholder="Anything to flag? (optional)">
+    <button class="btn primary" id="ci-go">✅ Check in</button>
+  </div>
+  <div id="ci-msg"></div>
+  <div id="ci-list" class="ci-list"></div>
+</section>
 
 <div class="overlay" id="compose" hidden>
   <div class="sheet-modal">
@@ -1820,6 +1852,59 @@ function draw() {
 }
 
 
+// ── Check in: who has cross-checked the board ─────────────────────────────
+// Its own small feed, loaded once on boot and after each check-in. The name is
+// the same one the board already uses for everything else somebody does here
+// (the 👤 at the top) — self-declared, and the log says so rather than
+// implying an identity the board does not actually verify.
+async function loadCheckins(after) {
+  const list = document.getElementById("ci-list");
+  if (!list) return;
+  try {
+    const rows = after || (await (await fetch(`${API}/checkins`)).json()).rows || [];
+    if (!rows.length) {
+      list.innerHTML = `<div class="none">Nobody has checked in yet.</div>`;
+      return;
+    }
+    list.innerHTML = rows.map(r => `<div class="ci-row">
+        <b>${esc(r.who || "someone")}</b>
+        <span class="ci-when">${esc(when(r.at))}</span>
+        <span class="ci-what">${r.leads ? esc(r.leads) + (r.leads_capped ? "+" : "") + " leads" : ""}${
+          r.newest ? " · newest " + esc(r.newest) : ""}</span>
+        ${r.note ? `<span class="ci-note">${esc(r.note)}</span>` : ""}
+      </div>`).join("");
+  } catch (e) {
+    list.innerHTML = `<div class="err">Could not read the check-ins: ${esc(e.message)}</div>`;
+  }
+}
+
+document.getElementById("ci-go").onclick = async () => {
+  const who = whoAmI(true);        // asks for the name if the board has none
+  const msg = document.getElementById("ci-msg");
+  if (!who) {
+    msg.innerHTML = `<div class="err">Tell the board your name first — tap 👤 at the top.</div>`;
+    return;
+  }
+  const go = document.getElementById("ci-go");
+  go.disabled = true;
+  msg.innerHTML = "";
+  try {
+    const res = await fetch(`${API}/checkins`, {
+      method: "POST", headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({who, note: document.getElementById("ci-note").value.trim()}),
+    });
+    const body = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(body.error || res.status);
+    document.getElementById("ci-note").value = "";
+    msg.innerHTML = `<div class="ok">Checked in — thank you.</div>`;
+    loadCheckins(body.rows);
+  } catch (e) {
+    msg.innerHTML = `<div class="err">Could not check in: ${esc(e.message)}</div>`;
+  } finally {
+    go.disabled = false;
+  }
+};
+
 // ── People: drivers and supervisors ───────────────────────────────────────
 // Its own fetch, not part of the board's rows: the transmissions feed is
 // leads, and these are the people leads are sent TO. Reloaded whenever the tab
@@ -2515,6 +2600,7 @@ updateGameChip();
 setView(VIEW);
 loadConfig();
 load();
+loadCheckins();
 setInterval(() => {                     // the board is shared — keep it fresh,
   if (document.querySelector(".overlay:not([hidden])")) return;   // but never under a compose
   load();
@@ -2791,6 +2877,39 @@ def _save_board_supervisors(db, rows) -> bool:
         return bool(db.set_setting(_SUPERVISORS_KEY, json.dumps(rows or [])))
     except Exception as e:
         logger.error("supervisors write failed: %s", e)
+        return False
+
+
+# The cross-check log. A settings key, so it needs no migration; capped so it
+# cannot grow without bound in a column that was never sized for it.
+_CHECKINS_KEY = "receipts_checkins"
+_CHECKINS_MAX = 200
+
+
+def _read_checkins(db) -> list:
+    try:
+        raw = db.get_setting(_CHECKINS_KEY)
+    except Exception as e:
+        logger.warning("check-ins read failed: %s", e)
+        return []
+    try:
+        rows = json.loads(raw) if raw else []
+    except Exception as e:
+        logger.warning("check-ins parse failed: %s", e)
+        return []
+    out = []
+    for r in rows if isinstance(rows, list) else []:
+        if isinstance(r, dict) and str(r.get("at") or "").strip():
+            out.append(r)
+    return out[:_CHECKINS_MAX]
+
+
+def _write_checkins(db, rows) -> bool:
+    try:
+        return bool(db.set_setting(_CHECKINS_KEY,
+                                   json.dumps(rows[:_CHECKINS_MAX])))
+    except Exception as e:
+        logger.error("check-ins write failed: %s", e)
         return False
 
 
@@ -3593,6 +3712,55 @@ def register(app, db_provider):
                         "groups_notified": report.get("told", 0),
                         "groups_failed": report.get("failed", []),
                         "broadcast_error": report.get("error", "")})
+
+    # ── Cross-check ──────────────────────────────────────────────────────
+    # Who has been through the board, and when. /receipts-only, like everything
+    # else that writes: the open /api alias has no login gate.
+
+    @app.route("/receipts/api/checkins", methods=["GET"])
+    def api_checkins():
+        return jsonify({"rows": _read_checkins(_resolve())})
+
+    @app.route("/receipts/api/checkins", methods=["POST"])
+    def api_check_in():
+        """Record that somebody has cross-checked what is on the board.
+
+        The time is the SERVER's. A check-in is a claim about when somebody
+        looked, and a browser clock that is an hour out would put that claim in
+        the wrong place in the log with nothing to show it had happened.
+        """
+        from datetime import datetime, timezone
+        body = request.get_json(silent=True) or {}
+        who = (body.get("who") or "").strip()[:60]
+        if not who:
+            return jsonify({"error": "Say who you are first — tap the name at "
+                                     "the top of the board."}), 400
+        db = _resolve()
+        # What they were looking at. Best effort: a check-in that cannot say how
+        # many leads were on the board is still a check-in.
+        # The reader caps at 1000. Recording a flat "1000 leads" would put a
+        # number in an audit log that quietly means "at least" -- so the cap is
+        # recorded with it and the board reads it out as 1000+.
+        seen, newest, capped = 0, "", False
+        try:
+            rows = db.get_transmissions(limit=1000) or []
+            seen = len(rows)
+            capped = seen >= 1000
+            newest = str((rows[0] or {}).get("reference_id") or "") if rows else ""
+        except Exception as e:
+            logger.warning("check-in: could not size the board: %s", e)
+        entry = {
+            "who": who,
+            "at": datetime.now(timezone.utc).isoformat(),
+            "note": (body.get("note") or "").strip()[:200],
+            "leads": seen,
+            "leads_capped": capped,
+            "newest": newest,
+        }
+        rows = [entry] + _read_checkins(db)
+        if not _write_checkins(db, rows):
+            return jsonify({"error": "Could not record that."}), 500
+        return jsonify({"ok": True, "rows": rows[:_CHECKINS_MAX]})
 
     @app.route("/receipts/api/deleted", methods=["GET"])
     def api_deleted_leads():
