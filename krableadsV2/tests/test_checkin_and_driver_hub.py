@@ -70,6 +70,8 @@ def _fake_db(checks=None, ready=True):
     db.get_all_drivers.return_value = []
     db.get_manually_suspended_driver_ids.return_value = set()
     db._get_all_pending_receipts_per_driver.return_value = []
+    db.resolve_telegram_names.return_value = {}
+    db.get_all_groups.return_value = []
     db.get_setting.return_value = ""
     db._store = store
     return db

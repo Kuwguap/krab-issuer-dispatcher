@@ -1139,6 +1139,44 @@ class AdminDatabase:
             logger.error("soft_delete_lead %s: %s", lead_id, e)
             return False
 
+    def resolve_telegram_names(self, ids) -> dict:
+        """{telegram_id: name} for whoever we can put a name to.
+
+        Two sources, both already here: telegram_user_directory (the @handle the
+        bot records the first time somebody talks to it) and drivers, because a
+        team's supervisor is very often on the roster too. A bare id is a person
+        nobody can identify, which is what the Supervisors list used to show.
+        """
+        want = [str(i).strip() for i in (ids or []) if str(i).strip()]
+        out = {}
+        if not want:
+            return out
+        try:
+            r = (self.client.table("telegram_user_directory")
+                 .select("telegram_id, telegram_username")
+                 .in_("telegram_id", want[:500]).execute())
+            for row in (r.data or []):
+                u = str(row.get("telegram_username") or "").strip().lstrip("@")
+                if u:
+                    out[str(row.get("telegram_id"))] = "@" + u
+        except Exception as e:
+            logger.info("resolve_telegram_names (directory): %s", e)
+        try:
+            r = (self.client.table("drivers")
+                 .select("driver_name, driver_telegram_id")
+                 .in_("driver_telegram_id", want[:500]).execute())
+            for row in (r.data or []):
+                tid = str(row.get("driver_telegram_id") or "")
+                name = str(row.get("driver_name") or "").strip()
+                if not tid or not name:
+                    continue
+                # A handle and a name are different facts; show both when both
+                # are known, rather than letting one silently win.
+                out[tid] = f"{name} {out[tid]}" if tid in out else name
+        except Exception as e:
+            logger.info("resolve_telegram_names (drivers): %s", e)
+        return out
+
     # ── Cross-checking a transaction ─────────────────────────────────────
 
     def checkins_ready(self) -> bool:

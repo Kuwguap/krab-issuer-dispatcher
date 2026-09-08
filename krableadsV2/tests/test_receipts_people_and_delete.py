@@ -70,7 +70,14 @@ def _fake_db(**over):
     db.get_manually_suspended_driver_ids.return_value = {"d-2"}
     db._get_all_pending_receipts_per_driver.return_value = [
         {"driver_id": DRIVER, "lead_id": LEAD, "reference_id": "LAB4CDVZ"}]
-    db.get_setting.return_value = json.dumps([{"id": "999888777", "label": "Boss"}])
+    db.resolve_telegram_names.return_value = {}
+    db.get_all_groups.return_value = []
+    # Per key. One return value for every key made the fake answer the
+    # st_telegram_id lookup with the supervisor list, inventing a supervisor.
+    _settings = {receipts_page._SUPERVISORS_KEY:
+                 json.dumps([{"id": "999888777", "label": "Boss"}])}
+    db.get_setting.side_effect = lambda k: _settings.get(k, "")
+    db._settings = _settings
     db.set_setting.return_value = True
     db.lead_deletion_ready.return_value = True
     db.get_lead_by_id.return_value = dict(LEAD_ROW)
@@ -98,7 +105,7 @@ class _Signed(unittest.TestCase):
         # depend on whoever's .env happens to be loaded.
         self._env = mock.patch.object(receipts_page, "_env_supervisors",
                                       return_value=[{"id": "1253370362", "label": "",
-                                                     "fixed": True}])
+                                                     "fixed": True, "source": "env"}])
         self._env.start()
         self.addCleanup(self._env.stop)
         ad.app.config["TESTING"] = True
@@ -174,8 +181,10 @@ class ThePeopleFeedTest(_Signed):
         self.assertFalse(marco["active"])
         self.assertTrue(marco["suspended"])
         self.assertEqual(
-            [{"id": "1253370362", "label": "", "fixed": True},
-             {"id": "999888777", "label": "Boss", "fixed": False}],
+            [{"id": "1253370362", "label": "", "fixed": True,
+              "source": "env", "name": ""},
+             {"id": "999888777", "label": "Boss", "fixed": False,
+              "source": "added", "name": ""}],
             got["supervisors"])
         self.assertTrue(got["can_delete_lead"])
 
@@ -321,6 +330,53 @@ class SupervisorOperationsTest(_Signed):
         self.assertEqual([{"id": "999888777", "label": "Boss renamed"}],
                          json.loads(db.set_setting.call_args[0][1]))
 
+    def test_the_supervisors_a_team_has_are_supervisors(self):
+        """The list showed nobody on a system with four working supervisors: it
+        read this service's env (never set) and the extras key (never written),
+        and never looked at who each team's leads are copied to."""
+        db = _fake_db()
+        db.get_all_groups.return_value = [
+            {"group_name": "Higkage's team", "supervisory_telegram_id": "5994570412"},
+            {"group_name": "AUTOMATE PLATE", "supervisory_telegram_id": "5994570412"},
+            {"group_name": "Sensei's Team", "supervisory_telegram_id": "8117389622"},
+            {"group_name": "No supervisor", "supervisory_telegram_id": ""},
+        ]
+        db.resolve_telegram_names.return_value = {"5994570412": "Highkage"}
+        rows = self.call("get", "/receipts/api/people", db=db).get_json()["supervisors"]
+        by = {r["id"]: r for r in rows}
+        self.assertIn("5994570412", by)
+        self.assertEqual("team", by["5994570412"]["source"])
+        self.assertEqual("Highkage", by["5994570412"]["name"])
+        # One person supervising two teams is ONE supervisor, carrying both.
+        self.assertEqual(1, sum(1 for r in rows if r["id"] == "5994570412"))
+        self.assertEqual(["Higkage's team", "AUTOMATE PLATE"],
+                         sorted(by["5994570412"]["teams"], key=len, reverse=True))
+        self.assertIn("8117389622", by)
+
+    def test_the_standing_supervisor_in_settings_is_one_too(self):
+        db = _fake_db()
+        db._settings["st_telegram_id"] = "1184788227"
+        rows = self.call("get", "/receipts/api/people", db=db).get_json()["supervisors"]
+        self.assertEqual("settings",
+                         [r for r in rows if r["id"] == "1184788227"][0]["source"])
+
+    def test_a_bare_telegram_id_is_given_a_name_where_one_is_known(self):
+        db = _fake_db()
+        db.resolve_telegram_names.return_value = {"999888777": "Boss @bossman"}
+        rows = self.call("get", "/receipts/api/people", db=db).get_json()["supervisors"]
+        self.assertEqual("Boss @bossman",
+                         [r for r in rows if r["id"] == "999888777"][0]["name"])
+
+    def test_a_team_supervisor_is_not_removed_from_this_list(self):
+        """Removing them here would not remove them — say where they are set."""
+        db = _fake_db()
+        db.get_all_groups.return_value = [
+            {"group_name": "Higkage's team", "supervisory_telegram_id": "5994570412"}]
+        r = self.call("delete", "/receipts/api/supervisors/5994570412", db=db)
+        self.assertEqual(409, r.status_code)
+        self.assertIn("set on the team", r.get_json()["error"])
+        db.set_setting.assert_not_called()
+
     def test_a_supervisor_the_environment_owns_cannot_be_removed_here(self):
         """A web page cannot edit a service environment variable. Saying where to
         change it beats a Remove button that appears to work and does not."""
@@ -358,10 +414,10 @@ class SupervisorOperationsTest(_Signed):
         """The bug: the tab read only the extras, which are empty on this system,
         so a board with a supervisor showed none."""
         db = _fake_db()
-        db.get_setting.return_value = None
+        db._settings.clear()
         got = self.call("get", "/receipts/api/people", db=db).get_json()
-        self.assertEqual([{"id": "1253370362", "label": "", "fixed": True}],
-                         got["supervisors"])
+        self.assertEqual([{"id": "1253370362", "label": "", "fixed": True,
+                           "source": "env", "name": ""}], got["supervisors"])
 
     def test_a_supervisor_needs_a_numeric_id(self):
         r = self.call("post", "/receipts/api/supervisors",
@@ -380,6 +436,46 @@ class SupervisorOperationsTest(_Signed):
         self.assertEqual(getattr(_bot, "EXTRA_SUPERVISORS_KEY", None)
                          or receipts_page._SUPERVISORS_KEY,
                          receipts_page._SUPERVISORS_KEY)
+
+
+class TheTabFoldsAndCanBeUndoneTest(_Signed):
+    """"each section should be collapsable" and "show a brief undo button for 10
+    seconds and make it disappear"."""
+
+    def setUp(self):
+        super().setUp()
+        self.body = self.client.get("/receipts").get_data(as_text=True)
+
+    def test_every_section_folds_and_remembers(self):
+        self.assertIn('<details class="pfold"', self.body)
+        for key in ('"drivers"', '"sups"', '"deleted"'):
+            self.assertIn("fold(%s" % key, self.body, key)
+        self.assertIn("krab_pfold", self.body)
+        self.assertIn("d.ontoggle", self.body)
+
+    def test_a_closed_section_still_says_what_is_in_it(self):
+        """Otherwise folding it hides the one number worth seeing."""
+        self.assertIn("owing`", self.body)
+        self.assertIn('<summary><span>${title}</span>', self.body)
+
+    def test_the_undo_lasts_ten_seconds_and_then_goes(self):
+        self.assertIn("const UNDO_MS = 10000", self.body)
+        self.assertIn("setTimeout(close, UNDO_MS)", self.body)
+        self.assertIn("undodrain 10s linear forwards", self.body)
+
+    def test_every_action_offers_one(self):
+        for undoable in ("suspended: !on", "excluded: false",
+                         "`${API}/drivers`, {name: was.name",
+                         "/supervisors`, {id: id",
+                         "/restore`"):
+            self.assertIn(undoable, self.body, undoable)
+
+    def test_undoing_a_restore_keeps_the_original_reason(self):
+        """An undo must not quietly rewrite why a lead was deleted."""
+        self.assertIn("reason: row.reason", self.body)
+
+    def test_a_failed_undo_says_so_rather_than_pretending(self):
+        self.assertIn('toast("Could not undo that: " + e.message, false)', self.body)
 
 
 class DeletingALeadTest(_Signed):

@@ -862,6 +862,18 @@ BOARD_HTML = r"""<!doctype html>
  .chkrow:last-child{border-bottom:0}
  .chklist{margin:4px 0 6px;width:100%}
  .ppl .tblwrap{overflow-x:auto}
+ .pfold{border:1px solid var(--line);border-radius:12px;background:var(--card);
+        overflow:hidden}
+ .pfold>summary{cursor:pointer;padding:11px 14px;font-weight:600;
+                display:flex;align-items:center;gap:10px;list-style:none;
+                justify-content:space-between}
+ .pfold>summary::-webkit-details-marker{display:none}
+ .pfold>summary:hover{background:var(--bg)}
+ .pfold>summary::before{content:"\25b8";display:inline-block;margin-right:2px;
+                        transition:transform .15s;color:var(--muted)}
+ .pfold[open]>summary::before{transform:rotate(90deg)}
+ .pfold>summary>span:first-of-type{flex:1}
+ .pbody{padding:0 14px 14px}
  .ppl .tblwrap table{min-width:44rem}
  .pend { display:inline-block; margin-left:6px; padding:1px 6px; border-radius:9px;
          font-size:10px; font-weight:700; letter-spacing:.04em; text-transform:uppercase;
@@ -924,6 +936,19 @@ BOARD_HTML = r"""<!doctype html>
  body:has(.overlay:not([hidden])) #vc-root { display:none !important; }
  .toast.ok { background:var(--ok-bg); color:var(--ok-ink); }
  .toast.bad { background:var(--bad-bg); color:var(--bad-ink); }
+ .toast.undo { pointer-events:auto; display:flex; align-items:center; gap:10px;
+               position:relative; overflow:hidden; padding-bottom:12px; }
+ .undobtn { font:inherit; font-size:12px; font-weight:700; cursor:pointer;
+            border:1px solid currentColor; background:transparent; color:inherit;
+            border-radius:6px; padding:3px 10px; }
+ .undobtn[disabled] { opacity:.6; cursor:default; }
+ /* The bar runs out with the ten seconds, so the window is visible rather
+    than something to guess at. */
+ .undobar { position:absolute; left:0; bottom:0; height:3px; width:100%;
+            background:currentColor; opacity:.45; transform-origin:left center;
+            animation:undodrain 10s linear forwards; }
+ @keyframes undodrain { from { transform:scaleX(1); } to { transform:scaleX(0); } }
+ @media (prefers-reduced-motion:reduce) { .undobar { animation:none; opacity:.2; } }
  /* ── Phone cards ────────────────────────────────────────────────────────── */
  .mdivider { font-weight:750; color:var(--muted); padding:8px 4px 2px; cursor:pointer;
              user-select:none; font-size:13px; }
@@ -1257,6 +1282,46 @@ document.getElementById("who").onclick = () => {
   if (w) localStorage.setItem("krab_who", w);
   whoAmI(false);
 };
+
+// Ten seconds to take it back. Every action on the People tab changes who gets
+// sent work or what somebody owes, and a misclick otherwise means working out
+// which button undoes it -- or, for a deleted lead, that every team has already
+// been told. The window is deliberately short: after it, the change is the
+// truth and the way back is the same buttons that got here.
+const UNDO_MS = 10000;
+
+function toastUndo(text, undo) {
+  const t = document.createElement("div");
+  t.className = "toast ok undo";
+  const label = document.createElement("span");
+  label.textContent = text;
+  const btn = document.createElement("button");
+  btn.className = "undobtn";
+  btn.textContent = "Undo";
+  const bar = document.createElement("i");
+  bar.className = "undobar";
+  let done = false;
+  const close = () => { if (!done) { done = true; t.remove(); } };
+  btn.onclick = async () => {
+    if (done) return;
+    done = true;
+    btn.disabled = true;
+    btn.textContent = "Undoing…";
+    try {
+      await undo();
+      t.remove();
+      toast("Undone.", true);
+    } catch (e) {
+      t.remove();
+      toast("Could not undo that: " + e.message, false);
+    }
+  };
+  t.appendChild(label);
+  t.appendChild(btn);
+  t.appendChild(bar);
+  document.getElementById("toasts").appendChild(t);
+  setTimeout(close, UNDO_MS);
+}
 
 function toast(text, ok) {
   const t = document.createElement("div");
@@ -1936,7 +2001,7 @@ async function loadPeople(force) {
   return PEOPLE;
 }
 
-async function peopleAction(url, opts, el) {
+async function peopleAction(url, opts, el, said, undo) {
   if (el) el.disabled = true;
   try {
     const res = await fetch(url, opts);
@@ -1944,6 +2009,9 @@ async function peopleAction(url, opts, el) {
     if (!res.ok) throw new Error(body.error || (await res.text().catch(() => "")) || res.status);
     await loadPeople(true);
     renderPeople();
+    if (said) {
+      if (undo) toastUndo(said, undo); else toast(said, true);
+    }
     return true;
   } catch (e) {
     const box = document.getElementById("ppl-err");
@@ -1951,6 +2019,29 @@ async function peopleAction(url, opts, el) {
     if (el) el.disabled = false;
     return false;
   }
+}
+
+// The same call again with different arguments IS the undo for most of these,
+// so they share one helper rather than each inventing its own.
+function jpost(url, body, method) {
+  return peopleAction(url, {
+    method: method || "POST", headers: {"Content-Type": "application/json"},
+    body: body === undefined ? undefined : JSON.stringify(body),
+  });
+}
+
+// Sections fold, and remember. The drivers table alone runs to eighty rows, so
+// reaching the supervisors under it was a scroll rather than a glance. Each
+// summary carries its own count, so a closed section still says what is in it.
+let PFOLD = {};
+try { PFOLD = JSON.parse(localStorage.getItem("krab_pfold") || "{}") || {}; } catch (e) {}
+
+function fold(key, title, count, inner) {
+  const open = PFOLD[key] !== false;      // open unless this person closed it
+  return `<details class="pfold" data-fold="${esc(key)}"${open ? " open" : ""}>
+    <summary><span>${title}</span><span class="counts">${esc(count)}</span></summary>
+    <div class="pbody">${inner}</div>
+  </details>`;
 }
 
 function renderPeople() {
@@ -1984,25 +2075,34 @@ function renderPeople() {
       </td></tr>`;
   }).join("") || `<tr><td colspan="3" class="none">No drivers yet.</td></tr>`;
 
-  // An empty table is a lie on a system that has supervisors — say where the
-  // ones it cannot see are kept, and what to do about it.
-  const supEmpty = `<tr><td colspan="2" class="none">Nobody here yet. Standing
-    supervisors set in the bot's own SUPERVISORY_TELEGRAM_ID are not visible to
-    this service — add them below and the bot will read the same list.</td></tr>`;
-  const sRows = sups.map(s => `<tr>
-      <td><b>${esc(s.label || (s.fixed ? "Supervisor" : "(no name)"))}</b>
-          ${s.fixed ? '<span class="pflag">from the environment</span>' : ""}
+  const supEmpty = `<tr><td colspan="3" class="none">Nobody — no team has a
+    supervisor set, and none has been added here.</td></tr>`;
+  const SRC = {
+    team: ["supervises a team", "Set on the team itself, under Dispatchers in the bot's /settings"],
+    settings: ["standing supervisor", "st_telegram_id in the bot's /settings"],
+    env: ["service setting", "SUPERVISORY_TELEGRAM_ID on this service"],
+    added: ["added here", "In the shared list the bot reads in /settings"],
+  };
+  const sRows = sups.map(s => {
+    const [what, where] = SRC[s.source] || SRC.added;
+    const who = s.name || s.label || "";
+    return `<tr>
+      <td><b>${esc(who || "Supervisor")}</b>
           <div class="counts">${esc(s.id)}</div></td>
+      <td><span class="pflag" title="${esc(where)}">${esc(what)}</span>
+          ${(s.teams || []).length
+              ? `<div class="counts">${esc((s.teams || []).join(", "))}</div>` : ""}</td>
       <td>${s.fixed
-              ? '<span class="none" title="SUPERVISORY_TELEGRAM_ID on the service">set in the service settings</span>'
+              ? `<span class="none" title="${esc(where)}">not changed from here</span>`
               : `<button class="fixbtn danger p-dels" data-s="${esc(s.id)}"
-                         data-n="${esc(s.label || s.id)}">Remove</button>`}</td>
-    </tr>`).join("") || supEmpty;
+                         data-n="${esc(who || s.id)}">Remove</button>`}</td>
+    </tr>`;
+  }).join("") || supEmpty;
 
+  const owing = drivers.filter(d => (d.owed || []).length).length;
   el.innerHTML = `<div class="ppl">
     <div id="ppl-err"></div>
-    <section>
-      <h3>🚗 Drivers</h3>
+    ${fold("drivers", "🚗 Drivers", `${drivers.length} · ${owing} owing`, `
       <table><thead><tr><th>Driver</th><th>Receipts</th><th>Actions</th></tr></thead>
         <tbody>${dRows}</tbody></table>
       <div class="add">
@@ -2010,11 +2110,9 @@ function renderPeople() {
         <input id="nd-tg" placeholder="Telegram id (from /whoami)" autocomplete="off">
         <input id="nd-phone" placeholder="Phone (optional)" autocomplete="off">
         <button class="btn primary" id="nd-add">Add driver</button>
-      </div>
-    </section>
-    <section>
-      <h3>👑 Supervisors</h3>
-      <table><thead><tr><th>Supervisor</th><th></th></tr></thead>
+      </div>`)}
+    ${fold("sups", "👑 Supervisors", String(sups.length), `
+      <table><thead><tr><th>Supervisor</th><th>Where from</th><th></th></tr></thead>
         <tbody>${sRows}</tbody></table>
       <div class="add">
         <input id="ns-label" placeholder="Name" autocomplete="off">
@@ -2022,11 +2120,9 @@ function renderPeople() {
         <button class="btn primary" id="ns-add">Add supervisor</button>
       </div>
       <p class="note">Anyone on this list can open the bot's /settings and release
-        a tag. The ones marked <b>from the environment</b> are set in
-        SUPERVISORY_TELEGRAM_ID on the service itself — they cannot be removed from
-        here, because a web page cannot edit a service's environment. Anyone added
-        below goes into the same list the bot reads in /settings.</p>
-    </section>
+        a tag. Only the ones <b>added here</b> can be removed here — a team's
+        supervisor is set on the team, and a service setting is set on the
+        service. Anyone added below goes into the same list the bot reads.</p>`)}
     ${delSection(p.deleted || [])}
   </div>`;
   // The board keeps the Delete button either way -- a button that says why it
@@ -2046,55 +2142,102 @@ function renderPeople() {
   CAN_BROADCAST = p.can_broadcast !== false;
   if (notes.length) document.getElementById("ppl-err").innerHTML = notes.join("");
 
+  el.querySelectorAll("details.pfold").forEach(d => d.ontoggle = () => {
+    PFOLD[d.dataset.fold] = d.open;
+    try { localStorage.setItem("krab_pfold", JSON.stringify(PFOLD)); } catch (e) {}
+  });
+
   const D = q => el.querySelectorAll(q);
-  D(".p-susp").forEach(b => b.onclick = () => peopleAction(
-    `${API}/drivers/${encodeURIComponent(b.dataset.d)}/suspend`,
-    {method: "POST", headers: {"Content-Type": "application/json"},
-     body: JSON.stringify({suspended: b.dataset.on === "1"})}, b));
-  D(".p-act").forEach(b => b.onclick = () => peopleAction(
-    `${API}/drivers/${encodeURIComponent(b.dataset.d)}/active`, {method: "POST"}, b));
-  D(".p-waive").forEach(b => b.onclick = () => peopleAction(
-    `${API}/drivers/${encodeURIComponent(b.dataset.d)}/waive`,
-    {method: "POST", headers: {"Content-Type": "application/json"},
-     body: JSON.stringify({lead_id: b.dataset.l})}, b));
+  // Each action says what it did and how to put it back. The way back is the
+  // same endpoint with the opposite argument, so there is no second code path
+  // that could disagree with the first.
+  D(".p-susp").forEach(b => b.onclick = () => {
+    const on = b.dataset.on === "1";
+    const url = `${API}/drivers/${encodeURIComponent(b.dataset.d)}/suspend`;
+    peopleAction(url, {method: "POST", headers: {"Content-Type": "application/json"},
+                       body: JSON.stringify({suspended: on})}, b,
+      on ? "Suspended." : "Unsuspended.",
+      () => jpost(url, {suspended: !on}));
+  });
+  D(".p-act").forEach(b => b.onclick = () => {
+    const url = `${API}/drivers/${encodeURIComponent(b.dataset.d)}/active`;
+    peopleAction(url, {method: "POST"}, b, "Changed.", () => jpost(url));
+  });
+  D(".p-waive").forEach(b => b.onclick = () => {
+    const url = `${API}/drivers/${encodeURIComponent(b.dataset.d)}/waive`;
+    const lead = b.dataset.l;
+    peopleAction(url, {method: "POST", headers: {"Content-Type": "application/json"},
+                       body: JSON.stringify({lead_id: lead})}, b,
+      "Receipt cleared.",
+      () => jpost(url, {lead_id: lead, excluded: false}));
+  });
   D(".p-delv").forEach(b => b.onclick = () => {
     if (!confirm(`Delete ${b.dataset.n || "this driver"}? Only a driver who has `
                  + `never been sent a lead can be deleted.`)) return;
-    peopleAction(`${API}/drivers/${encodeURIComponent(b.dataset.d)}`,
-                 {method: "DELETE"}, b);
+    const id = b.dataset.d;
+    const was = (PEOPLE.drivers || []).find(d => d.id === id) || {};
+    peopleAction(`${API}/drivers/${encodeURIComponent(id)}`, {method: "DELETE"}, b,
+      `${b.dataset.n || "Driver"} deleted.`,
+      // Only a driver with no history can be deleted, so putting them back is
+      // the same three facts going in again -- there is nothing else to lose.
+      () => jpost(`${API}/drivers`, {name: was.name, telegram_id: was.telegram_id,
+                                     phone: was.phone, email: was.email}));
   });
   D(".p-undel").forEach(b => b.onclick = () => {
     if (!confirm(`Put ${b.dataset.n} back on the boards?`)) return;
-    peopleAction(`${API}/transmissions/${encodeURIComponent(b.dataset.l)}/restore`,
-                 {method: "POST"}, b).then(ok => { if (ok) load(); });
+    const id = b.dataset.l;
+    const row = (PEOPLE && PEOPLE.deleted || []).find(r => r.lead_id === id) || {};
+    peopleAction(`${API}/transmissions/${encodeURIComponent(id)}/restore`,
+                 {method: "POST"}, b, `${b.dataset.n} is back on the boards.`,
+      // Re-deleting keeps the reason it was deleted with the first time, so an
+      // undo cannot quietly rewrite why it went.
+      () => jpost(`${API}/transmissions/${encodeURIComponent(id)}/delete`,
+                  {reason: row.reason || "restored in error", by: whoAmI(false) || "the office"})
+    ).then(ok => { if (ok) load(); });
   });
   D(".p-dels").forEach(b => b.onclick = () => {
     if (!confirm(`Remove ${b.dataset.n} as a supervisor?`)) return;
-    peopleAction(`${API}/supervisors/${encodeURIComponent(b.dataset.s)}`,
-                 {method: "DELETE"}, b);
+    const id = b.dataset.s;
+    const was = sups.find(s => s.id === id) || {};
+    peopleAction(`${API}/supervisors/${encodeURIComponent(id)}`, {method: "DELETE"}, b,
+      `${b.dataset.n} removed.`,
+      () => jpost(`${API}/supervisors`, {id: id, label: was.label || was.name || ""}));
   });
   const add = document.getElementById("nd-add");
-  if (add) add.onclick = () => peopleAction(`${API}/drivers`, {
-    method: "POST", headers: {"Content-Type": "application/json"},
-    body: JSON.stringify({
-      name: document.getElementById("nd-name").value.trim(),
-      telegram_id: document.getElementById("nd-tg").value.trim(),
-      phone: document.getElementById("nd-phone").value.trim(),
-    })}, add);
+  if (add) add.onclick = () => {
+    const tg = document.getElementById("nd-tg").value.trim();
+    const name = document.getElementById("nd-name").value.trim();
+    peopleAction(`${API}/drivers`, {
+      method: "POST", headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({
+        name, telegram_id: tg,
+        phone: document.getElementById("nd-phone").value.trim(),
+      })}, add, `${name || "Driver"} added.`,
+      // The id is the database's, not ours, so the undo finds them by the one
+      // thing we did choose -- their Telegram id.
+      () => {
+        const made = (PEOPLE.drivers || []).find(d => String(d.telegram_id) === tg);
+        if (!made) throw new Error("that driver is no longer here");
+        return jpost(`${API}/drivers/${encodeURIComponent(made.id)}`, undefined, "DELETE");
+      });
+  };
   const sadd = document.getElementById("ns-add");
-  if (sadd) sadd.onclick = () => peopleAction(`${API}/supervisors`, {
-    method: "POST", headers: {"Content-Type": "application/json"},
-    body: JSON.stringify({
-      label: document.getElementById("ns-label").value.trim(),
-      id: document.getElementById("ns-tg").value.trim(),
-    })}, sadd);
+  if (sadd) sadd.onclick = () => {
+    const id = document.getElementById("ns-tg").value.trim();
+    const label = document.getElementById("ns-label").value.trim();
+    peopleAction(`${API}/supervisors`, {
+      method: "POST", headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({label, id})}, sadd, `${label || id} added.`,
+      () => jpost(`${API}/supervisors/${encodeURIComponent(id)}`, undefined, "DELETE"));
+  };
 }
 
 // Nothing here is destroyed, so everything here can come back. Payments and
 // receipts owed stay against the row either way -- restoring only puts it back
 // on the boards.
 function delSection(rows) {
-  if (!rows.length) return "";
+  if (!rows.length) return fold("deleted", "🗑 Deleted leads", "0",
+    `<p class="note">Nothing has been deleted.</p>`);
   const dash = v => (v === undefined || v === null || v === "" || v === "—") ? "—" : v;
   const body = rows.map(r => `<tr>
       <td><b>${esc(r.reference_id)}</b>
@@ -2113,15 +2256,13 @@ function delSection(rows) {
       <td><button class="fixbtn p-undel" data-l="${esc(r.lead_id)}"
                   data-n="${esc(r.reference_id)}">Put it back</button></td>
     </tr>`).join("");
-  return `<section>
-    <h3>🗑 Deleted leads <span class="counts">${rows.length}</span></h3>
+  return fold("deleted", "🗑 Deleted leads", String(rows.length), `
     <div class="tblwrap">
     <table><thead><tr><th>Lead</th><th>Issuer / team</th><th>Driver</th>
       <th>Was at</th><th>Deleted</th><th></th></tr></thead>
       <tbody>${body}</tbody></table></div>
     <p class="note">Deleted leads are hidden from every board and every count.
-      Nothing was destroyed — anything paid against them is still on record.</p>
-  </section>`;
+      Nothing was destroyed — anything paid against them is still on record.</p>`);
 }
 
 // ── Deleting a lead ───────────────────────────────────────────────────────
@@ -2163,6 +2304,9 @@ document.getElementById("del-go").onclick = async () => {
     return;
   }
   const go = document.getElementById("del-go");
+  const gone = DEL_ID;
+  const delRow = ALL.find(x => x.lead_id === gone) || {};
+  const ref = delRow.reference_id || "That lead";
   go.disabled = true;
   document.getElementById("del-result").textContent = "Deleting…";
   try {
@@ -2189,6 +2333,19 @@ document.getElementById("del-go").onclick = async () => {
     if (bad.length) note += `<div class="err">Could not tell: ` +
       bad.map(f => `${esc(f.name)} (${esc(f.why)})`).join("; ") + `</div>`;
     document.getElementById("err").innerHTML = note;
+    // Ten seconds to take it back. The teams have already been told it is gone,
+    // so the notice stays wrong until somebody says otherwise -- which is
+    // exactly why the way back has to be one tap and not a hunt.
+    toastUndo(`${ref} deleted.`, async () => {
+      const r2 = await fetch(`${API}/transmissions/${encodeURIComponent(gone)}/restore`,
+                             {method: "POST"});
+      if (!r2.ok) throw new Error(((await r2.json().catch(() => ({}))).error) || r2.status);
+      PEOPLE = null;
+      await load();
+      document.getElementById("err").innerHTML =
+        `<div class="ok">${esc(ref)} is back. The teams were told it was deleted —
+         tell them it is back if anybody is waiting on it.</div>`;
+    });
   } catch (e) {
     document.getElementById("del-result").textContent = "";
     document.getElementById("err").innerHTML =
@@ -2850,7 +3007,7 @@ def _env_supervisors() -> list:
         if not t or t in seen:
             continue
         seen.add(t)
-        out.append({"id": t, "label": "", "fixed": True})
+        out.append({"id": t, "label": "", "fixed": True, "source": "env"})
     return out
 
 
@@ -2873,14 +3030,82 @@ def _extra_supervisors(db) -> list:
     return out
 
 
+def _team_supervisors(db) -> list:
+    """Each team's supervisor, from groups.supervisory_telegram_id.
+
+    This is who the bot copies that team's leads to -- the working definition of
+    a supervisor on this system, and the one the board could see all along.
+    Several teams can share one person, so the teams are collected onto them.
+    """
+    try:
+        groups = db.get_all_groups() or []
+    except Exception as e:
+        logger.warning("team supervisors read failed: %s", e)
+        return []
+    by_id = {}
+    for g in groups:
+        for tok in str((g or {}).get("supervisory_telegram_id") or "").split(","):
+            tid = tok.strip()
+            if not tid:
+                continue
+            row = by_id.setdefault(tid, {"id": tid, "label": "", "fixed": True,
+                                         "source": "team", "teams": []})
+            name = str((g or {}).get("group_name") or "").strip()
+            if name and name not in row["teams"]:
+                row["teams"].append(name)
+    return list(by_id.values())
+
+
+def _st_supervisor(db) -> list:
+    """The standing supervisor kept in settings (st_telegram_id)."""
+    try:
+        raw = (db.get_setting("st_telegram_id") or "").strip()
+    except Exception:
+        return []
+    out = []
+    for tok in raw.split(","):
+        tid = tok.strip()
+        if tid:
+            out.append({"id": tid, "label": "", "fixed": True, "source": "settings"})
+    return out
+
+
 def _board_supervisors(db) -> list:
-    """Everyone in charge: the environment's, then the ones added from /settings."""
-    out = _env_supervisors()
-    have = {r["id"] for r in out}
-    for r in _extra_supervisors(db):
-        if r["id"] not in have:
-            have.add(r["id"])
-            out.append(r)
+    """Everyone this system treats as a supervisor, and where each comes from.
+
+    Four sources, in the order somebody would want to see them: the teams they
+    supervise, the standing one in settings, this service's own environment, and
+    anyone added here. Deduped by id -- one person supervising three teams is
+    one supervisor -- and named wherever a name can be found, because a bare
+    Telegram id identifies nobody.
+    """
+    out, have = [], set()
+    for row in (_team_supervisors(db) + _st_supervisor(db)
+                + _env_supervisors() + _extra_supervisors(db)):
+        tid = str(row.get("id") or "").strip()
+        if not tid:
+            continue
+        if tid in have:
+            # Already listed from a stronger source; keep any teams it carries.
+            for r in out:
+                if r["id"] == tid:
+                    for t in row.get("teams") or []:
+                        if t not in r.setdefault("teams", []):
+                            r["teams"].append(t)
+                    if not r.get("label") and row.get("label"):
+                        r["label"] = row["label"]
+            continue
+        have.add(tid)
+        row.setdefault("source", "added")
+        row.setdefault("fixed", False)
+        out.append(row)
+    try:
+        names = db.resolve_telegram_names([r["id"] for r in out]) or {}
+    except Exception as e:
+        logger.info("supervisor names: %s", e)
+        names = {}
+    for r in out:
+        r["name"] = names.get(r["id"], "")
     return out
 
 
@@ -3617,11 +3842,14 @@ def register(app, db_provider):
         leaderboard, the receipts owed and the suspension counter all agree
         about it at once.
         """
-        lead_id = ((request.get_json(silent=True) or {}).get("lead_id") or "").strip()
+        body = request.get_json(silent=True) or {}
+        lead_id = (body.get("lead_id") or "").strip()
+        # False puts the receipt back on their count -- what Undo sends.
+        excluded = bool(body.get("excluded", True))
         if not lead_id:
             return jsonify({"error": "Which receipt?"}), 400
         try:
-            ok = _resolve().set_lead_excluded(lead_id, True)
+            ok = _resolve().set_lead_excluded(lead_id, excluded)
         except Exception as e:
             return jsonify({"error": str(e)}), 500
         return (jsonify({"ok": True}) if ok else
@@ -3637,9 +3865,15 @@ def register(app, db_provider):
             return jsonify({"error": "A numeric Telegram id is required — "
                                      "they can get theirs from /whoami."}), 400
         db = _resolve()
-        if any(str(r.get("id")) == tg for r in _env_supervisors()):
-            return jsonify({"error": "Already a supervisor — they are set in "
-                                     "SUPERVISORY_TELEGRAM_ID."}), 409
+        # Only a supervisor this list does not own blocks the add. Re-adding one
+        # that WAS added here is how you rename them, and refusing that would
+        # take away the only way to put a name on a bare Telegram id.
+        clash = next((r for r in _board_supervisors(db)
+                      if str(r.get("id")) == tg and r.get("source") != "added"), None)
+        if clash:
+            return jsonify({"error": "They are already a supervisor (%s) — adding "
+                                     "them here would change nothing."
+                                     % clash.get("source")}), 409
         rows = [r for r in _extra_supervisors(db) if str(r.get("id")) != tg]
         rows.append({"id": tg, "label": label})
         return (jsonify({"ok": True, "supervisors": rows})
@@ -3649,11 +3883,19 @@ def register(app, db_provider):
     @app.route("/receipts/api/supervisors/<sup_id>", methods=["DELETE"])
     def api_remove_supervisor(sup_id):
         db = _resolve()
-        if any(str(r.get("id")) == str(sup_id) for r in _env_supervisors()):
-            return jsonify({"error": "That supervisor is set in the service's own "
-                                     "SUPERVISORY_TELEGRAM_ID. Change it on "
-                                     "krab-issuer-admin (and the bot) — a web page "
-                                     "cannot edit an environment variable."}), 409
+        fixed = {str(r.get("id")): r for r in _board_supervisors(db)
+                 if r.get("source") != "added"}
+        if str(sup_id) in fixed:
+            where = {
+                "team": "set on the team itself — change it under Dispatchers "
+                        "in the bot's /settings",
+                "settings": "the standing supervisor (st_telegram_id) — change it "
+                            "in the bot's /settings",
+                "env": "set in the service's own SUPERVISORY_TELEGRAM_ID — change "
+                       "it on krab-issuer-admin and the bot",
+            }.get(fixed[str(sup_id)].get("source"), "not managed from this list")
+            return jsonify({"error": "That supervisor is %s. Removing them here "
+                                     "would not remove them." % where}), 409
         rows = [r for r in _extra_supervisors(db) if str(r.get("id")) != str(sup_id)]
         return (jsonify({"ok": True, "supervisors": rows})
                 if _save_board_supervisors(db, rows)
