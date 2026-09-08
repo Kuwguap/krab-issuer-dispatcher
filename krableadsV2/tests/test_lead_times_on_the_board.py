@@ -188,5 +188,73 @@ class EveryTimeIsNewYorkTimeTest(unittest.TestCase):
         self.assertIn('class="tz">ET<', SRC_BOARD)
 
 
+class TheBoardShowsTheVinTest(unittest.TestCase):
+    """The one identifying fact about the car. "2020 RAM 1500" is true of a great
+    many vehicles; the VIN is what gets read back to a client, checked against a
+    title, or searched for when somebody rings about the wrong car."""
+
+    ALIGNED = ("MARQUISE REID\n55 HOBSON AVE\nMILFORD CT 06460\n-\n-\n"
+               "1C6SRFJT3LN251538\n2020 RAM 1500\nWhite")
+
+    def test_it_reads_the_vin_line(self):
+        self.assertEqual("1C6SRFJT3LN251538",
+                         ad._vin_from_vehicle_details(self.ALIGNED))
+
+    def test_a_misaligned_paste_still_finds_it(self):
+        """Issuers paste these by hand and the lines come in shifted often
+        enough that the bot and the web tag endpoint both recover this way. A
+        board showing nothing for a VIN the tag PDF prints would send somebody
+        hunting a bug that is not there."""
+        shifted = "NAME\nADDR\n1C6SRFJT3LN251538\nCITY\n-\n-\n2020 RAM 1500"
+        self.assertEqual("1C6SRFJT3LN251538", ad._vin_from_vehicle_details(shifted))
+
+    def test_it_is_upper_cased(self):
+        low = "N\n-\n-\n-\n-\n1c6srfjt3ln251538\nCAR"
+        self.assertEqual("1C6SRFJT3LN251538", ad._vin_from_vehicle_details(low))
+
+    def test_something_that_is_not_a_vin_is_not_offered_as_one(self):
+        """17 characters exactly, or nothing. A truncated or padded VIN on a
+        legal document is worse than an empty field."""
+        for blob in ("N\n-\n-\n-\n-\nABC123\n-",          # too short
+                     "N\n-\n-\n-\n-\n-\nCAR",              # absent
+                     "",
+                     None):
+            with self.subTest(blob=blob):
+                self.assertEqual("", ad._vin_from_vehicle_details(blob))
+
+    def test_the_detail_panel_shows_it(self):
+        detail = SRC_BOARD.split("function detailBody(", 1)[1].split("\nfunction ", 1)[0]
+        self.assertIn("<dt>VIN</dt>", detail)
+        self.assertIn("vinCell(r)", detail)
+
+    def test_a_two_car_lead_shows_both(self):
+        """Two cars owe two tags and have two VINs; showing only the first is
+        how the second car goes unchecked."""
+        cell = SRC_BOARD.split("function vinCell(r)", 1)[1].split("\nfunction ", 1)[0]
+        self.assertIn("r.vins", cell)
+        self.assertIn("list.length > 1", cell)
+
+    def test_a_missing_vin_says_so(self):
+        cell = SRC_BOARD.split("function vinCell(r)", 1)[1].split("\nfunction ", 1)[0]
+        self.assertIn("not on file", cell)
+
+    def test_the_export_carries_it(self):
+        self.assertIn('"car","vin"', SRC_BOARD)
+
+    def test_click_to_copy_is_actually_wired(self):
+        """The cell carries a title promising it. A tooltip that lies about what
+        a click does is worse than no tooltip."""
+        self.assertIn('data-copy="${esc(v)}"', SRC_BOARD)
+        self.assertIn('e.target.closest(".vin")', SRC_BOARD)
+
+    def test_the_copy_handler_runs_before_the_expander(self):
+        """A VIN sits inside the detail panel; .exp further down the chain would
+        otherwise fold the row shut under the cursor."""
+        handler = SRC_BOARD.split('addEventListener("click"', 1)[1]
+        i_vin = handler.index('closest(".vin")')
+        i_exp = handler.index('closest(".exp")')
+        self.assertLess(i_vin, i_exp)
+
+
 if __name__ == "__main__":
     unittest.main()

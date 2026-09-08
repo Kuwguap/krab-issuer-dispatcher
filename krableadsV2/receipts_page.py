@@ -952,6 +952,10 @@ BOARD_HTML = r"""<!doctype html>
  .taglink:hover { border-color:var(--accent); color:var(--accent); }
  .tagset { display:flex; flex-wrap:wrap; }
  .rate { display:inline-block; margin-right:10px; }
+ .vin { display:inline-block; margin-right:10px; font-family:ui-monospace,
+        SFMono-Regular,Menlo,monospace; font-size:12.5px; letter-spacing:.02em;
+        cursor:pointer; }
+ .vin:hover { text-decoration:underline; }
  .stamp { line-height:1.25; white-space:nowrap; }
  .stamp .sday { font-size:12px; }
  .stamp .sclock { font-size:12px; font-variant-numeric:tabular-nums; opacity:.85; }
@@ -1308,13 +1312,26 @@ function contacts(r) {
       tgHref: r.issuer_username ? "https://t.me/" + r.issuer_username : "",
       phone: "", email: "",
     },
-    dispatcher: {
-      label: "Dispatcher", name: r.group_name === "—" ? "" : r.group_name,
-      tg: r.dispatcher_tg_id ? "sup " + r.dispatcher_tg_id
-          : (r.group_tg_id ? "grp " + r.group_tg_id : ""),
-      tgHref: "",
-      phone: "", email: "",
-    },
+    dispatcher: (() => {
+      // A lead's group_id is stamped at ingest with the alphabetically FIRST
+      // active dispatcher, so until a team accepts, the name on the row is an
+      // accident of sorting -- not a fact about who owns the job. That is why
+      // one team kept appearing on leads that were never theirs.
+      const claimed = r.group_accepted !== false || !(r.group_offers > 0);
+      const nm = r.group_name === "—" ? "" : r.group_name;
+      return {
+        label: claimed ? "Dispatcher" : "Dispatcher (offered)",
+        name: claimed ? nm : "",
+        pending: !claimed,
+        offers: r.group_offers || 0,
+        tg: claimed
+          ? (r.dispatcher_tg_id ? "sup " + r.dispatcher_tg_id
+             : (r.group_tg_id ? "grp " + r.group_tg_id : ""))
+          : "",
+        tgHref: "",
+        phone: "", email: "",
+      };
+    })(),
   };
 }
 
@@ -1383,8 +1400,12 @@ function block(r, party) {
   const btns = [];
   if (c.email) btns.push(actButton(r, party, "email", "✉ Email"));
   if (c.phone) btns.push(actButton(r, party, "sms", "💬 SMS"));
+  const unclaimedNote = (party === "dispatcher" && c.pending)
+    ? `<span class="none">offered to ${c.offers || 0} \u00b7 none accepted</span>`
+    : "";
   return `<div class="party">`
-    + `<div class="pname">${c.name ? esc(c.name) : '<span class="none">—</span>'}`
+    + `<div class="pname">${c.name ? esc(c.name)
+        : (unclaimedNote || '<span class="none">—</span>')}`
     + (c.pending && c.name ? ` <span class="pend" title="Offered — this driver has not accepted yet">offered</span>` : "")
     + `</div>`
     + contactLine("✈", c.tg, c.tgHref)
@@ -1499,6 +1520,7 @@ function detailBody(r) {
   return `<dl>
       <dt>Reference</dt><dd class="ref">${esc(r.reference_id)}</dd>
       <dt>Car</dt><dd>${esc(r.car)} ${(r.tags || 1) > 1 ? `— <b>${esc(r.tags)} tags owed</b>` : ""}</dd>
+      <dt>VIN</dt><dd>${vinCell(r)}</dd>
       <dt>Entered</dt><dd>${esc(exactWhen(r.created_at))} ET</dd>
       <dt>Delivered</dt><dd>${r.delivered_at
         ? esc(exactWhen(r.delivered_at)) + " ET" + (r.delivered_exact === false
@@ -1536,6 +1558,16 @@ function tagLink(r, car, label, title) {
   const href = TAG + encodeURIComponent(r.lead_id) + (car > 1 ? `?car=${car}` : "");
   return `<a class="taglink" href="${href}" target="_blank" rel="noopener"
     title="${esc(title)}">🏷 ${esc(label)}</a>`;
+}
+
+// The VIN, tap-to-copy, one per car. Monospaced because a VIN gets read out
+// character by character and 8/B and 0/O are the whole difficulty of doing that.
+function vinCell(r) {
+  const list = (r.vins && r.vins.length) ? r.vins : (r.vin ? [r.vin] : []);
+  if (!list.length) return '<span class="none">not on file</span>';
+  return list.map((v, i) => `<span class="vin" title="Click to copy"
+      data-copy="${esc(v)}">${list.length > 1 ? `<b>${i + 1}.</b> ` : ""}${esc(v)}</span>`)
+    .join("");
 }
 
 function tagCell(r) {
@@ -1621,6 +1653,7 @@ function cardHtml(r, idx) {
       <div class="c-id">
         <div class="cname"><span class="idx">#${idx}</span> ${esc(r.client_name)}</div>
         <div class="ref">${esc(r.reference_id)} · ${esc(r.car)}</div>
+        <div class="ref">${vinCell(r)}</div>
         <div class="tagset">${tagCell(r)}</div>
         <div class="stamps">
           <span class="slab">Entered</span>${stampCell(r.created_at)}
@@ -1763,6 +1796,28 @@ async function saveStatus(id, next, holder) {
 // One set of listeners for every layout — rows, cards and month folders come
 // and go, the container stays.
 document.querySelector("main").addEventListener("click", e => {
+  // First, because a VIN lives inside the detail panel and the expander below
+  // would otherwise swallow the click and fold the row shut under the cursor.
+  const vin = e.target.closest(".vin");
+  if (vin && vin.dataset.copy) {
+    const text = vin.dataset.copy;
+    const done = ok => toast(ok ? "VIN copied: " + text : "Could not copy the VIN", ok);
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(text).then(() => done(true), () => done(false));
+    } else {
+      // http:// origins and older browsers have no clipboard API. Select it so
+      // the VIN can still be copied by hand rather than silently doing nothing.
+      try {
+        const rng = document.createRange();
+        rng.selectNodeContents(vin);
+        const sel = window.getSelection();
+        sel.removeAllRanges();
+        sel.addRange(rng);
+        toast("VIN selected \u2014 press Ctrl+C", true);
+      } catch (err) { done(false); }
+    }
+    return;
+  }
   const mh = e.target.closest(".mrow, .mdivider");
   if (mh) {
     const k = mh.dataset.mk;
@@ -1954,7 +2009,7 @@ document.addEventListener("keydown", e => {
 
 // ── CSV ────────────────────────────────────────────────────────────────────
 function fallbackCsv(rows) {
-  const cols = ["reference_id","client_name","client_phone","email","car","tags","price",
+  const cols = ["reference_id","client_name","client_phone","email","car","vin","tags","price",
                 "has_receipt","receipt_at","status","driver_name","group_name","issuer",
                 "created_at","delivered_at","issue_date","delivery","notes",
                 "status_updated_by"];

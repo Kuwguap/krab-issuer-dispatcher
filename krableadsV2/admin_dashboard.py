@@ -139,6 +139,31 @@ def _price_number(raw) -> float:
         return 0.0
 
 
+# Exactly 17 alphanumerics: the only valid VIN shape. Mirrors bot.py and
+# dispatch_web/tagpdf.py -- never cut or pad one to fit.
+_VIN_RE = re.compile(r"\b[A-Za-z0-9]{17}\b")
+
+
+def _vin_from_vehicle_details(vd: str, line_index: int = 5) -> str:
+    """The VIN off a stored lead, the way the tag builder finds it.
+
+    Line 6 when the blob is well-formed, otherwise the first 17-character run
+    anywhere in it. The fallback is not paranoia: issuers paste these by hand,
+    the lines come in misaligned regularly, and both the bot and the web tag
+    endpoint already recover the same way. A board showing nothing for a VIN
+    that the tag PDF prints would send somebody looking for a bug that is not
+    there.
+    """
+    text = str(vd or "")
+    lines = [ln.strip() for ln in text.splitlines()]
+    if len(lines) > line_index:
+        candidate = lines[line_index]
+        if _VIN_RE.fullmatch(candidate or ""):
+            return candidate.upper()
+    m = _VIN_RE.search(text)
+    return m.group(0).upper() if m else ""
+
+
 def _delivery_moment(lead: dict, stamped) -> dict:
     """When this lead was delivered, and how sure we are of it.
 
@@ -655,6 +680,30 @@ class AdminDatabase:
             except Exception as e:
                 logger.warning("transmissions: insurance lookup (%s) failed: %s", cols[:40], e)
 
+        # Has anybody actually TAKEN this lead? A lead's group_id is stamped at
+        # ingest with the alphabetically-first active group, so until a team
+        # accepts, the name on the row is an accident of sorting rather than a
+        # fact about who owns the job.
+        offers_by_lead = {}
+        try:
+            go = (
+                self.client.table("group_lead_offers")
+                .select("lead_id, status")
+                .in_("lead_id", lead_ids[:1000]).execute()
+            )
+            for row in (go.data or []):
+                lid = str(row.get("lead_id") or "")
+                if not lid:
+                    continue
+                seen = offers_by_lead.setdefault(lid, {"offers": 0, "accepted": False})
+                seen["offers"] += 1
+                if str(row.get("status") or "") == "accepted":
+                    seen["accepted"] = True
+        except Exception as e:
+            # No offers table, no claim to make either way. The column falls back
+            # to naming the stamped group, which is what it always did.
+            logger.warning("transmissions: group offer lookup failed: %s", e)
+
         # Its own query, like the insurance block above and for the same reason:
         # delivered_at arrives by migration, and folding it into the main select
         # would drop the WHOLE board back to the lean fallback (losing
@@ -709,16 +758,35 @@ class AdminDatabase:
             if driver_pending:
                 drv = pending_by_lead.get(lid) or {}
             grp = groups_by_id.get(str(r.get("group_id") or "")) or {}
+            # Every VIN on the lead, car 1 first. A two-car lead owes two tags
+            # and has two VINs, and showing only the first is how the second car
+            # goes unchecked.
+            vins = []
+            first_vin = _vin_from_vehicle_details(r.get("vehicle_details"))
+            if first_vin:
+                vins.append(first_vin)
+            for v in extra:
+                ev = str(v.get("vin") or "").strip().upper()
+                if ev and ev not in vins:
+                    vins.append(ev)
+
             row = {
                 "lead_id": lid,
                 "reference_id": (r.get("reference_id") or "N/A").strip(),
                 "client_name": client or "—",
                 "car": car or "—",
+                "vin": first_vin,
+                "vins": vins,
                 "price": (r.get("price") or "").strip() or "—",
                 "driver_name": (drv.get("driver_name") or "").strip() or "—",
                 # True when that name is an OPEN OFFER, not an acceptance.
                 "driver_pending": bool(driver_pending and drv.get("driver_name")),
                 "group_name": (grp.get("group_name") or "").strip() or "—",
+                # How many dispatchers were asked, and whether any said yes.
+                # The board uses these to avoid calling an unclaimed lead
+                # somebody's -- see the note on offers_by_lead above.
+                "group_offers": int((offers_by_lead.get(lid) or {}).get("offers") or 0),
+                "group_accepted": bool((offers_by_lead.get(lid) or {}).get("accepted")),
                 "issuer": (r.get("telegram_username") or "—").strip() or "—",
                 "tags": 1 + len(extra),
                 "status": (r.get("delivery_status") or "new"),
