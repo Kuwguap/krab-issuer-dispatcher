@@ -763,7 +763,7 @@ BOARD_HTML = r"""<!doctype html>
         display:none; }
  .err { background:var(--bad-bg); color:var(--bad-ink); padding:10px 14px;
         border-radius:8px; margin:10px 18px; }
- main { padding:12px 18px 18px; }
+ main { padding:12px 18px 80px; }
  .view { display:none; }
  .view.on { display:block; }
  .wrap { overflow:auto; background:var(--card); border:1px solid var(--line);
@@ -849,21 +849,18 @@ BOARD_HTML = r"""<!doctype html>
  .pflag.off{color:#b3261e;border-color:#e0b4b4}
  .pflag.susp{color:#8a5a00;border-color:#e4c98a}
  .owe{display:flex;gap:6px;flex-wrap:wrap;margin-top:4px}
- /* The board's main is full width with 18px sides — match it, so the section
-    reads as the end of the same page rather than a card floating under it. */
- .checkin{margin:0 18px 90px;padding:16px 18px;
-          border:1px solid var(--line);border-radius:14px;background:var(--card)}
- .checkin h2{margin:0 0 4px;font-size:1.05rem}
- .checkin .note{margin:0 0 12px}
- .ci-do{display:flex;gap:8px;flex-wrap:wrap;align-items:center}
- .ci-do input{flex:1 1 16rem;min-width:0}
- .ci-list{margin-top:14px;display:grid;gap:8px}
- .ci-row{display:flex;gap:10px;align-items:baseline;flex-wrap:wrap;
-         padding:8px 10px;border:1px solid var(--line);border-radius:10px}
- .ci-row b{white-space:nowrap}
- .ci-when{color:var(--muted);font-size:.85rem;white-space:nowrap}
- .ci-what{color:var(--muted);font-size:.85rem}
- .ci-note{flex:1 1 12rem}
+ .chk{display:flex;flex-direction:column;gap:4px;align-items:flex-start}
+ .chkbtn{font:inherit;font-size:.8rem;padding:4px 9px;border-radius:999px;
+         border:1px solid var(--line);background:var(--bg);color:inherit;
+         cursor:pointer;white-space:nowrap}
+ .chkbtn:hover{border-color:var(--muted)}
+ .chkbtn.on{border-color:#1f7a4d;color:#1f7a4d;font-weight:600}
+ .chkbtn[disabled]{opacity:.5;cursor:default}
+ .chkn{font-size:.75rem;color:var(--muted);cursor:help}
+ .chkrow{display:flex;gap:8px;flex-wrap:wrap;align-items:baseline;
+         padding:3px 0;border-bottom:1px dashed var(--line)}
+ .chkrow:last-child{border-bottom:0}
+ .chklist{margin:4px 0 6px;width:100%}
  .ppl .tblwrap{overflow-x:auto}
  .ppl .tblwrap table{min-width:44rem}
  .pend { display:inline-block; margin-left:6px; padding:1px 6px; border-radius:9px;
@@ -963,7 +960,6 @@ BOARD_HTML = r"""<!doctype html>
    h1 { font-size:16px; }
    .sub { display:none; }
    main { padding:10px 8px 90px; }
-   .checkin { margin:0 8px 90px; }
    #stats { padding:8px 8px 0; }
    .wrap { max-height:none; }
    .tabs { width:100%; order:3; overflow-x:auto; flex-wrap:nowrap;
@@ -1048,8 +1044,9 @@ BOARD_HTML = r"""<!doctype html>
       <th>Status</th>
       <th>Insurance</th>
       <th class="hide-sm">Updated</th>
+      <th>Checked</th>
     </tr></thead>
-    <tbody id="rows"><tr><td colspan="16" class="none">Loading…</td></tr></tbody>
+    <tbody id="rows"><tr><td colspan="17" class="none">Loading…</td></tr></tbody>
   </table>
   </div>
   </div>
@@ -1060,21 +1057,6 @@ BOARD_HTML = r"""<!doctype html>
   <div class="view" id="vw-people"></div>
 </main>
 
-<!-- The very end of the board: who has been through it, and when. Outside
-     <main> so it stays put whichever view is open — a cross-check is of the
-     board, not of one way of looking at it. -->
-<section class="checkin" id="checkin">
-  <h2>✅ Check in</h2>
-  <p class="note">Checking in records that you have cross-checked the
-    transactions above — everyone signed in here can see who has, and when.</p>
-  <div class="ci-do">
-    <input id="ci-note" maxlength="200" autocomplete="off"
-           placeholder="Anything to flag? (optional)">
-    <button class="btn primary" id="ci-go">✅ Check in</button>
-  </div>
-  <div id="ci-msg"></div>
-  <div id="ci-list" class="ci-list"></div>
-</section>
 
 <div class="overlay" id="compose" hidden>
   <div class="sheet-modal">
@@ -1614,6 +1596,12 @@ function detailBody(r) {
                             : (r.has_receipt ? "external link" : "not handed in")}</dd>
       ${partyLines}
     </dl>
+    <div class="fixrec">
+      <b>Cross-checked by</b>
+      <div class="chklist">${checkList(r)}</div>
+      <span class="counts">Names are what each person calls themselves on this
+        board — an accountability trail, not a verified identity.</span>
+    </div>
     ${insuranceBlock(r)}
     ${r.has_receipt ? `<img loading="lazy" src="${IMG + encodeURIComponent(r.lead_id)}"
                          data-full="${IMG + encodeURIComponent(r.lead_id)}" alt="receipt">` : ""}
@@ -1661,6 +1649,77 @@ function tagCell(r) {
   return `<div class="tagset" title="one tag per car">${links.join("")}</div>`;
 }
 
+// ── Cross-checking a transaction ──────────────────────────────────────────
+// One check per person per lead. The cell shows whether YOU have checked this
+// one and how many others have; the names and times are in the row's detail
+// panel, where there is room to read them.
+function myCheck(r) {
+  const me = (localStorage.getItem("krab_who") || "").trim().toLowerCase();
+  if (!me) return null;
+  return (r.checkins || []).find(c => (c.who || "").trim().toLowerCase() === me) || null;
+}
+
+function checkCell(r) {
+  const all = r.checkins || [];
+  const mine = myCheck(r);
+  const others = all.length - (mine ? 1 : 0);
+  const who = all.map(c => `${c.who} · ${when(c.at)}`).join("\n");
+  return `<div class="chk">
+    <button class="chkbtn${mine ? " on" : ""}" data-check="${esc(r.lead_id)}"
+            title="${mine ? "You checked this " + esc(when(mine.at)) + " — tap to undo"
+                          : "Mark that you have cross-checked this transaction"}"
+      >${mine ? "✅ Checked" : "☐ Check"}</button>
+    ${all.length ? `<span class="chkn" title="${esc(who)}"
+        >${all.length} ✓${others && mine ? " (you +" + others + ")" : ""}</span>` : ""}
+  </div>`;
+}
+
+function checkList(r) {
+  const all = r.checkins || [];
+  if (!all.length) return '<span class="none">nobody has cross-checked this yet</span>';
+  return all.map(c => `<div class="chkrow"><b>${esc(c.who)}</b>
+      <span class="counts">${esc(when(c.at))}</span>
+      ${c.note ? `<span>${esc(c.note)}</span>` : ""}</div>`).join("");
+}
+
+async function toggleCheck(id, btn) {
+  const r = ALL.find(x => x.lead_id === id);
+  if (!r) return;
+  const who = whoAmI(true);
+  if (!who) { toast("Tell the board your name first — tap 👤 at the top.", false); return; }
+  const mine = myCheck(r);
+  btn.disabled = true;
+  try {
+    const res = await fetch(`${API}/transmissions/${encodeURIComponent(id)}/check`, {
+      method: mine ? "DELETE" : "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({who}),
+    });
+    const body = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(body.error || res.status);
+    // The server answers with the lead's whole list, so two people checking at
+    // once cannot leave one of them looking at a count that is short.
+    r.checkins = body.checkins || [];
+    // draw() rebuilds every row, and a rebuilt detail row comes back closed.
+    // Somebody who opened one to read the names and then pressed Check would
+    // watch it shut under them.
+    const det = document.getElementById("d-" + id);
+    const wasOpen = !!det && !det.hidden;
+    draw();
+    if (wasOpen) {
+      const back = document.getElementById("d-" + id);
+      const arrow = document.querySelector(`.exp[data-x="${CSS.escape(id)}"]`);
+      if (back) back.hidden = false;
+      if (arrow) arrow.textContent =
+        arrow.classList.contains("c-more") ? "▾ details" : "▾";
+    }
+    toast(mine ? "Check removed." : "Checked — thank you.", true);
+  } catch (e) {
+    toast("Could not do that: " + e.message, false);
+    btn.disabled = false;
+  }
+}
+
 function rowHtml(r, idx) {
   const s = statusBits(r);
   const phone = r.client_phone
@@ -1690,13 +1749,14 @@ function rowHtml(r, idx) {
     <td>${insuranceChip(r)}</td>
     <td class="hide-sm">${esc(when(r.status_updated_at))}<br>
         <span class="counts">${esc(r.status_updated_by || "")}</span></td>
+    <td>${checkCell(r)}</td>
   </tr>
-  <tr class="detail" id="d-${esc(r.lead_id)}" hidden><td colspan="16">${detailBody(r)}</td></tr>`;
+  <tr class="detail" id="d-${esc(r.lead_id)}" hidden><td colspan="17">${detailBody(r)}</td></tr>`;
 }
 
 function monthRowHtml(g) {
   const closed = !!COLLAPSED[g.key];
-  return `<tr class="mrow" data-mk="${esc(g.key)}"><td colspan="16">
+  return `<tr class="mrow" data-mk="${esc(g.key)}"><td colspan="17">
     ${closed ? "📁" : "📂"} ${esc(g.label)}
     <span class="msum">${g.rows.length} lead${g.rows.length === 1 ? "" : "s"}
       · ${fmtMoney(g.sumAll)} total · ${fmtMoney(g.sumRec)} with receipts (${g.nRec})
@@ -1749,6 +1809,7 @@ function cardHtml(r, idx) {
         <div><b>${esc(r.price)}</b> · <span class="counts">${esc(date)}</span></div>
         <div class="c-phone">${phone}</div>
         ${s.select}
+        ${checkCell(r)}
       </div>
     </div>
     <div class="c-parties">${PARTY_KEYS.map(partyRow).join("")}</div>
@@ -1804,7 +1865,7 @@ function draw() {
 
   if (VIEW === "table") {
     if (!rows.length) {
-      tb.innerHTML = '<tr><td colspan="16" class="none">Nothing here yet.</td></tr>';
+      tb.innerHTML = '<tr><td colspan="17" class="none">Nothing here yet.</td></tr>';
       return;
     }
     let idx = 0;
@@ -1851,59 +1912,6 @@ function draw() {
   }
 }
 
-
-// ── Check in: who has cross-checked the board ─────────────────────────────
-// Its own small feed, loaded once on boot and after each check-in. The name is
-// the same one the board already uses for everything else somebody does here
-// (the 👤 at the top) — self-declared, and the log says so rather than
-// implying an identity the board does not actually verify.
-async function loadCheckins(after) {
-  const list = document.getElementById("ci-list");
-  if (!list) return;
-  try {
-    const rows = after || (await (await fetch(`${API}/checkins`)).json()).rows || [];
-    if (!rows.length) {
-      list.innerHTML = `<div class="none">Nobody has checked in yet.</div>`;
-      return;
-    }
-    list.innerHTML = rows.map(r => `<div class="ci-row">
-        <b>${esc(r.who || "someone")}</b>
-        <span class="ci-when">${esc(when(r.at))}</span>
-        <span class="ci-what">${r.leads ? esc(r.leads) + (r.leads_capped ? "+" : "") + " leads" : ""}${
-          r.newest ? " · newest " + esc(r.newest) : ""}</span>
-        ${r.note ? `<span class="ci-note">${esc(r.note)}</span>` : ""}
-      </div>`).join("");
-  } catch (e) {
-    list.innerHTML = `<div class="err">Could not read the check-ins: ${esc(e.message)}</div>`;
-  }
-}
-
-document.getElementById("ci-go").onclick = async () => {
-  const who = whoAmI(true);        // asks for the name if the board has none
-  const msg = document.getElementById("ci-msg");
-  if (!who) {
-    msg.innerHTML = `<div class="err">Tell the board your name first — tap 👤 at the top.</div>`;
-    return;
-  }
-  const go = document.getElementById("ci-go");
-  go.disabled = true;
-  msg.innerHTML = "";
-  try {
-    const res = await fetch(`${API}/checkins`, {
-      method: "POST", headers: {"Content-Type": "application/json"},
-      body: JSON.stringify({who, note: document.getElementById("ci-note").value.trim()}),
-    });
-    const body = await res.json().catch(() => ({}));
-    if (!res.ok) throw new Error(body.error || res.status);
-    document.getElementById("ci-note").value = "";
-    msg.innerHTML = `<div class="ok">Checked in — thank you.</div>`;
-    loadCheckins(body.rows);
-  } catch (e) {
-    msg.innerHTML = `<div class="err">Could not check in: ${esc(e.message)}</div>`;
-  } finally {
-    go.disabled = false;
-  }
-};
 
 // ── People: drivers and supervisors ───────────────────────────────────────
 // Its own fetch, not part of the board's rows: the transmissions feed is
@@ -2029,6 +2037,9 @@ function renderPeople() {
   if (p.can_delete_lead === false) notes.push(`<div class="err">Deleting a lead is
     not available yet — run <b>database/migration_lead_deleted.sql</b>. Until then
     the Delete button will refuse rather than half-delete anything.</div>`);
+  if (p.can_check === false) notes.push(`<div class="err">The <b>Checked</b>
+    column cannot record anything yet — run
+    <b>database/migration_lead_checkins.sql</b>.</div>`);
   if (p.can_broadcast === false) notes.push(`<div class="err">This service has no
     <b>TELEGRAM_BOT_TOKEN</b>, so deleting a lead will <b>not</b> tell any team.
     The deletion itself still works. Set it on the krab-issuer-admin service.</div>`);
@@ -2265,6 +2276,8 @@ document.querySelector("main").addEventListener("click", e => {
   if (clr) { clearReceipt(clr.dataset.id, clr.dataset.ref); return; }
   const dl = e.target.closest(".dellead");
   if (dl) { openDelete(dl.dataset.id); return; }
+  const ck = e.target.closest(".chkbtn");
+  if (ck) { toggleCheck(ck.dataset.check, ck); return; }
   const act = e.target.closest(".act");
   if (act) {
     const row = ALL.find(r => r.lead_id === act.dataset.id);
@@ -2600,7 +2613,6 @@ updateGameChip();
 setView(VIEW);
 loadConfig();
 load();
-loadCheckins();
 setInterval(() => {                     // the board is shared — keep it fresh,
   if (document.querySelector(".overlay:not([hidden])")) return;   // but never under a compose
   load();
@@ -2877,39 +2889,6 @@ def _save_board_supervisors(db, rows) -> bool:
         return bool(db.set_setting(_SUPERVISORS_KEY, json.dumps(rows or [])))
     except Exception as e:
         logger.error("supervisors write failed: %s", e)
-        return False
-
-
-# The cross-check log. A settings key, so it needs no migration; capped so it
-# cannot grow without bound in a column that was never sized for it.
-_CHECKINS_KEY = "receipts_checkins"
-_CHECKINS_MAX = 200
-
-
-def _read_checkins(db) -> list:
-    try:
-        raw = db.get_setting(_CHECKINS_KEY)
-    except Exception as e:
-        logger.warning("check-ins read failed: %s", e)
-        return []
-    try:
-        rows = json.loads(raw) if raw else []
-    except Exception as e:
-        logger.warning("check-ins parse failed: %s", e)
-        return []
-    out = []
-    for r in rows if isinstance(rows, list) else []:
-        if isinstance(r, dict) and str(r.get("at") or "").strip():
-            out.append(r)
-    return out[:_CHECKINS_MAX]
-
-
-def _write_checkins(db, rows) -> bool:
-    try:
-        return bool(db.set_setting(_CHECKINS_KEY,
-                                   json.dumps(rows[:_CHECKINS_MAX])))
-    except Exception as e:
-        logger.error("check-ins write failed: %s", e)
         return False
 
 
@@ -3577,6 +3556,8 @@ def register(app, db_provider):
             "can_delete_lead": bool(db.lead_deletion_ready()),
             # False = a deletion will be recorded and no team will hear about it.
             "can_broadcast": _can_broadcast(),
+            # False = the Checked column cannot record anything yet.
+            "can_check": bool(db.checkins_ready()),
         })
 
     @app.route("/receipts/api/drivers", methods=["POST"])
@@ -3713,54 +3694,55 @@ def register(app, db_provider):
                         "groups_failed": report.get("failed", []),
                         "broadcast_error": report.get("error", "")})
 
-    # ── Cross-check ──────────────────────────────────────────────────────
-    # Who has been through the board, and when. /receipts-only, like everything
-    # else that writes: the open /api alias has no login gate.
+    # ── Cross-checking a transaction ─────────────────────────────────────
+    # One check per person per lead. /receipts-only, like everything else that
+    # writes: the open /api alias has no login gate.
 
-    @app.route("/receipts/api/checkins", methods=["GET"])
-    def api_checkins():
-        return jsonify({"rows": _read_checkins(_resolve())})
+    @app.route("/receipts/api/transmissions/<lead_id>/check", methods=["POST"])
+    def api_check_lead(lead_id):
+        """Record that this person has cross-checked this transaction.
 
-    @app.route("/receipts/api/checkins", methods=["POST"])
-    def api_check_in():
-        """Record that somebody has cross-checked what is on the board.
-
-        The time is the SERVER's. A check-in is a claim about when somebody
-        looked, and a browser clock that is an hour out would put that claim in
-        the wrong place in the log with nothing to show it had happened.
+        The time is the DATABASE's default, not the browser's. A check is a
+        claim about when somebody looked, and a laptop clock an hour out would
+        file that claim in the wrong place with nothing to show it had.
         """
-        from datetime import datetime, timezone
-        body = request.get_json(silent=True) or {}
-        who = (body.get("who") or "").strip()[:60]
+        who = ((request.get_json(silent=True) or {}).get("who") or "").strip()
+        note = ((request.get_json(silent=True) or {}).get("note") or "").strip()
         if not who:
-            return jsonify({"error": "Say who you are first — tap the name at "
-                                     "the top of the board."}), 400
+            return jsonify({"error": "Say who you are first — tap 👤 at the top "
+                                     "of the board."}), 400
         db = _resolve()
-        # What they were looking at. Best effort: a check-in that cannot say how
-        # many leads were on the board is still a check-in.
-        # The reader caps at 1000. Recording a flat "1000 leads" would put a
-        # number in an audit log that quietly means "at least" -- so the cap is
-        # recorded with it and the board reads it out as 1000+.
-        seen, newest, capped = 0, "", False
         try:
-            rows = db.get_transmissions(limit=1000) or []
-            seen = len(rows)
-            capped = seen >= 1000
-            newest = str((rows[0] or {}).get("reference_id") or "") if rows else ""
+            ok, why = db.add_lead_checkin(lead_id, who, note)
         except Exception as e:
-            logger.warning("check-in: could not size the board: %s", e)
-        entry = {
-            "who": who,
-            "at": datetime.now(timezone.utc).isoformat(),
-            "note": (body.get("note") or "").strip()[:200],
-            "leads": seen,
-            "leads_capped": capped,
-            "newest": newest,
-        }
-        rows = [entry] + _read_checkins(db)
-        if not _write_checkins(db, rows):
-            return jsonify({"error": "Could not record that."}), 500
-        return jsonify({"ok": True, "rows": rows[:_CHECKINS_MAX]})
+            return jsonify({"error": str(e)}), 500
+        if not ok:
+            code = 503 if "migration_lead_checkins" in (why or "") else 500
+            return jsonify({"error": why}), code
+        return jsonify({"ok": True, "checkins": db.get_lead_checkins(lead_id)})
+
+    @app.route("/receipts/api/transmissions/<lead_id>/check", methods=["DELETE"])
+    def api_uncheck_lead(lead_id):
+        """Take back your OWN check.
+
+        Only your own: a cross-check is a statement somebody made, and letting
+        one person clear another's would make the column worth nothing. The
+        board has one shared password, so this is a convention the page keeps
+        rather than a rule it can enforce -- which is why the name is required
+        here and the removal is scoped to it.
+        """
+        who = ((request.get_json(silent=True) or {}).get("who") or "").strip()
+        if not who:
+            return jsonify({"error": "Say who you are first."}), 400
+        db = _resolve()
+        try:
+            ok, why = db.remove_lead_checkin(lead_id, who)
+        except Exception as e:
+            return jsonify({"error": str(e)}), 500
+        if not ok:
+            code = 503 if "migration_lead_checkins" in (why or "") else 500
+            return jsonify({"error": why}), code
+        return jsonify({"ok": True, "checkins": db.get_lead_checkins(lead_id)})
 
     @app.route("/receipts/api/deleted", methods=["GET"])
     def api_deleted_leads():

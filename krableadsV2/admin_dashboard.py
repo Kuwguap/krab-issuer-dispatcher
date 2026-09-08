@@ -657,6 +657,10 @@ class AdminDatabase:
 
         # Active renewal clocks — when the bot holds a real due date, the
         # board's Renewal countdown uses it instead of issue_date arithmetic.
+        # Who has cross-checked each of these transactions. Absent table =
+        # nobody has, which is the truth on a database without the migration.
+        checkins_by_lead = self._checkins_for_leads(lead_ids)
+
         renewal_due = {}
         try:
             rr = (
@@ -839,6 +843,8 @@ class AdminDatabase:
                 "deleted_at": r.get("deleted_at"),
                 "deleted_reason": (r.get("deleted_reason") or "").strip(),
                 "deleted_by": (r.get("deleted_by") or "").strip(),
+                # [{who, at, note}], newest first. Empty until somebody checks.
+                "checkins": checkins_by_lead.get(lid, []),
             }
             if needle:
                 hay = " ".join(str(v).lower() for v in row.values())
@@ -1132,6 +1138,128 @@ class AdminDatabase:
         except Exception as e:
             logger.error("soft_delete_lead %s: %s", lead_id, e)
             return False
+
+    # ── Cross-checking a transaction ─────────────────────────────────────
+
+    def checkins_ready(self) -> bool:
+        """Can a check-in be recorded? See migration_lead_checkins.sql."""
+        try:
+            self.client.table("lead_checkins").select("id").limit(1).execute()
+            return True
+        except Exception as e:
+            if "lead_checkins" not in str(e):
+                logger.warning("checkins_ready: %s", e)
+            return False
+
+    def _checkins_for_leads(self, lead_ids: list) -> dict:
+        """{lead_id: [{who, at, note}, …]} newest first, for the whole page.
+
+        Batched, never one query per row -- the board draws up to a thousand.
+        """
+        out = {}
+        ids = [i for i in (lead_ids or []) if i][:1000]
+        if not ids:
+            return out
+        # PostgREST answers at most 1000 rows however large a limit is asked
+        # for -- proven against this database, which returns 1000 for limit=5000.
+        # A single query would therefore stop reporting checks partway down a
+        # full board, and those leads would read as never cross-checked. So the
+        # ids are chunked and each chunk is paged until it runs short.
+        PAGE = 1000
+        for i in range(0, len(ids), 200):
+            chunk = ids[i:i + 200]
+            start = 0
+            while True:
+                try:
+                    r = (self.client.table("lead_checkins")
+                         .select("lead_id, who, checked_at, note")
+                         .in_("lead_id", chunk)
+                         .order("checked_at", desc=True)
+                         .range(start, start + PAGE - 1).execute())
+                except Exception as e:
+                    # The table arrives with a migration. Until then nobody has
+                    # checked anything, which is what an empty map says.
+                    if "lead_checkins" not in str(e):
+                        logger.warning("_checkins_for_leads: %s", e)
+                    return out
+                got = r.data or []
+                for row in got:
+                    lid = str(row.get("lead_id") or "")
+                    if not lid:
+                        continue
+                    out.setdefault(lid, []).append({
+                        "who": str(row.get("who") or ""),
+                        "at": row.get("checked_at"),
+                        "note": str(row.get("note") or ""),
+                    })
+                if len(got) < PAGE:
+                    break
+                start += PAGE
+                if start >= 20000:      # a lead with 20k checks is a bug, not a board
+                    logger.warning("_checkins_for_leads: stopped paging at %d", start)
+                    break
+        return out
+
+    def get_lead_checkins(self, lead_id: str) -> list:
+        return self._checkins_for_leads([str(lead_id)]).get(str(lead_id), [])
+
+    def add_lead_checkin(self, lead_id: str, who: str, note: str = "") -> tuple:
+        """(ok, error). One per person per lead — checking again keeps the
+        FIRST time, because that is when they actually looked."""
+        who = (who or "").strip()[:60]
+        if not who:
+            return False, "Who is checking?"
+        try:
+            existing = [c for c in self.get_lead_checkins(lead_id)
+                        if c["who"].lower() == who.lower()]
+            if existing:
+                return True, ""          # already checked; nothing to change
+            self.client.table("lead_checkins").insert({
+                "lead_id": str(lead_id), "who": who,
+                "note": (note or "").strip()[:200] or None,
+            }).execute()
+            return True, ""
+        except Exception as e:
+            if "lead_checkins" in str(e):
+                return False, ("This database is missing "
+                               "database/migration_lead_checkins.sql — a "
+                               "check cannot be recorded yet.")
+            # The unique index is the backstop for two taps at once: the second
+            # insert loses, and the first check stands. That is the right answer.
+            if "uq_lead_checkins_lead_who" in str(e) or "duplicate key" in str(e):
+                return True, ""
+            logger.error("add_lead_checkin %s: %s", lead_id, e)
+            return False, "Could not record that."
+
+    def remove_lead_checkin(self, lead_id: str, who: str) -> tuple:
+        """(ok, error). Undoes your own check, nobody else's — see the route.
+
+        Matched by reading the lead's checks and comparing names in Python, NOT
+        with ilike: ilike takes a PATTERN, so a person calling themselves "%"
+        would have cleared every check on the lead, and one called "K_ta" would
+        have cleared "Kata" too. The whole worth of the column is that one
+        person cannot erase another's statement.
+        """
+        want = (who or "").strip().lower()
+        if not want:
+            return False, "Who is un-checking?"
+        try:
+            rows = (self.client.table("lead_checkins").select("id, who")
+                    .eq("lead_id", str(lead_id)).execute()).data or []
+            mine = [r["id"] for r in rows
+                    if str(r.get("who") or "").strip().lower() == want]
+            for rid in mine:
+                self.client.table("lead_checkins").delete().eq("id", rid).execute()
+            return True, ""
+        except Exception as e:
+            # The same missing table the POST reports, said the same way:
+            # a generic 500 here would look like a bug rather than a migration.
+            if "lead_checkins" in str(e):
+                return False, ("This database is missing "
+                               "database/migration_lead_checkins.sql — a "
+                               "check cannot be recorded yet.")
+            logger.error("remove_lead_checkin %s: %s", lead_id, e)
+            return False, "Could not remove that."
 
     def get_deleted_leads(self, limit: int = 50) -> list:
         """The deleted leads, most recently deleted first — as full board rows.
