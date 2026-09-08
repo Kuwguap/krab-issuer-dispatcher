@@ -536,8 +536,14 @@ class AdminDatabase:
                 "delivery_status, status_updated_at, status_updated_by, "
                 "created_at, updated_at, group_id, telegram_username, "
                 "vehicle_details, delivery_details, extra_info, email, "
-                "extra_vehicles, user_id, issue_date"
+                "extra_vehicles, user_id, issue_date, deleted_at"
             )
+            # A deleted lead is gone from the board. Asked for in the QUERY so a
+            # deletion also shrinks the newest-N window rather than occupying a
+            # slot invisibly. A database without the column raises here and the
+            # lean fallback below answers instead -- correct, because nothing can
+            # have been deleted yet on such a database.
+            q = q.is_("deleted_at", "null")
             if status and status in self.DELIVERY_STATUSES:
                 if status == "new":
                     q = q.is_("delivery_status", "null")
@@ -976,6 +982,172 @@ class AdminDatabase:
         except Exception:
             return False
     
+    # ── What the Drivers & Supervisors tab needs ─────────────────────────
+    # Mirrors utils/database.py, deliberately: the dashboard has its own client
+    # and cannot borrow the bot's methods. Where the shapes must agree (the
+    # suspension set, the waiver flag) the column names are the contract.
+
+    @staticmethod
+    def _missing_column(err, name: str) -> bool:
+        s = str(err)
+        return name in s and ("42703" in s or "does not exist" in s)
+
+    def get_lead_by_id(self, lead_id: str):
+        try:
+            r = (self.client.table("leads").select("*")
+                 .eq("id", str(lead_id)).limit(1).execute())
+            return (r.data or [None])[0]
+        except Exception as e:
+            logger.error("get_lead_by_id %s: %s", lead_id, e)
+            return None
+
+    def get_driver_by_telegram_id(self, telegram_user_id: str):
+        try:
+            r = (self.client.table("drivers").select("*")
+                 .eq("driver_telegram_id", str(telegram_user_id)).limit(1).execute())
+            return (r.data or [None])[0]
+        except Exception as e:
+            logger.warning("get_driver_by_telegram_id: %s", e)
+            return None
+
+    def get_lead_assignment_status(self, lead_id: str):
+        """The accepted assignment for a lead, with its driver."""
+        try:
+            r = (self.client.table("lead_assignments")
+                 .select("*, driver:drivers(*)")
+                 .eq("lead_id", str(lead_id)).eq("status", "accepted")
+                 .limit(1).execute())
+            return (r.data or [None])[0]
+        except Exception as e:
+            logger.warning("get_lead_assignment_status: %s", e)
+            return None
+
+    def get_manually_suspended_driver_ids(self) -> set:
+        """Driver ids a supervisor flagged.
+
+        drivers.is_suspended, the SAME column utils/database.py reads and
+        writes (database/migration_driver_manual_suspend.sql). Anything else
+        here would let the board suspend somebody the bot never sees.
+        """
+        try:
+            r = self.client.table("drivers").select("id, is_suspended").execute()
+            return {str(x["id"]) for x in (r.data or []) if x.get("is_suspended")}
+        except Exception:
+            return set()          # column not migrated — nobody is suspended by hand
+
+    def set_driver_suspended(self, driver_id: str, suspended: bool) -> bool:
+        """False when the column is absent, so the board can say so rather than
+        appear to have suspended somebody."""
+        try:
+            self.client.table("drivers").update(
+                {"is_suspended": bool(suspended)}).eq("id", str(driver_id)).execute()
+            return True
+        except Exception as e:
+            logger.warning("set_driver_suspended (run "
+                           "migration_driver_manual_suspend.sql?): %s", e)
+            return False
+
+    def _get_all_pending_receipts_per_driver(self, limit: int = 400) -> list:
+        """[{driver_id, lead_id, reference_id}] — accepted, no receipt yet.
+
+        Waived leads drop out through a separate tolerant query: naming
+        exclude_from_count in the embed would 42703 a database without the
+        column and report every driver as owing nothing.
+        """
+        try:
+            r = (self.client.table("lead_assignments")
+                 .select("driver_id, lead_id, lead:leads(reference_id, receipt_image_url)")
+                 .eq("status", "accepted").limit(max(1, min(int(limit or 400), 1000)))
+                 .execute())
+        except Exception as e:
+            logger.warning("_get_all_pending_receipts_per_driver: %s", e)
+            return []
+        out = []
+        for row in (r.data or []):
+            lead = row.get("lead") or {}
+            if lead.get("receipt_image_url") or not row.get("driver_id"):
+                continue
+            out.append({"driver_id": str(row["driver_id"]),
+                        "lead_id": str(row.get("lead_id") or ""),
+                        "reference_id": str(lead.get("reference_id") or "")})
+        ids = [o["lead_id"] for o in out if o["lead_id"]]
+        waived = set()
+        for i in range(0, len(ids), 100):
+            try:
+                ex = (self.client.table("leads").select("id, exclude_from_count")
+                      .in_("id", ids[i:i + 100]).execute())
+                waived |= {str(x["id"]) for x in (ex.data or [])
+                           if x.get("exclude_from_count")}
+            except Exception:
+                pass                       # un-migrated: nothing is waived yet
+        return [o for o in out if o["lead_id"] not in waived]
+
+    def set_lead_excluded(self, lead_id: str, excluded: bool) -> bool:
+        """Strike a lead out of every count — the waiver the bot also sets."""
+        try:
+            r = (self.client.table("leads")
+                 .update({"exclude_from_count": bool(excluded)})
+                 .eq("id", str(lead_id)).execute())
+            return bool(getattr(r, "data", None))
+        except Exception as e:
+            logger.error("set_lead_excluded %s: %s", lead_id, e)
+            return False
+
+    def lead_deletion_ready(self) -> bool:
+        """Can a deletion be recorded at all? See migration_lead_deleted.sql."""
+        try:
+            self.client.table("leads").select(
+                "deleted_at, deleted_reason, deleted_by").limit(1).execute()
+            return True
+        except Exception as e:
+            if not self._missing_column(e, "deleted_at"):
+                logger.warning("lead_deletion_ready: %s", e)
+            return False
+
+    def soft_delete_lead(self, lead_id: str, reason: str, by: str = "") -> bool:
+        from datetime import datetime, timezone
+        try:
+            r = (self.client.table("leads")
+                 .update({"deleted_at": datetime.now(timezone.utc).isoformat(),
+                          "deleted_reason": (reason or "")[:200],
+                          "deleted_by": (by or "")[:120]})
+                 .eq("id", str(lead_id)).is_("deleted_at", "null").execute())
+            return bool(getattr(r, "data", None))
+        except Exception as e:
+            logger.error("soft_delete_lead %s: %s", lead_id, e)
+            return False
+
+    def count_driver_assignments(self, driver_id: str) -> int:
+        try:
+            r = (self.client.table("lead_assignments").select("id", count="exact")
+                 .eq("driver_id", str(driver_id)).limit(1).execute())
+            return int(getattr(r, "count", None) or 0)
+        except Exception as e:
+            logger.warning("count_driver_assignments: %s", e)
+            return -1                      # unknown: the caller must not delete
+
+    def delete_driver(self, driver_id: str) -> tuple:
+        """(ok, reason). Refuses a driver who has history.
+
+        lead_assignments.driver_id and group_drivers.driver_id are ON DELETE
+        CASCADE, so deleting a driver who has worked erases every accept they
+        made -- and with it the receipts they owe and the record of who
+        delivered what. Deactivating is what the board offers instead.
+        """
+        n = self.count_driver_assignments(driver_id)
+        if n < 0:
+            return False, "Could not check this driver's history — not deleting."
+        if n > 0:
+            return False, (f"This driver has {n} lead(s) on record. Deleting them "
+                           "would erase those deliveries and the receipts they owe. "
+                           "Deactivate them instead.")
+        try:
+            self.client.table("drivers").delete().eq("id", str(driver_id)).execute()
+            return True, ""
+        except Exception as e:
+            logger.error("delete_driver %s: %s", driver_id, e)
+            return False, "The database refused that."
+
     def toggle_driver_status(self, driver_id: str) -> bool:
         """Toggle driver active status."""
         if not self._check_tables_exist():

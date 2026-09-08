@@ -834,6 +834,21 @@ BOARD_HTML = r"""<!doctype html>
  .thumb{cursor:zoom-in}
  .fixrec .fixbtn{cursor:pointer;border:1px solid #dfe3e8;border-radius:8px;padding:5px 10px;background:#fff;font:inherit;font-size:12px}
  .fixrec .fixbtn.danger{border-color:#e0b4b4;color:#b3261e}
+ .btn.danger{background:#b3261e;border-color:#b3261e;color:#fff}
+ .ppl{display:grid;gap:18px}
+ .ppl h3{margin:0 0 8px;font-size:1rem}
+ .ppl table{width:100%;border-collapse:collapse}
+ .ppl th,.ppl td{padding:8px 10px;border-bottom:1px solid var(--line);
+                 text-align:left;vertical-align:top}
+ .ppl th{font-size:.78rem;text-transform:uppercase;letter-spacing:.04em;
+         color:var(--muted)}
+ .ppl .add{display:flex;gap:8px;flex-wrap:wrap;margin:10px 0 0}
+ .ppl .add input{flex:1 1 9rem;min-width:0}
+ .pflag{font-size:.75rem;padding:2px 7px;border-radius:999px;
+        border:1px solid var(--line);white-space:nowrap}
+ .pflag.off{color:#b3261e;border-color:#e0b4b4}
+ .pflag.susp{color:#8a5a00;border-color:#e4c98a}
+ .owe{display:flex;gap:6px;flex-wrap:wrap;margin-top:4px}
  .pend { display:inline-block; margin-left:6px; padding:1px 6px; border-radius:9px;
          font-size:10px; font-weight:700; letter-spacing:.04em; text-transform:uppercase;
          background:#fde8b0; color:#7a5200; vertical-align:middle; }
@@ -981,6 +996,7 @@ BOARD_HTML = r"""<!doctype html>
     <button data-view="sheet" title="Spreadsheet">📑 Sheet</button>
     <button data-view="chart" title="Charts">📊 Charts</button>
     <button data-view="crm" title="Pipeline">📌 CRM</button>
+    <button data-view="people" title="Drivers &amp; supervisors">👥 People</button>
   </div>
   <button class="hbtn" id="csv" title="Download everything as a CSV file">⬇ CSV</button>
   <a class="hbtn" id="issuersLink" href="/receipts/issuers"
@@ -1023,6 +1039,7 @@ BOARD_HTML = r"""<!doctype html>
   <div class="view" id="vw-sheet"></div>
   <div class="view" id="vw-chart"></div>
   <div class="view" id="vw-crm"></div>
+  <div class="view" id="vw-people"></div>
 </main>
 
 <div class="overlay" id="compose" hidden>
@@ -1040,6 +1057,33 @@ BOARD_HTML = r"""<!doctype html>
       <span class="spacer"></span>
       <button class="btn" id="c-cancel">Cancel</button>
       <button class="btn primary" id="c-send">Send</button>
+    </div>
+  </div>
+</div>
+<div class="overlay" id="del" hidden>
+  <div class="sheet-modal">
+    <h2>Delete this lead?</h2>
+    <div class="c-to" id="del-what"></div>
+    <label>Why
+      <select id="del-reason">
+        <option value="duplicate">Duplicate</option>
+        <option value="mistake">Mistake</option>
+        <option value="test">Test lead</option>
+        <option value="cancelled">Client cancelled</option>
+        <option value="other">Other…</option>
+      </select>
+    </label>
+    <label id="del-otherwrap" hidden>Reason
+      <input id="del-other" autocomplete="off" placeholder="Say what happened">
+    </label>
+    <p class="note" id="del-note">Every team is told it is gone, with the
+      reference, the client, who had it and why. Nothing is destroyed — a
+      supervisor can put it back.</p>
+    <div class="c-actions">
+      <span id="del-result"></span>
+      <span class="spacer"></span>
+      <button class="btn" id="del-cancel">Keep it</button>
+      <button class="btn danger" id="del-go">Delete and tell everyone</button>
     </div>
   </div>
 </div>
@@ -1067,7 +1111,7 @@ let ALL = [], filter = "", q = "";
 let CFG = {email: true, sms: "unknown"};   // refreshed from /receipts/api/sendconfig
 let COMPOSE = null;                        // {row, party, channel}
 let VIEW = localStorage.getItem("krab_view") || "table";
-if (!["table","cards","sheet","chart","crm"].includes(VIEW)) VIEW = "table";
+if (!["table","cards","sheet","chart","crm","people"].includes(VIEW)) VIEW = "table";
 let COLLAPSED = {};
 try { COLLAPSED = JSON.parse(localStorage.getItem("krab_mcollapse") || "{}") || {}; } catch (e) {}
 let PREV_STATUS = null;                    // lead_id -> status, for bus diffing
@@ -1605,7 +1649,10 @@ function rowHtml(r, idx) {
     <td>${block(r, "issuer")}</td>
     <td>${block(r, "dispatcher")}</td>
     <td>${renewalChip(r)}</td>
-    <td>${s.pill}<br>${s.select}</td>
+    <td>${s.pill}<br>${s.select}
+        <button class="fixbtn danger dellead" data-id="${esc(r.lead_id)}"
+                title="Take this lead off every board and tell the teams"
+                >🗑 Delete</button></td>
     <td>${insuranceChip(r)}</td>
     <td class="hide-sm">${esc(when(r.status_updated_at))}<br>
         <span class="counts">${esc(r.status_updated_by || "")}</span></td>
@@ -1685,6 +1732,12 @@ function setView(v) {
 }
 
 function draw() {
+  // The status filters and the money stats describe LEADS. Left on screen over
+  // a roster of people they read as that tab's own numbers.
+  const people = VIEW === "people";
+  document.getElementById("tabs").hidden = people;
+  const statsEl = document.getElementById("stats");
+  if (statsEl) statsEl.hidden = people;
   tabs();
   renderStats(ALL);
   const rows = visible();
@@ -1706,6 +1759,7 @@ function draw() {
     }
     crmEl.innerHTML = "";
   }
+  if (VIEW === "people") { loadPeople(false).then(renderPeople); }
   if (VIEW !== "chart") {
     const chEl = document.getElementById("vw-chart");
     if (chEl.__kcRO) { chEl.__kcRO.disconnect(); chEl.__kcRO = null; }
@@ -1762,6 +1816,211 @@ function draw() {
     else el.innerHTML = '<div class="none empty">CRM module not installed.</div>';
   }
 }
+
+
+// ── People: drivers and supervisors ───────────────────────────────────────
+// Its own fetch, not part of the board's rows: the transmissions feed is
+// leads, and these are the people leads are sent TO. Reloaded whenever the tab
+// is opened or an action changes something, so two supervisors working at once
+// see each other's changes on the next action rather than never.
+let PEOPLE = null;
+
+async function loadPeople(force) {
+  if (PEOPLE && !force) return PEOPLE;
+  try {
+    const res = await fetch(`${API}/people`);
+    if (!res.ok) throw new Error(await res.text());
+    PEOPLE = await res.json();
+  } catch (e) {
+    PEOPLE = {drivers: [], supervisors: [], error: e.message};
+  }
+  return PEOPLE;
+}
+
+async function peopleAction(url, opts, el) {
+  if (el) el.disabled = true;
+  try {
+    const res = await fetch(url, opts);
+    const body = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(body.error || (await res.text().catch(() => "")) || res.status);
+    await loadPeople(true);
+    renderPeople();
+    return true;
+  } catch (e) {
+    const box = document.getElementById("ppl-err");
+    if (box) box.innerHTML = `<div class="err">${esc(e.message)}</div>`;
+    if (el) el.disabled = false;
+    return false;
+  }
+}
+
+function renderPeople() {
+  const el = document.getElementById("vw-people");
+  if (!el) return;
+  const p = PEOPLE || {drivers: [], supervisors: []};
+  const drivers = (p.drivers || []).slice().sort((a, b) =>
+    (a.name || "").localeCompare(b.name || ""));
+  const sups = p.supervisors || [];
+
+  const dRows = drivers.map(d => {
+    const flags = [];
+    if (!d.active) flags.push('<span class="pflag off">off</span>');
+    if (d.suspended) flags.push('<span class="pflag susp">suspended</span>');
+    const owe = (d.owed || []).map(o =>
+      `<button class="fixbtn p-waive" data-d="${esc(d.id)}" data-l="${esc(o.lead_id)}"
+               title="Stop this receipt counting against them">${esc(o.reference_id)} ✕</button>`
+    ).join("");
+    return `<tr>
+      <td><b>${esc(d.name || "(unnamed)")}</b> ${flags.join(" ")}
+          <div class="counts">${esc(d.telegram_id)}</div></td>
+      <td>${(d.owed || []).length
+              ? `${(d.owed || []).length} owed<div class="owe">${owe}</div>`
+              : '<span class="none">none</span>'}</td>
+      <td>
+        <button class="fixbtn p-susp" data-d="${esc(d.id)}" data-on="${d.suspended ? "0" : "1"}"
+          >${d.suspended ? "Unsuspend" : "Suspend"}</button>
+        <button class="fixbtn p-act" data-d="${esc(d.id)}">${d.active ? "Deactivate" : "Activate"}</button>
+        <button class="fixbtn danger p-delv" data-d="${esc(d.id)}"
+                data-n="${esc(d.name || "")}">Delete</button>
+      </td></tr>`;
+  }).join("") || `<tr><td colspan="3" class="none">No drivers yet.</td></tr>`;
+
+  const sRows = sups.map(s => `<tr>
+      <td><b>${esc(s.label || "(no name)")}</b>
+          <div class="counts">${esc(s.id)}</div></td>
+      <td><button class="fixbtn danger p-dels" data-s="${esc(s.id)}"
+                  data-n="${esc(s.label || s.id)}">Remove</button></td>
+    </tr>`).join("") || `<tr><td colspan="2" class="none">Nobody added here.</td></tr>`;
+
+  el.innerHTML = `<div class="ppl">
+    <div id="ppl-err"></div>
+    <section>
+      <h3>🚗 Drivers</h3>
+      <table><thead><tr><th>Driver</th><th>Receipts</th><th>Actions</th></tr></thead>
+        <tbody>${dRows}</tbody></table>
+      <div class="add">
+        <input id="nd-name" placeholder="Name" autocomplete="off">
+        <input id="nd-tg" placeholder="Telegram id (from /whoami)" autocomplete="off">
+        <input id="nd-phone" placeholder="Phone (optional)" autocomplete="off">
+        <button class="btn primary" id="nd-add">Add driver</button>
+      </div>
+    </section>
+    <section>
+      <h3>👑 Supervisors</h3>
+      <table><thead><tr><th>Supervisor</th><th></th></tr></thead>
+        <tbody>${sRows}</tbody></table>
+      <div class="add">
+        <input id="ns-label" placeholder="Name" autocomplete="off">
+        <input id="ns-tg" placeholder="Telegram id (from /whoami)" autocomplete="off">
+        <button class="btn primary" id="ns-add">Add supervisor</button>
+      </div>
+      <p class="note">Supervisors set here are the same list the bot reads in
+        /settings. Anyone on it can open /settings and release a tag.</p>
+    </section>
+  </div>`;
+  // The board keeps the Delete button either way -- a button that says why it
+  // cannot work beats one that quietly is not there. This is where the office
+  // finds out what to do about it.
+  const notes = [];
+  if (p.error) notes.push(`<div class="err">Could not load people: ${esc(p.error)}</div>`);
+  if (p.can_delete_lead === false) notes.push(`<div class="err">Deleting a lead is
+    not available yet — run <b>database/migration_lead_deleted.sql</b>. Until then
+    the Delete button will refuse rather than half-delete anything.</div>`);
+  if (notes.length) document.getElementById("ppl-err").innerHTML = notes.join("");
+
+  const D = q => el.querySelectorAll(q);
+  D(".p-susp").forEach(b => b.onclick = () => peopleAction(
+    `${API}/drivers/${encodeURIComponent(b.dataset.d)}/suspend`,
+    {method: "POST", headers: {"Content-Type": "application/json"},
+     body: JSON.stringify({suspended: b.dataset.on === "1"})}, b));
+  D(".p-act").forEach(b => b.onclick = () => peopleAction(
+    `${API}/drivers/${encodeURIComponent(b.dataset.d)}/active`, {method: "POST"}, b));
+  D(".p-waive").forEach(b => b.onclick = () => peopleAction(
+    `${API}/drivers/${encodeURIComponent(b.dataset.d)}/waive`,
+    {method: "POST", headers: {"Content-Type": "application/json"},
+     body: JSON.stringify({lead_id: b.dataset.l})}, b));
+  D(".p-delv").forEach(b => b.onclick = () => {
+    if (!confirm(`Delete ${b.dataset.n || "this driver"}? Only a driver who has `
+                 + `never been sent a lead can be deleted.`)) return;
+    peopleAction(`${API}/drivers/${encodeURIComponent(b.dataset.d)}`,
+                 {method: "DELETE"}, b);
+  });
+  D(".p-dels").forEach(b => b.onclick = () => {
+    if (!confirm(`Remove ${b.dataset.n} as a supervisor?`)) return;
+    peopleAction(`${API}/supervisors/${encodeURIComponent(b.dataset.s)}`,
+                 {method: "DELETE"}, b);
+  });
+  const add = document.getElementById("nd-add");
+  if (add) add.onclick = () => peopleAction(`${API}/drivers`, {
+    method: "POST", headers: {"Content-Type": "application/json"},
+    body: JSON.stringify({
+      name: document.getElementById("nd-name").value.trim(),
+      telegram_id: document.getElementById("nd-tg").value.trim(),
+      phone: document.getElementById("nd-phone").value.trim(),
+    })}, add);
+  const sadd = document.getElementById("ns-add");
+  if (sadd) sadd.onclick = () => peopleAction(`${API}/supervisors`, {
+    method: "POST", headers: {"Content-Type": "application/json"},
+    body: JSON.stringify({
+      label: document.getElementById("ns-label").value.trim(),
+      id: document.getElementById("ns-tg").value.trim(),
+    })}, sadd);
+}
+
+// ── Deleting a lead ───────────────────────────────────────────────────────
+let DEL_ID = null;
+
+function openDelete(id) {
+  const r = ALL.find(x => x.lead_id === id);
+  if (!r) return;
+  DEL_ID = id;
+  document.getElementById("del-what").innerHTML =
+    `<b>${esc(r.reference_id)}</b> · ${esc(r.client_name || "this client")}`;
+  document.getElementById("del-result").textContent = "";
+  document.getElementById("del-go").disabled = false;
+  document.getElementById("del").hidden = false;
+}
+
+document.getElementById("del-reason").onchange = e => {
+  document.getElementById("del-otherwrap").hidden = e.target.value !== "other";
+};
+document.getElementById("del-cancel").onclick = () => {
+  document.getElementById("del").hidden = true; DEL_ID = null;
+};
+document.getElementById("del-go").onclick = async () => {
+  if (!DEL_ID) return;
+  const sel = document.getElementById("del-reason").value;
+  const reason = sel === "other"
+    ? document.getElementById("del-other").value.trim() : sel;
+  if (!reason) {
+    document.getElementById("del-result").textContent = "Say why.";
+    return;
+  }
+  const go = document.getElementById("del-go");
+  go.disabled = true;
+  document.getElementById("del-result").textContent = "Deleting…";
+  try {
+    const res = await fetch(
+      `${API}/transmissions/${encodeURIComponent(DEL_ID)}/delete`, {
+        method: "POST", headers: {"Content-Type": "application/json"},
+        body: JSON.stringify({reason, by: whoAmI(true)}),
+      });
+    const body = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(body.error || res.status);
+    ALL = ALL.filter(x => x.lead_id !== DEL_ID);
+    document.getElementById("del").hidden = true;
+    DEL_ID = null;
+    draw();
+    document.getElementById("err").innerHTML =
+      `<div class="ok">Deleted — ${body.groups_notified || 0} team(s) told.</div>`;
+  } catch (e) {
+    document.getElementById("del-result").textContent = "";
+    document.getElementById("err").innerHTML =
+      `<div class="err">Could not delete that: ${esc(e.message)}</div>`;
+    document.getElementById("del").hidden = true;
+    go.disabled = false;
+  }
+};
 
 async function saveStatus(id, next, holder) {
   if (holder) holder.classList.add("saving");
@@ -1839,6 +2098,8 @@ document.querySelector("main").addEventListener("click", e => {
   }
   const clr = e.target.closest(".clr");
   if (clr) { clearReceipt(clr.dataset.id, clr.dataset.ref); return; }
+  const dl = e.target.closest(".dellead");
+  if (dl) { openDelete(dl.dataset.id); return; }
   const act = e.target.closest(".act");
   if (act) {
     const row = ALL.find(r => r.lead_id === act.dataset.id);
@@ -1927,7 +2188,7 @@ function pauseTetrisForModal() {
 // above the sheets) and pauses any game behind them. Attribute-driven, so it
 // is correct no matter which code path opened or closed the overlay.
 (function watchModals() {
-  const overlays = ["compose", "lightbox"].map(id => document.getElementById(id))
+  const overlays = ["compose", "lightbox", "del"].map(id => document.getElementById(id))
                                           .filter(Boolean);
   const sync = () => {
     const open = overlays.some(o => !o.hidden);
@@ -2035,7 +2296,7 @@ document.getElementById("csv").onclick = downloadCsv;
 window.krabVoiceAction = function (action, args) {
   args = args || {};
   switch (action) {
-    case "set_view": if (["table","cards","sheet","chart","crm"].includes(args.view)) setView(args.view); break;
+    case "set_view": if (["table","cards","sheet","chart","crm","people"].includes(args.view)) setView(args.view); break;
     case "toggle_view": setView(VIEW === "table" ? "cards" : "table"); break;
     case "set_theme": {
       if (typeof applyTheme !== "function") break;
@@ -2359,6 +2620,122 @@ def _session_ok(raw) -> bool:
 
 def _logged_in() -> bool:
     return _session_ok(request.cookies.get(RECEIPTS_COOKIE))
+
+
+# Supervisors are a JSON list in the settings table, written by the bot as
+# EXTRA_SUPERVISORS_KEY. The board reads and writes the SAME key -- a second
+# store would mean the bot and the board disagreed about who is in charge.
+_SUPERVISORS_KEY = "extra_supervisor_ids"
+
+
+def record_is_active(row) -> bool:
+    """A driver row counts as active unless it says otherwise."""
+    v = (row or {}).get("is_active")
+    return True if v is None else bool(v)
+
+
+def _board_supervisors(db) -> list:
+    """[{id, label}, …] as the bot stores them."""
+    try:
+        raw = db.get_setting(_SUPERVISORS_KEY)
+    except Exception as e:
+        logger.warning("supervisors read failed: %s", e)
+        return []
+    out = []
+    try:
+        for r in (json.loads(raw) if raw else []):
+            if isinstance(r, dict) and str(r.get("id") or "").strip():
+                out.append({"id": str(r["id"]).strip(),
+                            "label": str(r.get("label") or "").strip()})
+    except Exception as e:
+        logger.warning("supervisors parse failed: %s", e)
+    return out
+
+
+def _save_board_supervisors(db, rows) -> bool:
+    try:
+        return bool(db.set_setting(_SUPERVISORS_KEY, json.dumps(rows or [])))
+    except Exception as e:
+        logger.error("supervisors write failed: %s", e)
+        return False
+
+
+def _deleted_lead_notice(lead: dict, reason: str, by: str, driver_name: str) -> str:
+    """What every team is told. Names the lead so nobody works it by mistake."""
+    ref = html_escape(str((lead or {}).get("reference_id") or "N/A"), quote=False)
+    client = html_escape(_client_name_from_lead(lead) or "this client", quote=False)
+    who = html_escape(str(by or "the office"), quote=False)
+    driver = html_escape(driver_name or "nobody yet", quote=False)
+    return "\n".join([
+        "🗑 <b>LEAD DELETED</b>",
+        f"📋 Reference: <code>{ref}</code>",
+        f"👤 Client: {client}",
+        f"🚗 Was assigned to: {driver}",
+        f"📝 Reason: {html_escape(str(reason or ''), quote=False)}",
+        f"🙋 Deleted by: {who}",
+        "",
+        "This lead and all of its trails are gone. Do not work it.",
+    ])
+
+
+def _client_name_from_lead(lead: dict) -> str:
+    """The client's name off the stored card — the first line of the block."""
+    first = str((lead or {}).get("vehicle_details") or "").split("\n", 1)[0].strip()
+    return "" if first in ("-", "N/A") else first
+
+
+def _deleted_lead_driver_name(db, lead: dict) -> str:
+    """Who held it, if anybody did."""
+    try:
+        row = db.get_lead_assignment_status(str(lead.get("id") or ""))
+    except Exception:
+        row = None
+    name = str(((row or {}).get("driver") or {}).get("driver_name") or "").strip()
+    return name
+
+
+def _broadcast_lead_deleted(db, lead: dict, reason: str, by: str) -> int:
+    """Tell every active team. Returns how many were reached.
+
+    Sent straight from this service with the bot token, the way the dashboard
+    already attaches documents -- the alternative is a column the bot polls, and
+    a deletion that nobody hears about until the next sweep is a deletion
+    somebody keeps working in the meantime.
+    """
+    import requests as _rq
+    from config import Config
+    token = (getattr(Config, "TELEGRAM_BOT_TOKEN", "") or "").strip()
+    if not token:
+        logger.error("lead %s deleted but TELEGRAM_BOT_TOKEN is not set here — "
+                     "no team was told", lead.get("reference_id"))
+        return 0
+    text = _deleted_lead_notice(lead, reason, by, _deleted_lead_driver_name(db, lead))
+    try:
+        groups = db.get_all_groups() or []
+    except Exception as e:
+        logger.error("lead deleted: could not read the groups: %s", e)
+        return 0
+    told, seen = 0, set()
+    for g in groups:
+        if not record_is_active(g):
+            continue
+        cid = str((g or {}).get("group_telegram_id") or "").strip()
+        if not cid or cid in seen:
+            continue
+        seen.add(cid)
+        try:
+            r = _rq.post(f"https://api.telegram.org/bot{token}/sendMessage",
+                         json={"chat_id": cid, "text": text, "parse_mode": "HTML"},
+                         timeout=20)
+            if r.ok and (r.json() or {}).get("ok"):
+                told += 1
+            else:
+                logger.warning("lead deleted: %s refused: %s", cid, r.text[:160])
+        except Exception as e:
+            logger.warning("lead deleted: could not tell %s: %s", cid, e)
+    logger.info("lead %s deleted by %s (%s) — told %d group(s)",
+                lead.get("reference_id"), by, reason, told)
+    return told
 
 
 def _guarded_path(path: str) -> bool:
@@ -2872,6 +3249,180 @@ def register(app, db_provider):
         logger.info("receipts board: receipt REPLACED for %s (%s) by %s — %s",
                     lead_id, ref, who, reason or "no reason given")
         return jsonify({"ok": True, "lead_id": lead_id, "replaced": True})
+
+    # ── Drivers & supervisors ────────────────────────────────────────────
+    # Mounted under /receipts/ ONLY, never the bare /api alias: these change who
+    # can be sent work and who can approve it, and /receipts/* is what the login
+    # gate covers (see _guarded_path).
+
+    @app.route("/receipts/api/people", methods=["GET"])
+    def api_people():
+        """Everyone the board can act on, and what it is allowed to do."""
+        db = _resolve()
+        try:
+            drivers = db.get_all_drivers() or []
+        except Exception as e:
+            return jsonify({"error": str(e)}), 500
+        try:
+            suspended = {str(x) for x in (db.get_manually_suspended_driver_ids() or set())}
+        except Exception:
+            suspended = set()
+        try:
+            owed_by = db._get_all_pending_receipts_per_driver()
+        except Exception:
+            owed_by = []
+        owed = {}
+        for row in (owed_by or []):
+            did = str((row or {}).get("driver_id") or "")
+            if did:
+                owed.setdefault(did, []).append({
+                    "lead_id": str(row.get("lead_id") or ""),
+                    "reference_id": str(row.get("reference_id") or ""),
+                })
+        out = []
+        for d in drivers:
+            did = str(d.get("id") or "")
+            out.append({
+                "id": did,
+                "name": d.get("driver_name") or "",
+                "telegram_id": str(d.get("driver_telegram_id") or ""),
+                "phone": d.get("phone_number") or "",
+                "email": d.get("email") or "",
+                "active": bool(record_is_active(d)),
+                "suspended": did in suspended,
+                "owed": owed.get(did, []),
+            })
+        return jsonify({
+            "drivers": out,
+            "supervisors": _board_supervisors(db),
+            # The board keeps the button and lets it refuse out loud (503),
+            # and says so on the People tab: the columns arrive with a migration
+            # and a missing button would look like a missing feature.
+            "can_delete_lead": bool(db.lead_deletion_ready()),
+        })
+
+    @app.route("/receipts/api/drivers", methods=["POST"])
+    def api_add_driver():
+        body = request.get_json(silent=True) or {}
+        name = (body.get("name") or "").strip()
+        tg = (body.get("telegram_id") or "").strip()
+        if not name or not re.fullmatch(r"-?\d{5,15}", tg):
+            return jsonify({"error": "A name and a numeric Telegram id are required. "
+                                     "They can get theirs from /whoami."}), 400
+        db = _resolve()
+        try:
+            if db.get_driver_by_telegram_id(tg):
+                return jsonify({"error": "That Telegram id is already a driver."}), 409
+            ok = db.create_driver(name, tg,
+                                  (body.get("phone") or "").strip() or None,
+                                  (body.get("email") or "").strip() or None)
+        except Exception as e:
+            return jsonify({"error": str(e)}), 500
+        return (jsonify({"ok": True}) if ok
+                else (jsonify({"error": "Could not add that driver."}), 500))
+
+    @app.route("/receipts/api/drivers/<driver_id>/suspend", methods=["POST"])
+    def api_suspend_driver(driver_id):
+        want = bool((request.get_json(silent=True) or {}).get("suspended", True))
+        try:
+            ok = _resolve().set_driver_suspended(driver_id, want)
+        except Exception as e:
+            return jsonify({"error": str(e)}), 500
+        return (jsonify({"ok": True, "suspended": want}) if ok
+                else (jsonify({"error": "Could not change that."}), 500))
+
+    @app.route("/receipts/api/drivers/<driver_id>/active", methods=["POST"])
+    def api_toggle_driver_active(driver_id):
+        """On or off for new work, without touching a thing they have done."""
+        try:
+            ok = _resolve().toggle_driver_status(driver_id)
+        except Exception as e:
+            return jsonify({"error": str(e)}), 500
+        return (jsonify({"ok": True}) if ok
+                else (jsonify({"error": "Could not change that."}), 500))
+
+    @app.route("/receipts/api/drivers/<driver_id>", methods=["DELETE"])
+    def api_delete_driver(driver_id):
+        """Only a driver who has never worked. See Database.delete_driver."""
+        try:
+            ok, why = _resolve().delete_driver(driver_id)
+        except Exception as e:
+            return jsonify({"error": str(e)}), 500
+        return jsonify({"ok": True}) if ok else (jsonify({"error": why}), 409)
+
+    @app.route("/receipts/api/drivers/<driver_id>/waive", methods=["POST"])
+    def api_waive_receipt(driver_id):
+        """Stop one owed receipt counting against this driver.
+
+        The same exclude_from_count flag an accepted appeal sets, so the
+        leaderboard, the receipts owed and the suspension counter all agree
+        about it at once.
+        """
+        lead_id = ((request.get_json(silent=True) or {}).get("lead_id") or "").strip()
+        if not lead_id:
+            return jsonify({"error": "Which receipt?"}), 400
+        try:
+            ok = _resolve().set_lead_excluded(lead_id, True)
+        except Exception as e:
+            return jsonify({"error": str(e)}), 500
+        return (jsonify({"ok": True}) if ok else
+                (jsonify({"error": "Could not waive that — the database may be "
+                                   "missing migration_exclude_from_count.sql."}), 500))
+
+    @app.route("/receipts/api/supervisors", methods=["POST"])
+    def api_add_supervisor():
+        body = request.get_json(silent=True) or {}
+        tg = (body.get("id") or "").strip()
+        label = (body.get("label") or "").strip()
+        if not re.fullmatch(r"-?\d{5,15}", tg):
+            return jsonify({"error": "A numeric Telegram id is required — "
+                                     "they can get theirs from /whoami."}), 400
+        db = _resolve()
+        rows = [r for r in _board_supervisors(db) if str(r.get("id")) != tg]
+        rows.append({"id": tg, "label": label})
+        return (jsonify({"ok": True, "supervisors": rows})
+                if _save_board_supervisors(db, rows)
+                else (jsonify({"error": "Could not save that."}), 500))
+
+    @app.route("/receipts/api/supervisors/<sup_id>", methods=["DELETE"])
+    def api_remove_supervisor(sup_id):
+        db = _resolve()
+        rows = [r for r in _board_supervisors(db) if str(r.get("id")) != str(sup_id)]
+        return (jsonify({"ok": True, "supervisors": rows})
+                if _save_board_supervisors(db, rows)
+                else (jsonify({"error": "Could not save that."}), 500))
+
+    # ── Deleting a lead ──────────────────────────────────────────────────
+
+    @app.route("/receipts/api/transmissions/<lead_id>/delete", methods=["POST"])
+    def api_delete_lead(lead_id):
+        """Take a lead off every board, say why, and tell every team.
+
+        A flag, not a DELETE: money may already have been taken against the row
+        and a driver may already owe a receipt for it.
+        """
+        body = request.get_json(silent=True) or {}
+        reason = (body.get("reason") or "").strip()
+        by = (body.get("by") or "").strip() or "the office"
+        if not reason:
+            return jsonify({"error": "A reason is required."}), 400
+        db = _resolve()
+        if not db.lead_deletion_ready():
+            return jsonify({"error": "This database is missing "
+                                     "database/migration_lead_deleted.sql — "
+                                     "a deletion cannot be recorded yet."}), 503
+        lead = None
+        try:
+            lead = db.get_lead_by_id(lead_id)
+        except Exception as e:
+            logger.warning("delete lead: lookup failed for %s: %s", lead_id, e)
+        if not lead:
+            return jsonify({"error": "That lead no longer exists."}), 404
+        if not db.soft_delete_lead(lead_id, reason, by):
+            return jsonify({"error": "Could not delete that — it may already be "
+                                     "deleted."}), 409
+        told = _broadcast_lead_deleted(db, lead, reason, by)
+        return jsonify({"ok": True, "groups_notified": told})
 
     @app.route("/receipts/insurance/<lead_id>", methods=["GET"])
     def receipts_insurance_card(lead_id):

@@ -37,6 +37,19 @@ import admin_dashboard as ad                                   # noqa: E402
 SRC_BOARD = (ROOT / "receipts_page.py").read_text(encoding="utf-8")
 
 
+
+def _board_only(html: str) -> str:
+    """The page without the People tab's own tables.
+
+    Drivers and supervisors are rendered into tables three and two columns
+    wide. Only the transmissions table's colspans have to match ITS header, so
+    counting theirs was counting a different table. The two anchors are the
+    banner the People JS opens with and the function that follows it — if
+    either moves this raises rather than quietly passing.
+    """
+    head, rest = html.split("// \u2500\u2500 People: drivers and supervisors", 1)
+    return head + rest.split("async function saveStatus(", 1)[1]
+
 class TheDeliveryMomentTest(unittest.TestCase):
     """_delivery_moment decides what the Delivered column says."""
 
@@ -145,7 +158,7 @@ class TheBoardShowsBothTimesTest(unittest.TestCase):
         row_start = block.rindex("<tr>")
         thead = SRC_BOARD[row_start:SRC_BOARD.index("</tr>", row_start)]
         headers = len(re.findall(r"<th[\s>]", thead))
-        spans = set(re.findall(r'colspan="(\d+)"', SRC_BOARD))
+        spans = set(re.findall(r'colspan="(\d+)"', _board_only(SRC_BOARD)))
         self.assertEqual({str(headers)}, spans,
                          f"{headers} columns but colspans {spans}")
 

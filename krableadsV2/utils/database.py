@@ -2344,6 +2344,96 @@ class Database:
             logger.warning("set_driver_suspended (run migration_driver_manual_suspend.sql?): %s", e)
             return False
 
+    # ── Deleting a lead ──────────────────────────────────────────────────
+    # A flag, never a DELETE. Money may already have been taken against the row
+    # and a driver may already owe a receipt for it; a row that is gone cannot
+    # answer either question. See database/migration_lead_deleted.sql.
+    _DELETED_COL = "deleted_at"
+
+    def lead_deletion_ready(self) -> bool:
+        """Can this database record a deletion at all?
+
+        The board asks before it offers the button, so a supervisor is never
+        told a lead was deleted when the write was silently dropped.
+        """
+        if not self._check_tables_exist():
+            return False
+        try:
+            self.client.table("leads").select(
+                "deleted_at, deleted_reason, deleted_by").limit(1).execute()
+            return True
+        except Exception as e:
+            if self._missing_column(e, self._DELETED_COL):
+                return False
+            logger.warning("lead_deletion_ready: %s", e)
+            return False
+
+    def soft_delete_lead(self, lead_id: str, reason: str, by: str = "") -> bool:
+        """Hide a lead everywhere, and record why and by whom."""
+        if not lead_id:
+            return False
+        from datetime import datetime, timezone
+        try:
+            r = (self.client.table("leads")
+                 .update({"deleted_at": datetime.now(timezone.utc).isoformat(),
+                          "deleted_reason": (reason or "")[:200],
+                          "deleted_by": (by or "")[:120]})
+                 .eq("id", str(lead_id)).is_("deleted_at", "null").execute())
+            return bool(getattr(r, "data", None))
+        except Exception as e:
+            logger.error("soft_delete_lead %s: %s", lead_id, e)
+            return False
+
+    def restore_lead(self, lead_id: str) -> bool:
+        """Undo a deletion. The whole reason it is a flag."""
+        try:
+            r = (self.client.table("leads")
+                 .update({"deleted_at": None, "deleted_reason": None,
+                          "deleted_by": None})
+                 .eq("id", str(lead_id)).execute())
+            return bool(getattr(r, "data", None))
+        except Exception as e:
+            logger.error("restore_lead %s: %s", lead_id, e)
+            return False
+
+    # ── Drivers, from the board ──────────────────────────────────────────
+
+    def count_driver_assignments(self, driver_id: str) -> int:
+        """How much history a driver has. Deleting them would take it with them.
+
+        lead_assignments.driver_id and group_drivers.driver_id are both
+        ON DELETE CASCADE (database/schema_multi_group.sql), so removing a
+        driver who has worked erases every accept they ever made -- and with it
+        the receipts they owe and the record of who delivered what.
+        """
+        try:
+            r = (self.client.table("lead_assignments").select("id", count="exact")
+                 .eq("driver_id", str(driver_id)).limit(1).execute())
+            return int(getattr(r, "count", None) or 0)
+        except Exception as e:
+            logger.warning("count_driver_assignments %s: %s", driver_id, e)
+            return -1                      # unknown: the caller must not delete
+
+    def delete_driver(self, driver_id: str) -> tuple:
+        """(ok, reason). Refuses to delete a driver who has history.
+
+        Deactivating is what the board offers instead: it stops new leads
+        reaching them and keeps every receipt and accept intact.
+        """
+        n = self.count_driver_assignments(driver_id)
+        if n < 0:
+            return False, "Could not check this driver's history — not deleting."
+        if n > 0:
+            return False, (f"This driver has {n} lead(s) on record. Deleting them "
+                           "would erase those deliveries and the receipts they owe. "
+                           "Deactivate them instead.")
+        try:
+            self.client.table("drivers").delete().eq("id", str(driver_id)).execute()
+            return True, ""
+        except Exception as e:
+            logger.error("delete_driver %s: %s", driver_id, e)
+            return False, "The database refused that."
+
     def get_manually_suspended_driver_ids(self) -> set:
         """Driver ids flagged by a supervisor. Empty when the column is absent."""
         if not self._check_tables_exist():

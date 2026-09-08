@@ -338,10 +338,10 @@ class TheTagIsTheOneTheClientHasTest(unittest.TestCase):
 
 
 class TheTagRouteUsesAHandleThatCanBuildTest(unittest.TestCase):
-    """The board runs on AdminDatabase, which has none of get_lead_by_id,
-    update_lead or allocate_temp_plate. Handing the tag builder that handle is
-    an AttributeError on the first real click, on a page that otherwise tests
-    perfectly clean -- so the choice of handle is pinned here."""
+    """The board runs on AdminDatabase, which cannot mint or persist a plate.
+    Handing the tag builder that handle is an AttributeError on the first real
+    click, on a page that otherwise tests perfectly clean -- so the choice of
+    handle is pinned here."""
 
     def setUp(self):
         body = (ROOT / "receipts_page.py").read_text(encoding="utf-8")
@@ -356,8 +356,15 @@ class TheTagRouteUsesAHandleThatCanBuildTest(unittest.TestCase):
 
     def test_the_board_handle_really_cannot_build_a_tag(self):
         """If AdminDatabase ever grows these, this test is the place to decide
-        whether the split still earns its keep."""
-        for name in ("get_lead_by_id", "update_lead", "allocate_temp_plate"):
+        whether the split still earns its keep.
+
+        It did grow get_lead_by_id: deleting a lead has to read the row it is
+        about to flag, and reading is not building. What makes a tag is minting
+        a plate and writing it back, and the board's handle still cannot do
+        either -- so the split stands and the tag route still asks for the
+        bot's handle (test_it_does_not_use_the_boards_handle, above).
+        """
+        for name in ("update_lead", "allocate_temp_plate"):
             with self.subTest(name=name):
                 self.assertFalse(hasattr(ad.AdminDatabase, name),
                                  f"AdminDatabase now has {name} — revisit the handle split")

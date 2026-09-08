@@ -13,6 +13,19 @@ import receipts_page
 HTML = receipts_page.BOARD_HTML
 
 
+
+def _board_only(html: str) -> str:
+    """The page without the People tab's own tables.
+
+    Drivers and supervisors are rendered into tables three and two columns
+    wide. Only the transmissions table's colspans have to match ITS header, so
+    counting theirs was counting a different table. The two anchors are the
+    banner the People JS opens with and the function that follows it — if
+    either moves this raises rather than quietly passing.
+    """
+    head, rest = html.split("// \u2500\u2500 People: drivers and supervisors", 1)
+    return head + rest.split("async function saveStatus(", 1)[1]
+
 class InsuranceFieldsTest(unittest.TestCase):
     def test_a_tag_only_lead_is_not_marked_insured(self):
         got = ad._insurance_fields({})
@@ -101,7 +114,7 @@ class BoardMarkupTest(unittest.TestCase):
         head = HTML[HTML.index("<thead>"): HTML.index("</thead>")]
         # `<th[\s>]` so the opening `<thead>` is not counted as a column.
         n_cols = len(re.findall(r"<th[\s>]", head))
-        for span in re.findall(r'colspan="(\d+)"', HTML):
+        for span in re.findall(r'colspan="(\d+)"', _board_only(HTML)):
             self.assertEqual(
                 int(span), n_cols,
                 f"a colspan of {span} does not match the {n_cols} header columns — "
