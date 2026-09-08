@@ -36,7 +36,18 @@ def create_app() -> FastAPI:
 
     @app.get("/api/health")
     async def health():
-        return {"ok": True}
+        """Health, and WHICH BUILD is answering.
+
+        Whether a fix was actually live here could only be guessed at from the
+        last-modified header on a static file. Every service deploys from the
+        same push, so this commit is the one the bot is polling with too.
+        """
+        import os as _os
+        return {
+            "ok": True,
+            "commit": (_os.environ.get("RENDER_GIT_COMMIT") or "local")[:7],
+            "bot_token": bool((_os.environ.get("TELEGRAM_BOT_TOKEN") or "").strip()),
+        }
 
     app.include_router(routes_drafts.router)
     app.include_router(routes_admin.router)

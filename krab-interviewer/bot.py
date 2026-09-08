@@ -20,6 +20,7 @@ import pytz
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, InputFile, Update
 from telegram.ext import (
     Application,
+    ApplicationHandlerStop,
     CallbackQueryHandler,
     ChatJoinRequestHandler,
     CommandHandler,
@@ -1399,7 +1400,17 @@ async def _send_driver_onboarding_messages(
 
 
 def _resolve_hired_driver_interview(telegram_id: str) -> Optional[dict]:
-    """Latest hired interview for this Telegram user, if any."""
+    """A hired interview THIS BOT wrote for this Telegram user, or nothing.
+
+    It used to fall back to the drivers table and, on any hit, invent a row
+    saying status "hired". But `drivers` is the shared issuer/dispatch roster,
+    not this bot's: 82 people are on it and 62 of them have never had an
+    interview here at all. Every one of them tapped Start, was handed the full
+    new-hire onboarding for a job they were never hired for, and was then
+    dropped out of the conversation -- which is what "random users can't use the
+    bot" was. Being on the roster is not the same as having been hired here, and
+    only the second one has onboarding to deliver.
+    """
     if not db:
         return None
     tid = str(telegram_id or "").strip()
@@ -1408,20 +1419,10 @@ def _resolve_hired_driver_interview(telegram_id: str) -> Optional[dict]:
     interview = db.get_hired_interview_for_telegram_id(tid)
     if interview:
         return interview
-    driver = db.get_driver_by_telegram_id(tid)
-    if not driver:
-        return None
     latest = db.get_latest_interview_for_telegram_id(tid)
     if latest and (latest.get("status") or "") == "hired":
         return latest
-    return {
-        "telegram_id": tid,
-        "full_name": driver.get("driver_name"),
-        "first_name": driver.get("driver_name"),
-        "phone_number": driver.get("phone_number"),
-        "mailing_address": "",
-        "status": "hired",
-    }
+    return None
 
 
 async def _deliver_hired_driver_onboarding(
@@ -1972,6 +1973,57 @@ async def _process_interview_input(
 
 # --- Commands ---
 
+# The real handlers, filled in by main(). The net asks each of them whether it
+# would take an update before saying anything itself.
+_REAL_HANDLERS: list = []
+
+
+async def hint_no_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Answer a message nothing else would claim, instead of dropping it.
+
+    Runs in group -1, BEFORE the real handlers: PTB gives an update to every
+    group, so a net placed after them would also answer "I didn't catch that"
+    to messages the conversation had just handled. Asking first is the only
+    order in which the question "would anybody take this?" has a true answer.
+
+    Why it is needed at all: the bot has no PTB persistence, and every redeploy
+    drops in-flight applicants outside their conversation, where their next
+    message matched nothing and was discarded with no reply and no log line --
+    a broken bot and a silent one looked identical from both sides.
+    """
+    msg = update.effective_message
+    if not msg:
+        return
+    for h in _REAL_HANDLERS:
+        try:
+            if h.check_update(update):
+                return                  # somebody downstream wants this one
+        except Exception:
+            return                      # in doubt, stay quiet and let them have it
+    uid = getattr(update.effective_user, "id", "?")
+    logger.info("nothing would handle this private message from %s", uid)
+    await msg.reply_text(
+        "I didn't catch that — tap /start to begin (or continue) your driver "
+        "application, or /help to see what I can do."
+    )
+    raise ApplicationHandlerStop
+
+
+async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Log what broke, and tell the person something rather than nothing."""
+    logger.error("handler error on %s", update, exc_info=context.error)
+    msg = getattr(update, "effective_message", None)
+    if msg is None:
+        return
+    try:
+        await msg.reply_text(
+            "Something went wrong on my side — nothing you did. Tap /start to "
+            "pick up where you left off."
+        )
+    except Exception:
+        pass
+
+
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     user = update.effective_user
     msg = update.effective_message
@@ -2029,12 +2081,20 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
             await _deliver_hired_driver_onboarding(
                 context, hired_interview, source="start_web"
             )
+            return ConversationHandler.END
         await msg.reply_text(
             "✅ Your Telegram is linked for the driver application.\n\n"
-            "Return to the application form — your Telegram ID will appear automatically.\n\n"
+            "Return to the application form — your Telegram ID will appear "
+            "automatically.\n\n"
+            "Or just answer here instead: send your details below and I will "
+            "take the application in this chat.\n\n"
             f"When you're hired, start taking leads with @{dispatch}."
         )
-        return ConversationHandler.END
+        # Do NOT end here. This link is what tristatetags.com/interview/apply
+        # hands out, so ending the conversation left every applicant who used
+        # the site's own funnel with one message and a bot that ignored every
+        # word and photo after it.
+        return await _begin_questionnaire(update, context, supervisor_created=False)
 
     if hired_interview:
         await _deliver_hired_driver_onboarding(
@@ -3710,6 +3770,14 @@ def main() -> None:
         CallbackQueryHandler(handle_driver_callbacks, pattern=r"^drv_"),
     )
     application.add_handler(ChatJoinRequestHandler(handle_chat_join_request))
+
+    # Everything above is group 0. The net goes in front of it, holding a
+    # reference to exactly those handlers so it can ask them first.
+    _REAL_HANDLERS[:] = list(application.handlers.get(0, []))
+    application.add_handler(
+        MessageHandler(filters.ChatType.PRIVATE, hint_no_handler), group=-1,
+    )
+    application.add_error_handler(on_error)
 
     if application.job_queue:
         application.job_queue.run_repeating(check_pending_jobs, interval=30, first=15)
