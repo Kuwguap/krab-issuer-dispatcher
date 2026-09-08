@@ -269,6 +269,18 @@ def _user_is_hired_driver(user_id) -> bool:
         return False
 
 
+def _hiring_requires_someone_else() -> bool:
+    """Must a hire be approved by somebody other than the applicant?
+
+    No, by request. It was never much of a barrier once anyone could hire: the
+    person refused here could approve the same application from a second account
+    in under a minute. Set KRAB_HIRE_REQUIRES_OTHER=1 to require a second pair
+    of hands again.
+    """
+    raw = str(os.getenv("KRAB_HIRE_REQUIRES_OTHER") or "").strip().lower()
+    return raw in ("1", "true", "yes", "on")
+
+
 def _hiring_requires_team() -> bool:
     """Is the team-membership gate on? Off by default, by request.
 
@@ -2406,17 +2418,20 @@ async def handle_interview_callbacks(update: Update, context: ContextTypes.DEFAU
                 "drivers channel, or to turn the restriction off."
             )
             return STATE_INTERVIEW_INPUT
-        # Nobody approves themselves. Supervisors are exempt so the existing
-        # supervisor-created flow, where they enter the driver themselves, keeps
-        # working exactly as it did.
-        _pending = db.get_interview_by_id(iid)
-        if (_pending and not _user_is_global_supervisor(user.id)
-                and _is_own_application(_pending, user.id)):
-            await query.message.reply_text(
-                "⛔ You can't hire your own application — a teammate has to "
-                "approve it."
-            )
-            return STATE_INTERVIEW_INPUT
+        # Approving your own application is allowed, by request. The check is
+        # kept behind a switch rather than deleted — see
+        # _hiring_requires_someone_else. Supervisors stay exempt either way, so
+        # the flow where a supervisor enters a driver themselves and hires them
+        # keeps working exactly as it always did.
+        if _hiring_requires_someone_else():
+            _pending = db.get_interview_by_id(iid)
+            if (_pending and not _user_is_global_supervisor(user.id)
+                    and _is_own_application(_pending, user.id)):
+                await query.message.reply_text(
+                    "⛔ A second person has to approve a hire on this "
+                    "deployment (KRAB_HIRE_REQUIRES_OTHER)."
+                )
+                return STATE_INTERVIEW_INPUT
         interview, errors = hire_driver_records(db, iid)
         if not interview:
             await query.message.reply_text(
