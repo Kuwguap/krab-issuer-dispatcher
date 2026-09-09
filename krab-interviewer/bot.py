@@ -79,7 +79,8 @@ INTERVIEW_QUESTIONNAIRE_PROMPT = (
     "10. 💰 Payment Method (Zelle, Cashapp, Venmo, PayPal)\n"
     "11. 💳 Payment ID ($Cashtag, @Venmo, Zelle phone/email)\n"
     "12. ⚒️ Profession skill\n"
-    "13. 💬 Telegram ID\n\n"
+    "13. 💬 Telegram ID (optional — we fill this in from your username, or tap "
+    "the button on your card)\n\n"
     "✅ Please double-check all information before submitting"
 )
 
@@ -375,6 +376,56 @@ def _paper_girl_group_notify_ids() -> List[int]:
         seen.add(cid)
         out.append(cid)
     return out
+
+
+# 6 to 16 digits: the live table already holds nine-digit ids (945529353), and
+# ids only get longer, so a tighter window would reject real people.
+_TELEGRAM_ID_RE = re.compile(r"[1-9]\d{5,15}")
+
+
+def _clean_telegram_id(value) -> str:
+    """A usable numeric id, or "".
+
+    The parsed value is written with no validation today, so a pasted blob
+    ("Chat Id: 8713796087", or a whole sentence) lands in the column verbatim.
+    Nothing notices until delivery, where int(tid) raises and the driver record
+    exists with no way to reach them. Pull the number out if there is one.
+    """
+    s = str(value or "").strip()
+    if not s:
+        return ""
+    if _TELEGRAM_ID_RE.fullmatch(s):
+        return s
+    m = _TELEGRAM_ID_RE.search(s)
+    return m.group(0) if m else ""
+
+
+def _resolve_applicant_telegram_id(fields: dict) -> tuple:
+    """(telegram_id, how) for the person the application is ABOUT.
+
+    Never the sender: one chat filed thirteen applications for eight different
+    people, and is_supervisor_created cannot tell that apart from somebody
+    applying for themselves -- it is False for both. The username is the only
+    thing on the row that names the applicant rather than the typist, so that is
+    what gets resolved, out of the directory the bot itself writes on /start and
+    which only the web path has ever read back.
+    """
+    given = _clean_telegram_id((fields or {}).get("telegram_id"))
+    if given:
+        return given, "given"
+    un = str((fields or {}).get("telegram_username") or "").strip()
+    if not un or not db:
+        return "", ""
+    try:
+        from utils.drafts_db import DraftsDatabase
+        from utils.telegram_resolve import resolve_telegram_id_for_username
+        tid, source, _msg = resolve_telegram_id_for_username(
+            db, un, DraftsDatabase(db.client))
+        tid = _clean_telegram_id(tid)
+        return (tid, source or "directory") if tid else ("", "")
+    except Exception as e:
+        logger.warning("telegram id resolve for %s: %s", un, e)
+        return "", ""
 
 
 def _telegram_user_label(user) -> str:
@@ -964,21 +1015,50 @@ def _format_interview_understanding(interview: dict) -> str:
     st = (interview.get("status") or "").strip()
     if st == "hired":
         lines.append("\n✅ Hired — added to dispatch & issuer")
+    else:
+        missing = _hire_blockers(interview)
+        if missing:
+            lines.append("\n⚠️ Cannot hire yet — still needs: " + ", ".join(missing))
     return "\n".join(lines)
 
 
-def _review_keyboard(interview_id: str) -> InlineKeyboardMarkup:
+def _hire_blockers(interview: dict) -> list:
+    """What a hire would refuse for, in the words a person would use.
+
+    The same three fields validate_hire_ready checks. Said on the card, they are
+    a to-do list; discovered on the Hire button, they are a dead end somebody
+    hits after doing all the work.
+    """
+    out = []
+    if not str((interview or {}).get("full_name") or "").strip():
+        out.append("full name")
+    if not _clean_telegram_id((interview or {}).get("telegram_id")):
+        out.append("Telegram ID")
+    if not str((interview or {}).get("email") or "").strip():
+        out.append("email")
+    return out
+
+
+def _review_keyboard(interview_id: str, interview: dict = None) -> InlineKeyboardMarkup:
     sid = _short_uuid(interview_id)
-    return InlineKeyboardMarkup([
+    rows = [
         [
             InlineKeyboardButton("🪪 Upload license", callback_data=f"int_lic_{sid}"),
             InlineKeyboardButton("📆 Schedule appointment", callback_data=f"int_sched_{sid}"),
         ],
-        [
-            InlineKeyboardButton("✍️ Edit", callback_data=f"int_edit_{sid}"),
-            InlineKeyboardButton("✅ Hire", callback_data=f"int_hire_{sid}"),
-        ],
+    ]
+    # The one field the applicant cannot look up, offered as a tap instead of a
+    # question. It stamps the id of whoever presses it, so it is only ever shown
+    # while the id is missing -- and it says whose id it will use, because the
+    # person holding this card is often not the applicant.
+    if interview is not None and not _clean_telegram_id(interview.get("telegram_id")):
+        rows.append([InlineKeyboardButton("🙋 This application is mine",
+                                          callback_data=f"int_mine_{sid}")])
+    rows.append([
+        InlineKeyboardButton("✍️ Edit", callback_data=f"int_edit_{sid}"),
+        InlineKeyboardButton("✅ Hire", callback_data=f"int_hire_{sid}"),
     ])
+    return InlineKeyboardMarkup(rows)
 
 
 def _edit_fields_keyboard(interview_id: str) -> InlineKeyboardMarkup:
@@ -1003,7 +1083,7 @@ async def _refresh_understanding_card(
         return
     iid = interview.get("id")
     text = _format_interview_understanding(interview)
-    kb = _review_keyboard(iid) if (interview.get("status") or "") != "hired" else None
+    kb = _review_keyboard(iid, interview) if (interview.get("status") or "") != "hired" else None
     try:
         await context.bot.edit_message_text(
             chat_id=chat_id,
@@ -1028,6 +1108,7 @@ def _resolve_interview_id_from_callback(data: str, prefix: str) -> Optional[str]
 def _interview_id_from_callback(data: str) -> Optional[str]:
     for prefix in (
         "int_lic_", "int_sched_", "int_edit_", "int_hire_", "int_eback_", "int_open_",
+        "int_mine_",
     ):
         if data.startswith(prefix):
             return _resolve_interview_id_from_callback(data, prefix)
@@ -1852,6 +1933,61 @@ def _startup_reenqueue_jobs(application: Application) -> None:
 
 # --- Interview flow helpers ---
 
+async def _notify_supervisors_new_interview(
+    context: ContextTypes.DEFAULT_TYPE, interview: dict, filed_by: str,
+) -> int:
+    """Tell the supervisors an application has arrived. Returns how many heard.
+
+    Nothing did this before. The card goes to whoever typed it -- an applicant
+    or a recruiter -- and the office got no message, no copy and no trace, so
+    the only way to learn an application existed was to think to type
+    /interviews. Fifty-seven are sitting pending that way.
+
+    Sent with the Application rather than api/notify.py's requests.post: that
+    one blocks for up to fifteen seconds per recipient, inside the event loop
+    every other applicant's messages are waiting in. One bad chat id must not
+    cost the applicant their reply either, so each send stands alone.
+    """
+    iid = str((interview or {}).get("id") or "")
+    if not iid:
+        return 0
+    name = (str(interview.get("full_name") or "").strip()
+            or str(interview.get("first_name") or "").strip() or "Driver")
+    un = str(interview.get("telegram_username") or "").strip()
+    phone = str(interview.get("phone_number") or "").strip()
+    missing = _hire_blockers(interview)
+    lines = [
+        "🆕 New driver application",
+        "",
+        f"👤 {name}",
+        f"💬 {un or '—'}",
+        f"📱 {phone or '—'}",
+        f"🙋 Filed by {filed_by}",
+    ]
+    # Whether Hire will refuse, on the notice itself: a supervisor should know
+    # before opening it whether there is anything to do but chase a field.
+    lines.append("")
+    lines.append("⚠️ Cannot hire yet — still needs: " + ", ".join(missing)
+                 if missing else "✅ Ready to hire")
+    lines.append("")
+    lines.append(f"Open: /open {iid}")
+    text = "\n".join(lines)
+    told, seen = 0, set()
+    for cid in _global_supervisory_chat_ids():
+        if cid in seen:
+            continue
+        seen.add(cid)
+        try:
+            await context.bot.send_message(chat_id=cid, text=text)
+            told += 1
+        except Exception as e:
+            logger.warning("new-application notice to %s: %s", cid, e)
+    if not seen:
+        logger.error("application %s arrived but SUPERVISORY_TELEGRAM_ID is empty "
+                     "— nobody was told", iid)
+    return told
+
+
 async def _begin_questionnaire(
     update: Update, context: ContextTypes.DEFAULT_TYPE, *, supervisor_created: bool,
 ) -> int:
@@ -1951,7 +2087,7 @@ async def _process_interview_input(
             # rather than leaving the operator with no way to act on the entry.
             card = await msg.reply_text(
                 _format_interview_understanding(active),
-                reply_markup=_review_keyboard(active["id"]),
+                reply_markup=_review_keyboard(active["id"], active),
             )
             context.user_data["understanding_chat_id"] = card.chat_id
             context.user_data["understanding_message_id"] = card.message_id
@@ -1965,6 +2101,19 @@ async def _process_interview_input(
         return STATE_INTERVIEW_INPUT
 
     context.user_data.pop("active_interview_id", None)
+    # Resolved into `fields`, not passed as an argument: create_interview builds
+    # its payload by spreading the parsed fields LAST, so a keyword would be
+    # silently overwritten by whatever the model did or did not return.
+    resolved, how = _resolve_applicant_telegram_id(fields)
+    if resolved:
+        fields = dict(fields, telegram_id=resolved)
+        logger.info("interview: telegram id resolved from %s", how)
+    elif str(fields.get("telegram_id") or "").strip():
+        # It said something, and it was not an id. Storing it is how a driver
+        # record ends up with a number that cannot be messaged.
+        logger.info("interview: discarding unusable telegram_id %r",
+                    str(fields.get("telegram_id"))[:60])
+        fields = dict(fields, telegram_id="")
     interview = db.create_interview(
         fields,
         created_by_telegram_id=str(user.id),
@@ -1978,7 +2127,7 @@ async def _process_interview_input(
     context.user_data["understanding_chat_id"] = msg.chat_id
     card = await msg.reply_text(
         _format_interview_understanding(interview),
-        reply_markup=_review_keyboard(interview["id"]),
+        reply_markup=_review_keyboard(interview["id"], interview),
     )
     context.user_data["understanding_message_id"] = card.message_id
     db.update_interview(
@@ -1988,6 +2137,11 @@ async def _process_interview_input(
             "understanding_message_id": card.message_id,
         },
     )
+    # Here, and not a line earlier: the notice points at a card, so the card has
+    # to exist and have been recorded first.
+    told = await _notify_supervisors_new_interview(
+        context, interview, _telegram_user_label(user))
+    logger.info("application %s: %d supervisor(s) told", interview["id"], told)
     return STATE_INTERVIEW_INPUT
 
 
@@ -2337,7 +2491,7 @@ async def _send_interview_detail(message, context, interview_id: str) -> None:
         except ValueError:
             pass
     st = (interview.get("status") or "").strip()
-    kb = _review_keyboard(interview_id) if st not in ("hired", "cancelled") else None
+    kb = _review_keyboard(interview_id, interview) if st not in ("hired", "cancelled") else None
     await message.reply_text(_format_interview_understanding(interview), reply_markup=kb)
     await _send_interview_license_bundle(message, context, interview_id)
 
@@ -2507,6 +2661,32 @@ async def handle_interview_callbacks(update: Update, context: ContextTypes.DEFAU
         interview = db.get_interview_by_id(iid) if iid else None
         if interview:
             await _refresh_understanding_card(context, interview)
+        return STATE_INTERVIEW_INPUT
+
+    if data.startswith("int_mine_"):
+        iid = iid or _resolve_interview_id_from_callback(data, "int_mine_")
+        interview = db.get_interview_by_id(iid) if iid else None
+        if not interview:
+            return STATE_INTERVIEW_INPUT
+        # The one honest way to get this field. It cannot be inferred -- a
+        # recruiter filing for somebody else looks identical in the data to a
+        # person applying for themselves -- so it is answered, by the person
+        # whose id it would be, in one tap.
+        if _clean_telegram_id(interview.get("telegram_id")):
+            await query.message.reply_text("That application already has a Telegram ID.")
+            return STATE_INTERVIEW_INPUT
+        db.update_interview(iid, {"telegram_id": str(user.id)})
+        try:
+            db.upsert_telegram_user_directory(str(user.id), user.username or "")
+        except Exception as e:
+            logger.info("directory upsert on self-claim: %s", e)
+        interview = db.get_interview_by_id(iid) or interview
+        await _refresh_understanding_card(context, interview)
+        await query.message.reply_text(
+            f"✅ Recorded — this application is yours ({_telegram_user_label(user)}).\n"
+            "If you were filing it for somebody else, tap ✍️ Edit and put their "
+            "Telegram ID in instead."
+        )
         return STATE_INTERVIEW_INPUT
 
     if data.startswith("int_hire_"):
