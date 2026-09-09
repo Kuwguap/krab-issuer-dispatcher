@@ -239,7 +239,13 @@ class TheReleaseButtonHoldsTheClientsCopyTest(unittest.IsolatedAsyncioTestCase):
     def test_it_shows_only_while_the_client_still_needs_it(self):
         for lead, want in (
                 ({"wants_tag_email": True, "email": "a@b.com"}, True),
-                ({"wants_tag_email": False, "email": "a@b.com"}, False),
+                # The toggle is no longer the gate: an address is enough. The
+                # button OFFERS the send, it does not make it, and requiring the
+                # toggle meant the offer only ever appeared for leads somebody
+                # had already thought to configure. Thirty live leads carry a
+                # client address with the toggle off, and none of them could be
+                # released from anywhere. See test_tag_release_reachable.py.
+                ({"wants_tag_email": False, "email": "a@b.com"}, True),
                 ({"wants_tag_email": True, "email": ""}, False),
                 ({"wants_tag_email": True, "email": "a@b.com",
                   "tag_emailed_at": "x"}, False),

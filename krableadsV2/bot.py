@@ -17630,9 +17630,18 @@ def _insurance_email_keyboard(lead_id: str) -> InlineKeyboardMarkup:
 
 
 def _lead_awaiting_tag_email(lead: dict) -> bool:
-    """Tag issued with the email switch on, client's copy still held."""
+    """The client's copy of the tag could be released, and has not been.
+
+    Deliberately NOT gated on wants_tag_email. The button offers a choice; it
+    does not take one -- nothing reaches the client until a person presses it,
+    which is the same hold the insurance card has always had. Requiring the
+    toggle meant the offer only appeared for leads somebody had already thought
+    to configure, and thirty leads carry a client address with the toggle off.
+
+    What it still requires: an address to send to, and no send already made or
+    approved. Without an address there is nothing to offer.
+    """
     return bool(lead
-                and lead.get("wants_tag_email")
                 and str(lead.get("email") or "").strip()
                 and not str(lead.get("tag_emailed_at") or "").strip()
                 and not str(lead.get("tag_email_approved_at") or "").strip())
@@ -17919,6 +17928,16 @@ async def cmd_set_client_email(update: Update, context: ContextTypes.DEFAULT_TYP
         return
     if _lead_awaiting_insurance_email(fresh):
         reply += "\n🛡 Now tap 📧 Email insurance to client to send it."
+    # The tag may have gone out to the team BEFORE this address existed, in
+    # which case it was posted with no release button and there was no second
+    # chance anywhere. Offer it here, where the person who supplied the missing
+    # piece is standing. Still an offer: the sweep sends only after this is
+    # pressed, so nothing has changed about who decides.
+    if _lead_awaiting_tag_email(fresh):
+        await message.reply_text(
+            reply + "\n🏷 The tag can go to the client now — release it below.",
+            reply_markup=_tag_email_keyboard(str(fresh.get("id"))))
+        return
     await message.reply_text(reply)
 
 
