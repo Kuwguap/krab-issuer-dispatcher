@@ -162,8 +162,11 @@ class EveryNewButtonReachesAHandlerTest(unittest.TestCase):
         self.assertIn('pattern=r"^ins_email_"', src)
 
     def test_setclientemail_is_registered(self):
+        """Under both names: /email is what it is called now, and
+        /setclientemail is quoted in three months of chat history."""
         src = (ROOT / "bot.py").read_text(encoding="utf-8")
-        self.assertIn('CommandHandler("setclientemail", cmd_set_client_email)', src)
+        self.assertIn(
+            'CommandHandler(["email", "setclientemail"], cmd_set_client_email)', src)
 
 
 class TheDocumentationMatchesTheCodeTest(unittest.TestCase):

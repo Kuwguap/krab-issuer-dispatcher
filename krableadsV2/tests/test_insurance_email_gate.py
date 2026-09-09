@@ -356,14 +356,14 @@ class InsuranceEmailGateTest(unittest.TestCase):
         self.assertEqual(1, len(docs),
                          "only the tag PDF should go out for a no-email lead")
         bails = [d for e, d in TRANSPORT.calls if e == "sendMessage"
-                 and "/setclientemail" in str(d.get("text", ""))]
+                 and "/email " in str(d.get("text", ""))]
         self.assertTrue(bails, "the group was not told how to fix the missing email")
         self.assertFalse(str(FAKE_DB.lead.get("insurance_card_sent_at") or "").strip())
 
         # The lead's own group sets the email; the held card is issued right there.
         TRANSPORT.reset()
         emails = self._run([_command_update(
-            self.app, 8032, f"/setclientemail GATE1234 {CLIENT_EMAIL}")])
+            self.app, 8032, f"/email GATE1234 {CLIENT_EMAIL}")])
         self.assertEqual([], emails, "setting the email must not email the client")
         self.assertEqual(CLIENT_EMAIL, FAKE_DB.lead.get("email"))
         self.assertTrue(str(FAKE_DB.lead.get("insurance_card_sent_at") or "").strip(),

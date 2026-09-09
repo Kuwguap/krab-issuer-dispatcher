@@ -432,6 +432,72 @@ class Database:
             logger.warning("get_unpaid_instant_lead_ids: %s", e)
             return set()
 
+    def get_leads_needing_client_email(self, user_id=None, limit: int = 12) -> list:
+        """Leads held up for want of a client email, newest first.
+
+        Two things block on this exact field: the $100 insurance add-on, whose
+        card cannot be issued without an address, and the tag email. Both are
+        invisible until somebody happens to open the lead, which is why /email
+        with no arguments exists.
+
+        Asked as "which leads carry a flag that needs an email", NOT as "of the
+        newest leads, which are blocked" -- the second makes the answer a sample
+        of a busy week and can show a supervisor fewer leads than one of their
+        own issuers sees.
+
+        ``user_id`` scopes it to one person's leads; without it, everybody's.
+        The blank check stays in PYTHON: the column holds '' as well as NULL
+        depending on which path wrote the lead, so .is_("email", "null") would
+        silently miss every blank-string one.
+        """
+        if not self._check_tables_exist():
+            return []
+        cap = max(1, min(int(limit or 12), 50))
+        cols = ("id, reference_id, email, wants_insurance, wants_tag_email, "
+                "insurance_card_sent_at, tag_emailed_at, user_id, "
+                "vehicle_details, created_at")
+        lean = "id, reference_id, email, wants_insurance, user_id, vehicle_details, created_at"
+
+        def fetch(flag, done_col, select):
+            """One flag's blocked leads. A flag this database has never heard of
+            simply contributes nothing, rather than costing the whole list."""
+            try:
+                q = self.client.table("leads").select(select).eq(flag, True)
+                if done_col:
+                    q = q.is_(done_col, "null")
+                if user_id is not None:
+                    q = q.eq("user_id", str(user_id))
+                # Over-fetch a little: the blank-email rows are dropped below.
+                return (q.order("created_at", desc=True)
+                        .limit(min(cap * 4, 200)).execute().data) or []
+            except Exception as e:
+                logger.info("get_leads_needing_client_email (%s): %s", flag, e)
+                return []
+
+        rows = fetch("wants_insurance", "insurance_card_sent_at", cols)
+        if not rows:
+            # Older database: retry without the columns that arrived by migration.
+            rows = fetch("wants_insurance", None, lean)
+        rows += fetch("wants_tag_email", "tag_emailed_at", cols)
+
+        seen, out = set(), []
+        for r in rows:
+            lid = str(r.get("id") or "")
+            if not lid or lid in seen:
+                continue
+            if str(r.get("email") or "").strip():
+                continue                      # they have one; nothing is blocked
+            wants_ins = bool(r.get("wants_insurance")) and not str(
+                r.get("insurance_card_sent_at") or "").strip()
+            wants_tag = bool(r.get("wants_tag_email")) and not str(
+                r.get("tag_emailed_at") or "").strip()
+            if not (wants_ins or wants_tag):
+                continue
+            seen.add(lid)
+            out.append(dict(r, needs_insurance=wants_ins, needs_tag_email=wants_tag))
+        out.sort(key=lambda x: str(x.get("created_at") or ""), reverse=True)
+        return out[:cap]
+
     def get_tag_emails_awaiting_send(self, limit: int = 20) -> list:
         """Tags a supervisor released that the client has not been sent yet.
 

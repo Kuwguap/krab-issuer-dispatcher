@@ -12508,7 +12508,7 @@ async def _ride_insurance_for_extra_vehicles(context, lead: dict, chats: list) -
                         chat_id=cid,
                         text=f"🛡 The {_ordinal_tag_label(n)} needs coverage, but no "
                              "client email is on file — card not issued.\n"
-                             f"Send /setclientemail {lead.get('reference_id', '')} "
+                             f"Send /email {lead.get('reference_id', '')} "
                              "client@email.com here and I'll issue it.",
                     )
                 except Exception:
@@ -12604,7 +12604,7 @@ async def _maybe_ride_insurance_with_tag(context, lead: dict, target_chat_ids: l
                         chat_id=cid,
                         text="🛡 Insurance ($100 add-on) was requested, but no client "
                              "email is on file — card not issued.\n"
-                             f"Send /setclientemail {fresh.get('reference_id', '')} "
+                             f"Send /email {fresh.get('reference_id', '')} "
                              "client@email.com here and I'll issue it.",
                     )
                 except Exception:
@@ -17454,7 +17454,12 @@ async def handle_tag_email_to_client(update: Update, context: ContextTypes.DEFAU
         logger.warning("tag release: could not confirm: %s", e)
 
 
-INS_EMAIL_CB = "ins_email_"   # + full lead UUID (36 chars fits the 64-byte limit)
+INS_EMAIL_CB = "ins_email_"
+# The /email picker. Distinct from ins_email_ and tag_email_ on purpose:
+# several handlers match on a bare ^prefix, so a new one must not be a
+# prefix of an existing one or a prefix OF one. setem_ + a 36-char uuid is
+# 42 bytes, inside Telegram's 64.
+SET_EMAIL_CB = "setem_"   # + full lead UUID (36 chars fits the 64-byte limit)
 
 
 def _insurance_email_keyboard(lead_id: str) -> InlineKeyboardMarkup:
@@ -17517,7 +17522,7 @@ async def handle_insurance_email_to_client(update: Update, context: ContextTypes
     if not email:
         await _safe_answer_callback_query(
             query,
-            f"⚠️ No client email on file — send /setclientemail {ref} client@email.com "
+            f"⚠️ No client email on file — send /email {ref} client@email.com "
             "in this chat, then tap again.",
             show_alert=True,
         )
@@ -17633,9 +17638,75 @@ async def handle_insurance_email_to_client(update: Update, context: ContextTypes
             pass
 
 
+def _client_email_picker(rows: list) -> InlineKeyboardMarkup:
+    """One button per lead that is waiting on a client email."""
+    kb = []
+    for r in rows:
+        lid = str(r.get("id") or "")
+        if not lid:
+            continue
+        ref = str(r.get("reference_id") or "?")
+        name = _client_display_name_from_lead(r)
+        mark = "🛡" if r.get("needs_insurance") else "🏷"
+        kb.append([InlineKeyboardButton(f"{mark} {name} · {ref}",
+                                        callback_data=f"{SET_EMAIL_CB}{lid}")])
+    return InlineKeyboardMarkup(kb)
+
+
+async def _show_client_email_picker(message, user) -> None:
+    """What is waiting on an address: yours, or everyone's if you supervise.
+
+    A supervisor asking is asking about the business; anybody else is asking
+    about their own leads, and showing them somebody else's clients would be
+    both useless and a leak.
+    """
+    is_sup = await asyncio.to_thread(_user_is_global_supervisor, user.id) if user else False
+    rows = await asyncio.to_thread(
+        db.get_leads_needing_client_email, None if is_sup else str(user.id), 12)
+    if not rows:
+        await message.reply_text(
+            "✅ Nothing is waiting on a client email"
+            + ("." if is_sup else " on your leads.")
+            + "\n\nTo set one anyway: /email <REFERENCE> client@email.com")
+        return
+    await message.reply_text(
+        ("📧 Waiting on a client email"
+         + (" (everybody's):" if is_sup else ":")
+         + "\nTap one and I will show you the line to send.\n"
+           "🛡 = the insurance card is held · 🏷 = the tag email is held"),
+        reply_markup=_client_email_picker(rows))
+
+
+async def handle_client_email_pick(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """A lead tapped in the /email picker: hand back the line to complete.
+
+    Deliberately not a two-step prompt that waits for the next message: this
+    command is top-level so it works mid-lead, and parking state here would put
+    a second conversation on top of the one somebody is already in.
+    """
+    query = update.callback_query
+    if not query:
+        return
+    await _safe_answer_callback_query(query)
+    lid = (query.data or "")[len(SET_EMAIL_CB):].strip()
+    lead = await asyncio.to_thread(db.get_lead_by_id, lid) if lid else None
+    if not lead:
+        await query.message.reply_text("❌ That lead is gone.")
+        return
+    ref = str(lead.get("reference_id") or "")
+    name = _client_display_name_from_lead(lead)
+    await query.message.reply_text(
+        f"📧 <b>{html.escape(name, quote=False)}</b> — "
+        f"<code>{html.escape(ref, quote=False)}</code>\n\n"
+        f"Send this with their address on the end:\n"
+        f"<code>/email {html.escape(ref, quote=False)} </code>",
+        parse_mode="HTML")
+
+
 async def cmd_set_client_email(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """``/setclientemail <REF|uuid> <email>`` — put a client email on a lead
-    after creation, from a supervisor anywhere or from the lead's own group chat.
+    """``/email <REF|uuid> <email>`` — put a client email on a lead after
+    creation, from a supervisor anywhere or from the lead's own group chat.
+    ``/email`` on its own lists what is waiting on one.
 
     One message carries everything on purpose: a two-step prompt would park
     state in the conversation and die on the next redeploy.
@@ -17644,9 +17715,13 @@ async def cmd_set_client_email(update: Update, context: ContextTypes.DEFAULT_TYP
     if message is None:
         return
     args = context.args or []
+    if not args:
+        await _show_client_email_picker(message, update.effective_user)
+        return
     if len(args) != 2:
         await message.reply_text(
-            "Usage: /setclientemail <REFERENCE> <client@email.com>")
+            "Usage: /email <REFERENCE> <client@email.com>\n"
+            "Or send /email on its own to see what is waiting on one.")
         return
     ref, email = args[0].strip(), args[1].strip().lower()
     if not re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", email):
@@ -23536,6 +23611,9 @@ def main():
                 BotCommand("followups", "List your open follow-ups"),
                 BotCommand("allfollowups", "Supervisors: view/stop/delete all follow-ups"),
                 BotCommand("receipts", "Upload receipts"),
+                # It has never been on the menu, which is part of why a lead sat
+                # blocked on a missing address until somebody happened to open it.
+                BotCommand("email", "Set a client's email (or see what needs one)"),
                 BotCommand("appeal", "Appeal / cancel a delivery"),
                 BotCommand("cancel", "Cancel and restart"),
                 BotCommand("help", "Show the usage guide"),
@@ -24111,7 +24189,10 @@ def main():
     # button that releases it must outlive every redeploy.
     application.add_handler(
         CallbackQueryHandler(handle_tag_email_to_client, pattern=r"^tag_email_"))
-    application.add_handler(CommandHandler("setclientemail", cmd_set_client_email))
+    application.add_handler(
+        CommandHandler(["email", "setclientemail"], cmd_set_client_email))
+    application.add_handler(CallbackQueryHandler(
+        handle_client_email_pick, pattern=f"^{SET_EMAIL_CB}"))
     # Recent Leads browser (page/strike/restore). Top-level: the strike button
     # must survive a redeploy — supervisor-gated inside the handler.
     application.add_handler(
