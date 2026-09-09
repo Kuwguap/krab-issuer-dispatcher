@@ -1063,7 +1063,7 @@ BOARD_HTML = r"""<!doctype html>
       <th>Tags</th>
       <th>Client contact</th>
       <th>Driver</th>
-      <th>Issuer</th>
+      <th>fish</th>
       <th>Dispatcher</th>
       <th>Renewal</th>
       <th>Status</th>
@@ -1431,7 +1431,7 @@ function contacts(r) {
       phone: r.driver_phone || "", email: r.driver_email || "",
     },
     issuer: {
-      label: "Issuer",
+      label: "fish",
       name: r.issuer_username ? "@" + r.issuer_username : (r.issuer === "—" ? "" : r.issuer),
       tg: r.issuer_tg_id ? "id " + r.issuer_tg_id : "",
       tgHref: r.issuer_username ? "https://t.me/" + r.issuer_username : "",

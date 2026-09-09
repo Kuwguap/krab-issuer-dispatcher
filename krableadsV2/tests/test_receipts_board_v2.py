@@ -66,7 +66,7 @@ class TheBigBoardRendersTest(unittest.TestCase):
 
     def test_the_columns_come_in_the_asked_order(self):
         heads = ("<th>Client</th>", "<th>Receipt</th>", "<th>Client phone</th>",
-                 "<th>Client contact</th>", "<th>Driver</th>", "<th>Issuer</th>",
+                 "<th>Client contact</th>", "<th>Driver</th>", "<th>fish</th>",
                  "<th>Dispatcher</th>", "<th>Status</th>")
         positions = [self.body.index(h) for h in heads]
         self.assertEqual(positions, sorted(positions), "columns out of order")

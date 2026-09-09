@@ -521,7 +521,7 @@ ASSETS = {
      get: function (r) { return r.driver_phone || ""; }},
     {h: "Driver email",  align: "left", clip: 220,
      get: function (r) { return r.driver_email || ""; }},
-    {h: "Issuer",        align: "left",
+    {h: "fish",          align: "left",
      get: function (r) { return r.issuer || ""; }},
     {h: "Dispatcher",    align: "left",
      get: function (r) { return r.group_name || ""; }},

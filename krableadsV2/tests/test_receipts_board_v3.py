@@ -57,7 +57,7 @@ class TheBoardStructureTest(unittest.TestCase):
     def test_the_new_columns_exist_in_order(self):
         heads = ("<th>#</th>", "<th>Client</th>", "<th>Receipt</th>",
                  "<th>Client phone</th>", "<th>Tags</th>", "<th>Client contact</th>",
-                 "<th>Driver</th>", "<th>Issuer</th>", "<th>Dispatcher</th>",
+                 "<th>Driver</th>", "<th>fish</th>", "<th>Dispatcher</th>",
                  "<th>Renewal</th>", "<th>Status</th>")
         positions = [self.body.index(h) for h in heads]
         self.assertEqual(positions, sorted(positions))
