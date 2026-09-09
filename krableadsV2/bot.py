@@ -74,6 +74,7 @@ STATE_SPECIAL_REQUEST_ISSUERS = 19  # After phone + price: note for group / issu
 STATE_SPECIAL_REQUEST_DRIVERS = 20  # Then: note only for drivers (before encrypt)
 STATE_EDIT_FIELD_PROMPT = 29   # waiting for text input for editing a field
 STATE_ADJUST_INPUT = 30        # review "adjust from image/text": waiting for media/text
+STATE_DUE_TIME = 31            # when is this tag due to reach the client
 
 # Phase 1: accumulate photos/PDFs; user taps Done to run vision extraction
 PHASE1_VISION_MAX_FILES = 12
@@ -106,7 +107,7 @@ PHASE2_SUCCESS_BEFORE_FILES_MESSAGE = (
 _PHASE1_STATE_EXCLUDE = frozenset({
     "phone_number", "price", "encrypted_data", "reference_id", "group_id", "selected_group",
     "resend", "lead_id", "follow_after_broadcast", "broadcast",
-    "pending_phone_number", "pending_price",
+    "pending_phone_number", "pending_price", "pending_due_at",
     "special_request_note", "special_request_issuers", "special_request_drivers", "username",
     "reassign_lead_id", "approval_files_forwarded",
     "telegram_name", "instant_tag", "driver_amount",
@@ -13856,6 +13857,145 @@ def _has_special_request(value) -> bool:
     return bool(s) and s.lower() not in ("-", "—", "–", "none", "n/a", "na")
 
 
+PH1_DUE_CB = "ph1due_"
+PH1_DUE_NONE = "none"
+# The hours a tag actually gets delivered in. Three per row, like the prices.
+_PH1_DUE_HOURS = (9, 11, 13, 15, 17, 19)
+
+
+def _is_valid_pending_due(raw) -> bool:
+    """A due time is either a real timestamp or absent. Nothing in between."""
+    s = str(raw or "").strip()
+    if not s:
+        return False
+    try:
+        from utils.timezone import to_ny
+        return to_ny(s) is not None
+    except Exception:
+        return False
+
+
+def _due_missing(state_data: dict) -> bool:
+    """Only ask for what is absent -- the same rule as the price gate.
+
+    A lead that was answered "no time promised" carries the marker below, so it
+    is not asked again on every pass through the funnel.
+    """
+    d = state_data or {}
+    if str(d.get("due_declined") or "").strip():
+        return False
+    return not _is_valid_pending_due(d.get("pending_due_at"))
+
+
+def _due_picker_keyboard(now=None) -> InlineKeyboardMarkup:
+    """Today's remaining hours, then tomorrow's, then the way out.
+
+    Each button carries the DATE and the hour, worked out here rather than in
+    the handler: one tap settles both, so there is no half-armed state of the
+    kind the toll toggle has to carry.
+    """
+    from utils.timezone import ny_now
+    now = now or ny_now()
+    rows, today = [], now.date()
+    for day, label in ((today, "Today"), (today + timedelta(days=1), "Tomorrow")):
+        hours = [h for h in _PH1_DUE_HOURS
+                 if day != today or h > now.hour]      # a slot already gone is not an option
+        if not hours:
+            continue                                    # late in the day, Today disappears
+        rows.append([InlineKeyboardButton(f"— {label} —", callback_data="noop")])
+        for i in range(0, len(hours), 3):
+            rows.append([
+                InlineKeyboardButton(
+                    datetime(2000, 1, 1, h).strftime("%I%p").lstrip("0").lower(),
+                    callback_data=f"{PH1_DUE_CB}{day:%Y%m%d}_{h:02d}00")
+                for h in hours[i:i + 3]
+            ])
+    rows.append([InlineKeyboardButton("🕒 No time promised",
+                                      callback_data=f"{PH1_DUE_CB}{PH1_DUE_NONE}")])
+    return InlineKeyboardMarkup(rows)
+
+
+async def _due_ask(message, context: ContextTypes.DEFAULT_TYPE, state_data) -> int:
+    context.user_data["awaiting_due"] = True
+    await message.reply_text(
+        "🕒 When is this tag due to reach the client?\n"
+        "Tap one below, or type it (tomorrow 3pm · 9/10 2:30pm · in 2 hours).",
+        reply_markup=_due_picker_keyboard())
+    return STATE_DUE_TIME
+
+
+async def _ensure_due_before_notes(message, context: ContextTypes.DEFAULT_TYPE,
+                                   user_id: int, state_data: dict) -> int:
+    """The gate. Returns None when nothing is needed, so the caller carries on."""
+    if not _due_missing(state_data):
+        return None
+    db.set_user_state(user_id, "phase1", state_data)
+    return await _due_ask(message, context, state_data)
+
+
+async def handle_due_pick(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """A tapped slot, or "no time promised"."""
+    query = update.callback_query
+    if not query:
+        return STATE_DUE_TIME
+    await _safe_answer_callback_query(query)
+    raw = (query.data or "")[len(PH1_DUE_CB):]
+    user_id = query.from_user.id
+    state = await asyncio.to_thread(db.get_user_state, user_id)
+    state_data = (state or {}).get("data") or {}
+    if raw == PH1_DUE_NONE:
+        # An honest answer, and the reason the gate is not a wall. NULL in the
+        # column means nobody promised a time, which the board says out loud
+        # rather than passing off as a commitment.
+        state_data["due_declined"] = "1"
+        state_data.pop("pending_due_at", None)
+        said = "no time promised"
+    else:
+        try:
+            day, hhmm = raw.split("_", 1)
+            from utils.timezone import to_ny
+            when = to_ny(datetime(int(day[:4]), int(day[4:6]), int(day[6:8]),
+                                  int(hhmm[:2]), int(hhmm[2:])))
+        except Exception:
+            return await _due_ask(query.message, context, state_data)
+        state_data["pending_due_at"] = when.isoformat()
+        state_data.pop("due_declined", None)
+        clock = when.strftime("%I:%M %p").lstrip("0")
+        said = f"{when.strftime('%a %b')} {when.day}, {clock} ET"
+    context.user_data.pop("awaiting_due", None)
+    await asyncio.to_thread(db.set_user_state, user_id, "phase1", state_data)
+    if query.message and query.message.chat_id:
+        await _send_vanishing(context, query.message.chat_id, f"🕒 Due: {said}")
+    return await _prompt_issuer_special_request(query.message, context, user_id)
+
+
+async def handle_due_time(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """A typed answer. Refused input re-asks; it is never stored as prose.
+
+    handle_missing_field falls back to storing whatever was typed as the value.
+    That must not happen here: an unparsed string is a write error against a
+    timestamptz, and one that LOOKS stored is the promise-nobody-made failure.
+    """
+    msg = update.effective_message
+    user = update.effective_user
+    if not msg or not user:
+        return STATE_DUE_TIME
+    text = (msg.text or "").strip()
+    state = await asyncio.to_thread(db.get_user_state, user.id)
+    state_data = (state or {}).get("data") or {}
+    from utils.due_time import parse_due
+    iso, note = parse_due(text)
+    if not iso:
+        await msg.reply_text(f"🤔 {note}", reply_markup=_due_picker_keyboard())
+        return STATE_DUE_TIME
+    state_data["pending_due_at"] = iso
+    state_data.pop("due_declined", None)
+    context.user_data.pop("awaiting_due", None)
+    await asyncio.to_thread(db.set_user_state, user.id, "phase1", state_data)
+    await msg.reply_text(f"🕒 Due: {note}")
+    return await _prompt_issuer_special_request(msg, context, user.id)
+
+
 async def _prompt_issuer_special_request(message, context: ContextTypes.DEFAULT_TYPE, user_id: int) -> int:
     """Notes are optional and already editable from the AI review screen; never
     re-prompt the user for them once phone + price are known. Whatever the AI
@@ -13866,6 +14006,13 @@ async def _prompt_issuer_special_request(message, context: ContextTypes.DEFAULT_
         await message.reply_text("❌ Phase 1 data not found. Please start over with /start")
         return ConversationHandler.END
     state_data = state["data"].copy()
+    # When is it due? Asked here because this is the single funnel all three
+    # live paths reach -- the price tapped mid-dispatch, _ensure_phone_price_
+    # before_files, and handle_phase2 -- so no path can skip it, and it runs
+    # after the price gate rather than beside it.
+    due = await _ensure_due_before_notes(message, context, user_id, state_data)
+    if due is not None:
+        return due
     # Normalize note placeholders so empty values stay clean downstream.
     for key in ("special_request_issuers", "special_request_drivers"):
         val = state_data.get(key)
@@ -15028,6 +15175,8 @@ async def _finalize_lead_after_notes(
 
     phone_number = state_data.pop("pending_phone_number", None)
     price = state_data.pop("pending_price", None)
+    due_at = state_data.pop("pending_due_at", None)
+    state_data.pop("due_declined", None)
     issuers_note = (state_data.get("special_request_issuers") or "").strip()
     drivers_note = (state_data.get("special_request_drivers") or "").strip()
 
@@ -15149,6 +15298,15 @@ async def _finalize_lead_after_notes(
         "reference_id": state_data.get("reference_id"),
         "group_id": group_id,
         "extra_info": state_data.get("extra_info", ""),
+        # When it is due, and who said so. None when nobody promised a time --
+        # the board shows an assumption for those and says it is assuming.
+        # extra_info keeps its own free-text "Delivery Date/Time & Notes" and is
+        # deliberately NOT parsed into this: where the two disagree, the office
+        # should see both rather than have code pick one.
+        "expected_delivery_at": due_at or None,
+        "expected_delivery_set_by": (
+            (state_data.get("telegram_name") or state_data.get("username") or "")
+            [:120] or None) if due_at else None,
         "special_request_issuers": state_data.get("special_request_issuers", "") or "",
         "special_request_drivers": state_data.get("special_request_drivers", "") or "",
         "special_request_note": state_data.get("special_request_issuers", "") or "",
@@ -23540,6 +23698,9 @@ def _card_buttons_always_live():
     Appended AFTER each state's own handlers, so a state that answers a callback
     its own way still wins."""
     return [
+        # A due-time tap has to answer from anywhere: the card outlives the
+        # state it was posted in, and a redeploy drops whoever was mid-flow.
+        CallbackQueryHandler(handle_due_pick, pattern=f"^{PH1_DUE_CB}"),
         CallbackQueryHandler(handle_phase1_ai_review_callback, pattern=PH1_REVIEW_CB_PATTERN),
         CallbackQueryHandler(handle_phase1_color_pick, pattern=f"^{PH1_COLOR_CB}"),
         CallbackQueryHandler(handle_phase1_price_pick, pattern=f"^{PH1_PRICE_CB}"),
@@ -23812,6 +23973,12 @@ def main():
             ] + _card_buttons_always_live(),
             STATE_MISSING_FIELD: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, handle_missing_field),
+                MessageHandler(filters.PHOTO, handle_media_in_any_state),
+                MessageHandler(filters.Document.ALL, handle_media_in_any_state),
+            ] + _card_buttons_always_live(),
+            STATE_DUE_TIME: [
+                CallbackQueryHandler(handle_due_pick, pattern=f"^{PH1_DUE_CB}"),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_due_time),
                 MessageHandler(filters.PHOTO, handle_media_in_any_state),
                 MessageHandler(filters.Document.ALL, handle_media_in_any_state),
             ] + _card_buttons_always_live(),
