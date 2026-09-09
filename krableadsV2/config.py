@@ -69,6 +69,12 @@ class Config:
     # When both are set, the bot offers to email the client a FS-20 PDF after dispatch.
     RESEND_API_KEY = (os.getenv("RESEND_API_KEY") or "").strip().lstrip("=") or None
     RESEND_FROM = (os.getenv("RESEND_FROM") or "").strip().lstrip("=") or None
+    # The client's temp tag goes out as the tag business, not as the
+    # insurance agency. Same Resend account and the same API key -- this
+    # address simply has to be a verified sender on it, or Resend refuses
+    # the send and the reason lands in leads.tag_email_error.
+    RESEND_TAG_FROM = ((os.getenv("RESEND_TAG_FROM") or "").strip().lstrip("=")
+                       or "Tri State Tags <info@tristatetags.com>")
 
     # Issuer block printed on the NY FS-20 card.
     # INSURANCE_ISSUER_NAME → agency name (top "Name & Address of Issuer" block)

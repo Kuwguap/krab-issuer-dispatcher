@@ -36,6 +36,21 @@ def get_resend_client():
     return resend
 
 
+def get_tag_from_address() -> Optional[str]:
+    """Who the client's temporary tag arrives from.
+
+    Deliberately not the insurance sender. Falls back to RESEND_FROM only if
+    somebody blanks the setting, so a misconfiguration degrades to the address
+    that is known to work rather than to no email at all.
+    """
+    try:
+        from config import Config
+    except Exception:
+        return None
+    val = (getattr(Config, "RESEND_TAG_FROM", None) or "").strip()
+    return val or get_resend_from_address()
+
+
 def get_resend_from_address() -> Optional[str]:
     try:
         from config import Config
@@ -120,8 +135,13 @@ def send_insurance_card_email(
     pdf_bytes: bytes,
     pdf_filename: str,
     html: Optional[str] = None,
+    from_address: Optional[str] = None,
 ) -> InsuranceCardEmailResult:
-    """Send the FS-20 PDF as an attachment via Resend.
+    """Send a PDF as an attachment via Resend.
+
+    Named for the FS-20 card it was written for; it carries the temporary tag
+    too, which is why ``from_address`` exists -- those two go out as different
+    senders on the same account.
 
     Returns an ``InsuranceCardEmailResult``. Maps cleanly to the blueprint's
     HTTP error contract (503 misconfig, 502 send failure, 200 ok) so the bot
@@ -132,7 +152,7 @@ def send_insurance_card_email(
         return InsuranceCardEmailResult(False, "Recipient email is empty.", 400)
 
     resend = get_resend_client()
-    from_addr = get_resend_from_address()
+    from_addr = (from_address or "").strip() or get_resend_from_address()
     if resend is None or not from_addr:
         return InsuranceCardEmailResult(
             False,

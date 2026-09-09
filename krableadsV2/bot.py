@@ -12149,7 +12149,11 @@ async def send_approved_tag_emails(context: ContextTypes.DEFAULT_TYPE) -> None:
             result = await asyncio.to_thread(
                 lambda: rc.send_insurance_card_email(
                     to_address=email, subject=subject, body=body,
-                    pdf_bytes=pdf, pdf_filename=f"{safe or 'temp_tag'}.pdf"))
+                    pdf_bytes=pdf, pdf_filename=f"{safe or 'temp_tag'}.pdf",
+                    # From the tag business. The card keeps the insurance
+                    # sender; a client getting a temp tag from an insurance
+                    # agency reads as the wrong company's post.
+                    from_address=rc.get_tag_from_address()))
             now_iso = datetime.now(pytz.timezone("America/New_York")).isoformat()
             if getattr(result, "ok", False):
                 await asyncio.to_thread(db.update_lead, lead_id,
