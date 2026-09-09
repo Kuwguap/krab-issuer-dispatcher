@@ -73,7 +73,7 @@ _TRUTHY = ("1", "true", "on", "yes")
 _ENV_GROUPS = (
     ("Resend — FS-20 card email", ("RESEND_API_KEY", "RESEND_FROM")),
     ("TriStateCoverage portal", ("INTEGRATIONS_API_KEY",)),
-    ("Stripe — $100 instant PDF", ("STRIPE_SECRET_KEY", "STRIPE_WEBHOOK_SECRET")),
+    ("Stripe — $100 cash-payment PDF", ("STRIPE_SECRET_KEY", "STRIPE_WEBHOOK_SECRET")),
 )
 
 
@@ -112,7 +112,7 @@ def settings():
         try:
             instant_on = _instant_on(db)
         except Exception:
-            errors.append("Could not read the Instant Tag switch.")
+            errors.append("Could not read the Cash payment switch.")
         try:
             # Returns None on any DB trouble (helper swallows internally too).
             plates = db.get_plate_settings()
@@ -153,7 +153,7 @@ def settings():
     if toggle == "ok":
         notice = "Saved. The bot reads this switch live — no restart needed."
     elif toggle == "fail":
-        errors.append("Could not save the Instant Tag switch. Try again.")
+        errors.append("Could not save the Cash payment switch. Try again.")
     elif toggle == "csrf":
         errors.append(
             "Security check failed — the switch was NOT changed. "

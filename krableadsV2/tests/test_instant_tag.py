@@ -92,10 +92,10 @@ class TheToggleAndPickerTest(unittest.TestCase):
                 for b in row]
 
     def test_the_toggle_sits_on_the_card_and_shows_the_amount(self):
-        self.assertIn("🤖 Instant Tag 🏷️", self._kb_labels({"vin": "-"}))
+        self.assertIn("💵 Cash payment", self._kb_labels({"vin": "-"}))
         labels = self._kb_labels({"vin": "-", "instant_tag": True,
                                   "driver_amount": "$150"})
-        self.assertTrue(any("Instant Tag 🏷️: ON ($150)" in l for l in labels), labels)
+        self.assertTrue(any("Cash payment: ON ($150)" in l for l in labels), labels)
 
     def test_the_callback_is_in_the_review_pattern(self):
         self.assertIn("ph1_itag_toggle", bot.PH1_REVIEW_CB_PATTERN)

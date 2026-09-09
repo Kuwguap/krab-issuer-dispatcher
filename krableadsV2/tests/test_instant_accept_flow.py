@@ -424,16 +424,16 @@ class SupervisorsHearAboutEveryReleaseTest(unittest.IsolatedAsyncioTestCase):
                 side_effect=lambda **k: told.append((k.get("chat_id"), k.get("text"))))
             await bot._tell_supervisors(
                 ctx,
-                (f"🤖 Instant tag released to <b>Susan</b> by "
+                (f"💵 Cash payment released to <b>Susan</b> by "
                  f"{bot._acting_user_label(released_by)}") if how == "password"
-                else "🤖 Instant tag paid by <b>Susan</b>")
+                else "💵 Cash payment paid by <b>Susan</b>")
         return told
 
     async def test_the_password_release_names_the_driver_and_the_releaser(self):
         who = mock.MagicMock(username="kingkrab", full_name="King Krab")
         told = await self._deliver("password", who)
         self.assertEqual([11, 22], [c for c, _ in told])
-        self.assertIn("Instant tag released to <b>Susan</b> by @kingkrab", told[0][1])
+        self.assertIn("Cash payment released to <b>Susan</b> by @kingkrab", told[0][1])
 
     async def test_someone_without_a_username_is_named_anyway(self):
         who = mock.MagicMock(username="", full_name="King Krab")
@@ -442,7 +442,7 @@ class SupervisorsHearAboutEveryReleaseTest(unittest.IsolatedAsyncioTestCase):
 
     async def test_a_card_payment_is_reported_too(self):
         told = await self._deliver("paid")
-        self.assertIn("Instant tag paid by <b>Susan</b>", told[0][1])
+        self.assertIn("Cash payment paid by <b>Susan</b>", told[0][1])
 
     async def test_one_supervisor_failing_does_not_stop_the_rest(self):
         sent = []
@@ -461,8 +461,8 @@ class SupervisorsHearAboutEveryReleaseTest(unittest.IsolatedAsyncioTestCase):
     def test_the_delivery_actually_sends_it(self):
         body = SRC.split("async def _deliver_skip_dispatch", 1)[1]
         body = body.split("\nasync def ", 1)[0]
-        self.assertIn("Instant tag released to", body)
-        self.assertIn("Instant tag paid by", body)
+        self.assertIn("Cash payment released to", body)
+        self.assertIn("Cash payment paid by", body)
         self.assertIn("await _tell_supervisors(context, note)", body)
         # Only once the tag actually reached the driver.
         self.assertIn("if driver_ok:", body)

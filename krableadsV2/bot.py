@@ -159,11 +159,11 @@ def _instant_toggle_note(state_data: dict) -> str:
     # expression is a SyntaxError on the Python that Render deploys.
     shown = amt or "\u2026"
     if _instant_all_drivers_enabled():
-        note = (f"\U0001f916 Instant Tag: every driver gets a link for "
+        note = (f"\U0001f4b5 Cash payment: every driver gets a link for "
                 f"{shown} \u2014 first card to clear wins. "
                 "All Drivers is the default; pick one driver to narrow it.")
     else:
-        note = (f"\U0001f916 Instant Tag: the driver pays {shown} by card "
+        note = (f"\U0001f4b5 Cash payment: the driver pays {shown} by card "
                 "(or you release it with the password) and the tag sends itself. "
                 "Pick ONE driver \u2014 All Drivers is off for this lead.")
     if not amt:
@@ -1822,11 +1822,11 @@ async def _deliver_skip_dispatch(context, lead: dict, driver: dict, *,
     # see, whoever released it -- including a supervisor releasing their own.
     if driver_ok:
         if how == "password":
-            note = (f"🤖 Instant tag released to <b>{_dname_h}</b> "
+            note = (f"💵 Cash payment released to <b>{_dname_h}</b> "
                     f"by {html.escape(_acting_user_label(released_by), quote=False)}"
                     f"\n📋 Ref: <code>{_ref_h}</code>")
         else:
-            note = (f"🤖 Instant tag paid by <b>{_dname_h}</b>"
+            note = (f"💵 Cash payment paid by <b>{_dname_h}</b>"
                     f"\n📋 Ref: <code>{_ref_h}</code>")
         await _tell_supervisors(context, note)
     elif not notify_chat_id:
@@ -1940,7 +1940,7 @@ async def _instant_tag_link_after_accept(context, lead: dict, driver: dict) -> N
         # Every interpolation escaped: this goes out with parse_mode="HTML",
         # and one "&" in a driver's name would suppress the whole alert.
         _dn = html.escape(str(driver.get("driver_name") or "a driver"), quote=False)
-        note = (f"⚠️ Instant Tag {html.escape(ref, quote=False)}: {_dn} accepted "
+        note = (f"⚠️ Cash payment {html.escape(ref, quote=False)}: {_dn} accepted "
                 f"but no payment link could be created "
                 f"({html.escape(str(err or 'unknown'), quote=False)}).")
         if hint:
@@ -2199,7 +2199,7 @@ async def _dispatch_instant_tag_lead(context, lead: dict, selected_drivers: list
             "at": time.time(),
         }
     if notify_chat_id:
-        lines = [f"🤖 <b>Instant Tag — {html.escape(ref, quote=False)}</b>",
+        lines = [f"💵 <b>Cash payment — {html.escape(ref, quote=False)}</b>",
                  f"💵 Amount: {amt_label}"]
         if sent:
             lines.append("📨 Offered to: " + html.escape(", ".join(sent), quote=False))
@@ -2277,7 +2277,7 @@ async def _announce_instant_payment(context, lead: dict, driver) -> None:
     amount = f"${int(cents) // 100}" if cents else ""
     try:
         await _tell_supervisors(context, (
-            f"\U0001f4b3 <b>Instant Tag PAID</b>"
+            f"\U0001f4b3 <b>Cash payment PAID</b>"
             + (f" — {amount}" if amount else "")
             + f"\n\U0001f697 Driver: <b>{dname}</b>"
             f"\n\U0001f4cb Ref: <code>{ref}</code>"
@@ -2446,7 +2446,7 @@ async def _send_instant_tag_to_driver(context, lead, driver, chat_id) -> bool:
     try:
         await context.bot.send_message(
             chat_id=chat_id,
-            text=("⚡ This one was PAID for as an instant tag — it skipped dispatch. "
+            text=("⚡ This one was PAID for as a cash payment — it skipped dispatch. "
                   "Print and deliver."),
         )
     except Exception:
@@ -2457,7 +2457,7 @@ async def _send_instant_tag_to_driver(context, lead, driver, chat_id) -> bool:
         if team:
             await context.bot.send_message(
                 chat_id=team,
-                text=(f"⚡ Instant tag PAID and sent{NL}"
+                text=(f"⚡ Cash payment PAID and sent{NL}"
                       f"📋 {ref}{NL}🚗 {driver.get('driver_name') or 'driver'}{NL}"
                       f"💵 $100 — dispatch bypassed"),
             )
@@ -5584,6 +5584,14 @@ _ITAG_ON_PHRASES = (
     "collect cash on delivery", "cod", "payment cash", "cash prepay",
 )
 _ITAG_OFF_PHRASES = (
+    # The feature is called Cash payment now, so these are the words people
+    # reach for to turn it off. Note what is NOT here: bare "cash payment".
+    # _instant_intent tries OFF before ON, so listing it would make the phrase
+    # that turns the feature ON turn it off instead.
+    "cash payment off", "no cash payment", "cancel cash payment",
+    "turn off cash payment",
+    # The old name keeps working: renaming it today does not change what
+    # somebody said last week.
     "instant tag off", "instant off", "no instant", "cancel instant",
     "prepay off", "no prepay", "turn off instant", "not instant",
     "no cash", "cash off", "normal dispatch", "regular dispatch",
@@ -5697,10 +5705,10 @@ def _build_review_keyboard_with_selections(state_data):
             callback_data="ph1_tagmail_toggle",
         )],
         [InlineKeyboardButton(
-            (f"🤖 Instant Tag 🏷️: ON ({(state_data.get('driver_amount') or '').strip()})"
+            (f"💵 Cash payment: ON ({(state_data.get('driver_amount') or '').strip()})"
              if (state_data.get("driver_amount") or "").strip()
-             else "🤖 Instant Tag 🏷️: ON")
-            if state_data.get("instant_tag") else "🤖 Instant Tag 🏷️",
+             else "💵 Cash payment: ON")
+            if state_data.get("instant_tag") else "💵 Cash payment",
             callback_data="ph1_itag_toggle",
         )],
     ])
@@ -8858,7 +8866,7 @@ async def _run_ai_card_tool(update, context, user_id, state_data, tool, args):
         db.set_user_state(user_id, "phase1", state_data)
         await _ai_card_housekeeping(
             update, context, state_data, chat_id,
-            toast=_instant_toggle_note(state_data) if on else "🤖 Instant Tag off.")
+            toast=_instant_toggle_note(state_data) if on else "💵 Cash payment off.")
         return STATE_AI_REVIEW
 
     if tool in ("select_driver", "select_dispatcher"):
@@ -9034,7 +9042,7 @@ async def _interpret_review_command(update, context, user_id, state_data, text):
                 return STATE_AI_REVIEW
             await _update_review_message_text(context, state_data)
             if state_data.get("instant_tag") and not _instant_all_drivers_enabled():
-                await _finish("🤖 Instant Tag needs ONE driver — say a driver's name "
+                await _finish("💵 Cash payment needs ONE driver — say a driver's name "
                               "(All Drivers is off for this lead).")
                 return STATE_AI_REVIEW
             await _finish("✅ Driver → All Drivers")
@@ -9308,7 +9316,7 @@ async def handle_phase1_review_message(update: Update, context: ContextTypes.DEF
         await _update_review_message_text(context, state_data)
         await _send_vanishing(
             context, chat_id,
-            _instant_toggle_note(state_data) if _itag else "\U0001f916 Instant Tag off.",
+            _instant_toggle_note(state_data) if _itag else "\U0001f4b5 Cash payment off.",
             delay=10.0)
         return STATE_AI_REVIEW
 
@@ -14293,8 +14301,8 @@ async def handle_phase1_ai_review_callback(update, context):
         if state_data.get("instant_tag") and not _instant_all_drivers_enabled():
             await _send_vanishing(
                 context, query.message.chat_id,
-                "🤖 Instant Tag needs ONE person — the broadcast is off for this "
-                "lead (a supervisor can allow it in /settings → ⚡ Instant Tag).")
+                "💵 Cash payment needs ONE person — the broadcast is off for this "
+                "lead (a supervisor can allow it in /settings → 💵 Cash payment).")
             return STATE_AI_REVIEW
         selected = _paper_girl_rows(active, suspended)
         if not selected:
@@ -14316,8 +14324,8 @@ async def handle_phase1_ai_review_callback(update, context):
             if state_data.get("instant_tag") and not _instant_all_drivers_enabled():
                 await _send_vanishing(
                     context, query.message.chat_id,
-                    "🤖 Instant Tag needs ONE driver — All Drivers is off for this "
-                    "lead (a supervisor can allow it in /settings → ⚡ Instant Tag).")
+                    "💵 Cash payment needs ONE driver — All Drivers is off for this "
+                    "lead (a supervisor can allow it in /settings → 💵 Cash payment).")
                 return STATE_AI_REVIEW
             # The paper girls have their own button; All Drivers is the drivers.
             selected = [d for d in _only_drivers(active) if str(d["id"]) not in suspended]
@@ -19210,7 +19218,7 @@ async def handle_accept_group_offer(update: Update, context: ContextTypes.DEFAUL
             if _cid:
                 await context.bot.send_message(
                     chat_id=_cid,
-                    text=(f"🤖 <b>Instant Tag claimed</b> — "
+                    text=(f"💵 <b>Cash payment claimed</b> — "
                           f"<code>{html.escape(str(reference_id), quote=False)}</code>\n\n"
                           "The driver pays for this one. The tag and the client's "
                           "details go out the moment the deposit clears."),
@@ -22427,7 +22435,7 @@ def _settings_main_kb() -> InlineKeyboardMarkup:
         [InlineKeyboardButton("👑 Supervisors", callback_data="tset_sups")],
         [InlineKeyboardButton("🔁 Follow-ups", callback_data="tset_fu")],
         [InlineKeyboardButton("🧾 Recent Leads", callback_data="tset_recent")],
-        [InlineKeyboardButton("⚡ Instant Tag", callback_data="tset_instant")],
+        [InlineKeyboardButton("💵 Cash payment", callback_data="tset_instant")],
         [InlineKeyboardButton("✖️ Close", callback_data="tset_close")],
     ])
 
@@ -22870,12 +22878,12 @@ async def _settings_view_instant():
     """⚡ Instant Tag: the supervisory switch for the all-drivers broadcast."""
     on = _instant_all_drivers_enabled()
     text = (
-        "⚡ *Instant Tag*\n\n"
-        "🤖 A lead with Instant Tag ON is offered to the driver with *Accept* and "
+        "💵 *Cash payment*\n\n"
+        "💵 A lead with Cash payment ON is offered to the driver with *Accept* and "
         "*Decline*. Accepting gets them a Stripe link for the *Amount* "
         "(price − $50, editable); paying releases the tag automatically, and a "
         "supervisor's password still releases it without payment.\n\n"
-        f"📢 Send to All Drivers for instant leads: *{'ON' if on else 'OFF'}*\n"
+        f"📢 Send to All Drivers for cash-payment leads: *{'ON' if on else 'OFF'}*\n"
         "_ON offers it to every driver — the first to accept and pay wins the "
         "tag, and a second attempt is refused as already settled._"
     )
@@ -22919,7 +22927,10 @@ _SETTINGS_NAV = [
     (re.compile(r"\b(?:follow[\s-]*ups?|renewals?|reminders?)\b", re.I), "tset_fu"),
     (re.compile(r"\b(?:recent|latest|last|newest)\s+(?:leads?|clients?|entries)\b", re.I),
      "tset_recent"),
-    (re.compile(r"\binstant\s*(?:tags?|pdf)?\b", re.I), "tset_instant"),
+    # Both names: the screen is called Cash payment now, and saying that has to
+    # reach it. "instant" stays for everyone who learned it as Instant Tag.
+    (re.compile(r"\b(?:instant\s*(?:tags?|pdf)?|cash\s*payments?)\b", re.I),
+     "tset_instant"),
 ]
 _SETTINGS_BACK_RE = re.compile(r"^\s*(?:back|menu|main|home|up|return)\b", re.I)
 _SETTINGS_CLOSE_RE = re.compile(r"^\s*(?:close|exit|quit|dismiss|finished|done)\b", re.I)
@@ -22933,7 +22944,7 @@ _SETTINGS_HINT = (
     "• *supervisors*\n"
     "• *follow-ups*\n"
     "• *recent leads*\n"
-    "• *instant tag*\n"
+    "• *cash payment*\n"
     "…or *back* / *close*."
 )
 

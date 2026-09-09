@@ -52,7 +52,7 @@ class TheToggleSitsWithTheOthersTest(unittest.TestCase):
     def test_it_stands_beside_the_other_two_switches(self):
         state = {"wants_insurance": True, "instant_tag": True, "wants_tag_email": True}
         labels = " | ".join(_labels(state))
-        for needle in ("🛡 Insurance: ON", "🤖 Instant Tag", "📧 Tag email: ON"):
+        for needle in ("🛡 Insurance: ON", "💵 Cash payment", "📧 Tag email: ON"):
             self.assertIn(needle, labels, needle)
 
 

@@ -359,7 +359,7 @@ class AFailedDeliveryIsNotCalledDeliveredTest(unittest.IsolatedAsyncioTestCase):
     async def test_a_driver_who_never_got_it_is_not_reported_as_paid_and_sent(self):
         said = " ".join(_texts_to(self.wire, SUPERVISOR_TG))
         self.assertNotIn(
-            "Instant tag paid by", said,
+            "Cash payment paid by", said,
             "supervisors were told the tag went to Susan; it was refused by "
             "Telegram every time")
 

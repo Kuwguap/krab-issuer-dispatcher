@@ -73,7 +73,7 @@ class InstantTagWithBroadcastOffTest(unittest.TestCase):
         with mock.patch.object(bot, "_instant_all_drivers_enabled", return_value=False):
             rows = bot._driver_picker_rows(DRIVERS, set(), {"instant_tag": True})
         self.assertNotIn(ALL_CB, callbacks(rows),
-                         "Instant Tag needs ONE driver unless supervisors allow the broadcast")
+                         "Cash payment needs ONE driver unless supervisors allow the broadcast")
 
 
 class OrdinaryLeadTest(unittest.TestCase):

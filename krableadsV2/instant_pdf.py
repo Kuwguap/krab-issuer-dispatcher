@@ -435,7 +435,7 @@ def register(app, db_provider):
             "line_items[0][quantity]": "1",
             "line_items[0][price_data][currency]": "usd",
             "line_items[0][price_data][unit_amount]": str(amount_cents),
-            "line_items[0][price_data][product_data][name]": "Instant temp tag PDF",
+            "line_items[0][price_data][product_data][name]": "Cash payment — temp tag PDF",
             "line_items[0][price_data][product_data][description]":
                 f"Straight to the driver, no dispatch wait. Ref {reference_id or lead_id}",
             # On the session so the webhook needs no lookup table of its own.

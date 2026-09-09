@@ -127,10 +127,10 @@
   </div>
 
   <div class="card">
-    <p class="ld-card-title">Instant / skip dispatch</p>
+    <p class="ld-card-title">Cash payment / skip dispatch</p>
     <p><span class="badge {{ tone_cls[instant.tone] }}">{{ instant.status }}</span></p>
     <table class="ld-kv">
-      <tr><td>Instant tag</td><td>{{ "on" if instant.instant_tag else "off" }}</td></tr>
+      <tr><td>Cash payment</td><td>{{ "on" if instant.instant_tag else "off" }}</td></tr>
       {# "Charged" only once paid_at is stamped — before that the amount is a
          checkout quote, and saying money was taken would be untrue. #}
       {% if instant.amount_charged %}<tr><td>Charged</td><td>{{ instant.amount_charged }}</td></tr>{% endif %}
