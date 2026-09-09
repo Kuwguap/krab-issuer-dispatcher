@@ -182,6 +182,128 @@ class NothingIsSilentlyDroppedTest(unittest.TestCase):
         run(B.on_error(object(), ctx))          # must not raise
 
 
+class DriversCanHireTest(unittest.TestCase):
+    """"drivers cant hire allow this".
+
+    They always could press the button -- _user_can_hire returns True for anyone
+    unless KRAB_HIRE_REQUIRES_TEAM is set, and Hire is on every review card.
+    What they could not do was REACH a card: /interviews, /applications and
+    /open all returned silently for anyone who was not a supervisor. An open
+    permission behind a locked door.
+    """
+
+    def _cmd(self, fn, supervisor=False, driver=False, rows=None, args=None):
+        msg = mock.MagicMock()
+        msg.reply_text = mock.AsyncMock()
+        update = mock.MagicMock()
+        update.effective_message = msg
+        update.effective_user = types.SimpleNamespace(id=777)
+        ctx = mock.MagicMock()
+        ctx.args = args or []
+        db = mock.MagicMock()
+        db.list_interviews.return_value = rows if rows is not None else [
+            {"id": "i-1", "first_name": "Ada", "status": "pending"}]
+        db.list_interviews_by_status.return_value = db.list_interviews.return_value
+        db.get_driver_by_telegram_id.return_value = {"id": "d-1"} if driver else None
+        with mock.patch.object(B, "db", db), \
+             mock.patch.object(B, "_user_is_global_supervisor", return_value=supervisor), \
+             mock.patch.object(B, "_hiring_requires_team", return_value=False), \
+             mock.patch.object(B, "_interview_list_keyboard", return_value=None):
+            run(fn(update, ctx))
+        return msg
+
+    def _said(self, msg):
+        return " ".join(str(c[0][0]) for c in msg.reply_text.await_args_list)
+
+    def test_a_driver_can_open_the_applications_list(self):
+        msg = self._cmd(B.cmd_interviews, driver=True)
+        self.assertIn("Driver applications", self._said(msg))
+
+    def test_a_driver_can_open_a_hired_one(self):
+        msg = self._cmd(B.cmd_open, driver=True)
+        self.assertIn("Hired drivers", self._said(msg))
+
+    def test_a_supervisor_still_can(self):
+        msg = self._cmd(B.cmd_interviews, supervisor=True)
+        self.assertIn("Driver applications", self._said(msg))
+
+    def test_somebody_who_is_neither_is_told_why(self):
+        """Not silence. A refusal nobody can see is why "the bot ignores me"."""
+        msg = self._cmd(B.cmd_interviews)
+        said = self._said(msg)
+        self.assertIn("supervisors and drivers", said.lower())
+        self.assertNotIn("Driver applications", said)
+
+    def test_the_gate_still_closes_both_the_door_and_the_button(self):
+        """KRAB_HIRE_REQUIRES_TEAM=1 must not leave the list open to everyone."""
+        db = mock.MagicMock()
+        db.get_driver_by_telegram_id.return_value = {"id": "d-1"}
+        with mock.patch.object(B, "db", db), \
+             mock.patch.object(B, "_user_is_global_supervisor", return_value=False), \
+             mock.patch.object(B, "_hiring_requires_team", return_value=True):
+            self.assertFalse(B._user_can_open_applications(777))
+
+    def test_deleting_a_driver_is_still_supervisors_only(self):
+        """Hiring is reversible. Purging somebody from Issuer, Dispatch and the
+        interviews at once is not."""
+        msg = self._cmd(B.cmd_delete, driver=True)
+        self.assertIn("Supervisors only", self._said(msg))
+
+    def test_the_roster_is_still_supervisors_only(self):
+        msg = self._cmd(B.cmd_drivers, driver=True)
+        self.assertIn("Supervisors only", self._said(msg))
+
+    def test_hiring_itself_was_never_the_thing_that_was_shut(self):
+        with mock.patch.object(B, "_hiring_requires_team", return_value=False):
+            self.assertTrue(run(B._user_can_hire(mock.MagicMock(), 777)))
+
+
+class ASupervisorCommandDoesNotEatAnApplicationTest(unittest.TestCase):
+    """/announce and friends are conversation ENTRY POINTS with allow_reentry.
+
+    Returning END for a non-supervisor dropped whatever they were in the middle
+    of -- a driver halfway through the questionnaire who typed a command /help
+    advertises to them lost the lot, and was told nothing.
+    """
+
+    def _entry(self, fn):
+        msg = mock.MagicMock()
+        msg.reply_text = mock.AsyncMock()
+        update = mock.MagicMock()
+        update.effective_message = msg
+        update.effective_user = types.SimpleNamespace(id=777)
+        with mock.patch.object(B, "_user_is_global_supervisor", return_value=False), \
+             mock.patch.object(B, "db", mock.MagicMock()):
+            state = run(fn(update, mock.MagicMock()))
+        return state, msg
+
+    def test_announce_leaves_the_conversation_where_it_was(self):
+        state, msg = self._entry(B.cmd_announce)
+        self.assertIsNone(state)          # None = keep the current state
+        self.assertNotEqual(B.ConversationHandler.END, state)
+        msg.reply_text.assert_awaited_once()
+
+    def test_announce_schedule_does_too(self):
+        state, msg = self._entry(B.cmd_announce_schedule)
+        self.assertIsNone(state)
+        msg.reply_text.assert_awaited_once()
+
+    def test_setemail_does_too(self):
+        state, msg = self._entry(B.cmd_setemail)
+        self.assertIsNone(state)
+        msg.reply_text.assert_awaited_once()
+
+    def test_the_command_list_says_who_each_one_is_for(self):
+        msg = mock.MagicMock()
+        msg.reply_text = mock.AsyncMock()
+        update = mock.MagicMock()
+        update.effective_message = msg
+        run(B.cmd_help(update, mock.MagicMock()))
+        text = msg.reply_text.await_args[0][0]
+        self.assertIn("supervisors and drivers", text)
+        self.assertIn("<i>(supervisors)</i>", text)
+
+
 class TheWiringHoldsTest(unittest.TestCase):
 
     def test_the_net_and_the_error_handler_are_registered(self):

@@ -270,6 +270,26 @@ def _user_is_hired_driver(user_id) -> bool:
         return False
 
 
+def _user_can_open_applications(user_id) -> bool:
+    """Who may open the applications list and hire from it.
+
+    Supervisors, and anyone on the drivers roster -- the same people
+    _user_can_hire already lets press the button. Hiring was open and the list
+    was not, which is a permission nobody could use.
+
+    It carries what hiring carries: an application holds the applicant's name,
+    phone, email, address and licence, and hiring one creates a driver who then
+    receives real client leads. That is the deal the office asked for twice
+    (see _hiring_requires_team) -- and KRAB_HIRE_REQUIRES_TEAM=1 still closes
+    both the button and this door in one move.
+    """
+    if _user_is_global_supervisor(user_id):
+        return True
+    if _hiring_requires_team():
+        return False
+    return _user_is_hired_driver(user_id)
+
+
 def _hiring_requires_someone_else() -> bool:
     """Must a hire be approved by somebody other than the applicant?
 
@@ -2115,7 +2135,11 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
 
 
 async def cmd_interviews(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not _user_is_global_supervisor(update.effective_user.id):
+    if not _user_can_open_applications(update.effective_user.id):
+        await update.effective_message.reply_text(
+            "⛔ Only supervisors and drivers can open the applications list. "
+            "Ask a supervisor to add you as a driver."
+        )
         return
     rows = db.list_interviews(40)
     if not rows:
@@ -2190,7 +2214,10 @@ async def _send_driver_profile_card(
 
 
 async def cmd_drivers(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    # Supervisors only, and it says so now: returning nothing at all is how a
+    # restriction and a broken bot came to look the same from the outside.
     if not _user_is_global_supervisor(update.effective_user.id):
+        await update.effective_message.reply_text("⛔ Supervisors only.")
         return
     drivers = db.get_all_drivers()
     if not drivers:
@@ -2212,7 +2239,10 @@ async def cmd_drivers(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
 
 async def cmd_delete(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    # Stays supervisors only, on purpose: this one erases a driver from Issuer,
+    # Dispatch and the interviews at once. Hiring is reversible; that is not.
     if not _user_is_global_supervisor(update.effective_user.id):
+        await update.effective_message.reply_text("⛔ Supervisors only.")
         return
     drivers = db.get_all_drivers()
     if not drivers:
@@ -2246,12 +2276,15 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "🤖 <b>Krab Interviewer — Commands</b>\n\n"
         "1. ✅ /start — begin driver questionnaire (or supervisor hire menu)\n"
         "2. ❌ /cancel — cancel the current flow\n"
-        "3. 🎤 /interviews — driver applications (tap a first name to open)\n"
-        "4. 🚗 /drivers — list Issuer drivers (tap for profile)\n"
-        "5. 🗑 /delete — remove a driver (Issuer + Dispatch + interviews)\n"
-        "6. 📂 /open — hired drivers (tap a name) or /open &lt;id&gt; — open by id\n"
-        "7. 📢 /announce — post next message to drivers channel now\n"
-        "8. 🗓️📢 /announce_schedule — schedule a channel post\n"
+        "3. 🎤 /interviews — driver applications, tap a first name to open "
+        "and hire <i>(supervisors and drivers)</i>\n"
+        "4. 🚗 /drivers — list Issuer drivers <i>(supervisors)</i>\n"
+        "5. 🗑 /delete — remove a driver from Issuer, Dispatch and interviews "
+        "<i>(supervisors)</i>\n"
+        "6. 📂 /open — hired drivers, or /open &lt;id&gt; "
+        "<i>(supervisors and drivers)</i>\n"
+        "7. 📢 /announce — post to the drivers channel now <i>(supervisors)</i>\n"
+        "8. 🗓️📢 /announce_schedule — schedule a channel post <i>(supervisors)</i>\n"
         "9. 🎥📚 /training — view training videos (supervisors: add or remove)\n"
         "10. ❓ /help — show this command list"
     )
@@ -2265,7 +2298,11 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def cmd_open(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not _user_is_global_supervisor(update.effective_user.id):
+    if not _user_can_open_applications(update.effective_user.id):
+        await update.effective_message.reply_text(
+            "⛔ Only supervisors and drivers can open applications. "
+            "Ask a supervisor to add you as a driver."
+        )
         return
     args = context.args or []
     if not args:
@@ -2311,7 +2348,8 @@ async def cmd_setemail(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
     if not user or not msg:
         return ConversationHandler.END
     if not _user_is_global_supervisor(user.id):
-        return ConversationHandler.END
+        await msg.reply_text("⛔ Supervisors only.")
+        return None
     existing = shipments_db.get_supervisor_email(str(user.id))
     note = f"\n\nCurrent: `{existing}`" if existing else ""
     await msg.reply_text(
@@ -2342,7 +2380,10 @@ async def handle_supervisor_email(update: Update, context: ContextTypes.DEFAULT_
 
 async def cmd_announce(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     if not _user_is_global_supervisor(update.effective_user.id):
-        return ConversationHandler.END
+        # None, not END: this is an entry point with allow_reentry, so ending
+        # here threw away whatever the person was in the middle of.
+        await update.effective_message.reply_text("⛔ Supervisors only.")
+        return None
     await update.effective_message.reply_text(
         "📣 Announce mode: send your next message (text, photo, video, or document). "
         "It will be posted to the drivers channel immediately."
@@ -2353,7 +2394,8 @@ async def cmd_announce(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
 
 async def cmd_announce_schedule(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     if not _user_is_global_supervisor(update.effective_user.id):
-        return ConversationHandler.END
+        await update.effective_message.reply_text("⛔ Supervisors only.")
+        return None
     await update.effective_message.reply_text(
         "📅 Send the date and time to post (e.g. 2026-05-25 14:30 ET):"
     )
