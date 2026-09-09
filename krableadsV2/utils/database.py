@@ -42,6 +42,11 @@ _OPTIONAL_LEADS_WRITE_KEYS = frozenset({
     "tag_email_error",
     "tag_email_approved_at",
     "tag_email_asked_at",
+    # When the tag is expected to reach the client, and who said so.
+    # database/migration_lead_expected_delivery.sql — optional, so a database
+    # behind that migration still saves the lead, minus these two.
+    "expected_delivery_at",
+    "expected_delivery_set_by",
 })
 
 
