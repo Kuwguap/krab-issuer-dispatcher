@@ -432,6 +432,34 @@ class Database:
             logger.warning("get_unpaid_instant_lead_ids: %s", e)
             return set()
 
+    def get_recent_leads_for_dump(self, limit: int = 400) -> list:
+        """The columns /dump reconstructs the bot's activity from.
+
+        One read for the whole log. Nothing here writes an event, so the log is
+        rebuilt from the timestamps that already exist -- which is why it can
+        show the leads that have been stuck for a month rather than only what
+        happens from now on. Falls back to the columns that certainly exist so a
+        database behind a migration still answers.
+        """
+        if not self._check_tables_exist():
+            return []
+        cap = max(1, min(int(limit or 400), 1000))
+        for cols in ("id, reference_id, created_at, telegram_username, email, "
+                     "vehicle_details, issue_date, delivered_at, wants_insurance, "
+                     "insurance_card_sent_at, insurance_emailed_at, "
+                     "wants_tag_email, tag_email_approved_at, tag_emailed_at, "
+                     "deleted_at, deleted_by",
+                     "id, reference_id, created_at, telegram_username, email, "
+                     "vehicle_details, issue_date, wants_insurance",
+                     "id, reference_id, created_at, telegram_username"):
+            try:
+                return (self.client.table("leads").select(cols)
+                        .order("created_at", desc=True)
+                        .limit(cap).execute().data) or []
+            except Exception as e:
+                logger.info("get_recent_leads_for_dump (%s...): %s", cols[:32], e)
+        return []
+
     def get_leads_needing_client_email(self, user_id=None, limit: int = 12) -> list:
         """Leads held up for want of a client email, newest first.
 

@@ -173,6 +173,29 @@ def _instant_toggle_note(state_data: dict) -> str:
     return note
 
 
+KEEP_MESSAGES_KEY = "keep_user_messages"
+
+
+def _keep_user_messages() -> bool:
+    """Leave what people type in the chat, and keep the bot's reply last.
+
+    OFF by default, which is how the bot has always behaved: the typed line is
+    deleted and the review card is edited in place, so the chat stays short and
+    the card is the single source of truth. ON keeps every message for
+    reference and reposts the card underneath instead of editing it, so the
+    newest reading is always the last thing on screen.
+
+    Global, like every other switch on that screen: one office, one chat
+    convention. Per-person would mean two people in the same group seeing
+    different histories of the same lead.
+    """
+    try:
+        return str(db.get_setting(KEEP_MESSAGES_KEY) or "").strip().lower() in (
+            "1", "true", "on", "yes")
+    except Exception:
+        return False
+
+
 def _instant_all_drivers_enabled() -> bool:
     """Supervisory switch: allow the All-Drivers broadcast for Instant Tag
     leads (every driver gets their own payment link; first card to clear
@@ -2546,6 +2569,12 @@ def _after_send_keyboard(lead_id: str) -> InlineKeyboardMarkup:
         [InlineKeyboardButton("➕ Another tag (same client)", callback_data=f"another_tag_{lead_id}")],
         [InlineKeyboardButton("🚫 Skip Dispatch",
                               callback_data=f"{INSTANT_PDF_CB}{lead_id}")],
+        # Asked for: the way to email the client their tag without having had
+        # to switch anything on while entering the lead. Its own row, and last,
+        # so it is not adjacent to Skip Dispatch -- that one withdraws the lead,
+        # and these two must never be a mis-tap apart.
+        [InlineKeyboardButton("📧 Email tag to client",
+                              callback_data=f"{TAG_EMAIL_CB}{lead_id}")],
     ])
 
 
@@ -5724,9 +5753,21 @@ async def _edit_message_keyboard(context, chat_id, message_id, keyboard):
     except Exception as e:
         logger.warning(f"Could not edit keyboard: {e}")
 
-async def _update_review_message_text(context, state_data):
+async def _update_review_message_text(context, state_data, allow_reanchor=True):
+    """Put the newest reading in front of the person.
+
+    With "keep my messages" switched on in /settings, that means REPOSTING the
+    card at the bottom rather than editing it where it sits: their own messages
+    are still in the chat, and a card edited ten messages up is exactly what
+    they said they could not read. allow_reanchor exists for one caller --
+    _reanchor_review_card's own fallback, which lands here when a repost failed
+    and must not ask for another one.
+    """
     chat_id = context.user_data.get("review_chat_id")
     mid = context.user_data.get("review_message_id")
+    if allow_reanchor and chat_id and _keep_user_messages():
+        await _reanchor_review_card(context, chat_id, state_data)
+        return
     if not chat_id or not mid:
         logger.info("🔎DIAG update_review NO-OP: chat=%s mid=%s (ids missing)", chat_id, mid)
         return
@@ -5775,7 +5816,8 @@ async def _reanchor_review_card(context, chat_id, state_data) -> None:
         )
     except Exception as e:
         logger.warning("Could not re-anchor review card: %s", e)
-        await _update_review_message_text(context, state_data)
+        # No second repost: this IS the failed repost's fallback.
+        await _update_review_message_text(context, state_data, allow_reanchor=False)
         return
     context.user_data["review_message_id"] = msg.message_id
     context.user_data["review_chat_id"] = msg.chat_id
@@ -10024,6 +10066,10 @@ async def _autoclean_user_msg(update: Update, context: ContextTypes.DEFAULT_TYPE
         return  # keep media + let the voice pipeline manage its own echo cleanup
     if not (msg.text or "").strip():
         return
+    if _keep_user_messages():
+        # Switched on in /settings: what they typed stays put, and the card is
+        # reposted below it instead of edited in place.
+        return
     try:
         await msg.delete()
     except Exception:
@@ -12111,6 +12157,49 @@ async def _maybe_email_tag_to_client(lead: dict, vehicle: int, pdf: bytes,
         logger.warning("tag email: %s", e)
 
 
+# lead_id -> who pressed Release. Read once by the notice below and dropped.
+_TAG_EMAIL_APPROVED_BY: dict = {}
+
+
+async def _tell_supervisors_tag_emailed(context, lead: dict, email: str,
+                                        pdf: bytes, filename: str) -> None:
+    """Every supervisor gets the client's name, the reference, who released it,
+    and the tag that was sent.
+
+    The document goes first and carries the whole message as its caption, so the
+    tag and the fact are one item in the chat rather than two that can be read
+    apart. A chat that refuses documents still gets the text -- see the
+    can_send_documents note in the receipts board's history; a supervisor barred
+    from receiving files must not simply hear nothing.
+    """
+    ref = (lead.get("reference_id") or "N/A").strip()
+    client = _client_display_name_from_lead(lead) or "this client"
+    by = _TAG_EMAIL_APPROVED_BY.pop(str(lead.get("id") or ""), "")
+    lines = [
+        "📧 <b>Tag emailed to the client</b>",
+        f"👤 {html.escape(client, quote=False)}",
+        f"📋 <code>{html.escape(ref, quote=False)}</code>",
+        f"✉️ {html.escape(email, quote=False)}",
+    ]
+    if by:
+        lines.append(f"🙋 Released by {html.escape(by, quote=False)}")
+    text = "\n".join(lines)
+    for cid in _global_supervisory_chat_ids():
+        try:
+            await context.bot.send_document(
+                chat_id=cid,
+                document=InputFile(io.BytesIO(pdf), filename=filename),
+                caption=text, parse_mode="HTML")
+        except Exception as e:
+            logger.warning("tag emailed notice: document to %s failed (%s) — "
+                           "sending the text", cid, e)
+            try:
+                await context.bot.send_message(chat_id=cid, text=text,
+                                               parse_mode="HTML")
+            except Exception as e2:
+                logger.warning("tag emailed notice: %s heard nothing: %s", cid, e2)
+
+
 async def send_approved_tag_emails(context: ContextTypes.DEFAULT_TYPE) -> None:
     """Every tag a supervisor released, sent to the client now.
 
@@ -12162,6 +12251,11 @@ async def send_approved_tag_emails(context: ContextTypes.DEFAULT_TYPE) -> None:
                 await asyncio.to_thread(db.advance_delivery_status, lead_id,
                                         "tag_emailed")
                 logger.info("tag email: sent to the client for %s", ref or lead_id)
+                # Told on the SEND, not on the approval. "Approved" was a dead
+                # end for eleven leads and nobody noticed for a month, because
+                # nothing announced either end of it.
+                await _tell_supervisors_tag_emailed(context, lead, email, pdf,
+                                                    f"{safe or 'temp_tag'}.pdf")
             else:
                 err = str(getattr(result, "error", "") or "send failed")[:500]
                 await asyncio.to_thread(db.update_lead, lead_id,
@@ -17591,12 +17685,31 @@ async def handle_tag_email_to_client(update: Update, context: ContextTypes.DEFAU
     email = (lead.get("email") or "").strip()
     if not email:
         await _safe_answer_callback_query(
-            query, "❌ No email on file for this client.", show_alert=True)
+            query, "❌ No email on file for this client.\n\n"
+                   "Send /email " + str(lead.get("reference_id") or "")
+                   + " client@email.com, and I will offer this again.",
+            show_alert=True)
         return
+    # This button now also rides the lead-sent confirmation, which is posted
+    # before any driver has accepted. Approving there is legitimate -- the owner
+    # asked for it -- but the sweep BUILDS the tag, which allocates a plate. Say
+    # so plainly rather than let a tap quietly mint one for a lead that may yet
+    # be reassigned or withdrawn.
+    if not str(lead.get("krab_tag_pdf_sent_at") or "").strip():
+        await _safe_answer_callback_query(
+            query, "📧 Sending. The tag has not gone to the team yet, so it is "
+                   "being made now for the client.", show_alert=True)
     await _safe_answer_callback_query(query, f"📧 Sending to {email}…")
     # Recorded as approved and left to the sweep, which owns the builder and
     # will not block this tap on building a PDF and talking to a mail server.
     stamp = datetime.now(pytz.timezone("America/New_York")).isoformat()
+    # Who tapped, remembered for the notice the sweep sends thirty seconds
+    # later in a coroutine that has no idea who did. In memory rather than a
+    # column: _OPTIONAL_LEADS_WRITE_KEYS drops a column the database has never
+    # heard of, so persisting it would need a migration to say a name, and a
+    # name is the one part of that notice that can be lost harmlessly. After a
+    # restart it simply goes unsaid.
+    _TAG_EMAIL_APPROVED_BY[str(lead_id)] = _acting_user_label(query.from_user)[:120]
     ok = await asyncio.to_thread(db.update_lead, lead_id,
                                  {"tag_email_approved_at": stamp})
     if not ok:
@@ -17872,6 +17985,136 @@ async def handle_client_email_pick(update: Update, context: ContextTypes.DEFAULT
         f"Send this with their address on the end:\n"
         f"<code>/email {html.escape(ref, quote=False)} </code>",
         parse_mode="HTML")
+
+
+DUMP_CB = "dump_"
+DUMP_PAGE = 10
+
+
+def _dump_events(limit: int = 400) -> list:
+    """Everything the bot has done lately, newest first.
+
+    Rebuilt from the columns that already record it, because nothing writes an
+    event log: leads.created_at is a lead being entered, tag_emailed_at is a
+    client copy that actually went, tag_email_approved_at with no send is one
+    that was released and has not gone yet, and an address with a want and
+    neither stamp is the state that quietly held eleven leads for a month.
+
+    One read, not one per line: the page is cut from this list in memory.
+    """
+    try:
+        rows = db.get_recent_leads_for_dump(limit)
+    except Exception as e:
+        logger.warning("/dump read failed: %s", e)
+        return []
+    out = []
+    for r in rows or []:
+        ref = str(r.get("reference_id") or "?")
+        who = str(r.get("telegram_username") or "").strip() or "somebody"
+        client = _client_display_name_from_lead(r) or "—"
+        email = str(r.get("email") or "").strip()
+
+        def add(when, icon, what):
+            if str(when or "").strip():
+                out.append({"at": str(when), "icon": icon, "ref": ref,
+                            "client": client, "what": what})
+
+        add(r.get("created_at"), "🆕", f"lead entered by {who}")
+        add(r.get("issue_date"), "🏷", "tag issued")
+        add(r.get("delivered_at"), "🚚", "delivered")
+        add(r.get("insurance_card_sent_at"), "🛡", "insurance card issued")
+        add(r.get("insurance_emailed_at"), "🛡", "insurance card emailed to the client")
+        add(r.get("tag_emailed_at"), "📧", f"tag EMAILED to {email or 'the client'}")
+        # The two states that are invisible today, and the whole reason for this.
+        if (str(r.get("tag_email_approved_at") or "").strip()
+                and not str(r.get("tag_emailed_at") or "").strip()):
+            add(r.get("tag_email_approved_at"), "⏳",
+                "tag released — NOT sent yet")
+        if (email and not str(r.get("tag_emailed_at") or "").strip()
+                and not str(r.get("tag_email_approved_at") or "").strip()):
+            add(r.get("created_at"), "⚠️",
+                f"has {email} — tag NEVER sent to the client")
+        if r.get("wants_insurance") and not str(
+                r.get("insurance_card_sent_at") or "").strip() and not email:
+            add(r.get("created_at"), "⚠️", "wants insurance — no client email")
+        if str(r.get("deleted_at") or "").strip():
+            add(r.get("deleted_at"), "🗑",
+                f"deleted by {str(r.get('deleted_by') or 'somebody')}")
+    out.sort(key=lambda e: e["at"], reverse=True)
+    return out
+
+
+def _dump_page(events: list, page: int):
+    """(text, keyboard) for one page of ten."""
+    pages = max(1, (len(events) + DUMP_PAGE - 1) // DUMP_PAGE)
+    page = max(0, min(page, pages - 1))
+    chunk = events[page * DUMP_PAGE:(page + 1) * DUMP_PAGE]
+    lines = [f"📋 <b>What the bot has been doing</b>  ({len(events)} events)", ""]
+    for e in chunk:
+        lines.append(
+            f"{e['icon']} <code>{html.escape(e['ref'], quote=False)}</code> "
+            f"{html.escape(e['client'], quote=False)}\n"
+            f"    {html.escape(e['what'], quote=False)}  ·  "
+            f"<i>{html.escape(_dump_when(e['at']), quote=False)}</i>")
+    if not chunk:
+        lines.append("Nothing recorded yet.")
+    lines.append("")
+    lines.append(f"Page {page + 1} of {pages}")
+    row = []
+    if page > 0:
+        row.append(InlineKeyboardButton("⬅️ Newer", callback_data=f"{DUMP_CB}{page - 1}"))
+    if page + 1 < pages:
+        row.append(InlineKeyboardButton("Older ➡️", callback_data=f"{DUMP_CB}{page + 1}"))
+    kb = InlineKeyboardMarkup([row] if row else [])
+    return "\n".join(lines), kb
+
+
+def _dump_when(iso: str) -> str:
+    """New York, like everything else the office reads."""
+    try:
+        from utils.timezone import to_ny
+        d = to_ny(iso)
+        return f"{d.strftime('%b')} {d.day}, " + d.strftime("%I:%M %p").lstrip("0")
+    except Exception:
+        return str(iso)[:16]
+
+
+async def cmd_dump(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """``/dump`` — the recent life of the bot, ten events to a page.
+
+    Supervisors only: it spans every issuer's leads and every client's address,
+    which is the same reason /interviews and the roster are gated.
+    """
+    msg = update.effective_message
+    user = update.effective_user
+    if not msg or not user:
+        return
+    if not await asyncio.to_thread(_user_is_global_supervisor, user.id):
+        await msg.reply_text("⛔ Supervisors only.")
+        return
+    events = await asyncio.to_thread(_dump_events)
+    text, kb = _dump_page(events, 0)
+    await msg.reply_text(text, parse_mode="HTML", reply_markup=kb)
+
+
+async def handle_dump_page(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Another page. Re-read rather than cached: the point is what is happening."""
+    query = update.callback_query
+    if not query:
+        return
+    await _safe_answer_callback_query(query)
+    if not await asyncio.to_thread(_user_is_global_supervisor, query.from_user.id):
+        return
+    try:
+        page = int((query.data or "")[len(DUMP_CB):] or 0)
+    except ValueError:
+        page = 0
+    events = await asyncio.to_thread(_dump_events)
+    text, kb = _dump_page(events, page)
+    try:
+        await query.edit_message_text(text, parse_mode="HTML", reply_markup=kb)
+    except Exception as e:
+        logger.info("/dump page %s: %s", page, e)
 
 
 async def cmd_set_client_email(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -22692,6 +22935,7 @@ def _settings_main_kb() -> InlineKeyboardMarkup:
         [InlineKeyboardButton("🔁 Follow-ups", callback_data="tset_fu")],
         [InlineKeyboardButton("🧾 Recent Leads", callback_data="tset_recent")],
         [InlineKeyboardButton("💵 Cash payment", callback_data="tset_instant")],
+        [InlineKeyboardButton("💬 Chat history", callback_data="tset_keep")],
         [InlineKeyboardButton("✖️ Close", callback_data="tset_close")],
     ])
 
@@ -23152,6 +23396,29 @@ async def _settings_view_instant():
     return text, kb
 
 
+async def _settings_view_keep():
+    """💬 Chat history: keep what people type, and keep the bot's reply last."""
+    on = _keep_user_messages()
+    text = (
+        "💬 *Chat history*\n\n"
+        f"Keep what people type: *{'ON' if on else 'OFF'}*\n\n"
+        + ("_Your messages stay in the chat for reference, and the bot reposts "
+           "its reading underneath — so the newest information is always the "
+           "last thing on screen._"
+           if on else
+           "_The bot deletes what you type during a lead and edits its card in "
+           "place, so the chat stays short. Turn this on to keep your messages "
+           "and have the bot's reply move to the bottom instead._")
+    )
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton(
+            ("🔴 Go back to a clean chat" if on else "🟢 Keep my messages"),
+            callback_data="tset_keep_toggle")],
+        [InlineKeyboardButton("⬅️ Back", callback_data="tset_menu")],
+    ])
+    return text, kb
+
+
 _SETTINGS_VIEWS = {
     "tset_plates": _settings_view_plates,
     "tset_groups": _settings_view_groups,
@@ -23163,6 +23430,7 @@ _SETTINGS_VIEWS = {
     "tset_fu": _settings_view_followups,
     "tset_recent": _settings_view_recent,
     "tset_instant": _settings_view_instant,
+    "tset_keep": _settings_view_keep,
 }
 # Refs and client names carry characters Markdown v1 chokes on, so the Recent
 # Leads screen renders as HTML while every other view keeps Markdown.
@@ -23187,6 +23455,8 @@ _SETTINGS_NAV = [
     # reach it. "instant" stays for everyone who learned it as Instant Tag.
     (re.compile(r"\b(?:instant\s*(?:tags?|pdf)?|cash\s*payments?)\b", re.I),
      "tset_instant"),
+    (re.compile(r"\b(?:chat\s*history|keep\s*(?:my\s*)?messages?|"
+                r"stop\s*deleting|don'?t\s*delete)\b", re.I), "tset_keep"),
 ]
 _SETTINGS_BACK_RE = re.compile(r"^\s*(?:back|menu|main|home|up|return)\b", re.I)
 _SETTINGS_CLOSE_RE = re.compile(r"^\s*(?:close|exit|quit|dismiss|finished|done)\b", re.I)
@@ -23307,6 +23577,17 @@ async def handle_settings_cb(update: Update, context: ContextTypes.DEFAULT_TYPE)
         return SET_MENU
     if data == "tset_instant":
         await _show_settings_view("tset_instant", query=query)
+        return SET_MENU
+    if data == "tset_keep":
+        await _show_settings_view("tset_keep", query=query)
+        return SET_MENU
+    if data == "tset_keep_toggle":
+        want = not _keep_user_messages()
+        ok = await asyncio.to_thread(db.set_setting, KEEP_MESSAGES_KEY,
+                                     "1" if want else "0")
+        if not ok:
+            await query.message.reply_text("⚠️ Could not save the setting. Try again.")
+        await _show_settings_view("tset_keep", query=query)
         return SET_MENU
     if data == "tset_itag_all":
         want = not _instant_all_drivers_enabled()
@@ -23798,6 +24079,7 @@ def main():
                 # It has never been on the menu, which is part of why a lead sat
                 # blocked on a missing address until somebody happened to open it.
                 BotCommand("email", "Set a client's email (or see what needs one)"),
+                BotCommand("dump", "Supervisors: what the bot has been doing"),
                 BotCommand("appeal", "Appeal / cancel a delivery"),
                 BotCommand("cancel", "Cancel and restart"),
                 BotCommand("help", "Show the usage guide"),
@@ -24381,6 +24663,9 @@ def main():
         CallbackQueryHandler(handle_tag_email_to_client, pattern=r"^tag_email_"))
     application.add_handler(
         CommandHandler(["email", "setclientemail"], cmd_set_client_email))
+    application.add_handler(CommandHandler(["dump", "activity", "log"], cmd_dump))
+    application.add_handler(CallbackQueryHandler(handle_dump_page,
+                                                 pattern=f"^{DUMP_CB}"))
     application.add_handler(CallbackQueryHandler(
         handle_client_email_pick, pattern=f"^{SET_EMAIL_CB}"))
     # Recent Leads browser (page/strike/restore). Top-level: the strike button

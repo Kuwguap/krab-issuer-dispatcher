@@ -8,13 +8,16 @@ a lead that ALREADY had both the toggle and the client's address. Supply the
 address afterwards and the tag has already been posted with no button on it,
 and there is no way to release it from anywhere.
 
-What this file holds still is as much about where the button is NOT:
+The button also sits on the lead-sent confirmation, by the owner's decision: it
+was raised that at that moment no driver has accepted, no tag exists, and a tap
+makes the sweep BUILD one — allocating a plate for a lead that may still be
+reassigned or withdrawn — and the answer was to put it there anyway. So what is
+held still here is what makes that survivable rather than an argument against it:
 
-* It must not go on the lead-sent confirmation. At that moment no driver has
-  accepted, no tag exists and no plate has been minted; the sweep would mint one
-  for an unaccepted lead. "🚫 Skip Dispatch" is the button directly below it, so
-  a mis-tap would leave a client holding a real tag for a recalled lead.
-* Tapping it must stay the only thing that sends. Relaxing WHO is offered the
+* it never shares a row with "🚫 Skip Dispatch", which withdraws the lead from
+  the team and every driver — those two must not be a mis-tap apart;
+* an early tap SAYS it is making the tag now, rather than minting one silently;
+* and tapping remains the only thing that sends. Relaxing WHO is offered the
   choice must not relax who makes it.
 
 Run:  venv\Scripts\python.exe -m pytest tests/test_tag_release_reachable.py -q
@@ -118,16 +121,34 @@ class SettingTheAddressOffersItTest(unittest.TestCase):
         self.assertIn("insurance card", said.lower())
 
 
-class WhereItMustNotBeTest(unittest.TestCase):
+class WhereTheButtonLivesTest(unittest.TestCase):
 
-    def test_it_is_not_on_the_lead_sent_confirmation(self):
-        """At that moment no driver has accepted, no tag exists and no plate has
-        been minted — and Skip Dispatch is the button directly below."""
+    def test_it_is_on_the_lead_sent_confirmation_by_decision(self):
+        """The owner asked for it there and, told what it costs, asked again.
+
+        What it costs: that message is posted before any driver has accepted,
+        so the sweep BUILDS the tag when this is tapped, and building one
+        allocates a plate for a lead that may still be reassigned or withdrawn.
+        Two things make that survivable, and both are pinned below — it sits on
+        its own row away from Skip Dispatch, and the handler says out loud when
+        it is minting a tag early rather than doing it silently.
+        """
         src = (ROOT / "bot.py").read_text(encoding="utf-8")
         i = src.index("def _after_send_keyboard(")
         block = src[i:src.index("\ndef ", i + 10)]
-        self.assertNotIn("TAG_EMAIL_CB", block)
+        self.assertIn("TAG_EMAIL_CB", block)
         self.assertIn("Skip Dispatch", block)
+
+    def test_it_never_shares_a_row_with_skip_dispatch(self):
+        """Skip Dispatch withdraws the lead from the team and every driver."""
+        for row in B._after_send_keyboard(LEAD).inline_keyboard:
+            texts = " ".join(b.text for b in row)
+            self.assertFalse("Skip Dispatch" in texts and "Email tag" in texts, texts)
+
+    def test_an_early_tap_says_it_is_making_the_tag_now(self):
+        src = (ROOT / "bot.py").read_text(encoding="utf-8")
+        i = src.index("async def handle_tag_email_to_client(")
+        self.assertIn("has not gone to the team yet", src[i:i + 4000])
 
     def test_the_tag_pdf_is_still_where_the_button_normally_rides(self):
         src = (ROOT / "bot.py").read_text(encoding="utf-8")
@@ -140,7 +161,7 @@ class WhereItMustNotBeTest(unittest.TestCase):
         sweep sends on tag_email_approved_at, which only the tap writes."""
         src = (ROOT / "bot.py").read_text(encoding="utf-8")
         i = src.index("async def handle_tag_email_to_client(")
-        block = src[i:i + 2500]
+        block = src[i:i + 4000]
         self.assertIn('"tag_email_approved_at": stamp', block)
         j = src.index("async def send_approved_tag_emails(")
         self.assertIn("get_tag_emails_awaiting_send", src[j:j + 900])
