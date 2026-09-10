@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import html as _html
 import io
 import logging
 import os
@@ -502,30 +503,50 @@ def _format_paper_ship_message(
     ship_intro: str,
     receipt_line: str,
     include_recipient: bool = True,
+    as_html: bool = False,
 ) -> str:
     # Header and quantity read as one line of fact; the person and the
     # instructions are held apart from it, so a paper girl scanning the channel
     # finds the address without reading a paragraph.
+    #
+    # as_html: every line that carries a value is escaped, for a message sent
+    # with parse_mode="HTML". Otherwise the text is plain, which is how the
+    # driver notice and the channel post are sent. The header and the footer
+    # are fixed text with no & < > in them.
+    esc = _html_text if as_html else str
     parts = [
         "➕🚗 New Driver Hired ✅🎉",
-        ship_intro,
+        esc(ship_intro),
         "",
         "",
     ]
     if include_recipient:
         addr = _shipping_address_line(name, address)
         parts.extend([
-            f"👤 {name}",
-            f"📍 {addr}",
-            f"📞 {phone}",
+            f"👤 {esc(name)}",
+            f"📍 {esc(addr)}",
+            f"📞 {esc(phone)}",
             "",
             "",
         ])
-    parts.extend([receipt_line, _PAPER_SHIP_FOOTER])
+    parts.extend([esc(receipt_line), _PAPER_SHIP_FOOTER])
     return "\n".join(parts)
 
 
+def _html_text(value) -> str:
+    """Text safe to place in a parse_mode="HTML" message.
+
+    Telegram rejects the WHOLE message when a value breaks its parser, and that
+    recipient silently gets nothing. Under Markdown an underscore, asterisk,
+    bracket or backtick in a driver's name or address was enough; under HTML
+    only & < > matter, and escaping them makes any value safe. quote=False:
+    quotes only matter inside tag attributes, and no value goes in one.
+    """
+    return _html.escape(str(value), quote=False)
+
+
 def _format_paper_girl_ship_request(shipment: dict) -> str:
+    """The full paper order, as HTML: send it with parse_mode="HTML"."""
     qty = int(shipment.get("quantity") or Config.DEFAULT_PAPER_QTY)
     name = (shipment.get("driver_name") or "Driver").strip()
     return _format_paper_ship_message(
@@ -535,6 +556,7 @@ def _format_paper_girl_ship_request(shipment: dict) -> str:
         phone=(shipment.get("driver_phone") or "-").strip(),
         ship_intro=f"📦 Please ship {qty} temp tag papers today to:",
         receipt_line="🧾 Please upload the tracking number shipping receipt once sent.",
+        as_html=True,
     )
 
 
@@ -606,16 +628,36 @@ async def _broadcast_shipment_status(
             logger.warning("shipment broadcast to %s: %s", cid, e)
 
 
+def _paper_order_recipient_chat_ids() -> List[int]:
+    """Everyone a new paper order goes to: paper-girl DMs, paper-girl groups and
+    supervisors, once each however many of those lists a chat is in."""
+    seen: set = set()
+    out: List[int] = []
+    for cid in _paper_girl_notify_chat_ids() + _global_supervisory_chat_ids():
+        key = _norm_chat_id(cid)
+        if key is None or key in seen:
+            continue
+        seen.add(key)
+        out.append(cid)
+    return out
+
+
 async def _notify_paper_girl_chats(
     context: ContextTypes.DEFAULT_TYPE,
     text: str,
     *,
     reply_markup: Optional[InlineKeyboardMarkup] = None,
     parse_mode: Optional[str] = None,
+    chat_ids: Optional[List[int]] = None,
 ) -> List[str]:
-    """Send the same message to every paper-girl DM + notify group. Returns error strings."""
+    """Send the same message to each chat, each send on its own. Returns error strings.
+
+    chat_ids defaults to every paper-girl DM + notify group.
+    """
     errors: List[str] = []
-    for cid in _paper_girl_notify_chat_ids():
+    if chat_ids is None:
+        chat_ids = _paper_girl_notify_chat_ids()
+    for cid in chat_ids:
         try:
             kwargs: dict = {"chat_id": cid, "text": text}
             if reply_markup is not None:
@@ -1258,7 +1300,13 @@ async def _create_and_notify_paper_girl(
     *,
     created_by_telegram_id: str,
 ) -> tuple[Optional[dict], Optional[str]]:
-    """Create shipment and broadcast the full order to all paper girls."""
+    """Create the shipment and send the full order to everyone who works it.
+
+    One message, everyone: every paper-girl DM, every paper-girl group and
+    every supervisor gets the same full order -- name, full delivery address,
+    phone, quantity -- with the same buttons. Nobody accepts it; whoever ships
+    uploads the tracking number (_user_can_work_shipment lets both).
+    """
     fn = _driver_display_name(interview)
     addr = (interview.get("mailing_address") or "").strip()
     phone = (interview.get("phone_number") or "").strip()
@@ -1284,42 +1332,32 @@ async def _create_and_notify_paper_girl(
     if not shipment:
         return None, "Could not create paper_shipments row (run migration_paper_shipments.sql?)"
 
-    if not _paper_girl_notify_chat_ids():
+    recipients = _paper_order_recipient_chat_ids()
+    if not recipients:
         return shipment, (
-            "PAPER_GIRL_TELEGRAM_ID / PAPER_GIRL_NOTIFY_CHAT_IDS not set — "
-            "shipment saved but nobody was notified."
+            "PAPER_GIRL_TELEGRAM_ID / PAPER_GIRL_NOTIFY_CHAT_IDS / SUPERVISORY_TELEGRAM_ID "
+            "not set — shipment saved but nobody was notified."
         )
 
-    ship_text = _format_paper_girl_ship_request(shipment)
-    ship_kb = _paper_girl_ship_keyboard(shipment["id"])
     errs = await _notify_paper_girl_chats(
         context,
-        ship_text,
-        reply_markup=ship_kb,
-        parse_mode="Markdown",
+        _format_paper_girl_ship_request(shipment),
+        reply_markup=_paper_girl_ship_keyboard(shipment["id"]),
+        parse_mode="HTML",
+        chat_ids=recipients,
     )
 
-    supervisor_text = (
-        "📦 **New paper delivery order**\n\n"
-        f"👤 Driver: **{fn or 'Driver'}**\n"
-        f"🏙 City: **{city or '—'}**\n"
-        f"📮 ZIP: **{zip_code or '—'}**\n"
-        f"📄 Quantity: **{qty}** papers\n\n"
-        "Sent to all paper girls — awaiting tracking."
-    )
-    for cid in _global_supervisory_chat_ids():
-        try:
-            await context.bot.send_message(
-                chat_id=cid,
-                text=supervisor_text,
-                parse_mode="Markdown",
-            )
-        except Exception:
-            pass
-
-    if errs:
-        return shipment, "Some paper girl notifications failed: " + "; ".join(errs)
-    return shipment, None
+    warnings: List[str] = []
+    if not _paper_girl_notify_chat_ids():
+        warnings.append(
+            "No paper-girl chat set (PAPER_GIRL_TELEGRAM_ID / PAPER_GIRL_NOTIFY_CHAT_IDS) "
+            "— only supervisors got the order."
+        )
+    if errs and len(errs) >= len(recipients):
+        warnings.append("The paper order reached nobody: " + "; ".join(errs))
+    elif errs:
+        warnings.append("Some paper order notifications failed: " + "; ".join(errs))
+    return shipment, ("; ".join(warnings) or None)
 
 
 def _driver_channel_join_keyboard(
@@ -1885,7 +1923,11 @@ async def abandoned_drafts_sweep_job(context: ContextTypes.DEFAULT_TYPE) -> None
 
 
 async def paper_girl_receipt_reminder_job(context: ContextTypes.DEFAULT_TYPE) -> None:
-    """3x daily: re-broadcast pending paper orders to all paper girls."""
+    """3x daily: re-broadcast pending paper orders to all paper girls.
+
+    Paper girls only. Supervisors get each order once, when it is created;
+    adding them here would be three messages a day per open order.
+    """
     if not _paper_girl_notify_chat_ids():
         return
     pending = [
@@ -1905,19 +1947,151 @@ async def paper_girl_receipt_reminder_job(context: ContextTypes.DEFAULT_TYPE) ->
             shipment = {**shipment, "status": "awaiting_tracking"}
 
         reminder_text = (
-            "⏰ **Reminder** — ship ASAP and upload tracking:\n\n"
+            "⏰ <b>Reminder</b> — ship ASAP and upload tracking:\n\n"
             + _format_paper_girl_ship_request(shipment)
         )
         errs = await _notify_paper_girl_chats(
             context,
             reminder_text,
             reply_markup=_paper_girl_ship_keyboard(sid),
-            parse_mode="Markdown",
+            parse_mode="HTML",
         )
         all_errs.extend(errs)
 
     if all_errs:
         logger.warning("paper girl receipt reminder failed: %s", "; ".join(all_errs))
+
+
+# How often the bot re-checks that it can reach the people a paper order goes
+# to. A handful of read-only calls per run; /api/health only reads the result.
+_RECIPIENT_REACH_INTERVAL_SEC = 5 * 60
+_last_recipient_reach_summary: Optional[str] = None
+
+
+def _paper_order_recipient_groups() -> Dict[str, List[int]]:
+    """The three lists a paper order goes to, keyed as /api/health reports them."""
+    return {
+        "paper_girl_dms": _paper_girl_user_ids(),
+        "paper_girl_groups": _paper_girl_group_notify_ids(),
+        "supervisors": _global_supervisory_chat_ids(),
+    }
+
+
+def _bot_can_post(member, chat_type: str) -> bool:
+    """Can a bot with this membership send messages in a chat of this type?"""
+    status = str(getattr(member, "status", "") or "").lower()
+    if status in ("creator", "owner"):
+        return True
+    if status == "administrator":
+        # In a channel, only an admin with the post right can send.
+        return chat_type != "channel" or bool(getattr(member, "can_post_messages", False))
+    if status == "member":
+        return chat_type != "channel"
+    if status == "restricted":
+        return bool(getattr(member, "is_member", False)) and bool(
+            getattr(member, "can_send_messages", False)
+        )
+    return False  # "left", "kicked", or anything unknown
+
+
+async def _bot_can_reach_chat(bot, chat_id: int, bot_id: Optional[int]) -> bool:
+    """Read-only: getChat, and in a group getChatMember for the bot itself.
+
+    A person's DM fails getChat when the bot has never met them ("chat not
+    found") -- they never pressed Start. A block placed later is not visible
+    to any read-only call; only a send reveals it, and this does not send.
+    A group or channel also needs the bot to still be in it and allowed to
+    post: removed, banned or muted all count as unreachable.
+    """
+    try:
+        chat = await bot.get_chat(chat_id=chat_id)
+    except Exception as e:
+        _log_reach_problem(chat_id, f"getChat failed: {e}")
+        return False
+    chat_type = str(getattr(chat, "type", "") or "").lower()
+    if chat_type == "private":
+        return True
+    if bot_id is None:
+        # Not a verdict on the chat: without its own id the bot cannot ask
+        # about its membership. Say so, or a 0 in health reads as "removed".
+        _log_reach_problem(chat_id, "the bot's own id is unknown; membership not checked")
+        return False
+    try:
+        member = await bot.get_chat_member(chat_id=chat_id, user_id=bot_id)
+    except Exception as e:
+        _log_reach_problem(chat_id, f"getChatMember failed: {e}")
+        return False
+    if _bot_can_post(member, chat_type):
+        return True
+    _log_reach_problem(
+        chat_id, f"the bot cannot post (status {getattr(member, 'status', '?')})"
+    )
+    return False
+
+
+_logged_reach_problems: set = set()
+
+
+def _log_reach_problem(chat_id: int, reason: str) -> None:
+    """Name the unreachable chat in the logs -- the one place its id may go --
+    once per process, not every few minutes."""
+    if (chat_id, reason) in _logged_reach_problems:
+        return
+    _logged_reach_problems.add((chat_id, reason))
+    logger.warning("recipient check: chat %s unreachable: %s", chat_id, reason)
+
+
+async def _probe_paper_order_recipients(bot) -> Dict[str, Dict[str, int]]:
+    """configured/reachable counts per recipient list. Each chat is probed once."""
+    try:
+        bot_id: Optional[int] = int(bot.id)
+    except Exception:
+        bot_id = None
+    reached: Dict[int, bool] = {}
+    out: Dict[str, Dict[str, int]] = {}
+    for label, ids in _paper_order_recipient_groups().items():
+        n = 0
+        for cid in ids:
+            key = _norm_chat_id(cid)
+            if key not in reached:
+                reached[key] = await _bot_can_reach_chat(bot, cid, bot_id)
+            n += 1 if reached[key] else 0
+        out[label] = {"configured": len(ids), "reachable": n}
+    return out
+
+
+def _publish_recipient_reach(reach: Optional[Dict[str, Dict[str, int]]]) -> None:
+    """Hand the counts to /api/health. reach=None: configured only, not checked yet."""
+    from api import bot_bridge
+
+    snapshot: Dict[str, Any] = {
+        label: {"configured": len(ids), "reachable": None}
+        for label, ids in _paper_order_recipient_groups().items()
+    }
+    snapshot["checked_at"] = None
+    if reach is not None:
+        snapshot.update(reach)
+        snapshot["checked_at"] = (
+            datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+        )
+    bot_bridge.set_paper_order_recipients(snapshot)
+
+
+async def paper_order_recipient_reach_job(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """At startup, then every few minutes: can the bot reach who a paper order goes to?"""
+    global _last_recipient_reach_summary
+    try:
+        reach = await _probe_paper_order_recipients(context.bot)
+    except Exception as e:
+        logger.warning("paper order recipient check failed: %s", e)
+        return
+    _publish_recipient_reach(reach)
+    summary = ", ".join(
+        f"{label} {row['reachable']}/{row['configured']}" for label, row in reach.items()
+    )
+    if summary != _last_recipient_reach_summary:
+        _last_recipient_reach_summary = summary
+        logger.info("Paper order recipients reachable: %s", summary)
 
 
 def _startup_reenqueue_jobs(application: Application) -> None:
@@ -3869,6 +4043,9 @@ def main() -> None:
         sys.exit(1)
 
     db = Database()
+    # Configured recipient counts are in /api/health from its first answer;
+    # reachability follows once paper_order_recipient_reach_job has run.
+    _publish_recipient_reach(None)
 
     try:
         from api.server import start_in_background_thread
@@ -4008,6 +4185,12 @@ def main() -> None:
             interval=_PAPER_GIRL_REMINDER_INTERVAL_SEC,
             first=_PAPER_GIRL_REMINDER_INTERVAL_SEC,
             name="paper_girl_receipt_reminder",
+        )
+        application.job_queue.run_repeating(
+            paper_order_recipient_reach_job,
+            interval=_RECIPIENT_REACH_INTERVAL_SEC,
+            first=10,
+            name="paper_order_recipient_reach",
         )
         application.job_queue.run_repeating(
             abandoned_drafts_sweep_job,

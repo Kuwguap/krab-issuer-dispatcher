@@ -41,12 +41,22 @@ def create_app() -> FastAPI:
         Whether a fix was actually live here could only be guessed at from the
         last-modified header on a static file. Every service deploys from the
         same push, so this commit is the one the bot is polling with too.
+
+        paper_order_recipients: how many paper-girl DMs, paper-girl groups and
+        supervisors are configured, and how many of each the bot can actually
+        reach. The bot runs in this process and checks that itself on a timer
+        (paper_order_recipient_reach_job in bot.py); this only reads the cached
+        counts, so a health check never waits on Telegram. Counts only -- no
+        chat id, title, username or error text is ever put here. null when no
+        bot is running in this process.
         """
         import os as _os
+        from api import bot_bridge as _bridge
         return {
             "ok": True,
             "commit": (_os.environ.get("RENDER_GIT_COMMIT") or "local")[:7],
             "bot_token": bool((_os.environ.get("TELEGRAM_BOT_TOKEN") or "").strip()),
+            "paper_order_recipients": _bridge.paper_order_recipients(),
         }
 
     app.include_router(routes_drafts.router)
