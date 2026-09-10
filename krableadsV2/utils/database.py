@@ -1,8 +1,12 @@
 """Database utilities for Supabase integration."""
 import base64
+import copy
 import logging
+import os
+import queue
 import re
 import secrets
+import threading
 import time
 from supabase import create_client, Client
 from config import Config
@@ -89,6 +93,164 @@ def record_is_active(row: Optional[dict], key: str = "is_active") -> bool:
     return row.get(key) is not False
 
 
+def _state_cache_enabled() -> bool:
+    """Kill switch, same shape as KRAB_CHAT_LAYER. Off means the old behaviour
+    exactly: every read and write goes straight to Supabase on the caller's
+    thread."""
+    return (os.getenv("KRAB_STATE_CACHE", "1").strip().lower()
+            not in ("0", "false", "no", "off"))
+
+
+class _StateStore:
+    """The conversation state, in memory, with Supabase behind it.
+
+    Authoritative rather than a cache: this process is the only writer of the
+    states table, so a value here is the truth and the table is where it is kept
+    for the next boot. Reads never touch the network after the first miss.
+
+    Writes are drained by one daemon thread, newest-wins per user: a review card
+    edited five times in two seconds costs one upsert, not five, and the handler
+    never waits for any of them.
+    """
+
+    def __init__(self):
+        self._rows = {}                     # user_id -> row dict, or None = absent
+        self._lock = threading.RLock()
+        self._pending = {}                  # user_id -> row dict, or None = delete
+        self._wake = threading.Event()
+        self._idle = threading.Event()
+        self._idle.set()
+        self._thread = None
+        self._db = None
+
+    # ── the read side ────────────────────────────────────────────────────
+    def known(self, user_id):
+        with self._lock:
+            return user_id in self._rows
+
+    def get(self, user_id):
+        """A copy, because callers mutate the blob they are handed and then ask
+        us to save it; handing out the live dict would let a handler that dies
+        halfway leave a half-applied edit behind as the truth."""
+        with self._lock:
+            return copy.deepcopy(self._rows.get(user_id))
+
+    def prime(self, user_id, row):
+        """Seed from the database on a miss -- but never over a value this
+        process already has, which is newer by definition."""
+        with self._lock:
+            if user_id not in self._rows:
+                self._rows[user_id] = copy.deepcopy(row)
+
+    # ── the write side ───────────────────────────────────────────────────
+    def put(self, user_id, row, db):
+        with self._lock:
+            self._rows[user_id] = copy.deepcopy(row)
+            self._pending[user_id] = copy.deepcopy(row)
+        self._kick(db)
+
+    def drop(self, user_id, db):
+        with self._lock:
+            self._rows[user_id] = None
+            self._pending[user_id] = None
+        self._kick(db)
+
+    def _kick(self, db):
+        self._db = db
+        self._idle.clear()
+        if self._thread is None or not self._thread.is_alive():
+            self._thread = threading.Thread(target=self._run, name="state-flush",
+                                            daemon=True)
+            self._thread.start()
+        self._wake.set()
+
+    def _run(self):
+        while True:
+            self._wake.wait(timeout=5.0)
+            self._wake.clear()
+            with self._lock:
+                batch = self._pending
+                self._pending = {}
+            if not batch:
+                self._idle.set()
+                continue
+            for user_id, row in batch.items():
+                try:
+                    if row is None:
+                        self._db._clear_user_state_now(user_id)
+                    else:
+                        self._db._set_user_state_now(row)
+                except Exception as e:
+                    logger.error("state flush for %s failed, requeueing: %s",
+                                 user_id, e)
+                    with self._lock:
+                        # Only requeue if nothing newer arrived meanwhile.
+                        self._pending.setdefault(user_id, row)
+                    self._wake.set()
+            with self._lock:
+                if not self._pending:
+                    self._idle.set()
+
+    def flush(self, timeout: float = 5.0) -> bool:
+        """Wait for the queue to drain. Called at shutdown and by tests; a
+        handler never calls this."""
+        with self._lock:
+            if not self._pending and self._thread is None:
+                return True
+        self._wake.set()
+        return self._idle.wait(timeout=timeout)
+
+
+_STATES = _StateStore()
+
+
+# Seconds a settings value or the group list may be served from memory. Both
+# tables are written by OTHER processes (admin_dashboard, receipts_page,
+# dispatch_web/settingslite), so these cannot be authoritative the way the
+# conversation state is -- they are a short reprieve from asking the same
+# question ~200ms at a time, nothing more. A write made through the bot clears
+# its own key at once, so only a change made elsewhere can ever be this stale.
+_SETTING_TTL_SEC = 5.0
+_GROUPS_TTL_SEC = 15.0
+
+_setting_cache = {}                         # key -> (value, read_at)
+_groups_cache_box = {}                      # "rows" -> (list, read_at)
+_ttl_lock = threading.RLock()
+
+
+def _ttl_get(store, key, ttl):
+    with _ttl_lock:
+        hit = store.get(key)
+        if hit is not None and (time.time() - hit[1]) < ttl:
+            return True, hit[0]
+    return False, None
+
+
+def _ttl_put(store, key, value):
+    with _ttl_lock:
+        store[key] = (value, time.time())
+
+
+def invalidate_setting_cache(key=None):
+    """Called on every local write so the bot never reads its own change stale."""
+    with _ttl_lock:
+        if key is None:
+            _setting_cache.clear()
+        else:
+            _setting_cache.pop(key, None)
+
+
+def invalidate_groups_cache():
+    with _ttl_lock:
+        _groups_cache_box.clear()
+
+
+def flush_user_states(timeout: float = 5.0) -> bool:
+    """Drain pending conversation-state writes. Safe to call when the cache is
+    off -- there is then nothing to drain."""
+    return _STATES.flush(timeout=timeout)
+
+
 class Database:
     """Supabase database client wrapper."""
     
@@ -138,17 +300,30 @@ class Database:
     def get_user_state(self, user_id: int) -> Optional[Dict[str, Any]]:
         """Get the current state for a user.
 
+        Served from memory once this process has seen the user: the row cannot
+        have changed behind us, because nothing else writes the states table.
+        That turns ~200ms of frozen event loop into nothing at all, on the single
+        most-called read in the bot.
+
         One quick retry on transient errors: a lost read here is indistinguishable
         from "no lead" to the bot, which then wipes or restarts a live review card."""
+        cached = _state_cache_enabled()
+        if cached and _STATES.known(user_id):
+            return _STATES.get(user_id)
         if not self._check_tables_exist():
             return None
 
         for attempt in (0, 1):
             try:
                 response = self.client.table("states").select("*").eq("user_id", user_id).execute()
-                if response.data:
-                    return response.data[0]
-                return None
+                row = response.data[0] if response.data else None
+                if cached:
+                    # Only a MISS primes the store, and prime() refuses to
+                    # overwrite: a write that happened while this read was in
+                    # flight must win over the older row it returns.
+                    _STATES.prime(user_id, row)
+                    return _STATES.get(user_id)
+                return row
             except Exception as e:
                 error_msg = str(e)
                 if "Could not find the table" in error_msg or "PGRST205" in error_msg:
@@ -162,16 +337,29 @@ class Database:
     def set_user_state(self, user_id: int, state: str, data: Optional[Dict[str, Any]] = None) -> bool:
         """Set or update the state for a user.
 
+        Returns as soon as the value is held in memory; the upsert is drained by
+        the flusher thread. The handler is not kept waiting ~200ms for a row only
+        this process will ever read back, and a transient failure no longer loses
+        the edit -- the store keeps the new value and the flusher keeps trying.
+
         One quick retry on transient errors — a silently dropped write here loses
         the user's just-applied review edit."""
-        if not self._check_tables_exist():
-            return False
-
         state_data = {
             "user_id": user_id,
             "state": state,
             "data": data or {}
         }
+        if _state_cache_enabled():
+            _STATES.put(user_id, state_data, self)
+            return True
+        return self._set_user_state_now(state_data)
+
+    def _set_user_state_now(self, state_data: Dict[str, Any]) -> bool:
+        """The upsert itself. Called by the flusher thread, or directly when the
+        cache is switched off."""
+        if not self._check_tables_exist():
+            return False
+
         for attempt in (0, 1):
             try:
                 # Single atomic upsert on the user_id PK — the old read-then-write
@@ -191,6 +379,13 @@ class Database:
     
     def clear_user_state(self, user_id: int) -> bool:
         """Clear the state for a user."""
+        if _state_cache_enabled():
+            _STATES.drop(user_id, self)
+            return True
+        return self._clear_user_state_now(user_id)
+
+    def _clear_user_state_now(self, user_id: int) -> bool:
+        """The delete itself. Flusher thread, or the cache-off path."""
         if not self._check_tables_exist():
             return False
         
@@ -1041,6 +1236,7 @@ class Database:
                 "group_telegram_id": group_telegram_id,
                 "supervisory_telegram_id": supervisory_telegram_id
             }).execute()
+            invalidate_groups_cache()
             return True, ""
         except Exception as e:
             logger.error(f"Error creating group: {e}")
@@ -1080,19 +1276,38 @@ class Database:
             return None
     
     def get_all_groups(self) -> list:
-        """Get all groups."""
+        """Get all groups.
+
+        Held for _GROUPS_TTL_SEC. A copy is returned: callers filter this list in
+        place (record_is_active sweeps, name matching), and one of them mutating
+        the cached rows would quietly change what every later caller sees."""
+        fresh, rows = _ttl_get(_groups_cache_box, "rows", _GROUPS_TTL_SEC)
+        if fresh:
+            return copy.deepcopy(rows)
         if not self._check_tables_exist():
             return []
         
         try:
             response = self.client.table("groups").select("*").order("group_name").execute()
-            return response.data or []
+            rows = response.data or []
+            _ttl_put(_groups_cache_box, "rows", rows)
+            return copy.deepcopy(rows)
         except Exception as e:
             logger.error(f"Error getting groups: {e}")
             return []
     
     def get_group_by_id(self, group_id: str) -> Optional[Dict[str, Any]]:
-        """Get a group by ID."""
+        """Get a group by ID.
+
+        Answered from the cached list while it is fresh -- it is the same data,
+        and the accept handlers ask for both in the same breath. Falls through to
+        its own query on a miss, so a group created seconds ago in the admin is
+        still found."""
+        fresh, rows = _ttl_get(_groups_cache_box, "rows", _GROUPS_TTL_SEC)
+        if fresh:
+            for g in rows or []:
+                if str(g.get("id")) == str(group_id):
+                    return copy.deepcopy(g)
         if not self._check_tables_exist():
             return None
         
@@ -1118,6 +1333,7 @@ class Database:
                 # row "enabled" something already enabled and appeared to do nothing.
                 new_status = not record_is_active(group)
                 self.client.table("groups").update({"is_active": new_status}).eq("id", group_id).execute()
+                invalidate_groups_cache()
                 return True
             return False
         except Exception as e:
@@ -1145,6 +1361,7 @@ class Database:
                 .eq("id", str(group_id))
                 .execute()
             )
+            invalidate_groups_cache()
             if not resp.data:
                 logger.warning("rename_group(%s): update affected no rows", group_id)
                 return False
@@ -1202,14 +1419,24 @@ class Database:
 
     # Settings (e.g. assistants_choose_group)
     def get_setting(self, key: str) -> Optional[str]:
-        """Get a setting value by key. Returns None if not found or table missing."""
+        """Get a setting value by key. Returns None if not found or table missing.
+
+        Held for _SETTING_TTL_SEC: the toggles behind this are read on hot paths
+        (phone redaction on every driver message, cash-payment on every accept)
+        and the answer changes a few times a month."""
+        fresh, val = _ttl_get(_setting_cache, key, _SETTING_TTL_SEC)
+        if fresh:
+            return val
         if not self._check_tables_exist():
             return None
         try:
             r = self.client.table("settings").select("value").eq("key", key).limit(1).execute()
             if r.data and len(r.data) > 0:
-                return (r.data[0].get("value") or "").strip()
-            return None
+                out = (r.data[0].get("value") or "").strip()
+            else:
+                out = None
+            _ttl_put(_setting_cache, key, out)
+            return out
         except Exception as e:
             logger.error(f"Error getting setting {key}: {e}")
             return None
@@ -1220,6 +1447,7 @@ class Database:
             return False
         try:
             self.client.table("settings").upsert({"key": key, "value": str(value)}, on_conflict="key").execute()
+            invalidate_setting_cache(key)
             return True
         except Exception as e:
             logger.error(f"Error setting {key}: {e}")

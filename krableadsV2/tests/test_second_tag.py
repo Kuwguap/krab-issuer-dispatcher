@@ -828,7 +828,10 @@ class EveryCreateSiteCarriesTheExtraCarsTest(unittest.TestCase):
 
     def test_no_create_lead_call_is_left_unwired(self):
         src = Path(bot.__file__).read_text(encoding="utf-8")
-        creates = src.count("db.create_lead(")
+        # The call is threaded now (await asyncio.to_thread(db.create_lead, ...)),
+        # so count both shapes. Requiring "(" or "," after the name is what
+        # keeps db.create_lead_assignment out of the tally.
+        creates = src.count("db.create_lead(") + src.count("db.create_lead,")
         wired = src.count("_attach_extra_vehicles_for_create(")
         # One helper definition + one call per create site.
         self.assertEqual(wired, creates + 1,

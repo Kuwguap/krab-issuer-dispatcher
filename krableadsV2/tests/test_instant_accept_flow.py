@@ -216,7 +216,8 @@ class TheAcceptErrorIsFixedTest(unittest.TestCase):
 
     def test_it_only_heals_when_nobody_has_accepted_yet(self):
         """Otherwise the second driver to tap would steal a taken lead."""
-        self.assertIn("if not db.get_lead_assignment_status(lead_id):", self._body())
+        self.assertIn("if not await asyncio.to_thread(db.get_lead_assignment_status, lead_id):",
+                      self._body())
 
     def test_the_generic_error_is_still_there_for_real_failures(self):
         self.assertIn("Error accepting lead", self._body())

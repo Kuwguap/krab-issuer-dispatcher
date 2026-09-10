@@ -161,7 +161,7 @@ class ASupervisorMovesAnyLeadToAnyoneTest(unittest.TestCase):
 
     def test_a_named_driver_gets_it_directly(self):
         self.assertIn("if to_driver_id:", self.move)
-        self.assertIn("db.create_lead_assignment(lead_id, target[\"id\"]", self.move)
+        self.assertIn("db.create_lead_assignment, lead_id, target[\"id\"]", self.move)
 
     def test_the_pool_is_not_also_spammed_when_one_driver_was_named(self):
         self.assertIn("if not to_driver_id and group:", self.move)

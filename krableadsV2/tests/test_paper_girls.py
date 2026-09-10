@@ -288,7 +288,8 @@ class NoAutomaticFanOutReachesThemTest(_RosterCase):
         """A team taps Accept and the whole roster is offered the lead."""
         body = SRC.split("async def _send_driver_requests_for_group", 1)[1]
         body = body.split("\nasync def ", 1)[0]
-        self.assertIn("_only_drivers(db.get_group_driver_rows_for_group(group_id))", body)
+        self.assertIn("_only_drivers(await asyncio.to_thread("
+                      "db.get_group_driver_rows_for_group, group_id))", body)
         self.assertIn("_only_drivers(_get_all_drivers_cached())", body)
 
     def test_the_timeout_retry_broadcast_uses_the_driver_roster(self):

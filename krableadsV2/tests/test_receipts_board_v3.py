@@ -320,7 +320,7 @@ class TheBotTriggersAreWiredTest(unittest.TestCase):
                       self._fn("_send_all_tag_pdfs"))
 
     def test_receipt_upload_fires_from_bot_and_portal(self):
-        self.assertIn('advance_delivery_status(str(lead_id), "receipt_uploaded")',
+        self.assertIn('advance_delivery_status, str(lead_id), "receipt_uploaded"',
                       self._fn("handle_receipt_image(update"))
         self.assertIn('set_lead_status(lead_id, "receipt_uploaded", "portal")',
                       self._fn("receipt_portal(token)", self.ADMIN))

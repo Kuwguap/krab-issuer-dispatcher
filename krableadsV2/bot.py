@@ -15,6 +15,7 @@ import secrets
 import string
 import uuid as _uuid_mod
 import asyncio
+from concurrent.futures import ThreadPoolExecutor
 import time
 from datetime import datetime, time as dt_time, timedelta
 import pytz
@@ -34,7 +35,7 @@ from telegram.ext import (
     ContextTypes
 )
 from config import Config
-from utils.database import Database, record_is_active
+from utils.database import Database, record_is_active, flush_user_states
 from utils.onetimesecret import OneTimeSecret
 from utils.monday import MondayClient
 from utils import address_complete
@@ -708,7 +709,7 @@ async def _forward_accepted_lead_files(context: ContextTypes.DEFAULT_TYPE, lead:
     att = lead.get("phase1_attached_files")
     if not (isinstance(att, list) and att) and lead_id:
         try:
-            att = (db.get_lead_by_id(lead_id) or {}).get("phase1_attached_files")
+            att = (await asyncio.to_thread(db.get_lead_by_id, lead_id) or {}).get("phase1_attached_files")
         except Exception as e:
             logger.warning("accepted-lead files lookup failed: %s", e)
             att = None
@@ -835,7 +836,7 @@ async def _start_tracking_gate_or_send_details(
     if not delivery_addr or delivery_addr.strip().upper() == "N/A":
         delivery_addr = None
     from datetime import timezone as _tz
-    sess = db.create_tracking_session(
+    sess = await asyncio.to_thread(db.create_tracking_session, 
         token=token,
         kind=kind,
         chat_id=str(chat_id),
@@ -1077,7 +1078,7 @@ async def _delete_dispatch_messages(context, lead_id) -> tuple:
     targets, seen = [], set()
 
     try:
-        for o in (db.get_group_lead_offers(lead_id) or []):
+        for o in (await asyncio.to_thread(db.get_group_lead_offers, lead_id) or []):
             cid, mid = _parse_chat_id(o.get("group_chat_id")), o.get("group_message_id")
             if cid and mid:
                 targets.append((cid, int(mid)))
@@ -3079,7 +3080,7 @@ async def _post_single_group_approval(
         InlineKeyboardButton("🔄 Different Team", callback_data=f"dt_{short_lead}{short_gid}"),
     ]])
 
-    db.create_group_lead_offer(lead["id"], gid, group_chat_id=str(chat_id), group_message_id=None)
+    await asyncio.to_thread(db.create_group_lead_offer, lead["id"], gid, group_chat_id=str(chat_id), group_message_id=None)
     failures: list[tuple[str, str]] = []
     try:
         msg = await context.bot.send_message(
@@ -3088,7 +3089,7 @@ async def _post_single_group_approval(
             parse_mode="Markdown",
             reply_markup=offer_kb,
         )
-        db.update_group_lead_offer_message(lead["id"], gid, str(chat_id), msg.message_id)
+        await asyncio.to_thread(db.update_group_lead_offer_message, lead["id"], gid, str(chat_id), msg.message_id)
         return 1, failures
     except RetryAfter as e:
         wait_s = int(getattr(e, "retry_after", 1) or 1)
@@ -3101,7 +3102,7 @@ async def _post_single_group_approval(
                 parse_mode="Markdown",
                 reply_markup=offer_kb,
             )
-            db.update_group_lead_offer_message(lead["id"], gid, str(chat_id), msg.message_id)
+            await asyncio.to_thread(db.update_group_lead_offer_message, lead["id"], gid, str(chat_id), msg.message_id)
             return 1, failures
         except Exception as e2:
             logger.error("Error sending single-group approval after retry: %s", e2)
@@ -3138,7 +3139,7 @@ async def _post_lead_to_all_groups_for_approval(
             InlineKeyboardButton("✅ Accept", callback_data=f"ag_{short_lead}{short_gid}"),
             InlineKeyboardButton("🔄 Different Team", callback_data=f"dg_{short_lead}{short_gid}"),
         ]])
-        db.create_group_lead_offer(lead["id"], gid, group_chat_id=str(chat_id), group_message_id=None)
+        await asyncio.to_thread(db.create_group_lead_offer, lead["id"], gid, group_chat_id=str(chat_id), group_message_id=None)
         try:
             msg = await context.bot.send_message(
                 chat_id=chat_id,
@@ -3146,7 +3147,7 @@ async def _post_lead_to_all_groups_for_approval(
                 parse_mode="Markdown",
                 reply_markup=offer_kb,
             )
-            db.update_group_lead_offer_message(lead["id"], gid, str(chat_id), msg.message_id)
+            await asyncio.to_thread(db.update_group_lead_offer_message, lead["id"], gid, str(chat_id), msg.message_id)
         except Exception as e:
             logger.warning("All-groups approval send failed for %s: %s", g.get("group_name"), e)
 
@@ -3272,7 +3273,7 @@ async def process_pending_api_lead_dispatches(context: ContextTypes.DEFAULT_TYPE
     The lead is claimed (ingest_dispatch_pending -> False) before sending so a
     slow send can't double-fire on the next poll — no lead goes out twice.
     """
-    rows = db.list_leads_pending_ingest_dispatch(limit=10)
+    rows = await asyncio.to_thread(db.list_leads_pending_ingest_dispatch, limit=10)
     if not rows:
         return
     groups = db.get_all_groups()
@@ -3293,7 +3294,7 @@ async def process_pending_api_lead_dispatches(context: ContextTypes.DEFAULT_TYPE
                 main_group = active_groups[0]
 
             # Claim the lead BEFORE sending so the 10s poller can't re-dispatch it.
-            db.update_lead(lead_id, {
+            await asyncio.to_thread(db.update_lead, lead_id, {
                 "ingest_dispatch_pending": False,
                 "awaiting_group_accept": True,
                 "group_id": main_group.get("id"),
@@ -3342,7 +3343,7 @@ async def process_pending_api_lead_dispatches(context: ContextTypes.DEFAULT_TYPE
                     # must not lose the lead or stop the poll.
                     logger.error("client form: driver fan-out failed for %s: %s", lead_id, e)
 
-            offers = db.get_group_lead_offers(lead_id) or []
+            offers = await asyncio.to_thread(db.get_group_lead_offers, lead_id) or []
             logger.info(
                 "API ingest: lead %s ref %s offered to %d/%d group(s) for first-accept",
                 lead_id, lead.get("reference_id"), len(offers), len(active_groups),
@@ -3991,7 +3992,7 @@ async def _notify_initiator_lead_accepted_summary(
         logger.warning("Invalid lead user_id for initiator summary: %s", initiator_id)
         return
     lid = lead.get("id")
-    lead_row = db.get_lead_by_id(str(lid)) if lid else lead
+    lead_row = await asyncio.to_thread(db.get_lead_by_id, str(lid)) if lid else lead
     ref = (lead_row.get("reference_id") or "N/A").strip() or "N/A"
     group_label = _group_display_name_from_lead(lead_row) or "N/A"
     dn = (accepting_driver_name or "Driver").strip() or "Driver"
@@ -4094,7 +4095,7 @@ async def _send_driver_requests_for_group(
     # Both pools are drivers only. This fan-out runs with NO picker on screen --
     # a website lead, or a reassign -- so a paper girl reaching it would be a
     # lead nobody chose to send her. Same rule as _dispatch_drivers_with_reasons.
-    linked_rows = _only_drivers(db.get_group_driver_rows_for_group(group_id))
+    linked_rows = _only_drivers(await asyncio.to_thread(db.get_group_driver_rows_for_group, group_id))
     if linked_rows:
         rows = linked_rows
         scope = "group_linked"
@@ -4136,7 +4137,7 @@ async def _send_driver_requests_for_group(
         if not cid:
             continue
         try:
-            db.create_lead_assignment(lead["id"], driver["id"], group_id)
+            await asyncio.to_thread(db.create_lead_assignment, lead["id"], driver["id"], group_id)
             _offer = await _send_message_resiliently(
                 context, cid, driver_request_message, parse_mode="Markdown",
                 reply_markup=accept_keyboard)
@@ -8202,7 +8203,7 @@ async def _apply_selection(kind: str, payload: str, state_data: dict, user_id: i
         return True, f"Driver → {d.get('driver_name', '?')}"
     if kind == "SELECT_SOURCE":
         s = _source_by_exact_label(payload) or _resolve_pick_name(
-            payload, db.get_contact_info_sources(), "label")
+            payload, await asyncio.to_thread(db.get_contact_info_sources), "label")
         if not s:
             return False, f"No source matched “{payload}”"
         _select_source(state_data, user_id, s)
@@ -8675,7 +8676,7 @@ async def _open_source_picker(context: ContextTypes.DEFAULT_TYPE) -> None:
     chat_id = context.user_data.get("review_chat_id"); mid = context.user_data.get("review_message_id")
     if not chat_id or not mid:
         return
-    sources = db.get_contact_info_sources()
+    sources = await asyncio.to_thread(db.get_contact_info_sources)
     if not sources:
         return
     buttons = [[InlineKeyboardButton(s.get("label", str(s["id"])), callback_data=f"selsrc_{s['id']}")] for s in sources]
@@ -9110,7 +9111,7 @@ async def _interpret_review_command(update, context, user_id, state_data, text):
         return STATE_AI_REVIEW
 
     if kind == "SELECT_SOURCE":
-        s = _resolve_pick_name(payload, db.get_contact_info_sources(), "label")
+        s = _resolve_pick_name(payload, await asyncio.to_thread(db.get_contact_info_sources), "label")
         if not s:
             if _payload_is_prose(payload):
                 return None               # a note, not a pick
@@ -9798,7 +9799,7 @@ async def handle_select_state_text(update: Update, context: ContextTypes.DEFAULT
         return await handle_group_selection(_TypedAsTap(update, picked), context)
 
     if state_name == "select_contact_source":
-        sources = db.get_contact_info_sources() or []
+        sources = await asyncio.to_thread(db.get_contact_info_sources) or []
         src = _source_by_exact_label(text) or _match_name(text, sources, "label")
         if not src:
             if msg:
@@ -10522,6 +10523,19 @@ class PerChatUpdateProcessor(BaseUpdateProcessor):
 
     async def shutdown(self) -> None:
         self._locks.clear()
+        # Conversation state is written behind (see _StateStore in
+        # utils/database.py): the handler returns as soon as the value is held in
+        # memory. On the way down those upserts must actually land, or a redeploy
+        # mid-edit loses the card the user was filling in -- the one failure this
+        # speedup could introduce, closed here. Off the loop because the flush is
+        # a blocking join on the flusher thread.
+        try:
+            drained = await asyncio.to_thread(flush_user_states, 10.0)
+            if not drained:
+                logger.error("state flush timed out on shutdown - some edits may "
+                             "not have reached the database")
+        except Exception as e:
+            logger.error("state flush on shutdown failed: %s", e)
 
 
 async def _route_supervisor_message(update, context, user_id, text: str) -> bool:
@@ -11069,7 +11083,7 @@ async def handle_another_tag_callback(update: Update, context: ContextTypes.DEFA
         return ConversationHandler.END
     user_id = query.from_user.id
     lead_id = (query.data or "").replace("another_tag_", "").strip()
-    lead = db.get_lead_by_id(lead_id) if lead_id else None
+    lead = await asyncio.to_thread(db.get_lead_by_id, lead_id) if lead_id else None
     if not lead:
         await msg.reply_text("⚠️ Couldn't find that client. Use /lead to start a new one.")
         return ConversationHandler.END
@@ -11148,7 +11162,7 @@ async def _restart_bot_from_top(update: Update, context: ContextTypes.DEFAULT_TY
     driver = _driver_row_for_telegram_user(user_id)
     if driver:
         driver_nm = driver.get("driver_name", username)
-        pending = db.get_driver_pending_receipts(driver["id"])
+        pending = await asyncio.to_thread(db.get_driver_pending_receipts, driver["id"])
         n = len(pending)
         lines = [f"Welcome back, {driver_nm}! 🚗"]
         if n >= SUSPENSION_THRESHOLD:
@@ -11991,7 +12005,7 @@ async def _tag_fields_from_lead(lead: dict, *, renewal: bool = False,
         control = control or alloc["control_number"]
         try:
             if vehicle <= 1:
-                db.update_lead(str(lead.get("id")),
+                await asyncio.to_thread(db.update_lead, str(lead.get("id")),
                                {"plate": plate, "tag_control_number": control})
             else:
                 _persist_extra_vehicle_plate(lead, vehicle, plate, control)
@@ -12680,7 +12694,7 @@ async def _maybe_ride_insurance_with_tag(context, lead: dict, target_chat_ids: l
     try:
         if not lead or not lead.get("wants_insurance") or not lead.get("id"):
             return  # fast path: no DB read for the common (no-insurance) case
-        fresh = db.get_lead_by_id(lead.get("id")) or lead
+        fresh = await asyncio.to_thread(db.get_lead_by_id, lead.get("id")) or lead
         if not fresh.get("wants_insurance"):
             return
         chats, seen = [], set()
@@ -14497,7 +14511,7 @@ async def handle_phase1_ai_review_callback(update, context):
         return STATE_AI_REVIEW
 
     elif data == "ph1_pick_source":
-        sources = db.get_contact_info_sources()
+        sources = await asyncio.to_thread(db.get_contact_info_sources)
         if not sources:
             return STATE_AI_REVIEW
         buttons = [[InlineKeyboardButton(s.get("label", str(s["id"])), callback_data=f"selsrc_{s['id']}")] for s in sources]
@@ -14592,7 +14606,7 @@ async def handle_phase1_ai_review_callback(update, context):
 
     elif data.startswith("selsrc_"):
         source_id = data.replace("selsrc_", "")
-        source = db.get_contact_info_source_by_id(source_id)
+        source = await asyncio.to_thread(db.get_contact_info_source_by_id, source_id)
         label = source.get("label", "") if source else ""
         state_data["selected_source_label"] = label
         db.set_user_state(user_id, "phase1", state_data)
@@ -15344,7 +15358,7 @@ async def _finalize_lead_after_notes(
 
     if not selected_group:
         user_telegram_id = str(user_id)
-        assistant_group = db.get_group_by_assistant_telegram_id(user_telegram_id)
+        assistant_group = await asyncio.to_thread(db.get_group_by_assistant_telegram_id, user_telegram_id)
         if assistant_group and record_is_active(assistant_group):
             selected_group = assistant_group
             logger.info(
@@ -15414,7 +15428,7 @@ async def _finalize_lead_after_notes(
         "phase1_attached_files": attached_for_dispatch,
     }
     final_lead_data = await _attach_extra_vehicles_for_create(final_lead_data, state_data)
-    lead = db.create_lead(final_lead_data)
+    lead = await asyncio.to_thread(db.create_lead, final_lead_data)
     if not lead:
         await message.reply_text("❌ Error saving lead to database.")
         return ConversationHandler.END
@@ -15528,7 +15542,7 @@ async def _submit_lead_from_review(message, context, user_id, data):
     active_groups = [g for g in groups if record_is_active(g)]
     is_all_groups = str(group_id) == "all"
     if is_all_groups:
-        primary_group = db.get_group_by_assistant_telegram_id(str(user_id))
+        primary_group = await asyncio.to_thread(db.get_group_by_assistant_telegram_id, str(user_id))
         if not primary_group or not record_is_active(primary_group):
             primary_group = active_groups[0] if active_groups else None
         group = primary_group
@@ -15583,7 +15597,7 @@ async def _submit_lead_from_review(message, context, user_id, data):
     # actually pays (insurance add-on included).
     data["price"] = _price_with_insurance_addon(price, bool(data.get("wants_insurance")))
     _sync_driver_amount_from_price(data)
-    lead = db.create_lead({
+    lead = await asyncio.to_thread(db.create_lead, {
         **lead_payload,
         "user_id": user_id, "telegram_username": username,
         "telegram_name": data.get("telegram_name")
@@ -15653,7 +15667,7 @@ async def _submit_lead_from_review(message, context, user_id, data):
             chat_id = _parse_chat_id(g.get("group_telegram_id"))
             if not gid or not chat_id:
                 continue
-            db.create_group_lead_offer(lead["id"], gid, group_chat_id=str(chat_id), group_message_id=None)
+            await asyncio.to_thread(db.create_group_lead_offer, lead["id"], gid, group_chat_id=str(chat_id), group_message_id=None)
             try:
                 msg = await context.bot.send_message(
                     chat_id=chat_id,
@@ -15661,7 +15675,7 @@ async def _submit_lead_from_review(message, context, user_id, data):
                     parse_mode="Markdown",
                     reply_markup=offer_kb_by_group.get(gid),
                 )
-                db.update_group_lead_offer_message(lead["id"], gid, str(chat_id), msg.message_id)
+                await asyncio.to_thread(db.update_group_lead_offer_message, lead["id"], gid, str(chat_id), msg.message_id)
             except RetryAfter as e:
                 wait_s = int(getattr(e, "retry_after", 1) or 1)
                 await asyncio.sleep(wait_s)
@@ -15672,7 +15686,7 @@ async def _submit_lead_from_review(message, context, user_id, data):
                         parse_mode="Markdown",
                         reply_markup=offer_kb_by_group.get(gid),
                     )
-                    db.update_group_lead_offer_message(lead["id"], gid, str(chat_id), msg.message_id)
+                    await asyncio.to_thread(db.update_group_lead_offer_message, lead["id"], gid, str(chat_id), msg.message_id)
                 except Exception:
                     pass
             except Exception:
@@ -15694,7 +15708,7 @@ async def _submit_lead_from_review(message, context, user_id, data):
             fallback_pool: list = []
             if not is_all_groups and group:
                 try:
-                    linked = db.get_group_driver_rows_for_group(group.get("id"))
+                    linked = await asyncio.to_thread(db.get_group_driver_rows_for_group, group.get("id"))
                 except Exception:
                     linked = []
                 fallback_pool = (_only_drivers(linked)
@@ -15756,7 +15770,7 @@ async def handle_group_selection(update: Update, context: ContextTypes.DEFAULT_T
         groups = db.get_all_groups()
         active_groups = [g for g in groups if record_is_active(g)]
         # group_id is NOT NULL for driver assignments, so pick a primary group for the lead record.
-        primary_group = db.get_group_by_assistant_telegram_id(str(user_id))
+        primary_group = await asyncio.to_thread(db.get_group_by_assistant_telegram_id, str(user_id))
         if not primary_group or not record_is_active(primary_group):
             primary_group = active_groups[0] if active_groups else None
         if not primary_group:
@@ -15785,7 +15799,7 @@ async def handle_group_selection(update: Update, context: ContextTypes.DEFAULT_T
             "phase1_attached_files": _dispatch_attach_files(context, lead_data),
         }
         final_lead_data = await _attach_extra_vehicles_for_create(final_lead_data, lead_data)
-        lead = db.create_lead(final_lead_data)
+        lead = await asyncio.to_thread(db.create_lead, final_lead_data)
         if not lead:
             await query.message.reply_text("❌ Error saving lead to database.")
             return ConversationHandler.END
@@ -15825,7 +15839,7 @@ async def handle_group_selection(update: Update, context: ContextTypes.DEFAULT_T
                 failures.append((g.get("group_name") or str(gid) or "Unknown group", "missing group_telegram_id"))
                 continue
             # Create offer row first; we'll fill message IDs after sending.
-            db.create_group_lead_offer(lead["id"], gid, group_chat_id=str(chat_id), group_message_id=None)
+            await asyncio.to_thread(db.create_group_lead_offer, lead["id"], gid, group_chat_id=str(chat_id), group_message_id=None)
             try:
                 msg = await context.bot.send_message(
                     chat_id=chat_id,
@@ -15833,7 +15847,7 @@ async def handle_group_selection(update: Update, context: ContextTypes.DEFAULT_T
                     parse_mode="Markdown",
                     reply_markup=offer_kb_by_group.get(gid),
                 )
-                db.update_group_lead_offer_message(lead["id"], gid, str(chat_id), msg.message_id)
+                await asyncio.to_thread(db.update_group_lead_offer_message, lead["id"], gid, str(chat_id), msg.message_id)
                 sent_count += 1
             except RetryAfter as e:
                 # Telegram is rate limiting. Wait the requested time and retry once.
@@ -15847,7 +15861,7 @@ async def handle_group_selection(update: Update, context: ContextTypes.DEFAULT_T
                         parse_mode="Markdown",
                         reply_markup=offer_kb_by_group.get(gid),
                     )
-                    db.update_group_lead_offer_message(lead["id"], gid, str(chat_id), msg.message_id)
+                    await asyncio.to_thread(db.update_group_lead_offer_message, lead["id"], gid, str(chat_id), msg.message_id)
                     sent_count += 1
                 except Exception as e2:
                     logger.error("Error sending group offer to %s after retry: %s", g.get("group_name"), e2)
@@ -15914,8 +15928,8 @@ async def handle_group_selection(update: Update, context: ContextTypes.DEFAULT_T
         if not ok_row:
             await query.message.reply_text(f"❌ {err_row}")
             return ConversationHandler.END
-        db.delete_group_lead_offers_for_lead(rid)
-        db.update_lead(rid, {
+        await asyncio.to_thread(db.delete_group_lead_offers_for_lead, rid)
+        await asyncio.to_thread(db.update_lead, rid, {
             "group_id": group_id,
             # Reassign re-dispatches an EXISTING lead: keep its own stored files
             # (carried in lead_data by _issuer_state_data_from_lead). Do NOT pull the
@@ -15924,7 +15938,7 @@ async def handle_group_selection(update: Update, context: ContextTypes.DEFAULT_T
             # to this lead's newly chosen team.
             "phase1_attached_files": lead_data.get("attached_files") or [],
         })
-        lead = db.get_lead_by_id(rid) or lead
+        lead = await asyncio.to_thread(db.get_lead_by_id, rid) or lead
         await _post_single_group_approval(context, lead, selected_group)
         continue_data = _issuer_state_data_from_lead(lead)
         continue_data["lead_id"] = rid
@@ -15993,7 +16007,7 @@ async def handle_group_selection(update: Update, context: ContextTypes.DEFAULT_T
         "phase1_attached_files": _dispatch_attach_files(context, lead_data),
     }
     final_lead_data = await _attach_extra_vehicles_for_create(final_lead_data, lead_data)
-    lead = db.create_lead(final_lead_data)
+    lead = await asyncio.to_thread(db.create_lead, final_lead_data)
     if not lead:
         await query.message.reply_text("❌ Error saving lead to database.")
         return ConversationHandler.END
@@ -16085,8 +16099,8 @@ async def handle_driver_selection(update: Update, context: ContextTypes.DEFAULT_
 
     lid_gate = lead_data.get("lead_id")
     if lid_gate and not lead_data.get("resend"):
-        offers_gate = db.get_group_lead_offers(str(lid_gate))
-        if offers_gate and not db.get_accepted_group_for_lead(str(lid_gate)):
+        offers_gate = await asyncio.to_thread(db.get_group_lead_offers, str(lid_gate))
+        if offers_gate and not await asyncio.to_thread(db.get_accepted_group_for_lead, str(lid_gate)):
             await query.message.reply_text(
                 "⏳ **Wait for a team to accept first.**\n\n"
                 "A group must tap **Accept** on the approval message in their team chat before you can notify drivers.",
@@ -16147,7 +16161,7 @@ async def handle_driver_selection(update: Update, context: ContextTypes.DEFAULT_
         driver_id = callback_data.replace("driver_suspended_", "")
         driver = next((d for d in all_drivers if str(d.get("id")) == str(driver_id)), None)
         name = driver.get("driver_name", "Driver") if driver else "Driver"
-        pending = db.get_driver_pending_receipts(driver_id) if driver_id else []
+        pending = await asyncio.to_thread(db.get_driver_pending_receipts, driver_id) if driver_id else []
         count = len(pending)
         await query.message.reply_text(
             f"⚠️ **{_telegram_md1_escape(name)}** is temporarily suspended (PENALTY).\n\n"
@@ -16214,26 +16228,26 @@ async def handle_driver_selection(update: Update, context: ContextTypes.DEFAULT_
     }
 
     if lead_data.get("follow_after_broadcast") and lead_data.get("lead_id"):
-        lead = db.get_lead_by_id(lead_data["lead_id"])
+        lead = await asyncio.to_thread(db.get_lead_by_id, lead_data["lead_id"])
         if not lead:
             await query.message.reply_text("❌ Error: lead not found. Use /start to begin again.")
             return ConversationHandler.END
         reference_id = lead.get("reference_id") or reference_id
     else:
         final_lead_data = await _attach_extra_vehicles_for_create(final_lead_data, lead_data)
-        lead = db.create_lead(final_lead_data)
+        lead = await asyncio.to_thread(db.create_lead, final_lead_data)
         if not lead:
             await query.message.reply_text("❌ Error saving lead to database.")
             return ConversationHandler.END
         await _on_lead_created(context, lead)
 
-    had_broadcast_offers = bool(db.get_group_lead_offers(lead["id"]))
+    had_broadcast_offers = bool(await asyncio.to_thread(db.get_group_lead_offers, lead["id"]))
     if lead_data.get("follow_after_broadcast") and lead.get("group_id"):
         group_id = lead["group_id"]
     skip_duplicate_full_group_post = bool(lead_data.get("follow_after_broadcast") and had_broadcast_offers)
 
     # Fresh DB row so winning group (broadcast accept) is visible before Monday + messaging
-    lead = db.get_lead_by_id(lead["id"]) or lead
+    lead = await asyncio.to_thread(db.get_lead_by_id, lead["id"]) or lead
     selected_group = _resolve_selected_group(lead_data, lead)
     if lead_data.get("follow_after_broadcast") and selected_group:
         lead_data["selected_group"] = selected_group
@@ -16311,12 +16325,12 @@ async def handle_driver_selection(update: Update, context: ContextTypes.DEFAULT_
     ).add_done_callback(_bg_task_done)
 
     # Source is already chosen in the main lead flow; do not ask again here.
-    lead_fresh = db.get_lead_by_id(lead["id"]) if lead and lead.get("id") else None
+    lead_fresh = await asyncio.to_thread(db.get_lead_by_id, lead["id"]) if lead and lead.get("id") else None
     existing_source = (lead_fresh.get("contact_info_source") or "").strip() if lead_fresh else ""
     preselected_source = (lead_data.get("selected_source_label") or "").strip()
     if not existing_source and preselected_source:
         try:
-            db.update_lead(lead["id"], {"contact_info_source": preselected_source})
+            await asyncio.to_thread(db.update_lead, lead["id"], {"contact_info_source": preselected_source})
         except Exception as e:
             logger.warning("Could not persist preselected contact source on lead %s: %s", lead.get("id"), e)
 
@@ -16425,7 +16439,7 @@ async def _background_dispatch_lead_after_driver_pick(
             monday_result = None
 
         if monday_result:
-            db.update_lead(lead_id, {
+            await asyncio.to_thread(db.update_lead, lead_id, {
                 "monday_item_id": monday_result["item_id"],
                 "issue_date": monday_result["issue_date"].isoformat(),
                 "expiration_date": monday_result["expiration_date"].isoformat(),
@@ -16435,7 +16449,7 @@ async def _background_dispatch_lead_after_driver_pick(
             ny_tz = pytz.timezone("America/New_York")
             issue_date = datetime.now(ny_tz)
             expiration_date = issue_date + timedelta(days=30)
-            db.update_lead(lead_id, {
+            await asyncio.to_thread(db.update_lead, lead_id, {
                 "issue_date": issue_date.isoformat(),
                 "expiration_date": expiration_date.isoformat(),
             })
@@ -16445,13 +16459,13 @@ async def _background_dispatch_lead_after_driver_pick(
         ny_tz = pytz.timezone("America/New_York")
         issue_date = datetime.now(ny_tz)
         expiration_date = issue_date + timedelta(days=30)
-        db.update_lead(lead_id, {
+        await asyncio.to_thread(db.update_lead, lead_id, {
             "issue_date": issue_date.isoformat(),
             "expiration_date": expiration_date.isoformat(),
         })
         monday_result = {"issue_date": issue_date, "expiration_date": expiration_date}
 
-    lead = db.get_lead_by_id(lead_id) or lead
+    lead = await asyncio.to_thread(db.get_lead_by_id, lead_id) or lead
     selected_group = _resolve_selected_group(lead_data, lead)
     if selected_group:
         lead_data["selected_group"] = selected_group
@@ -16510,7 +16524,7 @@ async def _background_dispatch_lead_after_driver_pick(
         except (ValueError, TypeError):
             driver_chat_id = driver_telegram_id_raw
         try:
-            db.create_lead_assignment(lead_id, driver["id"], group_id)
+            await asyncio.to_thread(db.create_lead_assignment, lead_id, driver["id"], group_id)
             try:
                 _offer_msg = await context.bot.send_message(
                     chat_id=driver_chat_id,
@@ -16530,7 +16544,7 @@ async def _background_dispatch_lead_after_driver_pick(
             # Kept so "Skip Dispatch" can take this offer back off the driver.
             _remember_dispatch_message(
                 context, lead_id, driver_chat_id, getattr(_offer_msg, "message_id", None))
-            pending = db.get_driver_pending_receipts(driver["id"])
+            pending = await asyncio.to_thread(db.get_driver_pending_receipts, driver["id"])
             if pending and len(pending) < SUSPENSION_THRESHOLD:
                 ref_buttons = [
                     [InlineKeyboardButton(f"📤 Upload {p['reference_id']}", callback_data=f"receipt_for_{p['reference_id']}")]
@@ -16645,10 +16659,10 @@ async def _background_dispatch_lead_after_driver_pick(
                     e,
                 )
 
-    lead = db.get_lead_by_id(lead_id) or lead
+    lead = await asyncio.to_thread(db.get_lead_by_id, lead_id) or lead
     gn = _group_display_name_from_lead(lead) or (selected_group or {}).get("group_name", "N/A")
     # Supervisory "new lead" DMs go out when a driver accepts (see handle_accept_lead).
-    db.record_bot_usage(user_id, username or "Unknown", lead_id, gn, driver_names)
+    await asyncio.to_thread(db.record_bot_usage, user_id, username or "Unknown", lead_id, gn, driver_names)
 
 
 def _cancel_contact_source_timeout_job(application, user_id: int, lead_id) -> None:
@@ -16693,11 +16707,11 @@ async def _contact_source_timeout_job(context: ContextTypes.DEFAULT_TYPE) -> Non
 
     # One 📬 supervisory (Source: —) if a driver already accepted and source still empty
     try:
-        lead_row = db.get_lead_by_id(str(expected_lead_id))
+        lead_row = await asyncio.to_thread(db.get_lead_by_id, str(expected_lead_id))
         if (
             lead_row
             and not (lead_row.get("contact_info_source") or "").strip()
-            and db.get_lead_assignment_status(str(expected_lead_id))
+            and await asyncio.to_thread(db.get_lead_assignment_status, str(expected_lead_id))
         ):
             await _send_supervisory_new_lead_notices_from_lead(context, lead_row)
     except Exception as e:
@@ -16719,7 +16733,7 @@ async def _send_supervisory_new_lead_notices_from_lead(
     lid = str(lead.get("id") or "").strip()
     if not lid:
         return
-    st = db.get_lead_assignment_status(lid)
+    st = await asyncio.to_thread(db.get_lead_assignment_status, lid)
     acc_name = "Driver"
     if st and st.get("driver_id"):
         did = st.get("driver_id")
@@ -16755,7 +16769,7 @@ async def _send_supervisory_new_lead_notices(
 ) -> None:
     """SUPERVISORY MESSAGE new-lead template to per-group + global supervisory + ST (not usage row)."""
     uname = username or "Unknown"
-    lead_row = db.get_lead_by_id(lead_id)
+    lead_row = await asyncio.to_thread(db.get_lead_by_id, lead_id)
     client_nm = _client_display_name_from_lead(lead_row) if lead_row else "—"
     src_raw = (lead_row.get("contact_info_source") or "").strip() if lead_row else ""
     lead = lead_row or {}
@@ -16768,7 +16782,7 @@ async def _send_supervisory_new_lead_notices(
     group_display = _telegram_chat_link_html(group_chat_id, group_label)
 
     driver_display = html.escape((driver_names or "").strip() or "N/A", quote=False)
-    st = db.get_lead_assignment_status(lead_id) if lead_id else None
+    st = await asyncio.to_thread(db.get_lead_assignment_status, lead_id) if lead_id else None
     if st and st.get("driver_id"):
         drow = next(
             (d for d in _get_all_drivers_cached() if str(d.get("id")) == str(st.get("driver_id"))),
@@ -16862,19 +16876,19 @@ async def _finish_lead_send(
     contact_source_label: Optional[str] = None,
 ) -> None:
     """After lead source callback: save source, clear state immediately; Monday + follow-up in background."""
-    lead = db.get_lead_by_id(lead_id)
+    lead = await asyncio.to_thread(db.get_lead_by_id, lead_id)
     resolved_gn = _group_display_name_from_lead(lead)
     if resolved_gn:
         group_name = resolved_gn
     if contact_source_label and lead:
-        db.update_lead(lead_id, {"contact_info_source": contact_source_label})
+        await asyncio.to_thread(db.update_lead, lead_id, {"contact_info_source": contact_source_label})
     db.clear_user_state(user_id)
 
     if contact_source_label and lead:
         lid = str(lead_id)
         label = contact_source_label
-        lead_fresh = db.get_lead_by_id(lid) or lead
-        if db.get_lead_assignment_status(lid):
+        lead_fresh = await asyncio.to_thread(db.get_lead_by_id, lid) or lead
+        if await asyncio.to_thread(db.get_lead_assignment_status, lid):
             try:
                 await _send_supervisory_new_lead_notices_from_lead(context, lead_fresh)
             except Exception as e:
@@ -16882,7 +16896,7 @@ async def _finish_lead_send(
 
         async def _bg_contact_source_sync() -> None:
             try:
-                l2 = db.get_lead_by_id(lid) or lead
+                l2 = await asyncio.to_thread(db.get_lead_by_id, lid) or lead
                 if not monday:
                     return
                 for _ in range(40):
@@ -16890,7 +16904,7 @@ async def _finish_lead_send(
                     if mid:
                         break
                     await asyncio.sleep(0.05)
-                    l2 = db.get_lead_by_id(lid) or l2
+                    l2 = await asyncio.to_thread(db.get_lead_by_id, lid) or l2
                 monday_item_id = l2.get("monday_item_id") if l2 else None
                 if monday_item_id:
                     try:
@@ -16919,7 +16933,7 @@ async def _maybe_offer_insurance_card(
 
     Quietly skips when the lead has no email or Resend is not configured.
     """
-    lead = db.get_lead_by_id(lead_id) if lead_id else None
+    lead = await asyncio.to_thread(db.get_lead_by_id, lead_id) if lead_id else None
     if not lead:
         logger.warning(
             "Insurance card: lead %s not found; cannot offer card", lead_id
@@ -17546,7 +17560,7 @@ async def handle_insurance_card_decision(update: Update, context: ContextTypes.D
     except Exception:
         pass
 
-    lead = db.get_lead_by_id(lead_id)
+    lead = await asyncio.to_thread(db.get_lead_by_id, lead_id)
     if not lead:
         try:
             await query.message.reply_text("❌ Could not find this lead to issue the card.")
@@ -17605,7 +17619,7 @@ async def handle_insurance_card_decision(update: Update, context: ContextTypes.D
             update_payload["portal_email"] = portal_email
             update_payload["portal_password"] = portal_password
     try:
-        db.update_lead(lead["id"], update_payload)
+        await asyncio.to_thread(db.update_lead, lead["id"], update_payload)
     except Exception as e:
         logger.warning("Could not update insurance_card_* fields on lead %s: %s", lead.get("id"), e)
 
@@ -17789,7 +17803,7 @@ async def handle_insurance_email_to_client(update: Update, context: ContextTypes
     if not query:
         return
     lead_id = (query.data or "")[len(INS_EMAIL_CB):].strip()
-    lead = db.get_lead_by_id(lead_id) if lead_id else None
+    lead = await asyncio.to_thread(db.get_lead_by_id, lead_id) if lead_id else None
     if not lead:
         await _safe_answer_callback_query(query, "❌ Lead not found.", show_alert=True)
         return
@@ -17820,7 +17834,7 @@ async def handle_insurance_email_to_client(update: Update, context: ContextTypes
 
     claimed = await asyncio.to_thread(db.claim_insurance_email, lead_id)
     if not claimed:
-        fresh = db.get_lead_by_id(lead_id) or lead
+        fresh = await asyncio.to_thread(db.get_lead_by_id, lead_id) or lead
         if str(fresh.get("insurance_emailed_at") or "").strip():
             await _safe_answer_callback_query(query, "✅ Already emailed to the client.",
                                               show_alert=True)
@@ -18141,7 +18155,7 @@ async def cmd_set_client_email(update: Update, context: ContextTypes.DEFAULT_TYP
     if not re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", email):
         await message.reply_text("❌ That doesn't look like an email address.")
         return
-    lead = db.get_lead_by_reference_id(ref.upper()) or db.get_lead_by_id(ref)
+    lead = await asyncio.to_thread(db.get_lead_by_reference_id, ref.upper()) or await asyncio.to_thread(db.get_lead_by_id, ref)
     if not lead:
         await message.reply_text(f"❌ No lead found for `{ref}`.", parse_mode="Markdown")
         return
@@ -18157,10 +18171,10 @@ async def cmd_set_client_email(update: Update, context: ContextTypes.DEFAULT_TYP
         await message.reply_text(
             "❌ Only supervisors, or this lead's own dispatcher group, can set its email.")
         return
-    if not db.update_lead(str(lead["id"]), {"email": email}):
+    if not await asyncio.to_thread(db.update_lead, str(lead["id"]), {"email": email}):
         await message.reply_text("❌ Could not save the email — try again.")
         return
-    fresh = db.get_lead_by_id(str(lead["id"])) or {**lead, "email": email}
+    fresh = await asyncio.to_thread(db.get_lead_by_id, str(lead["id"])) or {**lead, "email": email}
     reply = f"✅ Client email for {lead.get('reference_id', ref)} set to {email}."
     if fresh.get("wants_insurance") and not str(
             fresh.get("insurance_card_sent_at") or "").strip():
@@ -18202,11 +18216,11 @@ async def handle_contact_source_selection(update: Update, context: ContextTypes.
     reference_id = data.get("reference_id", "")
     driver_names = data.get("driver_names", "")
     group_name = data.get("group_name", "N/A")
-    lead_row = db.get_lead_by_id(lead_id) if lead_id else None
+    lead_row = await asyncio.to_thread(db.get_lead_by_id, lead_id) if lead_id else None
     gn_from_db = _group_display_name_from_lead(lead_row)
     if gn_from_db:
         group_name = gn_from_db
-    source = db.get_contact_info_source_by_id(source_id)
+    source = await asyncio.to_thread(db.get_contact_info_source_by_id, source_id)
     label = source.get("label", "") if source else ""
     _cancel_contact_source_timeout_job(context.application, user_id, lead_id)
     try:
@@ -18313,7 +18327,7 @@ async def _handle_resend_to_drivers(
         except (ValueError, TypeError):
             driver_chat_id = tid
         try:
-            db.create_lead_assignment(lead_id, driver["id"], group_id)
+            await asyncio.to_thread(db.create_lead_assignment, lead_id, driver["id"], group_id)
             try:
                 _offer_msg = await context.bot.send_message(
                     chat_id=driver_chat_id,
@@ -18334,7 +18348,7 @@ async def _handle_resend_to_drivers(
             _remember_dispatch_message(
                 context, lead_id, driver_chat_id, getattr(_offer_msg, "message_id", None))
             assigned_count += 1
-            pending = db.get_driver_pending_receipts(driver["id"])
+            pending = await asyncio.to_thread(db.get_driver_pending_receipts, driver["id"])
             if pending and len(pending) < SUSPENSION_THRESHOLD:
                 ref_buttons = [
                     [InlineKeyboardButton(f"📤 Upload {p['reference_id']}", callback_data=f"receipt_for_{p['reference_id']}")]
@@ -18474,7 +18488,7 @@ async def _issuer_open_driver_selection_after_group_accept(
     if str(inner.get("lead_id") or "") != str(lead_id):
         return
     mode = (inner.get("await_mode") or "pick_drivers").strip()
-    lead_ref = db.get_lead_by_id(lead_id) or lead_row
+    lead_ref = await asyncio.to_thread(db.get_lead_by_id, lead_id) or lead_row
     win_gid = lead_ref.get("group_id")
     winner_group = db.get_group_by_id(str(win_gid)) if win_gid else None
 
@@ -18494,7 +18508,7 @@ async def _issuer_open_driver_selection_after_group_accept(
             fallback_ids = _resolve_dispatch_driver_ids(
                 {"selected_driver_ids": []},
                 group_id=str((winner_group or {}).get("id") or ""),
-                is_all_groups=bool(db.get_group_lead_offers(str(lead_id))),
+                is_all_groups=bool(await asyncio.to_thread(db.get_group_lead_offers, str(lead_id))),
             )
             id_set = {str(x).strip() for x in fallback_ids if str(x).strip()}
             selected_drivers = [d for d in all_drivers if str(d.get("id")) in id_set]
@@ -18605,12 +18619,12 @@ async def _issuer_open_driver_selection_after_group_accept(
         ).add_done_callback(_bg_task_done)
 
         # Source is already chosen in the main lead flow; do not prompt here.
-        lead_fresh = db.get_lead_by_id(lead_ref["id"]) if lead_ref and lead_ref.get("id") else None
+        lead_fresh = await asyncio.to_thread(db.get_lead_by_id, lead_ref["id"]) if lead_ref and lead_ref.get("id") else None
         existing_source = (lead_fresh.get("contact_info_source") or "").strip() if lead_fresh else ""
         preselected_source = (lead_data.get("selected_source_label") or "").strip()
         if not existing_source and preselected_source:
             try:
-                db.update_lead(lead_ref["id"], {"contact_info_source": preselected_source})
+                await asyncio.to_thread(db.update_lead, lead_ref["id"], {"contact_info_source": preselected_source})
             except Exception as e:
                 logger.warning(
                     "Could not persist preselected contact source on delayed dispatch lead %s: %s",
@@ -18874,7 +18888,7 @@ async def handle_accept_lead(update: Update, context: ContextTypes.DEFAULT_TYPE)
         )
         return
 
-    lead = db.get_lead_by_id(lead_id)
+    lead = await asyncio.to_thread(db.get_lead_by_id, lead_id)
     if not lead:
         await query.message.edit_text(
             "❌ Error: Lead not found.",
@@ -18896,7 +18910,7 @@ async def handle_accept_lead(update: Update, context: ContextTypes.DEFAULT_TYPE)
         )
         return
 
-    accepted_row = db.accept_lead_assignment(lead_id, driver['id'])
+    accepted_row = await asyncio.to_thread(db.accept_lead_assignment, lead_id, driver['id'])
 
     if not accepted_row and lead.get("instant_tag"):
         # Instant Tag offers made before this build recorded no lead_assignments
@@ -18905,17 +18919,17 @@ async def handle_accept_lead(update: Update, context: ContextTypes.DEFAULT_TYPE)
         # away with it. Write the row this driver's offer should have had, once,
         # and let the normal path continue. Only reachable by someone who was
         # actually sent the offer: the button lives in their chat.
-        if not db.get_lead_assignment_status(lead_id):
+        if not await asyncio.to_thread(db.get_lead_assignment_status, lead_id):
             created = await asyncio.to_thread(
                 db.create_lead_assignment, lead_id, str(driver["id"]),
                 lead.get("group_id"))
             if created:
                 logger.info("instant tag: back-filled the offer row for lead %s driver %s",
                             lead_id, driver.get("id"))
-                accepted_row = db.accept_lead_assignment(lead_id, driver['id'])
+                accepted_row = await asyncio.to_thread(db.accept_lead_assignment, lead_id, driver['id'])
 
     if not accepted_row:
-        st = db.get_lead_assignment_status(lead_id)
+        st = await asyncio.to_thread(db.get_lead_assignment_status, lead_id)
         if st and st.get("status") == "accepted":
             await query.message.edit_text(
                 "❌ Request Already Taken\n\n"
@@ -18938,10 +18952,10 @@ async def handle_accept_lead(update: Update, context: ContextTypes.DEFAULT_TYPE)
     # Paper inventory (shared Paper Investigator tables): subtract one paper per accepted lead
     aid = accepted_row.get("id")
     ref = (lead.get("reference_id") or "") or ""
-    new_paper_bal = db.apply_paper_on_lead_accept(str(driver["id"]), str(aid), str(ref))
+    new_paper_bal = await asyncio.to_thread(db.apply_paper_on_lead_accept, str(driver["id"]), str(aid), str(ref))
     if new_paper_bal is not None and new_paper_bal < Config.LOW_PAPER_THRESHOLD:
-        if not db.paper_was_low_alert_sent(driver["id"]):
-            db.paper_mark_low_alert_sent(driver["id"])
+        if not await asyncio.to_thread(db.paper_was_low_alert_sent, driver["id"]):
+            await asyncio.to_thread(db.paper_mark_low_alert_sent, driver["id"])
             sup = Config.PAPER_SUPERVISOR_TELEGRAM_ID
             if sup:
                 try:
@@ -19044,7 +19058,7 @@ async def handle_accept_lead(update: Update, context: ContextTypes.DEFAULT_TYPE)
         )
 
     # Issuer summary + supervisory "new lead" — before optional receipt strike / group posts so they always run
-    lead = db.get_lead_by_id(lead_id) or lead
+    lead = await asyncio.to_thread(db.get_lead_by_id, lead_id) or lead
     acc_name = str(driver.get("driver_name") or "Driver")
     await _notify_initiator_lead_accepted_summary(
         context,
@@ -19058,7 +19072,7 @@ async def handle_accept_lead(update: Update, context: ContextTypes.DEFAULT_TYPE)
         except Exception as e:
             logger.error("Supervisory new-lead notice on accept failed: %s", e, exc_info=True)
 
-    pending = db.get_driver_pending_receipts(driver["id"])
+    pending = await asyncio.to_thread(db.get_driver_pending_receipts, driver["id"])
     if pending:
         ref_buttons = [
             [InlineKeyboardButton(f"📤 Upload {p['reference_id']}", callback_data=f"receipt_for_{p['reference_id']}")]
@@ -19147,7 +19161,7 @@ async def handle_accept_lead(update: Update, context: ContextTypes.DEFAULT_TYPE)
         # for a lead dispatched straight to a driver with no team in the loop.
         offered_to_a_team = []
         try:
-            offered_to_a_team = db.get_group_lead_offers(lead_id) or []
+            offered_to_a_team = await asyncio.to_thread(db.get_group_lead_offers, lead_id) or []
         except Exception as e:
             logger.warning("Could not check group offers for %s, sending tag anyway: %s",
                            lead_id, e)
@@ -19211,10 +19225,10 @@ async def handle_accept_lead(update: Update, context: ContextTypes.DEFAULT_TYPE)
     try:
         from datetime import datetime, timedelta, timezone as _tz
         renewal_due = datetime.now(_tz.utc) + timedelta(days=Config.RENEWAL_DAYS)
-        existing_renewal = db.get_active_renewal_for_lead(lead_id)
+        existing_renewal = await asyncio.to_thread(db.get_active_renewal_for_lead, lead_id)
         if not existing_renewal:
-            renewal_group_id = group_id or db.resolve_renewal_group_id(lead_id, lead)
-            db.schedule_renewal(
+            renewal_group_id = group_id or await asyncio.to_thread(db.resolve_renewal_group_id, lead_id, lead)
+            await asyncio.to_thread(db.schedule_renewal, 
                 lead_id=lead_id,
                 group_id=renewal_group_id,
                 driver_id=driver["id"],
@@ -19241,7 +19255,7 @@ async def handle_decline_lead(update: Update, context: ContextTypes.DEFAULT_TYPE
         )
         return
 
-    db.decline_lead_assignment(lead_id, driver['id'])
+    await asyncio.to_thread(db.decline_lead_assignment, lead_id, driver['id'])
     
     await query.message.edit_text(
         "🔄 **Different driver**\n\n"
@@ -19266,13 +19280,13 @@ async def handle_reassign_lead(update: Update, context: ContextTypes.DEFAULT_TYP
     query = update.callback_query
     await query.answer()
     lead_id = query.data.replace("reassign_lead_", "")
-    lead = db.get_lead_by_id(lead_id)
+    lead = await asyncio.to_thread(db.get_lead_by_id, lead_id)
     if not lead:
         await query.message.reply_text("❌ Lead not found or expired.")
         return
     ref = lead.get("reference_id", "N/A")
 
-    assignment = db.get_lead_assignment_status(lead_id)
+    assignment = await asyncio.to_thread(db.get_lead_assignment_status, lead_id)
     old_driver = (assignment or {}).get("driver") or {}
 
     presser_id = update.effective_user.id
@@ -19322,7 +19336,7 @@ async def handle_reassign_pick(update: Update, context: ContextTypes.DEFAULT_TYP
     if not lead_id or not driver_id:
         await query.message.reply_text("❌ That button is stale — open the lead again.")
         return
-    lead = db.get_lead_by_id(lead_id)
+    lead = await asyncio.to_thread(db.get_lead_by_id, lead_id)
     if not lead:
         await query.message.reply_text("❌ Lead not found or expired.")
         return
@@ -19345,7 +19359,7 @@ async def handle_reassign_all(update: Update, context: ContextTypes.DEFAULT_TYPE
         lead_id = _long_uuid(body)
     except Exception:
         lead_id = body
-    lead = db.get_lead_by_id(lead_id)
+    lead = await asyncio.to_thread(db.get_lead_by_id, lead_id)
     if not lead:
         await query.message.reply_text("❌ Lead not found or expired.")
         return
@@ -19376,7 +19390,7 @@ async def _reassign_lead_to(
     lead_id = str(lead.get("id") or "")
     ref = lead.get("reference_id", "N/A")
 
-    assignment = db.get_lead_assignment_status(lead_id)
+    assignment = await asyncio.to_thread(db.get_lead_assignment_status, lead_id)
     old_driver = (assignment or {}).get("driver") or {}
     old_driver_id = (assignment or {}).get("driver_id")
     old_driver_name = old_driver.get("driver_name") or (
@@ -19385,10 +19399,10 @@ async def _reassign_lead_to(
     presser_id = update.effective_user.id
     is_the_driver = str(old_driver.get("driver_telegram_id") or "") == str(presser_id)
 
-    if not db.reopen_lead_for_reassign(lead_id, old_driver_id):
+    if not await asyncio.to_thread(db.reopen_lead_for_reassign, lead_id, old_driver_id):
         await query.message.reply_text("❌ Could not reassign. Please try again.")
         return
-    db.cancel_open_tracking_sessions_for_lead(lead_id)
+    await asyncio.to_thread(db.cancel_open_tracking_sessions_for_lead, lead_id)
 
     try:
         await query.edit_message_reply_markup(reply_markup=None)
@@ -19459,7 +19473,7 @@ async def _reassign_lead_to(
         else:
             new_driver_name = str(target.get("driver_name") or "Driver").strip()
             try:
-                db.create_lead_assignment(lead_id, target["id"], lead.get("group_id"))
+                await asyncio.to_thread(db.create_lead_assignment, lead_id, target["id"], lead.get("group_id"))
                 await context.bot.send_message(
                     chat_id=cid,
                     text=_driver_offer_message_text(lead),
@@ -19492,7 +19506,7 @@ async def _reassign_lead_to(
             if not cid:
                 continue
             try:
-                db.create_lead_assignment(lead_id, d["id"], lead.get("group_id"))
+                await asyncio.to_thread(db.create_lead_assignment, lead_id, d["id"], lead.get("group_id"))
                 await context.bot.send_message(
                     chat_id=cid, text=offer_text, parse_mode="Markdown", reply_markup=kb
                 )
@@ -19553,7 +19567,7 @@ async def handle_accept_group_offer(update: Update, context: ContextTypes.DEFAUL
         await query.message.reply_text("❌ Invalid request.")
         return
 
-    lead = db.get_lead_by_id(lead_id)
+    lead = await asyncio.to_thread(db.get_lead_by_id, lead_id)
     group = db.get_group_by_id(group_id)
     if not lead or not group or not record_is_active(group):
         try:
@@ -19565,10 +19579,10 @@ async def handle_accept_group_offer(update: Update, context: ContextTypes.DEFAUL
             pass
         return
 
-    accepted = db.accept_group_lead_offer(lead_id, group_id, accepted_by_telegram_id=str(query.from_user.id))
+    accepted = await asyncio.to_thread(db.accept_group_lead_offer, lead_id, group_id, accepted_by_telegram_id=str(query.from_user.id))
     if not accepted:
         # Someone else already accepted — refresh every group's message so Accept is gone everywhere.
-        accepted_row = db.get_accepted_group_for_lead(lead_id)
+        accepted_row = await asyncio.to_thread(db.get_accepted_group_for_lead, lead_id)
         win_gid = (accepted_row or {}).get("group_id")
         accepted_group = db.get_group_by_id(win_gid) if win_gid else None
         gname = accepted_group.get("group_name") if accepted_group else "another group"
@@ -19581,7 +19595,7 @@ async def handle_accept_group_offer(update: Update, context: ContextTypes.DEFAUL
         )
         acceptor_esc = _telegram_md1_escape(acceptor_handle)
         lead_by_esc = _telegram_md1_escape(_lead_issuer_display_from_lead(lead or {}))
-        for o in db.get_group_lead_offers(lead_id):
+        for o in await asyncio.to_thread(db.get_group_lead_offers, lead_id):
             ocid = _parse_chat_id(o.get("group_chat_id"))
             mid = o.get("group_message_id")
             ogid = o.get("group_id")
@@ -19616,9 +19630,9 @@ async def handle_accept_group_offer(update: Update, context: ContextTypes.DEFAUL
         return
 
     # Set lead.group_id to winning group (single accepted group per lead — enforced in DB)
-    db.update_lead(lead_id, {"group_id": group_id})
-    lead = db.get_lead_by_id(lead_id) or lead
-    acc_row = db.get_accepted_group_for_lead(lead_id)
+    await asyncio.to_thread(db.update_lead, lead_id, {"group_id": group_id})
+    lead = await asyncio.to_thread(db.get_lead_by_id, lead_id) or lead
+    acc_row = await asyncio.to_thread(db.get_accepted_group_for_lead, lead_id)
     if not acc_row or str(acc_row.get("group_id")) != str(group_id):
         logger.error(
             "accept_group_offer: accepted offer row missing or mismatch (lead=%s group=%s row=%s)",
@@ -19650,7 +19664,7 @@ async def handle_accept_group_offer(update: Update, context: ContextTypes.DEFAUL
     accepted_by_label = f"{winner_name} (@{acceptor_handle})"
 
     # Update all group offer messages to reflect taken/accepted
-    offers = db.get_group_lead_offers(lead_id)
+    offers = await asyncio.to_thread(db.get_group_lead_offers, lead_id)
     for o in offers:
         ocid = _parse_chat_id(o.get("group_chat_id"))
         mid = o.get("group_message_id")
@@ -19684,7 +19698,7 @@ async def handle_accept_group_offer(update: Update, context: ContextTypes.DEFAUL
         except Exception as e:
             logger.warning("Could not edit group offer message: %s", e)
 
-    lead_for_files = db.get_lead_by_id(lead_id) or lead
+    lead_for_files = await asyncio.to_thread(db.get_lead_by_id, lead_id) or lead
     att = lead_for_files.get("phase1_attached_files")
     if isinstance(att, list) and att:
         await _forward_phase1_attached_files_to_targets(
@@ -19724,9 +19738,9 @@ async def handle_accept_group_offer(update: Update, context: ContextTypes.DEFAUL
                     parse_mode="HTML")
         except Exception as e:
             logger.warning("could not confirm the instant claim for %s: %s", lead_id, e)
-    elif db.lead_has_assignments(lead_id):
+    elif await asyncio.to_thread(db.lead_has_assignments, lead_id):
         try:
-            lead_for_group = db.get_lead_by_id(lead_id) or lead
+            lead_for_group = await asyncio.to_thread(db.get_lead_by_id, lead_id) or lead
             if offers:
                 tag_released = True
                 await _send_full_group_lead_to_chat(
@@ -19756,7 +19770,7 @@ async def handle_accept_group_offer(update: Update, context: ContextTypes.DEFAUL
     else:
         # Multi-group broadcast: offers exist; issuer picks drivers only after a team accepts.
         if offers:
-            lead_fresh = db.get_lead_by_id(lead_id) or lead
+            lead_fresh = await asyncio.to_thread(db.get_lead_by_id, lead_id) or lead
             if lead_fresh.get("external_order_id"):
                 # Website lead — no human issuer: auto-dispatch drivers now.
                 await _api_lead_auto_dispatch_after_group_accept(
@@ -19810,7 +19824,7 @@ async def handle_accept_group_offer(update: Update, context: ContextTypes.DEFAUL
             if _tag_cid:
                 await _send_all_tag_pdfs(
                     context,
-                    db.get_lead_by_id(lead_id) or lead,
+                    await asyncio.to_thread(db.get_lead_by_id, lead_id) or lead,
                     [_tag_cid],
                     accepted_by=accepted_by_label,
                 )
@@ -19836,7 +19850,7 @@ async def handle_decline_group_offer(update: Update, context: ContextTypes.DEFAU
     except (ValueError, Exception):
         await query.message.reply_text("❌ Invalid request.")
         return
-    db.decline_group_lead_offer(lead_id, group_id)
+    await asyncio.to_thread(db.decline_group_lead_offer, lead_id, group_id)
     try:
         await query.message.edit_text(
             "❌ **Declined**",
@@ -19863,7 +19877,7 @@ async def handle_different_team_offer(update: Update, context: ContextTypes.DEFA
         await query.message.reply_text("❌ Invalid request.")
         return
 
-    lead = db.get_lead_by_id(lead_id)
+    lead = await asyncio.to_thread(db.get_lead_by_id, lead_id)
     group = db.get_group_by_id(group_id)
     if not lead or not group or not record_is_active(group):
         try:
@@ -19875,7 +19889,7 @@ async def handle_different_team_offer(update: Update, context: ContextTypes.DEFA
             pass
         return
 
-    db.decline_group_lead_offer(lead_id, group_id)
+    await asyncio.to_thread(db.decline_group_lead_offer, lead_id, group_id)
     try:
         await query.message.edit_text(
             "🔄 **Different team**\n\nThe lead creator will pick another group.",
@@ -20074,7 +20088,7 @@ async def _send_supervisor_pending_receipts_menu(
     Per the user request ("see each driver then each reference for easy
     upload"), this two-tier menu replaces the older flat list.
     """
-    pending = db.get_all_pending_receipts(500)
+    pending = await asyncio.to_thread(db.get_all_pending_receipts, 500)
     grouped = _group_pending_receipts_by_driver(pending)
 
     if not grouped:
@@ -20140,7 +20154,7 @@ async def handle_supervisor_receipts_nav(update: Update, context: ContextTypes.D
 
     # Back to drivers list — re-fetch + re-render the top-level menu in place.
     if data == RECSUP_BACK:
-        pending = db.get_all_pending_receipts(500)
+        pending = await asyncio.to_thread(db.get_all_pending_receipts, 500)
         grouped = _group_pending_receipts_by_driver(pending)
         if not grouped:
             try:
@@ -20182,7 +20196,7 @@ async def handle_supervisor_receipts_nav(update: Update, context: ContextTypes.D
             return
         driver_row = _driver_row_by_id(driver_id)
         driver_name = (driver_row.get("driver_name") or "Driver") if driver_row else "Driver"
-        rows_for_driver = db.get_driver_pending_receipts(driver_id) or []
+        rows_for_driver = await asyncio.to_thread(db.get_driver_pending_receipts, driver_id) or []
         if not rows_for_driver:
             try:
                 await query.edit_message_text(
@@ -20219,7 +20233,7 @@ async def _send_driver_pending_receipts_menu(
     driver: dict,
 ) -> None:
     """Show owed-receipt upload buttons, or a short message if none pending (same as /receipts)."""
-    pending = db.get_driver_pending_receipts(driver["id"])
+    pending = await asyncio.to_thread(db.get_driver_pending_receipts, driver["id"])
     if not pending:
         await reply_to_message.reply_text(
             "✅ You don't owe any receipts right now.",
@@ -20323,7 +20337,7 @@ async def handle_receipt_for_ref_callback(update: Update, context: ContextTypes.
     await query.answer()
     _merge_receipt_context_from_db(query.from_user.id, context)
     ref = query.data.partition("receipt_for_")[2].strip()
-    lead = db.get_lead_by_reference_id(ref)
+    lead = await asyncio.to_thread(db.get_lead_by_reference_id, ref)
     if not lead:
         await query.message.reply_text(f"❌ Reference ID `{ref}` not found.")
         return ConversationHandler.END
@@ -20405,7 +20419,7 @@ async def handle_reference_id_input(update: Update, context: ContextTypes.DEFAUL
     reference_id = extract_reference_id(msg.text, db.get_lead_by_reference_id)
     
     # Get lead by reference ID
-    lead = db.get_lead_by_reference_id(reference_id)
+    lead = await asyncio.to_thread(db.get_lead_by_reference_id, reference_id)
     
     if not lead:
         await msg.reply_text(
@@ -20703,7 +20717,7 @@ async def handle_receipt_image(update: Update, context: ContextTypes.DEFAULT_TYP
         return ConversationHandler.END
     
     # Get lead and driver info
-    lead = db.get_lead_by_id(lead_id)
+    lead = await asyncio.to_thread(db.get_lead_by_id, lead_id)
     if not lead:
         await update.message.reply_text("❌ Error: Lead not found.")
         db.clear_user_state(user_id)
@@ -20742,7 +20756,7 @@ async def handle_receipt_image(update: Update, context: ContextTypes.DEFAULT_TYP
             await update.message.reply_text(rv.message)
             return STATE_WAITING_RECEIPT_IMAGE
 
-    assignment_status = db.get_lead_assignment_status(lead_id)
+    assignment_status = await asyncio.to_thread(db.get_lead_assignment_status, lead_id)
     driver_name = "Driver"
     if assignment_status:
         driver_id = assignment_status.get("driver_id")
@@ -20753,7 +20767,7 @@ async def handle_receipt_image(update: Update, context: ContextTypes.DEFAULT_TYP
         if driver:
             driver_name = driver.get("driver_name", "Driver")
 
-    pending_before = db.get_driver_pending_receipts(dr_check["id"]) if dr_check else []
+    pending_before = await asyncio.to_thread(db.get_driver_pending_receipts, dr_check["id"]) if dr_check else []
     was_suspended = len(pending_before) >= SUSPENSION_THRESHOLD
 
     # Into the DATABASE first — a row cannot expire the way a Telegram file does,
@@ -20764,7 +20778,7 @@ async def handle_receipt_image(update: Update, context: ContextTypes.DEFAULT_TYP
                       else "image/jpeg"),
         reference_id=reference_id,
         driver_id=str((dr_check or {}).get("id") or ""))
-    storage_url = db.upload_receipt_to_storage(lead_id, reference_id, image_bytes, file_name)
+    storage_url = await asyncio.to_thread(db.upload_receipt_to_storage, lead_id, reference_id, image_bytes, file_name)
     if in_db:
         stored_url = f"{RECEIPT_PORTAL_BASE}/receipt/{lead_id}"
     else:
@@ -20796,29 +20810,29 @@ async def handle_receipt_image(update: Update, context: ContextTypes.DEFAULT_TYP
             logger.warning("receipt amount extraction failed (lead_id=%s): %s", lead_id, e)
 
     # Update lead with receipt URL (prefer durable Supabase Storage public URL)
-    success = db.update_lead_receipt(lead_id, stored_url, receipt_price=receipt_price)
+    success = await asyncio.to_thread(db.update_lead_receipt, lead_id, stored_url, receipt_price=receipt_price)
     if not success:
         logger.error("update_lead_receipt failed lead_id=%s ref=%s", lead_id, reference_id)
 
     if success:
         # The board's ladder ends here: a receipt in hand is Receipt uploaded.
         try:
-            db.advance_delivery_status(str(lead_id), "receipt_uploaded")
+            await asyncio.to_thread(db.advance_delivery_status, str(lead_id), "receipt_uploaded")
         except Exception as e:
             logger.warning("receipt_uploaded status advance failed for %s: %s", lead_id, e)
         # Paper Investigator shared tables: idempotent catch-up if subtract-at-accept missed the row
         # (UUID formatting, API errors, or race with PI job). Receipt proves the delivery is real.
         try:
-            st = db.get_lead_assignment_status(lead_id)
-            if st and db._norm_uuid_str(st.get("driver_id")) == db._norm_uuid_str(dr_check.get("id")):
+            st = await asyncio.to_thread(db.get_lead_assignment_status, lead_id)
+            if st and await asyncio.to_thread(db._norm_uuid_str, st.get("driver_id")) == await asyncio.to_thread(db._norm_uuid_str, dr_check.get("id")):
                 aid = st.get("id")
                 ref = (lead.get("reference_id") or "") or ""
-                new_paper_bal = db.apply_paper_on_lead_accept(
+                new_paper_bal = await asyncio.to_thread(db.apply_paper_on_lead_accept, 
                     str(dr_check["id"]), str(aid), str(ref)
                 )
                 if new_paper_bal is not None and new_paper_bal < Config.LOW_PAPER_THRESHOLD:
-                    if not db.paper_was_low_alert_sent(dr_check["id"]):
-                        db.paper_mark_low_alert_sent(dr_check["id"])
+                    if not await asyncio.to_thread(db.paper_was_low_alert_sent, dr_check["id"]):
+                        await asyncio.to_thread(db.paper_mark_low_alert_sent, dr_check["id"])
                         sup = Config.PAPER_SUPERVISOR_TELEGRAM_ID
                         if sup:
                             try:
@@ -20934,7 +20948,7 @@ async def handle_receipt_image(update: Update, context: ContextTypes.DEFAULT_TYP
             logger.error("Supervisory receipt notification failed: %s", e, exc_info=True)
 
         if was_suspended and dr_check:
-            pending_after = db.get_driver_pending_receipts(dr_check["id"])
+            pending_after = await asyncio.to_thread(db.get_driver_pending_receipts, dr_check["id"])
             if len(pending_after) < SUSPENSION_THRESHOLD:
                 await _notify_suspension_lifted(
                     context,
@@ -21115,7 +21129,7 @@ async def _send_renewal_to_group(context: ContextTypes.DEFAULT_TYPE, renewal: di
     text = _build_renewal_group_message(renewal)
     try:
         msg = await context.bot.send_message(chat_id=chat_id, text=text, reply_markup=kb)
-        db.update_renewal(renewal["id"], {
+        await asyncio.to_thread(db.update_renewal, renewal["id"], {
             "group_message_chat_id": str(chat_id),
             "group_message_id": msg.message_id,
         })
@@ -21136,7 +21150,7 @@ async def _send_renewal_to_driver(context: ContextTypes.DEFAULT_TYPE, renewal: d
     text = _build_renewal_driver_message(renewal)
     try:
         msg = await context.bot.send_message(chat_id=cid, text=text, reply_markup=kb)
-        db.update_renewal(renewal["id"], {
+        await asyncio.to_thread(db.update_renewal, renewal["id"], {
             "driver_message_chat_id": str(cid),
             "driver_message_id": msg.message_id,
         })
@@ -21157,10 +21171,10 @@ async def _offer_renewal_to_group_drivers(
     """Offer a renewal delivery to active drivers in the accepting group."""
     if not group_id:
         return False
-    drivers = db.get_active_drivers_for_group(group_id) or []
+    drivers = await asyncio.to_thread(db.get_active_drivers_for_group, group_id) or []
     suspended = _get_suspended_driver_ids()
-    refreshed = db.get_renewal_by_id(renewal_id) or renewal
-    db.update_renewal(renewal_id, {
+    refreshed = await asyncio.to_thread(db.get_renewal_by_id, renewal_id) or renewal
+    await asyncio.to_thread(db.update_renewal, renewal_id, {
         "driver_status": "sent",
         "driver_sent_at": _ny_stamp(),
     })
@@ -21180,21 +21194,21 @@ async def _offer_renewal_to_group_drivers(
 
 async def _escalate_renewal_group(context: ContextTypes.DEFAULT_TYPE, renewal_id: str) -> None:
     """Timer callback: original group didn't accept within the escalation window — broadcast to all."""
-    renewal = db.get_renewal_by_id(renewal_id)
+    renewal = await asyncio.to_thread(db.get_renewal_by_id, renewal_id)
     if not renewal:
         return
-    renewal = db.ensure_renewal_original_group(renewal)
+    renewal = await asyncio.to_thread(db.ensure_renewal_original_group, renewal)
     if renewal.get("group_status") == "accepted":
         return  # already handled
     logger.info("Renewal %s: group escalation triggered", renewal_id)
-    db.update_renewal(renewal_id, {
+    await asyncio.to_thread(db.update_renewal, renewal_id, {
         "group_status": "escalated",
         "group_escalated_at": _ny_stamp(),
     })
     groups = db.get_all_groups()
     active = [g for g in groups if record_is_active(g)]
     original_gid = renewal.get("original_group_id")
-    refreshed = db.get_renewal_by_id(renewal_id) or renewal
+    refreshed = await asyncio.to_thread(db.get_renewal_by_id, renewal_id) or renewal
     for g in active:
         if g.get("id") == original_gid:
             continue
@@ -21208,13 +21222,13 @@ async def _escalate_renewal_driver(
     exclude_driver_id: str | None = None,
 ) -> None:
     """Timer / reassign callback: offer renewal to other drivers in the accepted group."""
-    renewal = db.get_renewal_by_id(renewal_id)
+    renewal = await asyncio.to_thread(db.get_renewal_by_id, renewal_id)
     if not renewal:
         return
     if renewal.get("driver_status") == "accepted":
         return  # already handled
     logger.info("Renewal %s: driver escalation triggered", renewal_id)
-    db.update_renewal(renewal_id, {
+    await asyncio.to_thread(db.update_renewal, renewal_id, {
         "driver_status": "escalated",
         "driver_escalated_at": _ny_stamp(),
     })
@@ -21245,11 +21259,11 @@ async def _renewal_hand_back_to_creator(
 
     The claim is the same atomic one the old fan-out used, so a concurrent
     Accept still wins and the hand-back cannot fire twice for one refusal."""
-    if not db.claim_renewal_driver_escalation(renewal_id):
+    if not await asyncio.to_thread(db.claim_renewal_driver_escalation, renewal_id):
         logger.info("Renewal %s: hand-back skipped (already accepted or handed back)",
                     renewal_id)
         return
-    renewal = db.get_renewal_by_id(renewal_id)
+    renewal = await asyncio.to_thread(db.get_renewal_by_id, renewal_id)
     if not renewal:
         return
     lead = renewal.get("lead") or {}
@@ -21287,7 +21301,7 @@ async def handle_renewal_pick_open(update: Update, context: ContextTypes.DEFAULT
     except Exception:
         await query.message.reply_text("❌ Invalid request.")
         return
-    renewal = db.get_renewal_by_id(renewal_id)
+    renewal = await asyncio.to_thread(db.get_renewal_by_id, renewal_id)
     if not renewal:
         await query.message.reply_text("❌ That renewal no longer exists.")
         return
@@ -21334,7 +21348,7 @@ async def handle_renewal_pick_driver(update: Update, context: ContextTypes.DEFAU
     except Exception:
         await query.message.reply_text("❌ Invalid request.")
         return
-    renewal = db.get_renewal_by_id(renewal_id)
+    renewal = await asyncio.to_thread(db.get_renewal_by_id, renewal_id)
     if not renewal:
         await query.message.reply_text("❌ That renewal no longer exists.")
         return
@@ -21349,11 +21363,11 @@ async def handle_renewal_pick_driver(update: Update, context: ContextTypes.DEFAU
     # Back to 'sent' BEFORE the offer goes out: the hand-back claim only fires
     # on a renewal that is not already escalated, so without this reset the
     # next driver's Reassign would be swallowed and nobody would be told.
-    db.update_renewal(renewal_id, {
+    await asyncio.to_thread(db.update_renewal, renewal_id, {
         "driver_status": "sent",
         "driver_sent_at": _ny_stamp(),
     })
-    refreshed = db.get_renewal_by_id(renewal_id) or renewal
+    refreshed = await asyncio.to_thread(db.get_renewal_by_id, renewal_id) or renewal
     ok = await _send_renewal_to_driver(context, refreshed, driver)
     dname = _telegram_md1_escape(driver.get("driver_name") or "driver")
     ref = (refreshed.get("lead") or {}).get("reference_id") or "N/A"
@@ -21367,7 +21381,7 @@ async def handle_renewal_pick_driver(update: Update, context: ContextTypes.DEFAU
         pass
     if not ok:
         # Undo the reset so the renewal can still be handed back cleanly.
-        db.update_renewal(renewal_id, {"driver_status": "escalated"})
+        await asyncio.to_thread(db.update_renewal, renewal_id, {"driver_status": "escalated"})
 
 
 async def handle_renewal_group_accept(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -21386,14 +21400,14 @@ async def handle_renewal_group_accept(update: Update, context: ContextTypes.DEFA
         await query.message.reply_text("❌ Invalid request.")
         return
 
-    renewal = db.get_renewal_by_id(renewal_id)
+    renewal = await asyncio.to_thread(db.get_renewal_by_id, renewal_id)
     if not renewal:
         try:
             await query.message.edit_text("❌ Renewal not found or expired.")
         except Exception:
             pass
         return
-    renewal = db.ensure_renewal_original_group(renewal)
+    renewal = await asyncio.to_thread(db.ensure_renewal_original_group, renewal)
     group = db.get_group_by_id(group_id)
     if not group:
         try:
@@ -21402,7 +21416,7 @@ async def handle_renewal_group_accept(update: Update, context: ContextTypes.DEFA
             pass
         return
 
-    result = db.accept_renewal_group(renewal_id, group_id)
+    result = await asyncio.to_thread(db.accept_renewal_group, renewal_id, group_id)
     if result == "wrong_team":
         try:
             await query.message.edit_text(
@@ -21437,11 +21451,11 @@ async def handle_renewal_group_accept(update: Update, context: ContextTypes.DEFA
     except Exception:
         pass
 
-    refreshed = db.get_renewal_by_id(renewal_id) or renewal
+    refreshed = await asyncio.to_thread(db.get_renewal_by_id, renewal_id) or renewal
 
     # Re-send the lead to the accepting group with a RENEWAL header (not NEW CLIENT).
     try:
-        lead_full = db.get_lead_by_id(refreshed.get("lead_id")) or (refreshed.get("lead") or {})
+        lead_full = await asyncio.to_thread(db.get_lead_by_id, refreshed.get("lead_id")) or (refreshed.get("lead") or {})
         _renew_acceptor = (query.from_user.username or "").strip() or (query.from_user.full_name or "Unknown")
         await _send_full_group_lead_to_chat(
             context,
@@ -21478,7 +21492,7 @@ async def handle_renewal_group_reassign(update: Update, context: ContextTypes.DE
         await query.message.reply_text("❌ Invalid request.")
         return
 
-    renewal = db.get_renewal_by_id(renewal_id)
+    renewal = await asyncio.to_thread(db.get_renewal_by_id, renewal_id)
     if not renewal:
         return
     if renewal.get("group_status") == "accepted":
@@ -21515,7 +21529,7 @@ async def handle_renewal_driver_accept(update: Update, context: ContextTypes.DEF
         await query.message.reply_text("❌ Invalid request.")
         return
 
-    renewal = db.get_renewal_by_id(renewal_id)
+    renewal = await asyncio.to_thread(db.get_renewal_by_id, renewal_id)
     if not renewal:
         try:
             await query.message.edit_text("❌ Renewal not found or expired.")
@@ -21523,7 +21537,7 @@ async def handle_renewal_driver_accept(update: Update, context: ContextTypes.DEF
             pass
         return
 
-    result = db.accept_renewal_driver(renewal_id, driver_id)
+    result = await asyncio.to_thread(db.accept_renewal_driver, renewal_id, driver_id)
     if result == "wrong_driver":
         try:
             await query.message.edit_text(
@@ -21560,7 +21574,7 @@ async def handle_renewal_driver_accept(update: Update, context: ContextTypes.DEF
         pass
 
     # Full lead details for the driver — behind the location gate when configured.
-    lead_full = db.get_lead_by_id(renewal.get("lead_id")) or lead
+    lead_full = await asyncio.to_thread(db.get_lead_by_id, renewal.get("lead_id")) or lead
     try:
         await _start_tracking_gate_or_send_details(
             context,
@@ -21599,9 +21613,9 @@ async def handle_renewal_driver_accept(update: Update, context: ContextTypes.DEF
         next_due = datetime.now(_tz.utc) + timedelta(days=Config.RENEWAL_DAYS)
         lead_id = renewal.get("lead_id")
         accepted_group = renewal.get("group_accepted_by_id") or renewal.get("original_group_id")
-        existing = db.get_active_renewal_for_lead(lead_id) if lead_id else None
+        existing = await asyncio.to_thread(db.get_active_renewal_for_lead, lead_id) if lead_id else None
         if not existing and lead_id:
-            db.schedule_renewal(
+            await asyncio.to_thread(db.schedule_renewal, 
                 lead_id=lead_id,
                 group_id=accepted_group,
                 driver_id=driver_id,
@@ -21630,7 +21644,7 @@ async def handle_renewal_driver_reassign(update: Update, context: ContextTypes.D
         await query.message.reply_text("❌ Invalid request.")
         return
 
-    renewal = db.get_renewal_by_id(renewal_id)
+    renewal = await asyncio.to_thread(db.get_renewal_by_id, renewal_id)
     if not renewal:
         return
     if renewal.get("driver_status") == "accepted":
@@ -22048,7 +22062,7 @@ async def _fu_finish_save(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
     # No frequency chosen → save as a plain contact, no reminders.
     if not fu.get("freq"):
-        row = db.create_client_followup(
+        row = await asyncio.to_thread(db.create_client_followup, 
             user_id=update.effective_user.id,
             telegram_username=update.effective_user.username,
             client_name=fu.get("client_name"),
@@ -22088,7 +22102,7 @@ async def _fu_finish_save(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     end_iso = None
     if end_key in _FU_END_DAYS:
         end_iso = (start_utc + timedelta(days=_FU_END_DAYS[end_key])).isoformat()
-    row = db.create_client_followup(
+    row = await asyncio.to_thread(db.create_client_followup, 
         user_id=update.effective_user.id,
         telegram_username=update.effective_user.username,
         client_name=fu.get("client_name"),
@@ -22219,7 +22233,7 @@ async def cmd_followup_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 async def cmd_my_followups(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Follow-up history (open + closed), one message each; open ones get a Stop button."""
-    rows = db.get_followups_for_user(update.effective_user.id)
+    rows = await asyncio.to_thread(db.get_followups_for_user, update.effective_user.id)
     if not rows:
         await update.message.reply_text("You have no client follow-ups yet. Use /followup to add one.")
         return
@@ -22427,7 +22441,7 @@ async def _handle_cf_action(update: Update, context: ContextTypes.DEFAULT_TYPE, 
         # "call me later".
         from datetime import timezone
         nxt = datetime.now(timezone.utc) + timedelta(days=7)
-        db.update_client_followup(fid, {"next_reminder_at": nxt.isoformat()})
+        await asyncio.to_thread(db.update_client_followup, fid, {"next_reminder_at": nxt.isoformat()})
         try:
             await query.edit_message_reply_markup(reply_markup=None)
         except Exception:
@@ -22452,7 +22466,7 @@ async def _handle_cf_action(update: Update, context: ContextTypes.DEFAULT_TYPE, 
     if prefix == "cf_snooze_":
         from datetime import timezone
         nxt = datetime.now(timezone.utc) + timedelta(days=1)
-        db.update_client_followup(fid, {"next_reminder_at": nxt.isoformat()})
+        await asyncio.to_thread(db.update_client_followup, fid, {"next_reminder_at": nxt.isoformat()})
         try:
             await query.edit_message_reply_markup(reply_markup=None)
         except Exception:
@@ -22480,7 +22494,7 @@ async def _handle_cf_action(update: Update, context: ContextTypes.DEFAULT_TYPE, 
     if prefix == "cf_renew_":
         from datetime import timezone
         nxt = datetime.now(timezone.utc) + timedelta(days=30)
-        db.update_client_followup(fid, {
+        await asyncio.to_thread(db.update_client_followup, fid, {
             "status": "open",
             "kind": "renewal",
             "frequency": "monthly",
@@ -22500,7 +22514,7 @@ async def _handle_cf_action(update: Update, context: ContextTypes.DEFAULT_TYPE, 
         if not _user_is_global_supervisor(update.effective_user.id):
             await query.message.reply_text("⛔ Only supervisors can delete follow-ups.")
             return
-        db.delete_client_followup(fid)
+        await asyncio.to_thread(db.delete_client_followup, fid)
         try:
             await query.edit_message_reply_markup(reply_markup=None)
         except Exception:
@@ -22508,7 +22522,7 @@ async def _handle_cf_action(update: Update, context: ContextTypes.DEFAULT_TYPE, 
         await query.message.reply_text("🗑 Follow-up deleted.")
         return
 
-    db.close_client_followup(fid)
+    await asyncio.to_thread(db.close_client_followup, fid)
     try:
         await query.edit_message_reply_markup(reply_markup=None)
     except Exception:
@@ -22740,14 +22754,14 @@ async def handle_tracking_force(update: Update, context: ContextTypes.DEFAULT_TY
     except (ValueError, Exception):
         await query.message.reply_text("❌ Invalid request.")
         return
-    if not db.claim_tracking_override(sid):
+    if not await asyncio.to_thread(db.claim_tracking_override, sid):
         await query.message.reply_text(
             "ℹ️ Nothing to override — the driver already shared their location "
             "or the details were already sent."
         )
         return
-    s = db.get_tracking_session_by_id(sid)
-    lead = db.get_lead_by_id(s.get("lead_id")) if s and s.get("lead_id") else None
+    s = await asyncio.to_thread(db.get_tracking_session_by_id, sid)
+    lead = await asyncio.to_thread(db.get_lead_by_id, s.get("lead_id")) if s and s.get("lead_id") else None
     if not (s and lead):
         await query.message.reply_text("❌ Could not load the lead for this session.")
         return
@@ -22779,7 +22793,7 @@ async def handle_cf_info(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     except (ValueError, Exception):
         await query.message.reply_text("❌ Invalid request.")
         return
-    f = db.get_client_followup_by_id(fid)
+    f = await asyncio.to_thread(db.get_client_followup_by_id, fid)
     if not f:
         await query.message.reply_text("❌ Follow-up not found.")
         return
@@ -22838,7 +22852,7 @@ async def _broadcast_announcement(context: ContextTypes.DEFAULT_TYPE, announcer_
     except Exception as e:
         logger.warning("Announce: drivers lookup failed: %s", e)
     try:
-        for uid in db.get_lead_sender_telegram_ids() or []:
+        for uid in await asyncio.to_thread(db.get_lead_sender_telegram_ids) or []:
             cid = _parse_chat_id(uid)
             if cid is not None:
                 targets.setdefault(_norm_chat_id(cid), cid)
@@ -22885,7 +22899,7 @@ async def cmd_all_followups(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     if not _user_is_global_supervisor(update.effective_user.id):
         await update.message.reply_text("⛔ Supervisors only.")
         return
-    rows = db.get_all_open_followups()
+    rows = await asyncio.to_thread(db.get_all_open_followups)
     if not rows:
         await update.message.reply_text("No open follow-ups anywhere. ✅")
         return
@@ -24054,6 +24068,22 @@ def main():
 
     # Create application
     async def _post_init_set_commands(app: Application) -> None:
+        # Size the thread pool that every `await asyncio.to_thread(db....)` lands
+        # in. The default is min(32, cpu_count + 4), which on a one-CPU Render
+        # instance is FIVE -- and concurrent_updates is 32, so the pool itself
+        # would become the queue this work was moved off the event loop to
+        # escape. These threads are not doing arithmetic: each one is parked on a
+        # socket waiting for Supabase with the GIL released, so the right number
+        # is "as many as can be in flight", not "as many as there are cores".
+        try:
+            loop = asyncio.get_running_loop()
+            loop.set_default_executor(ThreadPoolExecutor(
+                max_workers=64, thread_name_prefix="db"))
+            logger.info("DB thread pool sized to 64 (default would be %d)",
+                        min(32, (os.cpu_count() or 1) + 4))
+        except Exception as e:
+            logger.warning("Could not size the DB thread pool: %s", e)
+
         # Tell the lead writer which handle is our own, so no creation path can
         # ever credit the bot as the person who entered a lead.
         try:
@@ -24717,7 +24747,7 @@ def main():
                 drivers = item.get("drivers") or []
                 driver_names = ", ".join(d.get("driver_name", "?") for d in drivers)
                 # Mark FIRST to prevent spam: if mark fails (e.g. migration not run), skip sending
-                if not db.mark_driver_timeout_notified(lead_id):
+                if not await asyncio.to_thread(db.mark_driver_timeout_notified, lead_id):
                     logger.error(
                         "Driver timeout: could not mark lead %s as notified (run database/migration_driver_timeout.sql). Skipping send to avoid spam.",
                         lead_id,
@@ -24842,7 +24872,7 @@ def main():
                         parse_mode="Markdown",
                         reply_markup=_driver_add_lead_keyboard_only(),
                     )
-                    db.mark_receipt_reminder_sent(assignment_id)
+                    await asyncio.to_thread(db.mark_receipt_reminder_sent, assignment_id)
                     logger.info("Receipt reminder sent to driver for ref %s", ref)
                 except Exception as e:
                     logger.warning("Could not send receipt reminder to %s: %s", chat_id, e)
@@ -24864,7 +24894,7 @@ def main():
                     continue
                 if not await asyncio.to_thread(db.mark_renewal_day27_alert_sent, rid):
                     continue
-                rn = db.ensure_renewal_original_group(rn)
+                rn = await asyncio.to_thread(db.ensure_renewal_original_group, rn)
                 lead27 = rn.get("lead") or {}
                 ref27 = lead27.get("reference_id", "N/A")
                 drv27 = next(
@@ -24915,7 +24945,7 @@ def main():
                 renewal_id = renewal.get("id")
                 if not renewal_id:
                     continue
-                renewal = db.ensure_renewal_original_group(renewal)
+                renewal = await asyncio.to_thread(db.ensure_renewal_original_group, renewal)
                 original_gid = renewal.get("original_group_id")
                 original_did = renewal.get("original_driver_id")
 
@@ -25036,7 +25066,7 @@ def main():
                 # Stop date reached → auto-close and tell the agent.
                 end_at = _fu_parse_iso(f.get("end_at"))
                 if end_at and now >= end_at:
-                    db.close_client_followup(fid)
+                    await asyncio.to_thread(db.close_client_followup, fid)
                     try:
                         await context.bot.send_message(
                             chat_id=chat_id,
@@ -25072,7 +25102,7 @@ def main():
                         )
                         client_results.append("📧 emailed" if ok else f"📧 email failed ({err})")
                     if client_results:
-                        db.update_client_followup(fid, {"last_client_contact_at": now.isoformat()})
+                        await asyncio.to_thread(db.update_client_followup, fid, {"last_client_contact_at": now.isoformat()})
 
                 # 2) Reminder DM to the agent + every supervisor, with stop button.
                 head = "🔁 Renewal due" if is_renewal else "⏰ Follow up with"
@@ -25141,7 +25171,7 @@ def main():
                 nxt = (_fu_parse_iso(f.get("next_reminder_at")) or now) + timedelta(days=days)
                 while nxt <= now:
                     nxt += timedelta(days=days)
-                db.advance_client_followup(fid, nxt.isoformat(), now.isoformat())
+                await asyncio.to_thread(db.advance_client_followup, fid, nxt.isoformat(), now.isoformat())
         except Exception as e:
             logger.error("Client follow-up job failed: %s", e)
 
@@ -25152,7 +25182,7 @@ def main():
     # Daily motivation (Pro Mode): morning PSYCHOLOGY, evening AGGRESSIVE, no-lead-24h AGGRESSIVE, top performer BONUS
     async def send_morning_motivation(context: ContextTypes.DEFAULT_TYPE) -> None:
         try:
-            user_ids = db.get_lead_sender_telegram_ids()
+            user_ids = await asyncio.to_thread(db.get_lead_sender_telegram_ids)
             text = motivation.morning_psychology()
             for uid in user_ids:
                 try:
@@ -25165,7 +25195,7 @@ def main():
 
     async def send_evening_motivation(context: ContextTypes.DEFAULT_TYPE) -> None:
         try:
-            recipients = db.get_motivation_recipients()
+            recipients = await asyncio.to_thread(db.get_motivation_recipients)
             top_count = max((r.get("leads_count_7d") or 0) for r in recipients) if recipients else 0
             top_performer_uid = None
             if top_count > 0:
