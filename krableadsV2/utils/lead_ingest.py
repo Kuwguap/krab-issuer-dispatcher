@@ -13,8 +13,8 @@ from utils.external_lead_parser import (
     _parse_labeled_fields,
     build_vehicle_details_11,
     build_delivery_details,
+    move_address_emails_to_email,
     parse_external_lead_fields,
-    parse_external_lead_message,
 )
 from utils.ingest_files import extract_fields_from_files, normalize_ingest_files
 from utils.lead_validation import is_valid_pending_phone, is_valid_pending_price
@@ -27,6 +27,17 @@ logger = logging.getLogger(__name__)
 def generate_reference_id() -> str:
     alphabet = string.ascii_uppercase + string.digits
     return "".join(secrets.choice(alphabet) for _ in range(8))
+
+
+def _email_out_of_address(fields: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    """An email typed into an address is an email (lead 1K3AX0XS): it moves to
+    the email field when that is empty and always leaves the address text --
+    see move_address_emails_to_email. Only new ingests pass through here.
+    Logs that it happened, never the values (client PII)."""
+    cleaned = move_address_emails_to_email(fields)
+    if cleaned != dict(fields or {}):
+        logger.info("Lead ingest: took an email out of the address text")
+    return cleaned
 
 
 def ingest_external_lead(
@@ -48,8 +59,12 @@ def ingest_external_lead(
 
     if attached_files:
         # Gap-fill BEFORE parsing so a document-supplied VIN can rescue a lead
-        # the parser would otherwise reject as "VIN is required".
-        work_fields = dict(fields) if fields else _parse_labeled_fields(message or "")
+        # the parser would otherwise reject as "VIN is required". An email the
+        # customer typed into an address is moved first, so the documents are
+        # not asked for an email the lead already has.
+        work_fields = _email_out_of_address(
+            dict(fields) if fields else _parse_labeled_fields(message or "")
+        )
         present = {
             _normalize_field_key(str(k))
             for k, v in work_fields.items()
@@ -68,9 +83,12 @@ def ingest_external_lead(
             work_fields[k] = v
         state, parse_errors = parse_external_lead_fields(work_fields)
     elif fields:
-        state, parse_errors = parse_external_lead_fields(fields)
+        state, parse_errors = parse_external_lead_fields(_email_out_of_address(fields))
     elif message:
-        state, parse_errors = parse_external_lead_message(message)
+        # parse_external_lead_message, with the address emails moved first.
+        state, parse_errors = parse_external_lead_fields(
+            _email_out_of_address(_parse_labeled_fields(message))
+        )
     else:
         return None, ["message or fields is required"]
 
@@ -137,6 +155,11 @@ def ingest_external_lead(
         "phase1_attached_files": attached_files,
         "ingest_dispatch_pending": True,
         "external_order_id": state.get("external_order_id"),
+        # True only when the order paid for our insurance ("Coverage: TriState
+        # insurance (paid)"). The bot never arms cover on a website order by
+        # itself, so this is the only way one reaches the card and the portal.
+        # An optional write key (utils/database.py), like the rest.
+        "wants_insurance": bool(state.get("wants_insurance")),
         "awaiting_group_accept": False,
     }
 

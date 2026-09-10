@@ -36,6 +36,7 @@ GROUP_ID = "44444444-4444-4444-8444-444444444444"
 GROUP_CHAT = -100456
 ACCEPTOR = 910001
 CLIENT_EMAIL = "client@example.com"
+SUPERVISOR_CHAT = 777001
 
 NY_VEHICLE = "\n".join([
     "CHARLES JONES", "9 hibiscus Lane", "Monticello New York 13701",
@@ -166,7 +167,11 @@ class Transport:
 TRANSPORT = Transport()
 
 
+PORTAL_CALLS = []
+
+
 def _portal_ok(payload, pdf_bytes=None):
+    PORTAL_CALLS.append(dict(payload))
     return SimpleNamespace(ok=True, status_code=200, error=None, payload={})
 
 
@@ -273,6 +278,8 @@ class InsuranceEmailGateTest(unittest.TestCase):
         async def go():
             with mock.patch.object(telegram.Bot, "_do_post", TRANSPORT.do_post), \
                  mock.patch.object(bot, "db", FAKE_DB), \
+                 mock.patch.object(bot, "_all_supervisory_chat_ids",
+                                   lambda: [SUPERVISOR_CHAT]), \
                  mock.patch.object(bot.Config, "INTEGRATIONS_API_KEY", "test-key"), \
                  mock.patch.object(bot.Config, "RESEND_API_KEY", "re_test"), \
                  mock.patch.object(bot.Config, "RESEND_FROM", "Cards <cards@x.com>"), \
@@ -347,34 +354,61 @@ class InsuranceEmailGateTest(unittest.TestCase):
         emails = self._run([_email_button_update(self.app, 8023)])
         self.assertEqual(1, len(emails))
 
-    def test_no_email_lead_recovers_via_setclientemail(self):
+    def test_no_email_lead_gets_its_card_now_and_finishes_via_email(self):
+        """No client email at accept: the NY card is issued anyway, under the
+        tag's policy, and goes to the group AND the supervisors with "Add client
+        email" -- no portal account, nobody emailed. /email then provisions the
+        portal under the SAME policy and puts the release button up; no second
+        card is posted and no second policy minted."""
         FAKE_DB.reset(email="")
         TRANSPORT.reset()
+        PORTAL_CALLS.clear()
         emails = self._run([_accept_update(self.app, 8031)])
         self.assertEqual([], emails)
-        docs = [d for e, d in TRANSPORT.calls if e == "sendDocument"]
-        self.assertEqual(1, len(docs),
-                         "only the tag PDF should go out for a no-email lead")
-        bails = [d for e, d in TRANSPORT.calls if e == "sendMessage"
-                 and "/email " in str(d.get("text", ""))]
-        self.assertTrue(bails, "the group was not told how to fix the missing email")
-        self.assertFalse(str(FAKE_DB.lead.get("insurance_card_sent_at") or "").strip())
+        cards = [d for e, d in TRANSPORT.calls if e == "sendDocument"
+                 and "Insurance card" in str(d.get("caption", ""))]
+        self.assertEqual({str(GROUP_CHAT), str(SUPERVISOR_CHAT)},
+                         {str(d.get("chat_id")) for d in cards},
+                         "the card must reach the group and the supervisors")
+        self.assertEqual(2, len(cards), "one card per chat")
+        add_email = [d for e, d in TRANSPORT.calls if e == "sendMessage"
+                     and f"setem_{LEAD_ID}" in str(d.get("reply_markup"))]
+        self.assertEqual({str(GROUP_CHAT), str(SUPERVISOR_CHAT)},
+                         {str(d.get("chat_id")) for d in add_email},
+                         "no Add client email button under the card")
+        self.assertFalse([d for _, d in TRANSPORT.calls
+                          if f"ins_email_{LEAD_ID}" in str(d.get("reply_markup"))],
+                         "a release button with nobody to release it to")
+        self.assertTrue(str(FAKE_DB.lead.get("insurance_card_sent_at") or "").strip())
+        self.assertFalse(str(FAKE_DB.lead.get("insurance_card_sent_to_email") or "").strip(),
+                         "the missing email must stay visible")
+        self.assertEqual([], PORTAL_CALLS, "a portal account was made with no email")
+        policy = FAKE_DB.lead.get("insurance_card_policy_number")
+        self.assertTrue(policy)
+        issued_at = FAKE_DB.lead.get("insurance_card_sent_at")
 
-        # The lead's own group sets the email; the held card is issued right there.
+        # The lead's own group sets the email: portal now, same policy, button.
         TRANSPORT.reset()
         emails = self._run([_command_update(
             self.app, 8032, f"/email GATE1234 {CLIENT_EMAIL}")])
         self.assertEqual([], emails, "setting the email must not email the client")
         self.assertEqual(CLIENT_EMAIL, FAKE_DB.lead.get("email"))
-        self.assertTrue(str(FAKE_DB.lead.get("insurance_card_sent_at") or "").strip(),
-                        "the held card was not issued after the email arrived")
+        self.assertEqual(1, len(PORTAL_CALLS))
+        self.assertEqual(policy, PORTAL_CALLS[0]["policyNumber"])
+        self.assertEqual(CLIENT_EMAIL, PORTAL_CALLS[0]["email"])
+        self.assertEqual(policy, FAKE_DB.lead.get("insurance_card_policy_number"))
+        self.assertEqual(issued_at, FAKE_DB.lead.get("insurance_card_sent_at"))
+        self.assertEqual(CLIENT_EMAIL, FAKE_DB.lead.get("insurance_card_sent_to_email"))
+        self.assertEqual([], [e for e, _ in TRANSPORT.calls if e == "sendDocument"],
+                         "a second card was posted")
         with_button = [d for e, d in TRANSPORT.calls if e == "sendMessage"
                        and f"ins_email_{LEAD_ID}" in str(d.get("reply_markup"))]
-        self.assertTrue(with_button, "no release button after the recovery issue")
+        self.assertTrue(with_button, "no release button after the email arrived")
 
         emails = self._run([_email_button_update(self.app, 8033)])
         self.assertEqual(1, len(emails))
         self.assertEqual(CLIENT_EMAIL, emails[0]["to_address"])
+        self.assertIn(policy, emails[0]["pdf_filename"])
 
     def test_nj_lead_is_never_gated(self):
         FAKE_DB.reset(vehicle=NJ_VEHICLE)

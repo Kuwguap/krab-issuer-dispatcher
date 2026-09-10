@@ -668,6 +668,10 @@ class Database:
         of a busy week and can show a supervisor fewer leads than one of their
         own issuers sees.
 
+        An insurance lead waits for as long as the email is missing, card or no
+        card: a NY card is now made before the email exists, and it is the email
+        that lets anyone release it to the client.
+
         ``user_id`` scopes it to one person's leads; without it, everybody's.
         The blank check stays in PYTHON: the column holds '' as well as NULL
         depending on which path wrote the lead, so .is_("email", "null") would
@@ -685,7 +689,12 @@ class Database:
             """One flag's blocked leads. A flag this database has never heard of
             simply contributes nothing, rather than costing the whole list."""
             try:
-                q = self.client.table("leads").select(select).eq(flag, True)
+                q = (self.client.table("leads").select(select).eq(flag, True)
+                     # NULL or '' -- the only rows that can be blocked. Filtering
+                     # here keeps the over-fetch below from filling up with
+                     # leads that already have an email. Whitespace-only still
+                     # falls to the Python check.
+                     .or_("email.is.null,email.eq."))
                 if done_col:
                     q = q.is_(done_col, "null")
                 if user_id is not None:
@@ -697,7 +706,7 @@ class Database:
                 logger.info("get_leads_needing_client_email (%s): %s", flag, e)
                 return []
 
-        rows = fetch("wants_insurance", "insurance_card_sent_at", cols)
+        rows = fetch("wants_insurance", None, cols)
         if not rows:
             # Older database: retry without the columns that arrived by migration.
             rows = fetch("wants_insurance", None, lean)
@@ -710,14 +719,16 @@ class Database:
                 continue
             if str(r.get("email") or "").strip():
                 continue                      # they have one; nothing is blocked
-            wants_ins = bool(r.get("wants_insurance")) and not str(
-                r.get("insurance_card_sent_at") or "").strip()
+            # No email means the card, made or not, has not reached the client.
+            wants_ins = bool(r.get("wants_insurance"))
             wants_tag = bool(r.get("wants_tag_email")) and not str(
                 r.get("tag_emailed_at") or "").strip()
             if not (wants_ins or wants_tag):
                 continue
             seen.add(lid)
-            out.append(dict(r, needs_insurance=wants_ins, needs_tag_email=wants_tag))
+            out.append(dict(r, needs_insurance=wants_ins, needs_tag_email=wants_tag,
+                            insurance_card_made=bool(str(
+                                r.get("insurance_card_sent_at") or "").strip())))
         out.sort(key=lambda x: str(x.get("created_at") or ""), reverse=True)
         return out[:cap]
 

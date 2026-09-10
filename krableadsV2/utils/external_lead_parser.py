@@ -27,6 +27,21 @@ _LABEL_KEYS: Tuple[Tuple[str, str], ...] = (
     ("vin", "vin"),
 )
 
+# The website's one signal that the customer PAID for our insurance. The
+# ingest message carries this exact line for a "Plate + Insurance" or
+# "Insurance Only" order and no Coverage line at all for a tag-only order
+# (server/krableads-ingest.js in speedy-tags). Case and spacing are forgiven;
+# the words are not -- anything else is not a paid cover.
+PAID_COVERAGE_LINE = "Coverage: TriState insurance (paid)"
+_COVERAGE_LINE_RE = re.compile(r"^coverage\s*:(.*)$", re.I)
+
+
+def coverage_is_paid_tristate(value: Any) -> bool:
+    """True only for the Coverage value "TriState insurance (paid)"."""
+    squashed = re.sub(r"\s+", "", str(value or "")).casefold()
+    return squashed == "tristateinsurance(paid)"
+
+
 SAMPLE_MESSAGE = """🆕 New Lead
 Order #bf6923ca
 Customer: Zebin Fang Fang
@@ -82,6 +97,10 @@ def _parse_labeled_fields(text: str) -> Dict[str, str]:
             val = re.sub(r"^order\s*#?\s*", "", line, flags=re.I).strip().lstrip("#").strip()
             if val:
                 fields["external_order_id"] = val
+            continue
+        cov = _COVERAGE_LINE_RE.match(line)
+        if cov:
+            fields["coverage"] = cov.group(1).strip()
             continue
         for label, key in _LABEL_KEYS:
             prefix = f"{label}:"
@@ -188,6 +207,150 @@ def _normalize_field_key(key: str) -> str:
     return mapping.get(k, k.replace(" ", "_"))
 
 
+# ------------------------------------------------ an email typed into an address
+#
+# Lead 1K3AX0XS came from a checkout with an empty email and the customer's
+# email typed at the end of the address ("113, East 84th Street, ..., 10028,
+# United States, Josue_jeanette@icloud.com"). Carried in the address it rode
+# into every driver offer, and its lone "_" broke the offer's Markdown, so no
+# driver got it. On a website/API ingest an email typed into an address is an
+# email: it becomes the lead's email if there is none, and it always leaves
+# the address text. See move_address_emails_to_email.
+#
+# Conservative on purpose: name@a.dotted.domain ending in a 2-24 letter TLD,
+# not run straight on into more address characters. "Unit @ rear" and
+# "x@localhost" are not emails and stay exactly where they are.
+_ADDRESS_EMAIL_RE = re.compile(
+    r"(?<![A-Za-z0-9._%+\-@])"
+    r"[A-Za-z0-9._%+\-]+@"
+    r"(?:[A-Za-z0-9](?:[A-Za-z0-9\-]*[A-Za-z0-9])?\.)+[A-Za-z]{2,24}"
+    r"(?![A-Za-z0-9\-@]|\.[A-Za-z0-9])"
+)
+# An "Email:" / "e-mail address -" label left in front of a removed email.
+_EMAIL_LABEL_TAIL_RE = re.compile(r"\be-?mail(?:\s+address)?\s*[:\-]?[ \t]*$", re.I)
+# What joined an email to the address, cut out with it. Newlines included, so
+# "5 Main St,\na@b.com" loses its comma too; "/" and "-" so " / a@b.com" and
+# " - a@b.com" leave no stray separator behind.
+_ADDRESS_JOIN_CHARS = " \t\r\n,;|/-"
+_EMAIL_WRAPPERS = {"(": ")", "<": ">", "[": "]"}
+
+
+def _unwrap_email(left: str, right: str) -> Tuple[str, str]:
+    """Drop a bracket pair round a removed email: "(" + ... + ")"."""
+    left_bare, right_bare = left.rstrip(" \t"), right.lstrip(" \t")
+    if (left_bare and right_bare and left_bare[-1] in _EMAIL_WRAPPERS
+            and right_bare[0] == _EMAIL_WRAPPERS[left_bare[-1]]):
+        return left_bare[:-1], right_bare[1:]
+    return left, right
+# An address line 2 / apartment field, spelled as _normalize_field_key spells
+# it: "Address line 2", "address2", "Apartment", "Apt #", "Delivery unit"...
+_ADDRESS_LINE2_KEY_RE = re.compile(
+    r"^(?:(?:delivery|registration)_)?"
+    r"(?:address_?line_?2|address_?2|apartment|apt|unit|suite)"
+    r"(?:_?(?:number|num|no|#))?$"
+)
+
+
+def pull_emails_from_address(text: Any) -> Tuple[str, List[str]]:
+    """Split one address text into (the address without emails, the emails).
+
+    Each email leaves with the comma or space that joined it -- and an
+    "Email:" label or brackets round it -- so "..., United States, a_b@c.com"
+    becomes "..., United States" and "5 Main St, a@b.com, Apt 2D" becomes
+    "5 Main St, Apt 2D". Text holding no email (no "@" at all, or only a
+    stray one) comes back exactly as given.
+    """
+    raw = "" if text is None else str(text)
+    if "@" not in raw:
+        return raw, []
+    out = raw
+    emails: List[str] = []
+    match = _ADDRESS_EMAIL_RE.search(out)
+    while match:
+        emails.append(match.group(0))
+        left, right = _unwrap_email(out[: match.start()], out[match.end():])
+        left = _EMAIL_LABEL_TAIL_RE.sub("", left)
+        # "(Email: a@b.com)": the brackets sit outside the label.
+        left, right = _unwrap_email(left, right)
+        left_kept = left.rstrip(_ADDRESS_JOIN_CHARS)
+        right_kept = right.lstrip(_ADDRESS_JOIN_CHARS + ".")
+        joint = left[len(left_kept):] + right[: len(right) - len(right_kept)]
+        if not left_kept or not right_kept:
+            glue = ""
+        elif "\n" in joint:
+            glue = "\n"
+        elif "," in joint:
+            glue = ", "
+        else:
+            glue = " "
+        out = left_kept + glue + right_kept
+        match = _ADDRESS_EMAIL_RE.search(out)
+    if not emails:
+        return raw, []
+    return out.strip(), emails
+
+
+def _address_rank(raw_key: Any) -> Optional[int]:
+    """0 delivery address, 1 registration address, 2 a line 2 / apartment
+    field, None for anything that is not an address."""
+    nk = _normalize_field_key(str(raw_key))
+    if nk == "delivery_address_full":
+        return 0
+    if nk == "registration_address":
+        return 1
+    if _ADDRESS_LINE2_KEY_RE.match(nk):
+        return 2
+    return None
+
+
+def move_address_emails_to_email(fields: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    """A copy of ``fields`` in which no address carries an email.
+
+    Looks in the delivery address, the registration address and any address
+    line 2 / apartment field -- keys matched the way parse_external_lead_fields
+    matches them, so a raw ``fields`` body and _parse_labeled_fields output
+    both work. Every email found is cut out of its text. The first one found
+    becomes the lead's email only when the lead has none: an email already on
+    the lead (anything holding an "@") always wins. A placeholder in the email
+    field -- "-", "N/A", "none" -- is not an email and gives way, or the moved
+    email would be lost altogether. A text left empty is dropped so the other address
+    stands in for it; when no address is left at all the lead keeps a "-"
+    address rather than being refused, because it was accepted before.
+    ``fields`` itself is never changed.
+
+    Only utils/lead_ingest.py calls this (new website/API leads). The parse_*
+    functions are unchanged for every other caller.
+    """
+    work: Dict[str, Any] = dict(fields or {})
+    keys = [k for k in work if _address_rank(k) is not None]
+    keys.sort(key=_address_rank)  # stable: delivery, registration, line 2
+    found: List[str] = []
+    emptied: List[Any] = []
+    for key in keys:
+        if work[key] is None:
+            continue
+        kept, emails = pull_emails_from_address(work[key])
+        if not emails:
+            continue
+        found.extend(emails)
+        work[key] = kept if kept.strip() else ""
+        if not kept.strip():
+            emptied.append(key)
+    if not found:
+        return work
+    emptied_main = [k for k in emptied if _address_rank(k) < 2]
+    if emptied_main and not any(
+            str(work[k] or "").strip() for k in keys if _address_rank(k) < 2):
+        work[emptied_main[0]] = "-"
+    email_keys = [k for k in work if _normalize_field_key(str(k)) == "email"]
+    if any("@" in str(work[k] or "") for k in email_keys):
+        return work  # an email already on the lead wins
+    for k in email_keys:
+        work[k] = ""  # a placeholder ("-", "N/A"), not an email
+    work["email"] = found[0]
+    return work
+
+
 def parse_external_lead_fields(fields: Dict[str, Any]) -> Tuple[Optional[Dict[str, Any]], List[str]]:
     """Build phase-1 state from labeled field dict. Returns (state_dict, errors)."""
     errors: List[str] = []
@@ -249,6 +412,8 @@ def parse_external_lead_fields(fields: Dict[str, Any]) -> Tuple[Optional[Dict[st
         "pending_price": price,
         "email": f.get("email") or None,
         "external_order_id": f.get("external_order_id") or None,
+        # Only a paid cover arms our insurance on a website order.
+        "wants_insurance": coverage_is_paid_tristate(f.get("coverage")),
     }
     _apply_single_address_as_both(state)
     state["vehicle_details"] = build_vehicle_details_11(state)

@@ -233,6 +233,15 @@ class TheQueryAsksTheRightQuestionTest(unittest.TestCase):
         self.assertIn('insurance_card_sent_at', src)
         self.assertIn('tag_emailed_at', src)
 
+    def test_a_card_made_without_an_email_is_still_waiting(self):
+        """A NY card is now made before the email exists. The lead stays on the
+        list until the email arrives -- it is the email that releases it."""
+        src = _real_database_source("get_leads_needing_client_email")
+        self.assertIn('fetch("wants_insurance", None, cols)', src)
+        self.assertNotIn('fetch("wants_insurance", "insurance_card_sent_at"', src)
+        self.assertIn('.or_("email.is.null,email.eq.")', src)
+        self.assertIn('insurance_card_made=', src)
+
 
 if __name__ == "__main__":
     unittest.main()

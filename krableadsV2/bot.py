@@ -1677,15 +1677,19 @@ async def _deliver_skip_dispatch(context, lead: dict, driver: dict, *,
     # Like the main accept path: no insurer detected means TriState covers it —
     # arm the ride-along so the card + portal go out with the tag below. The
     # client email stays HELD behind the dispatcher's payment button as always.
+    # A website order that paid for the tag only is never armed: the customer
+    # did not buy the cover, so the supervisors are told instead.
     try:
         fresh = await asyncio.to_thread(db.get_lead_by_id, lead.get("id")) or lead
         if (not _lead_already_insured(fresh)
                 and not (str(fresh.get("insurance_card_sent_at") or "")).strip()
-                and not fresh.get("wants_insurance")):
+                and not fresh.get("wants_insurance")
+                and not _website_lead_not_paid_for_cover(fresh)):
             await asyncio.to_thread(db.update_lead, fresh["id"], {"wants_insurance": True})
             lead = await asyncio.to_thread(db.get_lead_by_id, fresh["id"]) or fresh
         else:
             lead = fresh
+            await _tell_supervisors_website_lead_uninsured(context, fresh)
     except Exception as e:
         logger.warning("skip dispatch: could not arm auto-insurance: %s", e)
 
@@ -3067,7 +3071,8 @@ async def _post_single_group_approval(
     reference_id = lead.get("reference_id", "N/A")
     group_offer_message = (
         "🏷 NEW CLIENT — Team approval\n"
-        f"📋 Ref ID: `{reference_id}`\n\n"
+        f"📋 Ref ID: `{reference_id}`\n"
+        f"{_group_offer_insurance_line(lead)}\n"
         "✅ Double-check the tag for mistakes\n"
         "📲 Send tag with Krab Dispatch (@KrabIssuerBot)\n"
         "📋 Copy/paste client phone, address, and delivery time\n\n"
@@ -3083,7 +3088,8 @@ async def _post_single_group_approval(
     await asyncio.to_thread(db.create_group_lead_offer, lead["id"], gid, group_chat_id=str(chat_id), group_message_id=None)
     failures: list[tuple[str, str]] = []
     try:
-        msg = await context.bot.send_message(
+        msg = await _send_md_or_plain(
+            context,
             chat_id=chat_id,
             text=group_offer_message,
             parse_mode="Markdown",
@@ -3096,7 +3102,8 @@ async def _post_single_group_approval(
         logger.warning("Single-group approval rate-limited; retrying in %ss", wait_s)
         await asyncio.sleep(wait_s)
         try:
-            msg = await context.bot.send_message(
+            msg = await _send_md_or_plain(
+                context,
                 chat_id=chat_id,
                 text=group_offer_message,
                 parse_mode="Markdown",
@@ -3123,7 +3130,8 @@ async def _post_lead_to_all_groups_for_approval(
     reference_id = lead.get("reference_id", "N/A")
     group_offer_message = (
         "🏷 NEW CLIENT\n"
-        f"📋 Ref ID: `{reference_id}`\n\n"
+        f"📋 Ref ID: `{reference_id}`\n"
+        f"{_group_offer_insurance_line(lead)}\n"
         "✅ Double-check the tag for mistakes\n"
         "📲 Send tag with Krab Dispatch (@KrabIssuerBot)\n"
         "📋 Copy/paste client phone, address, and delivery time"
@@ -3141,7 +3149,8 @@ async def _post_lead_to_all_groups_for_approval(
         ]])
         await asyncio.to_thread(db.create_group_lead_offer, lead["id"], gid, group_chat_id=str(chat_id), group_message_id=None)
         try:
-            msg = await context.bot.send_message(
+            msg = await _send_md_or_plain(
+                context,
                 chat_id=chat_id,
                 text=group_offer_message,
                 parse_mode="Markdown",
@@ -3314,6 +3323,9 @@ async def process_pending_api_lead_dispatches(context: ContextTypes.DEFAULT_TYPE
                 await _send_web_order_supervisory_notice(context, lead, active_groups)
             except Exception as e:
                 logger.warning("Web-order supervisory notice failed for %s: %s", lead_id, e)
+            # Paid tag-only with no insurer on file: tell the supervisors now,
+            # before any team accepts and the tag goes out (once per lead).
+            await _tell_supervisors_website_lead_uninsured(context, lead)
             # Nobody is chasing this on the customer's behalf -- they filled in a
             # form, or they paid on the website and closed the tab. Ask every
             # driver now,
@@ -3402,6 +3414,7 @@ def _build_web_order_supervisory_text(lead: dict) -> str:
         f"Vehicle: {vehicle}" if vehicle else None,
         f"Insurance: {phase1.get('insurance_company')}" if phase1.get("insurance_company") else None,
         f"Policy #: {phase1.get('insurance_policy_number')}" if phase1.get("insurance_policy_number") else None,
+        _insurance_status_line(lead),
         f"Service: {service}",
         f"Price: {_fmt_price_usd(lead.get('price'))}" if lead.get("price") else None,
         "Informational copy — not claimable from this message.",
@@ -4058,18 +4071,24 @@ def _reassign_target_keyboard(lead_id) -> InlineKeyboardMarkup:
 def _driver_offer_message_text(lead: dict) -> str:
     """The accept/decline offer DM body (shared by dispatch and reassign)."""
     reference_id = lead.get("reference_id", "N/A")
-    extra_safe = _sanitize_phones_for_send(lead.get("extra_info") or "")
+    # Every customer-typed value is escaped. The template is legacy Markdown on
+    # purpose (the reference in code, the italic line), and one unpaired _ * ` or
+    # [ in a delivery field -- an email such as Josue_jeanette@... -- made
+    # Telegram refuse the offer for every driver at once ("can't parse entities").
+    delivery_esc = _telegram_md1_escape(lead.get("delivery_details") or "")
+    extra_esc = _telegram_md1_escape(
+        _sanitize_phones_for_send(lead.get("extra_info") or ""))
     spec = _lead_driver_note(lead)
     msg = (
         f"👋Hi! New client 💸 available📈❗️\n\n"
-        f"📍 Delivery (City, State, Zip): {lead.get('delivery_details', '')}\n"
+        f"📍 Delivery (City, State, Zip): {delivery_esc}\n"
         f"📋 Reference ID: `{reference_id}`\n"
-        f" Delivery Time 🏷️: {extra_safe}\n"
+        f" Delivery Time 🏷️: {extra_esc}\n"
         f"Please have Car, Driver License, and Laser Printer Ready✅\n\n"
         f"_Tap Accept below, or just reply *accept*._"
     )
     if spec:
-        msg += f"\n\n📝 Special request (driver): {_sanitize_phones_for_send(spec)}"
+        msg += f"\n\n📝 Special request (driver): {_telegram_md1_escape(_sanitize_phones_for_send(spec))}"
     return msg
 
 
@@ -11696,6 +11715,33 @@ def _build_driver_resend_request_message(lead: dict) -> str:
     return driver_request_message
 
 
+def _is_markdown_parse_error(err) -> bool:
+    """Telegram's answer when a message's formatting does not parse."""
+    return "can't parse entities" in str(err).lower()
+
+
+async def _send_md_or_plain(context, chat_id, text, **kwargs):
+    """context.bot.send_message, with one way out of a formatting failure.
+
+    One unpaired _ * ` or [ in a customer's text makes Telegram refuse the WHOLE
+    message ("can't parse entities") -- lead 1K3AX0XS reached none of its 76
+    drivers over one underscore in an email address. The words matter more than
+    the bold: on exactly that answer, and only when a parse_mode was asked for,
+    the same text goes once more with no parse_mode. Every other BadRequest (a
+    blocked bot, a dead chat id) still raises, as it always has.
+    """
+    try:
+        return await context.bot.send_message(chat_id=chat_id, text=text, **kwargs)
+    except BadRequest as e:
+        if not kwargs.get("parse_mode") or not _is_markdown_parse_error(e):
+            raise
+        logger.warning(
+            "send to %s: Telegram could not parse the %s formatting (%s) -- "
+            "sending it once more as plain text", chat_id, kwargs.get("parse_mode"), e)
+        plain = {k: v for k, v in kwargs.items() if k != "parse_mode"}
+        return await context.bot.send_message(chat_id=chat_id, text=text, **plain)
+
+
 async def _send_message_resiliently(context, chat_id, text, *, tries: int = 3,
                                     **kwargs):
     """context.bot.send_message, but a busy moment is not a failed delivery.
@@ -11708,7 +11754,9 @@ async def _send_message_resiliently(context, chat_id, text, *, tries: int = 3,
     RetryAfter is obeyed for exactly as long as Telegram asks. A timeout or a
     dropped connection backs off briefly and tries again. A BadRequest is NOT
     retried -- bad HTML, a blocked bot or a dead chat id will fail identically
-    every time, and retrying only delays the honest answer.
+    every time, and retrying only delays the honest answer. The one exception is
+    formatting Telegram cannot parse, which goes once more as plain text (see
+    _send_md_or_plain) -- a stray _ in a customer's text is not a dead driver.
 
     Returns the Message, or raises the last error once the tries are spent.
     """
@@ -11716,7 +11764,7 @@ async def _send_message_resiliently(context, chat_id, text, *, tries: int = 3,
     last = None
     for attempt in range(max(1, tries)):
         try:
-            return await context.bot.send_message(chat_id=chat_id, text=text, **kwargs)
+            return await _send_md_or_plain(context, chat_id, text, **kwargs)
         except RetryAfter as e:
             last = e
             wait_s = min(int(getattr(e, "retry_after", 1) or 1), 30)
@@ -11888,6 +11936,93 @@ def _persist_extra_vehicle_plate(lead: dict, vehicle: int, plate: str, control: 
 TAG_INSURER_NAME = "National Specialty Ins"
 
 
+# Sources that write external_order_id WITHOUT being a website checkout: the
+# /form page and the Dispatch Web mirror both put their own reference_id there,
+# only so the group-accept handler fans them out to drivers (public_form.py,
+# dispatch_web/newlead.py). Neither takes a payment, so neither is a "website
+# order that paid tag-only" -- they keep the issuer lead's automatic cover.
+# Anything else carrying an order id is gated, so an unknown label fails safe.
+_NON_CHECKOUT_ORDER_ID_SOURCES = frozenset({CLIENT_FORM_SOURCE.casefold(), "dispatch web"})
+
+
+def _is_website_lead(lead: dict) -> bool:
+    """A tristatetags.com checkout order: it carries the website's order id."""
+    lead = lead or {}
+    if not str(lead.get("external_order_id") or "").strip():
+        return False
+    source = str(lead.get("contact_info_source") or "").strip().casefold()
+    return source not in _NON_CHECKOUT_ORDER_ID_SOURCES
+
+
+def _website_lead_not_paid_for_cover(lead: dict) -> bool:
+    """True for a website order that did NOT pay for our insurance.
+
+    The website sells the tag and the insurance separately, and its ingest
+    message says when the customer paid for the cover ("Coverage: TriState
+    insurance (paid)", which the parser turns into wants_insurance). Anything
+    else is a tag-only sale, and arming our cover on it gives away the $100
+    product: the card, the portal account and our policy number on the tag.
+
+    Issuer leads (no external_order_id) are priced by the issuer in Telegram and
+    keep the automatic arming exactly as before. A website lead that is already
+    armed is not this case either, so nothing here ever un-arms a lead.
+    """
+    return _is_website_lead(lead) and not (lead or {}).get("wants_insurance")
+
+
+# Leads the supervisors were already told about, so the several places a tag is
+# built from never repeat it. In memory only: a restart may say it once more,
+# which is the right side to err on for a tag about to go out uninsured.
+_WEBSITE_UNINSURED_NOTIFIED: set = set()
+
+
+async def _tell_supervisors_website_lead_uninsured(context, lead: dict) -> bool:
+    """Once per lead: a website order paid tag-only and has no insurance on file.
+
+    Where the bot used to cover such a car itself, the team is told instead, so
+    they get the customer's insurer and policy number or collect the $100 before
+    the tag goes out. Returns True only when this call sent the notice. Never
+    raises: _tell_supervisors is best effort and so is everything around it.
+    """
+    try:
+        if not lead or not _website_lead_not_paid_for_cover(lead):
+            return False
+        if str(lead.get("insurance_card_sent_at") or "").strip():
+            return False
+        needs_cover = (not _lead_already_insured(lead)
+                       or any(_vehicle_needs_coverage(v) for v in _extra_vehicles(lead)))
+        if not needs_cover:
+            return False
+        key = str(lead.get("id") or lead.get("reference_id") or "").strip()
+        if not key or key in _WEBSITE_UNINSURED_NOTIFIED:
+            return False
+        _WEBSITE_UNINSURED_NOTIFIED.add(key)
+        ref_h = html.escape(str(lead.get("reference_id") or "N/A"), quote=False)
+        order_h = html.escape(str(lead.get("external_order_id") or "").strip(), quote=False)
+        name_h = html.escape(_client_display_name_from_lead(lead), quote=False)
+        # What the order actually paid, so a $250 order that reached us without
+        # its Coverage line (a server still behind this change) is obvious.
+        paid_h = html.escape(_fmt_price_usd(lead.get("price")) or "?", quote=False)
+        text = (
+            "⚠️ <b>Website order paid for the tag only — no insurance on file</b>\n"
+            f"📋 Ref: <code>{ref_h}</code>  ·  Order #{order_h}\n"
+            f"👤 {name_h}  ·  💵 Paid {paid_h}\n\n"
+            "The customer did not buy our insurance and gave no insurer and "
+            "policy number, so the bot has NOT put this car on TriState cover "
+            "and the tag's insurance boxes stay as the customer left them.\n"
+            "Before the tag goes out: get the customer's insurer and policy "
+            "number, or collect the $100 for insurance."
+        )
+        await _tell_supervisors(context, text)
+        logger.info("insurance: told supervisors website lead %s (order %s) is uninsured",
+                    lead.get("reference_id"), lead.get("external_order_id"))
+        return True
+    except Exception as e:
+        logger.warning("insurance: could not tell supervisors about website lead %s: %s",
+                       (lead or {}).get("reference_id"), e)
+        return False
+
+
 async def _arm_insurance_for_lead(lead: dict) -> None:
     """Record that this lead is on our cover, so the card and portal follow.
 
@@ -11895,8 +12030,15 @@ async def _arm_insurance_for_lead(lead: dict) -> None:
     optional write key, so a database still behind that migration degrades to a
     tag that is correctly filled in with the card issued by hand — which is a
     great deal better than the blank tag this replaces.
+
+    Refuses a website order that did not pay for the cover: the customer bought
+    a tag, not insurance (see _website_lead_not_paid_for_cover).
     """
     if not lead or lead.get("wants_insurance") or not lead.get("id"):
+        return
+    if _website_lead_not_paid_for_cover(lead):
+        logger.info("insurance: not arming website lead %s (order %s) — tag-only sale",
+                    lead.get("reference_id"), lead.get("external_order_id"))
         return
     lead["wants_insurance"] = True
     try:
@@ -12022,9 +12164,15 @@ async def _tag_fields_from_lead(lead: dict, *, renewal: bool = False,
     # out with no insurer and no policy on it. A tag with those boxes empty is
     # not a document, so the rule is simply: if either would be blank, we cover
     # the car and both are filled.
+    #
+    # Except a website order that paid for the tag only: the customer did not
+    # buy our insurance, so no carrier of ours and no minted policy -- the boxes
+    # print as the customer left them, and the supervisors are told (see
+    # _tell_supervisors_website_lead_uninsured). An issuer lead, or a website
+    # order that paid for the cover, is untouched by this.
     ins_company = phase1.get("insurance_company", "")
     ins_policy = phase1.get("insurance_policy_number", "")
-    if _vehicle_needs_coverage(phase1):
+    if _vehicle_needs_coverage(phase1) and not _website_lead_not_paid_for_cover(lead):
         _policy = _tristate_policy_for_vehicle(lead, vehicle)
         if _policy:
             if not _is_blank_field(ins_company):
@@ -12299,6 +12447,9 @@ async def _build_and_send_tag_pdf(
     if not target_chat_ids:
         return 0
     fields = await _tag_fields_from_lead(lead, renewal=renewal, vehicle=vehicle)
+    # A website order that paid tag-only went out without our cover above; the
+    # supervisors hear about it once per lead (a no-op for everything else).
+    await _tell_supervisors_website_lead_uninsured(context, lead)
     pdf = await asyncio.to_thread(tag_pdf.build_tag_pdf, fields)
     reference_id = (lead.get("reference_id") or "N/A").strip()
     plate = fields.get("plate") or "tag"
@@ -12536,6 +12687,37 @@ def _insurance_chat_targets(lead: dict, target_chat_ids) -> list:
     return out
 
 
+def _insurance_card_recipients(lead: dict, target_chat_ids, *, supervisors=None) -> list:
+    """Where an insurance card and its button go: _insurance_chat_targets, plus
+    every supervisor whenever a person still has to act on the card -- there is
+    no client email yet (someone must add one), or it is a website/form client
+    (someone must release it). ``supervisors`` forces the choice either way. An
+    issuer's own lead that already has its email goes exactly where it always
+    went. De-duplicated by normalised chat id, so a supervisor who is also the
+    caller, or a group listed twice, gets one copy.
+
+    Reads the group row, so async callers run it through asyncio.to_thread.
+    """
+    lead = lead or {}
+    raw = list(_insurance_chat_targets(lead, target_chat_ids))
+    if supervisors is None:
+        supervisors = (not str(lead.get("email") or "").strip()
+                       or bool(str(lead.get("external_order_id") or "").strip()))
+    if supervisors:
+        try:
+            raw.extend(_all_supervisory_chat_ids())
+        except Exception as e:
+            logger.warning("insurance targets: supervisor lookup failed: %s", e)
+    out, seen = [], set()
+    for cid in raw:
+        key = _norm_chat_id(cid)
+        if key is None or key in seen:
+            continue
+        seen.add(key)
+        out.append(cid)
+    return out
+
+
 def _insurance_login_block(policy, portal_email, portal_pw,
                            password_unchanged: bool = False, *,
                            emailed: bool = True) -> str:
@@ -12690,41 +12872,47 @@ async def _maybe_ride_insurance_with_tag(context, lead: dict, target_chat_ids: l
     HOLD the client's email until the dispatcher taps the release button after
     payment. NJ is the exception: its upstream app emails the client itself, so it
     is stamped emailed at issue. Idempotent via insurance_card_sent_at; fully
-    best-effort so it never blocks tag delivery."""
+    best-effort so it never blocks tag delivery.
+
+    No client email yet: a NY card is issued anyway -- the policy (an existing
+    insurance_card_policy_number is reused, never re-minted) and the FS-20 -- and
+    posted with "📧 Add client email", insurance_card_sent_to_email left empty so
+    the missing address stays visible. The portal account follows when /email
+    supplies it (_finish_insurance_card_after_email). An NJ card cannot be built
+    without the address, so the same button goes under "not issued yet". When a
+    person has to act -- no email, or a website/form client -- the supervisors
+    get the card and the button too (_insurance_card_recipients)."""
     try:
         if not lead or not lead.get("wants_insurance") or not lead.get("id"):
             return  # fast path: no DB read for the common (no-insurance) case
         fresh = await asyncio.to_thread(db.get_lead_by_id, lead.get("id")) or lead
         if not fresh.get("wants_insurance"):
             return
-        chats, seen = [], set()
-        for cid in (_insurance_chat_targets(fresh, target_chat_ids)):
-            key = _norm_chat_id(cid)
-            if cid is None or key in seen:
-                continue
-            seen.add(key)
-            chats.append(cid)
+        chats = await asyncio.to_thread(_insurance_card_recipients, fresh, target_chat_ids)
         # Extra cars first: car 1's guard below returns early once its card exists,
         # which on a re-send would leave an uninsured second car untouched forever.
         await _ride_insurance_for_extra_vehicles(context, fresh, chats)
         if (fresh.get("insurance_card_sent_at") or "").strip():
             return  # already issued for this lead
         email = (fresh.get("email") or "").strip()
-        if not email:
+        from utils import state_detection as sd
+        card_state = sd.detect_card_state(fresh)
+        if not email and card_state == "NJ":
             for cid in chats:
                 try:
                     await context.bot.send_message(
                         chat_id=cid,
                         text="🛡 Insurance ($100 add-on) was requested, but no client "
-                             "email is on file — card not issued.\n"
-                             f"Send /email {fresh.get('reference_id', '')} "
-                             "client@email.com here and I'll issue it.",
+                             "email is on file — NJ card not issued yet (its issuer "
+                             "emails it straight to the client).\n"
+                             "Tap 📧 Add client email, or send /email "
+                             f"{fresh.get('reference_id', '')} client@email.com "
+                             "here and I'll issue it.",
+                        reply_markup=_insurance_card_keyboard(fresh),
                     )
                 except Exception:
                     pass
             return
-        from utils import state_detection as sd
-        card_state = sd.detect_card_state(fresh)
         ok, policy, err, portal_email, portal_pw, pdf_bytes = (
             await _build_and_send_insurance_card(fresh, send_client_email=False))
         now_iso = datetime.now(pytz.timezone("America/New_York")).isoformat()
@@ -12737,22 +12925,29 @@ async def _maybe_ride_insurance_with_tag(context, lead: dict, target_chat_ids: l
             # idempotency guard above was dead: every tag re-send re-issued.
             payload = {
                 "insurance_card_policy_number": policy,
-                "insurance_card_sent_to_email": email,
+                # Empty for a card issued before the email: "the client does not
+                # have this yet" stays visible, and /email knows to finish it.
+                "insurance_card_sent_to_email": email or None,
                 "insurance_card_sent_at": now_iso,
                 "insurance_card_error": None,
-                "portal_email": portal_email or email,
-                "portal_password": portal_pw,
             }
+            if email:
+                payload["portal_email"] = portal_email or email
+                payload["portal_password"] = portal_pw
             if card_state == "NJ":
                 # The NJ upstream app emailed the client at issue — nothing is
                 # held, so no release button must ever offer to send it again.
                 payload["insurance_emailed_at"] = now_iso
         else:
             payload = {
-                "insurance_card_policy_number": policy,
-                "insurance_card_sent_to_email": email,
+                "insurance_card_sent_to_email": email or None,
                 "insurance_card_error": (err or "Unknown error")[:500],
             }
+            # Only a number the builder actually holds. Writing its None here
+            # wiped a policy the tag had already printed, and the next try then
+            # minted a second one.
+            if policy:
+                payload["insurance_card_policy_number"] = policy
             if portal_email and portal_pw:
                 payload["portal_email"] = portal_email
                 payload["portal_password"] = portal_pw
@@ -12761,22 +12956,31 @@ async def _maybe_ride_insurance_with_tag(context, lead: dict, target_chat_ids: l
         except Exception as e:
             logger.warning("Could not persist insurance result for lead %s: %s", fresh.get("id"), e)
         if ok:
-            # The portal keeps an existing account's password, so a repeat client
-            # must not be handed the one we sent — it would fail at the login.
-            _unchanged = bool((fresh.get("portal_password_unchanged")))
-            login_txt = (_insurance_login_block(policy, portal_email, portal_pw, _unchanged,
-                                                emailed=False)
-                         if (portal_pw or _unchanged) else None)
+            if email:
+                # The portal keeps an existing account's password, so a repeat
+                # client must not be handed the one we sent — it would fail at
+                # the login.
+                _unchanged = bool((fresh.get("portal_password_unchanged")))
+                note = (_insurance_login_block(policy, portal_email, portal_pw, _unchanged,
+                                               emailed=False)
+                        if (portal_pw or _unchanged) else None)
+                caption = "🛡 Insurance card — $100 add-on. NOT emailed to the client yet."
+            else:
+                note = ("📧 No client email on file — the client has NOT got this card "
+                        "and has no portal login yet.\n"
+                        "Tap 📧 Add client email (or send /email "
+                        f"{fresh.get('reference_id', '')} client@email.com), then "
+                        "release it with 📧 Email insurance to client.")
+                caption = ("🛡 Insurance card — $100 add-on. No client email on file "
+                           "yet — NOT sent to the client.")
             for cid in chats:
                 await _drop_insurance_pdf_in_chat(
-                    context, cid, pdf_bytes, policy,
-                    caption="🛡 Insurance card — $100 add-on. NOT emailed to the client yet.",
-                )
-                if login_txt:
+                    context, cid, pdf_bytes, policy, caption=caption)
+                if note:
                     try:
                         await context.bot.send_message(
-                            chat_id=cid, text=login_txt,
-                            reply_markup=_insurance_email_keyboard(str(fresh["id"])),
+                            chat_id=cid, text=note,
+                            reply_markup=_insurance_card_keyboard(fresh),
                         )
                     except Exception:
                         pass
@@ -15669,7 +15873,8 @@ async def _submit_lead_from_review(message, context, user_id, data):
                 continue
             await asyncio.to_thread(db.create_group_lead_offer, lead["id"], gid, group_chat_id=str(chat_id), group_message_id=None)
             try:
-                msg = await context.bot.send_message(
+                msg = await _send_md_or_plain(
+                    context,
                     chat_id=chat_id,
                     text=group_offer_message,
                     parse_mode="Markdown",
@@ -15680,7 +15885,8 @@ async def _submit_lead_from_review(message, context, user_id, data):
                 wait_s = int(getattr(e, "retry_after", 1) or 1)
                 await asyncio.sleep(wait_s)
                 try:
-                    msg = await context.bot.send_message(
+                    msg = await _send_md_or_plain(
+                        context,
                         chat_id=chat_id,
                         text=group_offer_message,
                         parse_mode="Markdown",
@@ -15841,7 +16047,8 @@ async def handle_group_selection(update: Update, context: ContextTypes.DEFAULT_T
             # Create offer row first; we'll fill message IDs after sending.
             await asyncio.to_thread(db.create_group_lead_offer, lead["id"], gid, group_chat_id=str(chat_id), group_message_id=None)
             try:
-                msg = await context.bot.send_message(
+                msg = await _send_md_or_plain(
+                    context,
                     chat_id=chat_id,
                     text=group_offer_message,
                     parse_mode="Markdown",
@@ -15855,7 +16062,8 @@ async def handle_group_selection(update: Update, context: ContextTypes.DEFAULT_T
                 logger.warning("Broadcast rate-limited for %s; retrying in %ss", g.get("group_name"), wait_s)
                 await asyncio.sleep(wait_s)
                 try:
-                    msg = await context.bot.send_message(
+                    msg = await _send_md_or_plain(
+                        context,
                         chat_id=chat_id,
                         text=group_offer_message,
                         parse_mode="Markdown",
@@ -17039,6 +17247,55 @@ def _lead_already_insured(lead: dict) -> bool:
     return not _vehicle_needs_coverage(merged)
 
 
+INSURANCE_LINE_YES = "🛡 Insurance: ✅ YES — TriState coverage ($100 add-on)"
+INSURANCE_LINE_NONE = "⚠️ Insurance: NONE on file"
+INSURANCE_LINE_AT_TAG = ("🛡 Insurance: TriState coverage — added when the tag "
+                         "is made (no insurer given)")
+
+
+def _insurance_status_line(lead: dict, *, markdown: bool = False) -> str:
+    """One line, from the lead's own data, saying whether the client is insured.
+
+    Asked for: "show clearly if they opt in for insurance". Four answers only:
+    our cover (the lead is armed -- paid on the website, ticked on the form, or
+    armed when its tag was built), the customer's own insurer AND policy (read
+    exactly as _lead_already_insured reads them: the stored phase1 data, then the
+    columns), our cover still to come (no insurer given, and not a website order
+    that paid tag-only -- _tag_fields_from_lead arms it when the tag is built),
+    or nothing on file (a website order that paid tag-only). ``markdown=True`` escapes the customer's
+    insurer and policy for a legacy-Markdown message.
+    """
+    lead = lead or {}
+    if lead.get("wants_insurance"):
+        return INSURANCE_LINE_YES
+    if _lead_already_insured(lead):
+        try:
+            phase1 = _phase1_from_stored_lead(lead) or {}
+        except Exception:
+            phase1 = {}
+        insurer, policy = (
+            str(phase1.get(key) or lead.get(key) or "").strip()
+            for key in ("insurance_company", "insurance_policy_number"))
+        if markdown:
+            insurer, policy = _telegram_md1_escape(insurer), _telegram_md1_escape(policy)
+        return f"🛡 Insurance: customer's own — {insurer}, policy {policy}"
+    if not _website_lead_not_paid_for_cover(lead):
+        # The same test _tag_fields_from_lead makes before arming our cover, so
+        # this line and what the tag does can never disagree. "NONE" here would
+        # tell the team the opposite of what is about to happen.
+        return INSURANCE_LINE_AT_TAG
+    return INSURANCE_LINE_NONE
+
+
+def _group_offer_insurance_line(lead: dict) -> str:
+    """The insurance line for a team offer, newline included -- or "" for an
+    issuer's own lead (no external_order_id), whose offer stays exactly as it
+    was: its cover is decided later, when its tag is built."""
+    if not str((lead or {}).get("external_order_id") or "").strip():
+        return ""
+    return _insurance_status_line(lead, markdown=True) + "\n"
+
+
 _PORTAL_PW_ALPHABET = string.ascii_letters + string.digits + "#!@"
 
 
@@ -17212,10 +17469,13 @@ async def _build_and_send_insurance_card(
     pdf_bytes = None
 
     email = (lead.get("email") or "").strip()
-    if not email:
-        return (False, None, "Lead has no email on file.", None, None, pdf_bytes)
-
     card_state = sd.detect_card_state(lead)
+    # The NY card is built right here, so it can be issued before anyone has the
+    # client's email: only the portal account and the email itself need one, and
+    # those wait (see the no-email return after the PDF). NJ's card comes from an
+    # upstream app that emails the client itself -- and nothing can email nobody.
+    if not email and (card_state == "NJ" or send_client_email):
+        return (False, None, "Lead has no email on file.", None, None, pdf_bytes)
 
     raw_vehicle = (lead.get("vehicle_details") or "").splitlines()
     # vehicle_details layout (per parse_phase1_structured/_clean_vin_and_car):
@@ -17402,6 +17662,12 @@ async def _build_and_send_insurance_card(
     except Exception as e:
         logger.exception("Failed to build FS-20 PDF for lead %s: %s", lead.get("id"), e)
         return (False, policy_number, f"Could not build insurance card PDF: {e}", None, None, None)
+
+    if not email:
+        # Issued with no client email yet: the policy and the card exist and go to
+        # the team. The portal account and the client's email follow, under this
+        # same policy number, once /email supplies the address.
+        return (True, policy_number, None, None, None, pdf_bytes)
 
     phone_raw = (lead.get("phone_number") or "").strip()
     portal_payload = {
@@ -17756,6 +18022,18 @@ def _insurance_email_keyboard(lead_id: str) -> InlineKeyboardMarkup:
         "📧 Email insurance to client", callback_data=f"{INS_EMAIL_CB}{lead_id}")]])
 
 
+def _insurance_card_keyboard(lead: dict) -> InlineKeyboardMarkup:
+    """The one button under an insurance card: release it when there is an
+    address to send it to, otherwise ask for the address. "Add client email" is
+    the /email picker's own button (setem_ + lead uuid = 42 bytes, inside
+    Telegram's 64), whose tap hands back the ready-to-send "/email <REF> " line."""
+    lead_id = str((lead or {}).get("id") or "")
+    if str((lead or {}).get("email") or "").strip():
+        return _insurance_email_keyboard(lead_id)
+    return InlineKeyboardMarkup([[InlineKeyboardButton(
+        "📧 Add client email", callback_data=f"{SET_EMAIL_CB}{lead_id}")]])
+
+
 def _lead_awaiting_tag_email(lead: dict) -> bool:
     """The client's copy of the tag could be released, and has not been.
 
@@ -17790,6 +18068,81 @@ def _insurance_effective_date(stamp) -> Optional[object]:
         return ny_date(stamp)
     except (TypeError, ValueError):
         return None
+
+
+def _insurance_card_awaits_client_email(lead: dict) -> bool:
+    """A NY card issued before the client's email existed (see
+    _maybe_ride_insurance_with_tag): its policy is stored and the card is out,
+    but insurance_card_sent_to_email is empty -- so no portal account yet -- and
+    nothing was released. NJ never qualifies: that card is only ever issued with
+    an address, and rebuilding it would have its issuer email the client."""
+    if not (lead and lead.get("wants_insurance")
+            and str(lead.get("insurance_card_sent_at") or "").strip()
+            and str(lead.get("insurance_card_policy_number") or "").strip()
+            and not str(lead.get("insurance_card_sent_to_email") or "").strip()
+            and not str(lead.get("insurance_emailed_at") or "").strip()):
+        return False
+    try:
+        from utils import state_detection as sd
+        return sd.detect_card_state(lead) != "NJ"
+    except Exception:
+        return False
+
+
+async def _finish_insurance_card_after_email(context, lead: dict, target_chat_ids) -> None:
+    """The client's email arrived for a card that was issued without one.
+
+    Provisions the portal account now, under the SAME policy number and
+    effective date (the builder reuses insurance_card_policy_number, and the
+    date is pinned to the issue), then puts "📧 Email insurance to client" in
+    front of everyone who was shown the card. No second card and no second
+    policy -- the PDF is rebuilt only to travel with the portal account and is
+    not posted again -- and the client is still not emailed: that stays a
+    person's tap, which insurance_emailed_at keeps to one email. Extra cars that
+    were waiting on the same address are issued first, as the tag send would.
+    """
+    lead_id = str((lead or {}).get("id") or "")
+    email = str((lead or {}).get("email") or "").strip()
+    if not lead_id or not email:
+        return
+    chats = await asyncio.to_thread(
+        _insurance_card_recipients, lead, target_chat_ids, supervisors=True)
+    await _ride_insurance_for_extra_vehicles(context, lead, chats)
+    try:
+        ok, policy, err, portal_email, portal_pw, _pdf = await _build_and_send_insurance_card(
+            lead,
+            send_client_email=False,
+            effective_on=_insurance_effective_date(lead.get("insurance_card_sent_at")),
+        )
+    except Exception as e:
+        logger.warning("insurance portal login for %s failed: %s", lead_id, e)
+        ok, policy, err, portal_email, portal_pw = False, None, str(e), None, None
+    if ok:
+        payload = {
+            "insurance_card_sent_to_email": email,
+            "insurance_card_error": None,
+            "portal_email": portal_email or email,
+            "portal_password": portal_pw,
+        }
+        text = _insurance_login_block(
+            policy, portal_email or email, portal_pw,
+            bool(lead.get("portal_password_unchanged")), emailed=False)
+    else:
+        payload = {"insurance_card_error": (err or "Unknown error")[:500]}
+        text = ("🛡 Client email added, but the insurance portal login could not "
+                f"be set up: {err or 'unknown error'}\n"
+                "The card and its policy are unchanged — 📧 Email insurance to "
+                "client tries the portal again when it sends.")
+    try:
+        await asyncio.to_thread(db.update_lead, lead_id, payload)
+    except Exception as e:
+        logger.warning("Could not persist the insurance portal login for %s: %s", lead_id, e)
+    keyboard = _insurance_email_keyboard(lead_id)
+    for cid in chats:
+        try:
+            await context.bot.send_message(chat_id=cid, text=text, reply_markup=keyboard)
+        except Exception:
+            pass
 
 
 async def handle_insurance_email_to_client(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -18048,8 +18401,9 @@ def _dump_events(limit: int = 400) -> list:
                 and not str(r.get("tag_email_approved_at") or "").strip()):
             add(r.get("created_at"), "⚠️",
                 f"has {email} — tag NEVER sent to the client")
-        if r.get("wants_insurance") and not str(
-                r.get("insurance_card_sent_at") or "").strip() and not email:
+        # A NY card can now be issued before the email exists, so "card
+        # issued" no longer means the client has it: no address is the gap.
+        if r.get("wants_insurance") and not email:
             add(r.get("created_at"), "⚠️", "wants insurance — no client email")
         if str(r.get("deleted_at") or "").strip():
             add(r.get("deleted_at"), "🗑",
@@ -18182,6 +18536,14 @@ async def cmd_set_client_email(update: Update, context: ContextTypes.DEFAULT_TYP
         # right here, with the release button under it.
         await message.reply_text(reply + "\n🛡 Issuing the held insurance card…")
         await _maybe_ride_insurance_with_tag(context, fresh, [message.chat_id])
+        return
+    if _insurance_card_awaits_client_email(fresh):
+        # The card went out before this address existed. Same policy, same
+        # dates: only the portal login and the release button were missing.
+        await message.reply_text(
+            reply + "\n🛡 The insurance card was issued without an email — "
+                    "setting up the client's portal login now…")
+        await _finish_insurance_card_after_email(context, fresh, [message.chat_id])
         return
     if _lead_awaiting_insurance_email(fresh):
         reply += "\n🛡 Now tap 📧 Email insurance to client to send it."
@@ -19127,7 +19489,11 @@ async def handle_accept_lead(update: Update, context: ContextTypes.DEFAULT_TYPE)
         except Exception as e:
             logger.warning("Could not send driver receipt-strike follow-up: %s", e)
     # Forward acceptance message to group chat only (not per-group / global supervisory — reduces duplicate spam).
-    extra_safe = _sanitize_phones_for_send(lead.get("extra_info") or "")
+    # Customer text is escaped for the legacy-Markdown template, and the send
+    # falls back to plain text if anything still fails to parse -- one _ in the
+    # delivery time used to drop this notice silently.
+    extra_safe = _telegram_md1_escape(
+        _sanitize_phones_for_send(lead.get("extra_info") or ""))
     spec_grp = _lead_issuer_note(lead)
     acceptance_message = (
         "✅ **Lead Accepted**\n\n"
@@ -19136,12 +19502,15 @@ async def handle_accept_lead(update: Update, context: ContextTypes.DEFAULT_TYPE)
         f"📋 Reference ID: `{lead.get('reference_id', 'N/A')}`"
     )
     if spec_grp:
-        acceptance_message += f"\n📝 Issuers note: {_sanitize_phones_for_send(spec_grp)}"
+        acceptance_message += (
+            "\n📝 Issuers note: "
+            + _telegram_md1_escape(_sanitize_phones_for_send(spec_grp)))
     if group:
         group_telegram_id = group.get("group_telegram_id")
         if group_telegram_id:
             try:
-                await context.bot.send_message(
+                await _send_md_or_plain(
+                    context,
                     chat_id=group_telegram_id,
                     text=acceptance_message,
                     parse_mode="Markdown",
@@ -19474,7 +19843,8 @@ async def _reassign_lead_to(
             new_driver_name = str(target.get("driver_name") or "Driver").strip()
             try:
                 await asyncio.to_thread(db.create_lead_assignment, lead_id, target["id"], lead.get("group_id"))
-                await context.bot.send_message(
+                await _send_md_or_plain(
+                    context,
                     chat_id=cid,
                     text=_driver_offer_message_text(lead),
                     parse_mode="Markdown",
@@ -19507,8 +19877,8 @@ async def _reassign_lead_to(
                 continue
             try:
                 await asyncio.to_thread(db.create_lead_assignment, lead_id, d["id"], lead.get("group_id"))
-                await context.bot.send_message(
-                    chat_id=cid, text=offer_text, parse_mode="Markdown", reply_markup=kb
+                await _send_md_or_plain(
+                    context, chat_id=cid, text=offer_text, parse_mode="Markdown", reply_markup=kb
                 )
                 assigned_count += 1
             except Exception as e:
