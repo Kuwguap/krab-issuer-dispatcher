@@ -14399,7 +14399,14 @@ async def _due_ask(message, context: ContextTypes.DEFAULT_TYPE, state_data) -> i
 
 async def _ensure_due_before_notes(message, context: ContextTypes.DEFAULT_TYPE,
                                    user_id: int, state_data: dict) -> int:
-    """The gate. Returns None when nothing is needed, so the caller carries on."""
+    """Ask for a due time. Returns None when nothing is needed.
+
+    No longer on the entry funnel -- create_lead defaults every lead, so nobody
+    is stopped to answer this. Kept because the picker it opens is still the way
+    a real promised time gets set by hand, and because a future caller that DOES
+    want to ask should get the same "only ask for what is absent" rule rather
+    than writing its own.
+    """
     if not _due_missing(state_data):
         return None
     db.set_user_state(user_id, "phase1", state_data)
@@ -14479,13 +14486,11 @@ async def _prompt_issuer_special_request(message, context: ContextTypes.DEFAULT_
         await message.reply_text("❌ Phase 1 data not found. Please start over with /start")
         return ConversationHandler.END
     state_data = state["data"].copy()
-    # When is it due? Asked here because this is the single funnel all three
-    # live paths reach -- the price tapped mid-dispatch, _ensure_phone_price_
-    # before_files, and handle_phase2 -- so no path can skip it, and it runs
-    # after the price gate rather than beside it.
-    due = await _ensure_due_before_notes(message, context, user_id, state_data)
-    if due is not None:
-        return due
+    # The due-time question used to sit here, between the issuer and a finished
+    # lead. It no longer does: create_lead gives every lead a time -- one stated
+    # in its own notes, or an hour from now -- so asking bought a tap and told
+    # the office nothing it could not work out. The picker is still there for
+    # anyone who wants to promise a real time; it just never interrupts.
     # Normalize note placeholders so empty values stay clean downstream.
     for key in ("special_request_issuers", "special_request_drivers"):
         val = state_data.get(key)
@@ -21584,7 +21589,7 @@ async def _notify_supervisory_receipt_submission(
     client_name = _client_display_name_from_lead(lead)
     ref_plain = str(reference_id or "N/A")
     issuer_line = _lead_issuer_display_from_lead(lead)
-    caption = (
+    _caption = (
         ("🧾 Receipt REPLACED\n" if replacing_existing else "🧾 New receipt sent\n")
         + f"Reference: {ref_plain}\n"
         f"Group: {gn}\n"
@@ -21593,20 +21598,22 @@ async def _notify_supervisory_receipt_submission(
         f"Lead issued by: {issuer_line}"
     )
     if replacing_existing:
-        caption += "\n♻️ Replaces the previous receipt for this reference."
+        _caption += "\n♻️ Replaces the previous receipt for this reference."
     if uploaded_by_supervisor and supervisor_display_name:
-        caption += f"\nUploaded by supervisor: {supervisor_display_name}"
+        _caption += f"\nUploaded by supervisor: {supervisor_display_name}"
 
     # The receipt IS the payment signal for the $100 insurance add-on — put the
     # release button on the very message that shows the money arrived.
     ins_kb = None
     if _lead_awaiting_insurance_email(lead):
         ins_kb = _insurance_email_keyboard(str(lead.get("id")))
-        caption += ("\n🛡 $100 insurance add-on NOT emailed to the client yet — "
-                    "tap below once the receipt is confirmed.")
+        _caption += ("\n🛡 $100 insurance add-on NOT emailed to the client yet — "
+                     "tap below once the receipt is confirmed.")
 
-    async def _send_caption_and_receipt(chat_id: int, label: str) -> None:
+    async def _send_caption_and_receipt(chat_id: int, label: str,
+                                        text: str | None = None) -> None:
         msg = update.message
+        caption = text if text is not None else _caption
         try:
             if receipt_file_id and msg and msg.photo:
                 await context.bot.send_photo(
@@ -21668,6 +21675,48 @@ async def _notify_supervisory_receipt_submission(
         if st_chat_id is not None and stk is not None and stk not in sent_norm:
             await _send_caption_and_receipt(st_chat_id, "ST")
             sent_norm.add(stk)
+
+    # The person who entered this client. They were the only party who never
+    # heard -- and they are the one the client rings to ask if it is done.
+    await _tell_the_lead_adder(context, update, lead, _caption,
+                               sent_norm=sent_norm,
+                               send=_send_caption_and_receipt)
+
+
+async def _tell_the_lead_adder(context, update, lead: dict, caption: str, *,
+                               sent_norm: set, send) -> bool:
+    """DM the issuer who entered this client. True when one was sent.
+
+    Never raises: a receipt is already stored by the time this runs, and an
+    unreachable issuer must not read as a failed upload.
+    """
+    raw = (lead or {}).get("user_id")
+    if raw is None:
+        return False
+    try:
+        adder = int(str(raw).strip())
+    except (TypeError, ValueError):
+        logger.info("receipt: lead %s has an unusable user_id %r",
+                    (lead or {}).get("id"), raw)
+        return False
+
+    key = _norm_chat_id(adder)
+    if key is None or key in sent_norm:
+        return False                     # they are a supervisory chat already
+    uploader = getattr(getattr(update, "effective_user", None), "id", None)
+    if uploader is not None and str(uploader) == str(adder):
+        return False                     # they uploaded it; they know
+
+    # Plain text: these go out with no parse_mode, so a tag would be shown, not
+    # rendered -- and a client's name is free text that would break the parse.
+    body = "\U0001f9fe Receipt in for your client\n" + caption
+    try:
+        await send(adder, "lead adder", body)
+        sent_norm.add(key)
+        return True
+    except Exception as e:
+        logger.warning("receipt: could not tell the lead adder %s: %s", adder, e)
+        return False
 
 
 async def handle_receipt_image_stray(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:

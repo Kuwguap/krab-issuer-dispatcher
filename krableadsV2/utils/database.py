@@ -251,6 +251,55 @@ def flush_user_states(timeout: float = 5.0) -> bool:
     return _STATES.flush(timeout=timeout)
 
 
+# How long a tag is assumed to take when nobody says otherwise. The office asked
+# for an hour; it is a real promise the board measures lateness against, so it
+# lives here as one named number rather than inline arithmetic.
+DEFAULT_DUE_HOURS = 1
+# What lands in expected_delivery_set_by, so the board can tell a promise from
+# an assumption without a second column.
+DUE_FROM_NOTES = "the lead"
+DUE_ASSUMED = f"assumed (+{DEFAULT_DUE_HOURS}h)"
+
+
+def apply_default_expected_delivery(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """Give a lead a due time if it has none. Mutates and returns the payload.
+
+    Total by construction: every failure path falls through to the +1h default,
+    because a lead that cannot be saved over a due-time detail is a far worse
+    outcome than a due time that is merely an assumption.
+    """
+    try:
+        if str(payload.get("expected_delivery_at") or "").strip():
+            return payload                      # somebody chose it; leave it alone
+    except Exception:
+        return payload
+
+    from datetime import timedelta
+
+    from utils.timezone import ny_now
+
+    try:
+        from utils.due_time import find_due_in_text
+        stated, _ = find_due_in_text(payload.get("extra_info"))
+    except Exception as e:                       # a bad note must not cost the lead
+        logger.warning("due default: could not read the notes: %s", e)
+        stated = None
+
+    if stated:
+        payload["expected_delivery_at"] = stated
+        if not str(payload.get("expected_delivery_set_by") or "").strip():
+            payload["expected_delivery_set_by"] = DUE_FROM_NOTES
+        return payload
+
+    try:
+        payload["expected_delivery_at"] = (
+            ny_now() + timedelta(hours=DEFAULT_DUE_HOURS)).isoformat()
+        payload["expected_delivery_set_by"] = DUE_ASSUMED
+    except Exception as e:
+        logger.warning("due default: could not stamp the default: %s", e)
+    return payload
+
+
 class Database:
     """Supabase database client wrapper."""
     
@@ -437,6 +486,11 @@ class Database:
 
         payload = dict(lead_data)
         self._scrub_bot_entrant(payload)
+        # Here rather than in the bot's funnel: there are five create sites in
+        # bot.py plus the website/API ingest, and a default that only covered
+        # the paths which used to prompt would leave website orders with no
+        # promised time at all.
+        apply_default_expected_delivery(payload)
         for attempt in (0, 1, 2):
             try:
                 response = self.client.table("leads").insert(payload).execute()

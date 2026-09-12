@@ -229,15 +229,24 @@ class TypingItTest(unittest.TestCase):
 
 class ItIsWiredIntoTheOneFunnelTest(unittest.TestCase):
 
-    def test_the_gate_sits_at_the_top_of_the_funnel(self):
-        """_prompt_issuer_special_request is the single point all three live
-        paths reach, so no path can skip the question."""
+    def test_the_funnel_no_longer_stops_to_ask(self):
+        """Reversed deliberately: "stop sending this message then send the lead
+        (make default 1 hour) unless stated otherwise in the lead".
+
+        create_lead now gives every lead a time, so the question bought a tap
+        and told the office nothing it could not work out. The picker survives
+        for anyone who wants to promise a real time on purpose."""
         src = (ROOT / "bot.py").read_text(encoding="utf-8")
         i = src.index("async def _prompt_issuer_special_request(")
         block = src[i:i + 1400]
-        self.assertIn("_ensure_due_before_notes(", block)
-        self.assertLess(block.index("_ensure_due_before_notes("),
-                        block.index("special_request_issuers"))
+        self.assertNotIn("_ensure_due_before_notes(", block)
+
+    def test_the_picker_is_still_reachable(self):
+        """Not asking is not the same as taking it away."""
+        src = (ROOT / "bot.py").read_text(encoding="utf-8")
+        self.assertIn("PH1_DUE_CB", src)
+        self.assertIn("_due_picker_keyboard(", src)
+        self.assertIn("handle_due_pick", src)
 
     def test_it_runs_downstream_of_the_phone_and_price_gate(self):
         """Both roads out of _ensure_phone_price_before_files end at the funnel:

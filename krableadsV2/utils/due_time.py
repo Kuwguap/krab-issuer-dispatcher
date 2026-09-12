@@ -234,3 +234,53 @@ def parse_due(text, *, now=None):
         # a lead quietly promised for tomorrow is how a wrong "late" is born.
         note = "Tomorrow — " + note
     return when.isoformat(), note
+
+
+# A day word is only ever a QUALIFIER here -- it sharpens a clock reading that
+# follows it. On its own it names a date, not a moment.
+_DAY_WORD = (r"(?:today|tonight|tomorrow|tmr|tmrw|"
+             + "|".join(sorted(_WEEKDAYS, key=len, reverse=True)) + r")")
+# 3pm, 3:30pm, 15:00. An hour with no am/pm and no colon is NOT here on purpose:
+# "call 3" is not three o'clock.
+_CLOCK = r"(?:\d{1,2}\s*(?:a\.?m\.?|p\.?m\.?)|\d{1,2}:\d{2}\s*(?:a\.?m\.?|p\.?m\.?)?)"
+_ELAPSED = r"in\s+\d{1,3}\s*(?:min(?:ute)?s?|hrs?|hours?|days?)"
+
+_STATED_RE = re.compile(
+    r"(?:(?:by|before|at|around|due|deliver(?:y|ed)?|eta|needs?\s+to\s+be\s+there)\s+)?"
+    r"(?:" + _DAY_WORD + r"\s+)?" + _CLOCK
+    + r"|" + _ELAPSED,
+    re.I,
+)
+# A run this long is an account number or a phone, whatever else surrounds it.
+_LONG_DIGITS_RE = re.compile(r"\d{5,}")
+
+
+def find_due_in_text(text, *, now=None):
+    """(iso, note) for a time STATED in free-form notes, else (None, reason).
+
+    Every candidate goes through parse_due, so a fragment this finds but that
+    module refuses is refused here too. Finding is the only new part.
+    """
+    raw = str(text or "").strip()
+    if not raw:
+        return None, "nothing written down"
+    # Work line by line: a time on one line and a date on another are not one
+    # answer, and joining them invents a promise.
+    for line in re.split(r"[\n;\u2022|]+", raw):
+        line = line.strip()
+        if not line:
+            continue
+        for m in _STATED_RE.finditer(line):
+            frag = m.group(0).strip(" .,-\u2013\u2014")
+            if not frag or _LONG_DIGITS_RE.search(frag):
+                continue
+            # Strip the lead-in word: parse_due reads "3pm", not "by 3pm".
+            frag = re.sub(
+                r"^(?:by|before|at|around|due|delivery|delivered|deliver|eta|"
+                r"needs?\s+to\s+be\s+there)\s+", "", frag, flags=re.I).strip()
+            if not frag:
+                continue
+            iso, note = parse_due(frag, now=now)
+            if iso:
+                return iso, note
+    return None, "no clear time in the notes"

@@ -140,11 +140,50 @@ class ThePortalPage(unittest.TestCase):
         self.assertIn('type="file"', body)
         self.assertIn("REF1", body)
 
-    def test_it_lets_them_use_the_camera(self):
+    def _page(self):
         with mock.patch.object(ad, "db", self._db()):
-            body = self.client.get(f"/r/{ad.receipt_token(LEAD)}").get_data(as_text=True)
+            return self.client.get(f"/r/{ad.receipt_token(LEAD)}").get_data(as_text=True)
+
+    def test_it_lets_them_use_the_camera(self):
+        body = self._page()
         self.assertIn("capture=", body)
         self.assertIn("accept=\"image/*\"", body)
+
+    def test_it_also_lets_them_choose_one_they_already_have(self):
+        """capture= does not HINT at the camera on a phone, it REPLACES the file
+        picker with it. With it on the only input, a driver who had already
+        photographed the receipt had to photograph it again -- while the page's
+        own text offered a camera roll it had made unreachable."""
+        body = self._page()
+        self.assertIn("Take a photo", body)
+        self.assertIn("Choose from gallery", body)
+        gallery = body.split("Choose from gallery", 1)[1].split("</label>", 1)[0]
+        self.assertIn('type="file"', gallery)
+        self.assertNotIn("capture=", gallery)
+
+    def test_both_ways_post_the_same_field(self):
+        """The server reads one field name. Two inputs that disagree would make
+        the gallery button silently upload nothing."""
+        body = self._page()
+        inputs = [seg for seg in body.split("<input")[1:] if 'type="file"' in seg]
+        self.assertGreaterEqual(len(inputs), 3)          # camera, gallery, noscript
+        for seg in inputs:
+            with self.subTest(seg=seg[:70]):
+                self.assertIn('name="receipt"', seg)
+
+    def test_it_still_works_with_no_javascript(self):
+        """One driver, one bar of signal. A JS-only upload is no upload."""
+        body = self._page()
+        self.assertIn("<noscript>", body)
+        noscript = body.split("<noscript>", 1)[1].split("</noscript>", 1)[0]
+        self.assertIn('type="file"', noscript)
+        self.assertIn("type=\"submit\"", noscript)
+        self.assertNotIn("capture=", noscript)
+
+    def test_a_pdf_receipt_is_offered_where_the_server_accepts_one(self):
+        """_RECEIPT_TYPES has taken PDFs all along; the input never said so."""
+        self.assertIn("application/pdf", ad._RECEIPT_TYPES)
+        self.assertIn("accept=\"image/*,application/pdf\"", self._page())
 
     def test_a_bad_link_is_refused(self):
         r = self.client.get("/r/not-a-real-token")

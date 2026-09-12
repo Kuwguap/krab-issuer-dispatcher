@@ -3206,6 +3206,17 @@ _PORTAL_PAGE = """<!doctype html>
  button { width: 100%; margin-top: 18px; padding: 15px; font-size: 1.05rem;
           font-weight: 600; border: 0; border-radius: 10px; background: #0b7;
           color: #fff; }
+ /* The two ways in. Same size and weight: neither is the "real" one. */
+ .pick { display: flex; flex-direction: column; gap: 12px; margin-top: 4px; }
+ .pick label { display: flex; align-items: center; justify-content: center;
+               gap: 10px; margin: 0; padding: 17px; font-size: 1.05rem;
+               font-weight: 600; border-radius: 10px; cursor: pointer;
+               border: 2px solid transparent; background: #0b7; color: #fff; }
+ .pick label.alt { background: transparent; border-color: #0b7; color: #0b7; }
+ @media (prefers-color-scheme: dark) { .pick label.alt { color: #2dd4a7;
+                                       border-color: #2dd4a7; } }
+ .pick .nm { display: block; margin-top: 10px; font-size: .95rem; opacity: .8;
+             text-align: center; word-break: break-all; }
  button:disabled { opacity: .5; }
  .ok { color: #0a7; font-weight: 600; }
  .err { color: #c33; font-weight: 600; }
@@ -3221,15 +3232,133 @@ _PORTAL_PAGE = """<!doctype html>
   {% elif error %}
     <p class="err">{{ error }}</p>
   {% else %}
-    <form method="post" enctype="multipart/form-data">
-      <label for="f">Photo of the receipt</label>
-      <input id="f" type="file" name="receipt" accept="image/*" capture="environment" required>
-      <button type="submit">Upload</button>
+    <form id="up" method="post" enctype="multipart/form-data">
+      <label>Photo of the receipt</label>
+      <div class="pick">
+        <!-- capture= REPLACES the picker with the camera on iOS and Android, so
+             it belongs on the camera button and must never be on the other. -->
+        <label for="cam">\U0001f4f7 Take a photo
+          <input id="cam" type="file" name="receipt"
+                 accept="image/*" capture="environment" hidden></label>
+        <label class="alt" for="lib">\U0001f5bc\ufe0f Choose from gallery
+          <input id="lib" type="file" name="receipt"
+                 accept="image/*,application/pdf" hidden></label>
+      </div>
+      <span class="nm" id="nm"></span>
+      <button id="go" type="submit" hidden>Upload</button>
+      <noscript>
+        <!-- No JS: one plain input, no capture, so the phone still offers both. -->
+        <input type="file" name="receipt" accept="image/*,application/pdf" required>
+        <button type="submit">Upload</button>
+      </noscript>
     </form>
-    <p class="hint">Take the photo now, or pick one from your camera roll.
+    <script>
+    (function () {
+      var form = document.getElementById('up'), nm = document.getElementById('nm'),
+          go = document.getElementById('go'), sent = false;
+      function pick(other) {
+        return function () {
+          if (!this.files || !this.files.length) return;
+          // Only ONE input may carry a file, or the browser posts two "receipt"
+          // parts and the server reads whichever came first.
+          other.value = '';
+          nm.textContent = this.files[0].name + ' \u2014 sending\u2026';
+          go.hidden = false;
+          if (sent) return;            // a double change event must not double-post
+          sent = true;
+          if (form.requestSubmit) { form.requestSubmit(); } else { form.submit(); }
+        };
+      }
+      var cam = document.getElementById('cam'), lib = document.getElementById('lib');
+      cam.addEventListener('change', pick(lib));
+      lib.addEventListener('change', pick(cam));
+    })();
+    </script>
+    <p class="hint">Take it now, or send one you already have — a photo or a PDF.
        It is saved straight to the office — no Telegram, and the link does not expire.</p>
   {% endif %}
 </div></body></html>"""
+
+
+def _tg_send_message(chat_id, text: str) -> bool:
+    """One plain message from the admin service. Never raises."""
+    import requests as _rq
+    from config import Config
+
+    token = (Config.TELEGRAM_BOT_TOKEN or "").strip()
+    if not token or chat_id in (None, ""):
+        return False
+    try:
+        r = _rq.post(
+            f"https://api.telegram.org/bot{token}/sendMessage",
+            json={"chat_id": chat_id, "text": text,
+                  "disable_web_page_preview": True},
+            timeout=20,
+        )
+        if r.ok and (r.json() or {}).get("ok"):
+            return True
+        logger.warning("portal notify: sendMessage to %s failed (%s): %s",
+                       chat_id, r.status_code, r.text[:160])
+    except Exception as e:
+        logger.warning("portal notify: sendMessage to %s error: %s", chat_id, e)
+    return False
+
+
+def _notify_portal_receipt(lead_id: str, reference_id: str) -> int:
+    """Tell the lead's adder (and the supervisors) a receipt just came in.
+
+    Returns how many chats were reached, for the log. Every failure is
+    swallowed: the receipt is stored either way, and the driver's page must not
+    report an upload problem that did not happen.
+    """
+    reached, seen = 0, set()
+    try:
+        row = (db.client.table("leads")
+               .select("id, reference_id, user_id, telegram_name, "
+                       "vehicle_details, delivery_details")
+               .eq("id", lead_id).limit(1).execute())
+        lead = (row.data or [None])[0] or {}
+    except Exception as e:
+        logger.warning("portal notify: could not read lead %s: %s", lead_id, e)
+        lead = {}
+
+    ref = (reference_id or lead.get("reference_id") or "N/A").strip() or "N/A"
+    link = f"{RECEIPT_PORTAL_BASE}/receipt/{lead_id}"
+    text = ("\U0001f9fe Receipt uploaded\n"
+            f"Reference: {ref}\n"
+            "Sent from the receipt link, not Telegram.\n"
+            f"{link}")
+
+    adder = lead.get("user_id")
+    if adder not in (None, ""):
+        try:
+            adder = int(str(adder).strip())
+        except (TypeError, ValueError):
+            adder = None
+        if adder is not None:
+            seen.add(adder)
+            if _tg_send_message(adder, "\U0001f9fe Receipt in for your client\n" + text):
+                reached += 1
+
+    try:
+        from config import Config
+        raw = (Config.SUPERVISORY_TELEGRAM_ID or "")
+    except Exception:
+        raw = ""
+    for part in str(raw).replace(";", ",").split(","):
+        cid = part.strip().lstrip("=").strip()
+        if not cid:
+            continue
+        try:
+            cid_val = int(cid)
+        except ValueError:
+            continue
+        if cid_val in seen:
+            continue
+        seen.add(cid_val)
+        if _tg_send_message(cid_val, text):
+            reached += 1
+    return reached
 
 
 @app.route("/r/<token>", methods=["GET", "POST"])
@@ -3309,6 +3438,13 @@ def receipt_portal(token):
     except Exception as e:
         logger.warning("receipt portal: status advance failed for %s: %s", lead_id, e)
     logger.info("Receipt stored from portal for lead %s (%s bytes)", lead_id, len(data))
+    # Last, and swallowed whole: the bytes are safe by now, and a stale chat id
+    # must never show a driver an upload error that did not happen.
+    try:
+        reached = _notify_portal_receipt(lead_id, reference_id)
+        logger.info("Receipt from portal for %s announced to %d chat(s)", lead_id, reached)
+    except Exception as e:
+        logger.warning("receipt portal: could not announce %s: %s", lead_id, e)
     return render_template_string(
         _PORTAL_PAGE, heading="Receipt received", reference_id=reference_id,
         done=True, error="", img_url=f"/receipt/{lead_id}")
