@@ -464,7 +464,11 @@ class SupervisorsHearAboutEveryReleaseTest(unittest.IsolatedAsyncioTestCase):
         body = body.split("\nasync def ", 1)[0]
         self.assertIn("Cash payment released to", body)
         self.assertIn("Cash payment paid by", body)
-        self.assertIn("await _tell_supervisors(context, note)", body)
+        # The note now goes out with the actions it is about, so the call spans
+        # lines. What matters is unchanged: `note` is what supervisors are told.
+        self.assertIn("await _tell_supervisors(", body)
+        self.assertIn("context, note,", body)
+        self.assertIn("reply_markup=_lead_alert_keyboard(lead, receipt=True, add=True)", body)
         # Only once the tag actually reached the driver.
         self.assertIn("if driver_ok:", body)
 

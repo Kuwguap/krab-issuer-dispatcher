@@ -2326,16 +2326,81 @@ class Database:
         """True when appeals migration marked the lead excluded (column may be absent)."""
         return bool((lead or {}).get("exclude_from_count"))
 
+    def get_driver_accepted_receipt_rows(self, driver_id: str) -> list:
+        """Everything this driver has accepted, classified, newest first-ish.
+
+        [{lead_id, reference_id, lead, accepted_at, has_receipt, waived}]
+
+        Unlike get_driver_pending_receipts this filters NOTHING. An owed receipt
+        is by definition one with no receipt_image_url, so a "show me their
+        receipts" built on the pending list can only ever show an empty screen.
+        The caller needs all three groups to say anything useful.
+
+        The accepted_at retry below is copied deliberately: ordering must never
+        cost the rows themselves.
+        """
+        if not self._check_tables_exist():
+            return []
+        try:
+            lead_embed = (
+                "lead:leads(reference_id, receipt_image_url, vehicle_details, "
+                "delivery_details, extra_info)"
+            )
+
+            def _select(cols):
+                return self.client.table("lead_assignments").select(cols).eq(
+                    "driver_id", driver_id).eq("status", "accepted").execute()
+
+            try:
+                r = _select("lead_id, accepted_at, " + lead_embed)
+            except Exception as e:
+                logger.warning(
+                    "get_driver_accepted_receipt_rows: retrying without accepted_at: %s", e)
+                r = _select("lead_id, " + lead_embed)
+
+            rows = []
+            for row in r.data or []:
+                lead = row.get("lead") or {}
+                rows.append({
+                    "lead_id": row.get("lead_id"),
+                    "reference_id": lead.get("reference_id") or "N/A",
+                    "lead": lead,
+                    "accepted_at": row.get("accepted_at"),
+                    "has_receipt": bool(lead.get("receipt_image_url")),
+                    "waived": False,
+                })
+            waived = self._waived_lead_ids([x["lead_id"] for x in rows])
+            for x in rows:
+                x["waived"] = str(x["lead_id"]) in waived
+            return rows
+        except Exception as e:
+            logger.error("get_driver_accepted_receipt_rows: %s", e)
+            return []
+
     def get_driver_pending_receipts(self, driver_id: str) -> list:
-        """Accepted assignments for this driver where lead has no receipt. Returns list of {reference_id, lead_id, lead}."""
+        """Accepted assignments for this driver where lead has no receipt. Returns list of {reference_id, lead_id, lead, accepted_at}."""
         if not self._check_tables_exist():
             return []
         try:
             # Do not select appeal_status / exclude_from_count here — production DBs that
             # have not run migration_lead_appeals.sql will 42703 and return [] for all drivers.
-            r = self.client.table("lead_assignments").select(
-                "lead_id, lead:leads(reference_id, receipt_image_url, vehicle_details, delivery_details, extra_info, special_request_note, special_request_issuers, special_request_drivers)"
-            ).eq("driver_id", driver_id).eq("status", "accepted").execute()
+            lead_embed = (
+                "lead:leads(reference_id, receipt_image_url, vehicle_details, delivery_details, "
+                "extra_info, special_request_note, special_request_issuers, special_request_drivers)"
+            )
+
+            def _select(cols):
+                return self.client.table("lead_assignments").select(cols).eq(
+                    "driver_id", driver_id).eq("status", "accepted").execute()
+
+            try:
+                # accepted_at only orders the list (the suspension alert's "most recent")...
+                r = _select("lead_id, accepted_at, " + lead_embed)
+            except Exception as e:
+                # ...so it must never cost the count. [] here means "owes nothing",
+                # which silently lifts every suspension -- ask again exactly as before.
+                logger.warning("get_driver_pending_receipts: retrying without accepted_at: %s", e)
+                r = _select("lead_id, " + lead_embed)
             unpaid = []
             for row in r.data or []:
                 lead = row.get("lead") or {}
@@ -2345,6 +2410,7 @@ class Database:
                     "lead_id": row.get("lead_id"),
                     "reference_id": lead.get("reference_id") or "N/A",
                     "lead": lead,
+                    "accepted_at": row.get("accepted_at"),
                 })
             # The waiver, asked for separately — the embedded select above cannot
             # carry exclude_from_count without breaking un-migrated DBs, which left

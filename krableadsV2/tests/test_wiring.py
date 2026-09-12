@@ -15,6 +15,7 @@ Run:  venv\Scripts\python.exe -m pytest tests/test_wiring.py -q
 """
 import importlib.util
 import os
+import re
 import sys
 import unittest
 from pathlib import Path
@@ -160,6 +161,27 @@ class EveryNewButtonReachesAHandlerTest(unittest.TestCase):
                 for b in row]
         self.assertEqual([f"ins_email_{LEAD}"], data)
         self.assertIn('pattern=r"^ins_email_"', src)
+
+    def test_every_suspension_action_button_reaches_its_handler(self):
+        """These ride on an alert that outlives several redeploys, so they are
+        registered top-level -- and the pattern has to admit all six."""
+        src = (ROOT / "bot.py").read_text(encoding="utf-8")
+        m = re.search(
+            r"CallbackQueryHandler\(\s*handle_suspension_actions,\s*"
+            r'pattern=(r"[^"]+"\s*(?:\n\s*r"[^"]+"\s*)*)\)', src)
+        self.assertIsNotNone(m, "handle_suspension_actions is not registered")
+        pat = re.compile("".join(re.findall(r'r"([^"]+)"', m.group(1))))
+        d = bot._short_uuid("cccccccc-3333-4333-8333-cccccccccccc")
+        lead = bot._short_uuid("11111111-1111-4111-8111-111111111111")
+        emitted = [b.callback_data for row in
+                   bot._suspension_action_rows("cccccccc-3333-4333-8333-cccccccccccc")
+                   for b in row]
+        self.assertEqual(3, len(emitted))
+        for data in emitted + [bot.SUSP_LIFT_OK_CB + d, bot.SUSP_EXC_ONE_CB + d + lead,
+                               bot.SUSP_UNEXC_ONE_CB + d + lead]:
+            with self.subTest(data=data):
+                self.assertTrue(pat.match(data), data)
+                self.assertLess(len(data.encode("utf-8")), 64, data)
 
     def test_setclientemail_is_registered(self):
         """Under both names: /email is what it is called now, and

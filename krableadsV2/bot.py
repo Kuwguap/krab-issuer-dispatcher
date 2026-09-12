@@ -1714,7 +1714,8 @@ async def _deliver_skip_dispatch(context, lead: dict, driver: dict, *,
             f"↔️ <b>{_dname_h}</b> paid for <code>{_ref_h}</code>, which "
             f"{html.escape(str(held_by or 'someone else'), quote=False)} had accepted."
             + ("\nThe paid driver now holds it." if booked else
-               "\n<b>The takeover FAILED — this tag is paid for and undelivered.</b>")))
+               "\n<b>The takeover FAILED — this tag is paid for and undelivered.</b>")),
+            reply_markup=_lead_alert_keyboard(lead, reassign=True, receipt=True))
     if not booked and held_by:
         logger.warning("skip dispatch: %s is already held by %s — refusing", ref, held_by)
         if notify_chat_id:
@@ -1733,7 +1734,8 @@ async def _deliver_skip_dispatch(context, lead: dict, driver: dict, *,
             await _tell_supervisors(context, (
                 f"❌ <b>Paid and undelivered</b> — <code>{_ref_h}</code> is held by "
                 f"{html.escape(str(held_by), quote=False)}, so {_dname_h} paid and "
-                f"cannot be sent it."))
+                f"cannot be sent it."),
+                reply_markup=_lead_alert_keyboard(lead, reassign=True, release=True))
         return False
     if not booked:
         # (False, None) is "could not tell", not "somebody else has it" — a
@@ -1857,7 +1859,9 @@ async def _deliver_skip_dispatch(context, lead: dict, driver: dict, *,
         else:
             note = (f"💵 Cash payment paid by <b>{_dname_h}</b>"
                     f"\n📋 Ref: <code>{_ref_h}</code>")
-        await _tell_supervisors(context, note)
+        await _tell_supervisors(
+            context, note,
+            reply_markup=_lead_alert_keyboard(lead, receipt=True, add=True))
     elif not notify_chat_id:
         # how="paid" has no operator chat to report into, so this is the last
         # chance to tell anyone that money was taken and nothing was delivered.
@@ -1866,7 +1870,8 @@ async def _deliver_skip_dispatch(context, lead: dict, driver: dict, *,
             f"\n📋 Ref: <code>{_ref_h}</code>"
             + ("\n💰 <b>The deposit was already taken.</b>" if how == "paid" else "")
             + f"\nCheck their Telegram id in /settings, and whether the bot is "
-              f"allowed to send documents to that chat."))
+              f"allowed to send documents to that chat."),
+            reply_markup=_lead_alert_keyboard(lead, release=True, reassign=True))
     return driver_ok
 
 
@@ -1974,7 +1979,9 @@ async def _instant_tag_link_after_accept(context, lead: dict, driver: dict) -> N
                 f"({html.escape(str(err or 'unknown'), quote=False)}).")
         if hint:
             note += NL + "💡 " + hint
-        await _tell_supervisors(context, note)
+        await _tell_supervisors(
+            context, note,
+            reply_markup=_lead_alert_keyboard(lead, release=True, reassign=True))
         return
     # The LINK itself, arrowed, and no button. Accept was already the tap; a
     # second button to press before the payment page opens is one tap too many,
@@ -2031,7 +2038,64 @@ def _all_supervisory_chat_ids() -> list:
     return out
 
 
-async def _tell_supervisors(context, text: str, *, skip=None) -> None:
+def _safe_inline_keyboard(rows) -> "InlineKeyboardMarkup | None":
+    """Keep only the buttons Telegram will actually accept.
+
+    Telegram refuses the ENTIRE keyboard over one callback_data above 64 bytes,
+    and a refused keyboard takes the message with it. An alert is worth more
+    than any one button on it, so the bad one is dropped and the rest ship.
+    """
+    kept = []
+    for row in rows or []:
+        good = []
+        for b in row or []:
+            if b is None:
+                continue
+            data = getattr(b, "callback_data", None)
+            if data is not None and len(str(data).encode("utf-8")) > 64:
+                logger.warning("dropping oversize button %r (%d bytes)",
+                               getattr(b, "text", "?"), len(str(data).encode("utf-8")))
+                continue
+            good.append(b)
+        if good:
+            kept.append(good)
+    return InlineKeyboardMarkup(kept) if kept else None
+
+
+def _lead_alert_keyboard(lead: dict, *, reassign=False, add=False, email=False,
+                         receipt=False, release=False):
+    """The actions a supervisor can take on the lead an alert is about.
+
+    SYNC AND PURE on purpose -- see this module's note. Every prefix here
+    already exists and is already redeploy-safe (top-level or an entry point),
+    so attaching them adds no routing and cannot be killed by a restart.
+
+    Honest naming: there is no post-submit lead editor in this bot. ph1edit_*
+    callbacks are unparameterised, live in user_data, and their Submit creates a
+    NEW lead. So the closest true thing to "Edit" is "Add/fix client email".
+    """
+    lid = str((lead or {}).get("id") or "").strip()
+    rows = []
+    if not lid:
+        return None
+    if reassign:
+        rows.append([InlineKeyboardButton("\U0001f501 Reassign", callback_data=f"reassign_lead_{lid}")])
+    if add:
+        rows.append([InlineKeyboardButton("\u2795 Add another tag", callback_data=f"another_tag_{lid}")])
+    if email:
+        rows.append([InlineKeyboardButton("\U0001f4e7 Add/fix client email", callback_data=f"setem_{lid}")])
+    if receipt:
+        ref = str((lead or {}).get("reference_id") or "").strip()
+        if ref and ref.upper() != "N/A":
+            rows.append([InlineKeyboardButton(f"\U0001f4e4 Upload receipt \u2014 {ref}",
+                                              callback_data=f"receipt_for_{ref}")])
+    if release:
+        rows.append([InlineKeyboardButton("\U0001f4c4 Send the tag now",
+                                          callback_data=f"{INSTANT_PDF_CB}{lid}")])
+    return _safe_inline_keyboard(rows)
+
+
+async def _tell_supervisors(context, text: str, *, skip=None, reply_markup=None) -> None:
     """One line to every supervisor. Best effort — never fails a caller.
 
     Best effort is not the same as unaccountable. This used to return quietly
@@ -2050,9 +2114,12 @@ async def _tell_supervisors(context, text: str, *, skip=None) -> None:
         if key is None or key in seen or (skip is not None and key == _norm_chat_id(skip)):
             continue
         seen.add(key)
+        # Built conditionally so an alert with no keyboard makes exactly the
+        # call it made before this parameter existed.
+        _kb = {"reply_markup": reply_markup} if reply_markup is not None else {}
         try:
             await context.bot.send_message(chat_id=sid, text=text, parse_mode="HTML",
-                                           disable_web_page_preview=True)
+                                           disable_web_page_preview=True, **_kb)
             delivered += 1
         except Exception as e:
             logger.warning("could not tell supervisor %s: %s", sid, e)
@@ -2061,10 +2128,24 @@ async def _tell_supervisors(context, text: str, *, skip=None) -> None:
                 # the words matter more than the bold.
                 await context.bot.send_message(
                     chat_id=sid, text=re.sub(r"<[^>]+>", "", text),
-                    disable_web_page_preview=True)
+                    disable_web_page_preview=True, **_kb)
                 delivered += 1
             except Exception as e2:
-                logger.error("supervisor %s unreachable (plain retry too): %s", sid, e2)
+                logger.warning("supervisor %s: plain retry failed too: %s", sid, e2)
+                if not _kb:
+                    logger.error("supervisor %s unreachable: %s", sid, e2)
+                    continue
+                # Last resort: Telegram can refuse a keyboard and take the
+                # message with it. The words matter more than the buttons.
+                try:
+                    await context.bot.send_message(
+                        chat_id=sid, text=re.sub(r"<[^>]+>", "", text),
+                        disable_web_page_preview=True)
+                    delivered += 1
+                    logger.warning("supervisor %s got the alert without its buttons", sid)
+                except Exception as e3:
+                    logger.error("supervisor %s unreachable (no-keyboard retry too): %s",
+                                 sid, e3)
     if not delivered and seen:
         logger.error("supervisory notice reached NOBODY of %d target(s): %s",
                      len(seen), text[:160])
@@ -2334,7 +2415,8 @@ async def _warn_stuck_instant_tag(context, lead: dict, why: str, *, driver=None)
             f"\n\u2757 {html.escape(str(why), quote=False)}"
             f"\n\nThey have been charged and have nothing. Release it with the "
             f"password, or refund — the sweep keeps retrying every 20s until one "
-            f"of those happens."))
+            f"of those happens."),
+            reply_markup=_lead_alert_keyboard(lead, release=True, reassign=True))
     except Exception as e:
         logger.warning("could not escalate stuck instant tag %s: %s", lead_id, e)
 
@@ -2688,6 +2770,42 @@ def _get_suspended_driver_ids() -> set[str]:
     return s
 
 
+async def _lift_driver_suspension(
+    context: ContextTypes.DEFAULT_TYPE, driver_id, *, reply_message=None,
+) -> tuple:
+    """Lift a suspension the only way that works. Returns (lifted, waived).
+
+    Suspension is the union of two independent sources: the manual
+    drivers.is_suspended flag, and a count derived from unpaid receipts. Clear
+    the flag alone and the very next read re-suspends; excuse the receipts alone
+    and a hand-set flag keeps them out. So both, always.
+
+    `lifted` is READ BACK rather than assumed. set_driver_suspended returns
+    False both when the write failed and when the column was never migrated --
+    and in the second case the lift usually still worked, because nobody can be
+    manually suspended by a column that does not exist. Announcing a success we
+    did not verify is how a driver gets told they are free and still cannot take
+    a lead.
+    """
+    ok = await asyncio.to_thread(db.set_driver_suspended, driver_id, False)
+    waived = await asyncio.to_thread(db.waive_driver_pending_receipts, driver_id)
+    _bust_driver_caches()
+    still = str(driver_id) in (await asyncio.to_thread(_get_suspended_driver_ids) or set())
+    if not ok:
+        logger.warning("lift %s: manual flag not cleared (migration_driver_manual_suspend.sql?)",
+                       driver_id)
+    driver = await asyncio.to_thread(_driver_row_by_id, driver_id)
+    if driver and not still:
+        try:
+            pending_after = await asyncio.to_thread(db.get_driver_pending_receipts, driver_id)
+            await _notify_suspension_lifted(
+                context, driver=driver, pending_after=pending_after,
+                reply_message=reply_message)
+        except Exception as e:
+            logger.warning("suspension-lift notice failed: %s", e)
+    return (not still), waived
+
+
 async def _notify_suspension_lifted(
     context: ContextTypes.DEFAULT_TYPE,
     *,
@@ -2773,12 +2891,23 @@ async def _notify_suspension_lifted(
     sup_ids = _global_supervisory_chat_ids()
     if not sup_ids:
         logger.warning("Suspension lifted but SUPERVISORY_TELEGRAM_ID is empty — no supervisory alert sent")
+    # Built once, outside the loop: a per-recipient rebuild is the same keyboard
+    # N times and one more thing to get wrong.
+    try:
+        _sup_kb = InlineKeyboardMarkup(
+            [[InlineKeyboardButton("\U0001f5bc View receipts",
+                                   callback_data=SUSP_VIEW_CB + _short_uuid(str(driver.get("id"))))]]
+        )
+    except Exception:
+        _sup_kb = None
     for sup_id in sup_ids:
         try:
-            await context.bot.send_message(chat_id=sup_id, text=sup_txt, parse_mode="Markdown")
+            await context.bot.send_message(chat_id=sup_id, text=sup_txt,
+                                           parse_mode="Markdown", reply_markup=_sup_kb)
         except BadRequest:
             try:
-                await context.bot.send_message(chat_id=sup_id, text=sup_plain)
+                await context.bot.send_message(chat_id=sup_id, text=sup_plain,
+                                               reply_markup=_sup_kb)
             except Exception as e:
                 logger.warning("Could not send suspension-lifted alert to supervisory %s: %s", sup_id, e)
         except Exception as e:
@@ -3349,7 +3478,8 @@ async def process_pending_api_lead_dispatches(context: ContextTypes.DEFAULT_TYPE
                             f"\n\U0001f4cb Ref: <code>"
                             f"{html.escape(str(lead.get('reference_id') or 'N/A'), quote=False)}</code>"
                             f"\n{html.escape(str(why or 'no reason given'), quote=False)}"
-                            f"\nThe dispatcher groups still have it."))
+                            f"\nThe dispatcher groups still have it."),
+                            reply_markup=_lead_alert_keyboard(lead, reassign=True))
                 except Exception as e:
                     # The groups already have it; a driver fan-out that failed
                     # must not lose the lead or stop the poll.
@@ -12013,7 +12143,9 @@ async def _tell_supervisors_website_lead_uninsured(context, lead: dict) -> bool:
             "Before the tag goes out: get the customer's insurer and policy "
             "number, or collect the $100 for insurance."
         )
-        await _tell_supervisors(context, text)
+        await _tell_supervisors(
+            context, text,
+            reply_markup=_lead_alert_keyboard(lead, email=True, reassign=True))
         logger.info("insurance: told supervisors website lead %s (order %s) is uninsured",
                     lead.get("reference_id"), lead.get("external_order_id"))
         return True
@@ -14739,7 +14871,13 @@ async def handle_phase1_ai_review_callback(update, context):
         driver = next((d for d in _get_all_drivers_cached() if str(d.get("id")) == driver_id), None)
         name = driver.get("driver_name", "Driver") if driver else "Driver"
         if query.message:
-            await query.message.reply_text(f"🚫 {name} is suspended (PENALTY).")
+            # A supervisor who hits this wall should be able to clear it here.
+            # A dispatcher who is not one gets the same plain notice as before.
+            _sup_rows = (_suspension_action_rows(driver_id)
+                         if _user_is_global_supervisor(user_id) else [])
+            await query.message.reply_text(
+                f"🚫 {name} is suspended (PENALTY).",
+                reply_markup=InlineKeyboardMarkup(_sup_rows) if _sup_rows else None)
         return STATE_AI_REVIEW
 
     elif data == "selgrp_all" or data.startswith("selgrp_"):
@@ -16371,10 +16509,14 @@ async def handle_driver_selection(update: Update, context: ContextTypes.DEFAULT_
         name = driver.get("driver_name", "Driver") if driver else "Driver"
         pending = await asyncio.to_thread(db.get_driver_pending_receipts, driver_id) if driver_id else []
         count = len(pending)
+        # Supervisors get the way out attached; everyone else gets the notice.
+        _sup_rows = (_suspension_action_rows(driver_id)
+                     if _user_is_global_supervisor(update.effective_user.id) else [])
         await query.message.reply_text(
             f"⚠️ **{_telegram_md1_escape(name)}** is temporarily suspended (PENALTY).\n\n"
             f"They owe {count} receipt(s). No leads will be sent until all receipts are uploaded.",
             parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup(_sup_rows) if _sup_rows else None,
         )
         # Notify driver that dispatcher tried to send lead
         tid = driver.get("driver_telegram_id") if driver else None
@@ -19447,32 +19589,10 @@ async def handle_accept_lead(update: Update, context: ContextTypes.DEFAULT_TYPE)
                 "You will not receive new leads until all outstanding receipts are uploaded.\n\n"
                 "To view all receipts type /receipts"
             )
-            driver_nm = driver.get("driver_name", "Unknown")
-            ref_parts = []
-            for p in pending:
-                ref = (p.get("reference_id") or "").strip()
-                if not ref or ref.upper() == "N/A":
-                    continue
-                ref_parts.append(_telegram_md1_escape(ref))
-            refs_line = (
-                f"\nReceipt references: {', '.join(ref_parts)}"
-                if ref_parts
-                else "\nReceipt references: (none on file)"
-            )
-            try:
-                sup_txt = _prefix_supervisory_message(
-                    f"⛔ **Driver Suspended**\n\n"
-                    f"Driver: **{_telegram_md1_escape(driver_nm)}**\n"
-                    f"Reason: {len(pending)} unpaid receipt(s)"
-                    f"{refs_line}"
-                )
-                for sup_id in _global_supervisory_chat_ids():
-                    try:
-                        await context.bot.send_message(chat_id=sup_id, text=sup_txt, parse_mode="Markdown")
-                    except BadRequest:
-                        await context.bot.send_message(chat_id=sup_id, text=sup_txt.replace("*", ""))
-            except Exception as e:
-                logger.warning("Could not send suspension alert to supervisory: %s", e)
+            # Supervisors get it with an Upload button for the most recent owed
+            # receipt (+ Show all), so the debt can be cleared from the alert.
+            await _send_suspension_alert_to_supervisors(
+                context, driver, pending, just_accepted_lead_id=lead_id)
         else:
             txt = (
                 f"⚠️ You owe **{len(pending)}** receipt(s).\n\n"
@@ -20398,8 +20518,11 @@ def _merge_receipt_context_from_db(user_id: int, context: ContextTypes.DEFAULT_T
 # ── Supervisor receipt navigation: drill-down callback prefixes ──────────────
 # ``recsup_dri_<short_uuid>`` (10 + 22 chars) → show that driver's pending refs.
 # ``recsup_back``                              → return to the drivers list.
+# ``recsup_all_<short_uuid>`` (11 + 22 = 33)   → the suspension alert's "Show all":
+#                                                that driver's LIVE refs, as a NEW message.
 RECSUP_DRI_PREFIX = "recsup_dri_"
 RECSUP_BACK = "recsup_back"
+RECSUP_ALL_PREFIX = "recsup_all_"
 
 
 def _group_pending_receipts_by_driver(pending: list) -> list[tuple[str, str, list]]:
@@ -20447,6 +20570,452 @@ def _supervisor_driver_refs_keyboard(rows_for_driver: list) -> InlineKeyboardMar
         rows.append([InlineKeyboardButton(f"📤 Upload {ref}", callback_data=f"receipt_for_{ref}")])
     rows.append([InlineKeyboardButton("⬅️ Back to drivers", callback_data=RECSUP_BACK)])
     return InlineKeyboardMarkup(rows)
+
+
+def _accepted_at_sort_value(raw) -> float | None:
+    """lead_assignments.accepted_at as a UTC timestamp; None when missing or unreadable.
+
+    Normalised by hand ('Z', Postgres's trimmed fraction like ".12345") so it
+    reads the same on every Python, not only 3.11+'s lenient fromisoformat."""
+    from datetime import timezone
+    s = str(raw or "").strip().replace(" ", "T", 1)
+    if not s:
+        return None
+    if s[-1:] in ("Z", "z"):
+        s = s[:-1] + "+00:00"
+    m = re.match(r"^(.*?)\.(\d+)(.*)$", s)
+    if m:
+        s = m.group(1) + "." + m.group(2)[:6].ljust(6, "0") + m.group(3)
+    try:
+        dt = datetime.fromisoformat(s)
+    except ValueError:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.timestamp()
+
+
+def _pending_receipts_most_recent_first(pending: list) -> list:
+    """Owed receipts, newest accept first, minus the ones nobody can upload.
+
+    Blank / "N/A" references are dropped (no receipt_for_ button can name them).
+    Rows without a readable accepted_at go last, in their original order —
+    list.sort is stable, reverse=True included."""
+    valid = []
+    for p in pending or []:
+        ref = str(p.get("reference_id") or "").strip()
+        if ref and ref.upper() != "N/A":
+            valid.append(p)
+    keyed = [(_accepted_at_sort_value(p.get("accepted_at")), p) for p in valid]
+    dated = [kp for kp in keyed if kp[0] is not None]
+    dated.sort(key=lambda kp: kp[0], reverse=True)
+    return [p for _, p in dated] + [p for k, p in keyed if k is None]
+
+
+# Supervisor actions on a suspension. Short ids keep every one of these inside
+# Telegram's 64-byte callback limit: susp_xl_ carries two (8 + 22 + 22 = 52),
+# and two RAW uuids would be 81, which makes Telegram drop the whole keyboard.
+SUSP_VIEW_CB = "susp_v_"        # show me their receipts
+SUSP_EXC_CB = "susp_x_"         # open the per-receipt forgiveness picker
+SUSP_EXC_ONE_CB = "susp_xl_"    # forgive one lead
+SUSP_UNEXC_ONE_CB = "susp_xu_"  # put one back
+SUSP_LIFT_CB = "susp_l_"        # ask before lifting
+SUSP_LIFT_OK_CB = "susp_lc_"    # lift, confirmed
+
+# Every receipt image in one go floods a private chat and trips Telegram's rate
+# limit, so the tail would silently never arrive.
+_RECEIPT_IMAGE_BATCH = 10
+_EXCEPTION_PAGE_SIZE = 20
+
+
+def _suspension_action_rows(driver_id) -> list:
+    """View / Make an exception / Lift, for a SUPERVISOR's copy of an alert.
+
+    Total by construction: a driver id that is not a uuid returns no rows rather
+    than raising, because this is built inside the accept path and an exception
+    here would cost the alert itself.
+    """
+    try:
+        short = _short_uuid(str(driver_id))
+    except Exception:
+        return []
+    return [
+        [InlineKeyboardButton("\U0001f5bc View receipts", callback_data=SUSP_VIEW_CB + short)],
+        [InlineKeyboardButton("\U0001f645 Make an exception", callback_data=SUSP_EXC_CB + short)],
+        [InlineKeyboardButton("\u2705 Lift suspension", callback_data=SUSP_LIFT_CB + short)],
+    ]
+
+
+def _suspension_alert_keyboard(driver_id, pending: list,
+                               just_accepted_lead_id=None) -> InlineKeyboardMarkup | None:
+    """Buttons for the supervisory "Driver Suspended" alert.
+
+    Upload the most recent owed receipt via receipt_for_ (an ENTRY POINT of the
+    receipt conversation, so it still answers after a redeploy, and a supervisor's
+    upload is credited to the lead's driver). With 2+, "Show all" replies with the
+    driver's live list. None when nothing can be uploaded — the alert still goes."""
+    ordered = _pending_receipts_most_recent_first(pending)
+    # A driver owing five unreadable references is still one a supervisor needs
+    # to look at and lift, so "nothing uploadable" no longer means "no buttons".
+    # Only a driver id we cannot address at all leaves the alert bare.
+    actions = _suspension_action_rows(driver_id)
+    if not ordered:
+        return InlineKeyboardMarkup(actions) if actions else None
+    rows: list[list[InlineKeyboardButton]] = []
+    # The alert fires as the driver ACCEPTS a lead, so the newest accept is
+    # always that lead: not delivered yet, no receipt for it can exist. The
+    # button names the newest receipt that can actually be in hand; the lead
+    # just accepted still counts, and Show all still lists it.
+    skip = str(just_accepted_lead_id or "").strip()
+    pick = next((p for p in ordered
+                 if not skip or str(p.get("lead_id") or "").strip() != skip), ordered[0])
+    ref = str(pick.get("reference_id")).strip()
+    cb = f"receipt_for_{ref}"
+    # Past 64 bytes Telegram refuses the WHOLE keyboard, and with it the alert.
+    if len(cb.encode("utf-8")) <= 64:
+        label = f"📤 Upload receipt — {ref}" + (" (most recent)" if len(ordered) > 1 else "")
+        rows.append([InlineKeyboardButton(label, callback_data=cb)])
+    if len(ordered) > 1:
+        try:
+            short = _short_uuid(str(driver_id))
+        except Exception:
+            short = None  # not a UUID: no Show all, the Upload button still stands
+        if short:
+            rows.append([InlineKeyboardButton(
+                f"📋 Show all {len(ordered)} receipts",
+                callback_data=f"{RECSUP_ALL_PREFIX}{short}",
+            )])
+    rows.extend(actions)
+    return InlineKeyboardMarkup(rows) if rows else None
+
+
+async def _send_suspension_alert_to_supervisors(
+    context: ContextTypes.DEFAULT_TYPE, driver: dict, pending: list,
+    just_accepted_lead_id=None,
+) -> None:
+    """⛔ Driver Suspended → every global supervisor, with the buttons above.
+
+    The references are a snapshot of the moment of suspension, newest first;
+    Show all re-reads them live. The Markdown send and its plain-text fallback
+    both carry the keyboard. Never raises: the driver's own notice comes next."""
+    try:
+        driver_nm = driver.get("driver_name", "Unknown")
+        ref_parts = [
+            _telegram_md1_escape(str(p.get("reference_id")).strip())
+            for p in _pending_receipts_most_recent_first(pending)
+        ]
+        refs_line = (
+            f"\nReceipt references: {', '.join(ref_parts)}"
+            if ref_parts
+            else "\nReceipt references: (none on file)"
+        )
+        try:
+            kb = _suspension_alert_keyboard(driver.get("id"), pending, just_accepted_lead_id)
+        except Exception as e:
+            # The buttons are a convenience; the alert is the record.
+            logger.warning("suspension alert keyboard failed: %s", e)
+            kb = None
+        sup_txt = _prefix_supervisory_message(
+            f"⛔ **Driver Suspended**\n\n"
+            f"Driver: **{_telegram_md1_escape(driver_nm)}**\n"
+            f"Reason: {len(pending)} unpaid receipt(s)"
+            f"{refs_line}"
+        )
+        plain = sup_txt.replace("*", "")
+        for sup_id in _global_supervisory_chat_ids():
+            try:
+                try:
+                    await context.bot.send_message(
+                        chat_id=sup_id, text=sup_txt, parse_mode="Markdown", reply_markup=kb)
+                except BadRequest:
+                    try:
+                        await context.bot.send_message(chat_id=sup_id, text=plain, reply_markup=kb)
+                    except BadRequest:
+                        if kb is None:
+                            raise
+                        # A keyboard Telegram refuses costs the buttons, never the alert.
+                        await context.bot.send_message(chat_id=sup_id, text=plain)
+            except Exception as e:
+                # Per chat: one blocked or stale supervisor must not cost the rest the alert.
+                logger.warning("Could not send suspension alert to supervisory %s: %s", sup_id, e)
+    except Exception as e:
+        logger.warning("Could not send suspension alert to supervisory: %s", e)
+
+
+def _receipt_rows_newest_first(rows: list) -> list:
+    """Newest accept first, blanks last. accepted_at may be missing entirely."""
+    return sorted(rows or [], key=lambda r: str(r.get("accepted_at") or ""), reverse=True)
+
+
+def _exception_picker(driver_id, rows: list) -> tuple:
+    """The per-receipt forgiveness screen: text and keyboard.
+
+    Forgiven rows stay LISTED, with a way back. A row that vanished when you
+    pardoned it would leave a supervisor unable to see, let alone undo, what
+    they just did.
+    """
+    try:
+        dshort = _short_uuid(str(driver_id))
+    except Exception:
+        return "\u274c That driver link is unusable.", None
+    ordered = _receipt_rows_newest_first(rows)
+    owed = [r for r in ordered if not r.get("has_receipt") and not r.get("waived")]
+    forgiven = [r for r in ordered if not r.get("has_receipt") and r.get("waived")]
+    lines = [
+        "\U0001f645 <b>Make an exception</b>",
+        "",
+        f"Owes {len(owed)}. Forgiving a reference stops it counting "
+        "everywhere \u2014 receipts owed, the leaderboard, the suspension. "
+        "Reversible.",
+    ]
+    kb: list = []
+    for r in (owed + forgiven)[:_EXCEPTION_PAGE_SIZE]:
+        ref = str(r.get("reference_id") or "N/A").strip()
+        try:
+            lshort = _short_uuid(str(r.get("lead_id")))
+        except Exception:
+            continue  # not addressable in 64 bytes; it stays listed in the text
+        if r.get("waived"):
+            kb.append([InlineKeyboardButton(
+                f"\u21a9\ufe0f Restore {ref}",
+                callback_data=SUSP_UNEXC_ONE_CB + dshort + lshort)])
+            continue
+        row = []
+        cb_up = f"receipt_for_{ref}"
+        if ref and ref != "N/A" and len(cb_up.encode("utf-8")) <= 64:
+            row.append(InlineKeyboardButton(f"\U0001f4e4 Upload {ref}", callback_data=cb_up))
+        row.append(InlineKeyboardButton(
+            f"\U0001f645 Forgive {ref}"[:32],
+            callback_data=SUSP_EXC_ONE_CB + dshort + lshort))
+        kb.append(row)
+    if not kb:
+        lines.append("")
+        lines.append("<i>Nothing outstanding to forgive.</i>")
+    kb.append([InlineKeyboardButton("\u2705 Lift suspension",
+                                    callback_data=SUSP_LIFT_CB + dshort)])
+    return "\n".join(lines), InlineKeyboardMarkup(kb)
+
+
+async def _send_driver_receipt_images(context, chat_id, driver, rows: list) -> None:
+    """Show a supervisor what is actually on file, and say what is not.
+
+    The important case is the empty one. An OWED receipt has no stored image by
+    definition, so a suspended driver usually has nothing to show -- and a tap
+    that answers with silence reads as broken. It answers with the references
+    instead, and with the reason they are suspended.
+    """
+    ordered = _receipt_rows_newest_first(rows)
+    uploaded = [r for r in ordered if r.get("has_receipt")]
+    owed = [r for r in ordered if not r.get("has_receipt") and not r.get("waived")]
+    forgiven = [r for r in ordered if not r.get("has_receipt") and r.get("waived")]
+    name = str((driver or {}).get("driver_name") or "this driver").strip()
+
+    def _refs(items):
+        return " \u00b7 ".join(str(r.get("reference_id") or "N/A").strip()
+                               for r in items[:12]) or "\u2014"
+
+    lines = [f"\U0001f5bc <b>{html.escape(name, quote=False)}'s receipts</b>", ""]
+    if uploaded:
+        lines.append(f"\u2705 On file: {len(uploaded)} \u2014 sending them below.")
+    else:
+        lines.append("\u23f3 No receipt images on file yet.")
+    if owed:
+        lines.append(f"\u23f3 Owed, nothing uploaded: {len(owed)}")
+        lines.append(f"   {_refs(owed)}")
+    if forgiven:
+        lines.append(f"\U0001f645 Forgiven: {len(forgiven)}")
+    try:
+        dshort = _short_uuid(str((driver or {}).get("id")))
+        kb = InlineKeyboardMarkup(_suspension_action_rows((driver or {}).get("id")))
+    except Exception:
+        dshort, kb = None, None
+    try:
+        await context.bot.send_message(chat_id=chat_id, text="\n".join(lines),
+                                       parse_mode="HTML", reply_markup=kb)
+    except Exception:
+        await context.bot.send_message(
+            chat_id=chat_id, text=re.sub(r"<[^>]+>", "", "\n".join(lines)), reply_markup=kb)
+
+    sent = 0
+    for r in uploaded[:_RECEIPT_IMAGE_BATCH]:
+        lead_id = r.get("lead_id")
+        ref = str(r.get("reference_id") or "N/A").strip()
+        blob = None
+        try:
+            blob = await asyncio.to_thread(db.get_receipt_file, lead_id)
+        except Exception as e:
+            logger.warning("view receipts: could not read %s: %s", lead_id, e)
+        if blob and blob.get("data"):
+            caption = f"\U0001f9fe {ref}"
+            try:
+                await context.bot.send_photo(
+                    chat_id=chat_id,
+                    photo=InputFile(io.BytesIO(blob["data"]), filename=f"{ref}.jpg"),
+                    caption=caption)
+                sent += 1
+                continue
+            except Exception as e:
+                logger.info("view receipts: photo refused for %s (%s), trying document", ref, e)
+            try:
+                await context.bot.send_document(
+                    chat_id=chat_id,
+                    document=InputFile(io.BytesIO(blob["data"]), filename=f"{ref}.jpg"),
+                    caption=caption)
+                sent += 1
+                continue
+            except Exception as e:
+                logger.warning("view receipts: document refused for %s: %s", ref, e)
+        # Stored elsewhere, or unreadable. A link beats pretending it is missing.
+        try:
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text=f"\U0001f9fe {ref} \u2014 image not readable here.",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(
+                    "\U0001f310 Open receipt", url=receipt_portal_url(lead_id))]]))
+        except Exception as e:
+            logger.warning("view receipts: fallback link failed for %s: %s", ref, e)
+
+    extra = len(uploaded) - min(len(uploaded), _RECEIPT_IMAGE_BATCH)
+    if extra > 0:
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=f"\u2026and {extra} more on the board.")
+
+
+async def handle_suspension_actions(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """View receipts / forgive one / lift, from any suspension alert.
+
+    TOP-LEVEL on purpose: an alert sits in a supervisor's chat for days and
+    there is no PTB persistence, so a conversation-scoped button would be dead
+    after the next redeploy. The supervisor gate therefore lives in here, where
+    a handler trusts nobody.
+    """
+    query = update.callback_query
+    if not query:
+        return
+    if not update.effective_user or not _user_is_global_supervisor(update.effective_user.id):
+        await _safe_answer_callback_query(query, "Supervisors only.", show_alert=True)
+        return
+    await _safe_answer_callback_query(query)
+    data = str(query.data or "")
+
+    # An alert old enough to be inaccessible still has a chat to answer in.
+    msg = getattr(query, "message", None)
+    chat_id = getattr(getattr(msg, "chat", None), "id", None) or update.effective_user.id
+
+    def _driver_from(prefix):
+        try:
+            return _long_uuid(data[len(prefix):])
+        except Exception:
+            return None
+
+    async def _rows(did):
+        return await asyncio.to_thread(db.get_driver_accepted_receipt_rows, did)
+
+    # ---- forgive / restore one receipt -------------------------------------
+    for prefix, excluded in ((SUSP_EXC_ONE_CB, True), (SUSP_UNEXC_ONE_CB, False)):
+        if data.startswith(prefix):
+            pair = _parse_paired_short_uuids(data, prefix)
+            if not pair:
+                return
+            try:
+                did, lead_id = _long_uuid(pair[0]), _long_uuid(pair[1])
+            except Exception:
+                return
+            was = str(did) in (await asyncio.to_thread(_get_suspended_driver_ids) or set())
+            ok = await asyncio.to_thread(db.set_lead_excluded, lead_id, excluded)
+            if not ok:
+                await _safe_answer_callback_query(
+                    query, "⚠️ Could not update that lead — try again.",
+                    show_alert=True)
+                return
+            # Before re-reading anything: the suspended set is memoised, and a
+            # stale read here reports a suspension dispatch has already stopped
+            # enforcing.
+            _bust_driver_caches()
+            still = str(did) in (await asyncio.to_thread(_get_suspended_driver_ids) or set())
+            driver = await asyncio.to_thread(_driver_row_by_id, did)
+            if excluded and was and not still and driver:
+                # It lifted itself: the count fell below the threshold. Say so
+                # -- but never waive the rest, which is what Lift is for.
+                try:
+                    pending_after = await asyncio.to_thread(db.get_driver_pending_receipts, did)
+                    await _notify_suspension_lifted(
+                        context, driver=driver, pending_after=pending_after)
+                except Exception as e:
+                    logger.warning("auto-lift notice failed: %s", e)
+            text, kb = _exception_picker(did, await _rows(did))
+            try:
+                await query.edit_message_text(text, parse_mode="HTML", reply_markup=kb)
+            except BadRequest as e:
+                if "not modified" not in str(e).lower():
+                    logger.warning("exception picker re-render: %s", e)
+            return
+
+    # ---- the picker ---------------------------------------------------------
+    if data.startswith(SUSP_EXC_CB):
+        did = _driver_from(SUSP_EXC_CB)
+        if not did:
+            return
+        text, kb = _exception_picker(did, await _rows(did))
+        await context.bot.send_message(chat_id=chat_id, text=text,
+                                       parse_mode="HTML", reply_markup=kb)
+        return
+
+    # ---- view receipts ------------------------------------------------------
+    if data.startswith(SUSP_VIEW_CB):
+        did = _driver_from(SUSP_VIEW_CB)
+        if not did:
+            return
+        driver = await asyncio.to_thread(_driver_row_by_id, did) or {"id": did}
+        await _send_driver_receipt_images(context, chat_id, driver, await _rows(did))
+        return
+
+    # ---- lift: ask, then do -------------------------------------------------
+    if data.startswith(SUSP_LIFT_OK_CB):
+        did = _driver_from(SUSP_LIFT_OK_CB)
+        if not did:
+            return
+        lifted, waived = await _lift_driver_suspension(context, did)
+        if lifted:
+            body = f"✅ Lifted — excused {waived} outstanding receipt(s)."
+            kb = None
+        else:
+            body = ("⚠️ The receipts were excused, but the manual suspension "
+                    "flag could not be cleared — run "
+                    "database/migration_driver_manual_suspend.sql in Supabase. "
+                    "Receipt-debt suspensions lift without it.")
+            kb = InlineKeyboardMarkup([[InlineKeyboardButton(
+                "✅ Try again", callback_data=SUSP_LIFT_OK_CB + _short_uuid(str(did)))]])
+        try:
+            await query.edit_message_text(body, reply_markup=kb)
+        except BadRequest:
+            await context.bot.send_message(chat_id=chat_id, text=body, reply_markup=kb)
+        return
+
+    if data.startswith(SUSP_LIFT_CB):
+        did = _driver_from(SUSP_LIFT_CB)
+        if not did:
+            return
+        driver = await asyncio.to_thread(_driver_row_by_id, did) or {}
+        owed = [r for r in await _rows(did) if not r.get("has_receipt") and not r.get("waived")]
+        short = _short_uuid(str(did))
+        name = str(driver.get("driver_name") or "this driver").strip()
+        # Lifting excuses everything owed, which is a different act from
+        # pardoning one reference. Worth one tap of daylight.
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=(f"✅ Lift {name}'s suspension?\n\n"
+                  f"This excuses all {len(owed)} outstanding receipt(s) — they stop "
+                  "counting everywhere. To forgive them one at a time instead, use "
+                  "Make an exception."),
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton(f"✅ Yes, lift and excuse {len(owed)}",
+                                      callback_data=SUSP_LIFT_OK_CB + short)],
+                [InlineKeyboardButton("🙅 Make an exception instead",
+                                      callback_data=SUSP_EXC_CB + short)],
+            ]))
+        return
 
 
 async def _send_supervisor_pending_receipts_menu(
@@ -20500,9 +21069,10 @@ def _supervisor_driver_refs_body(driver_name: str, n: int) -> str:
 async def handle_supervisor_receipts_nav(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Top-level handler for supervisor receipts drill-down navigation.
 
-    Pattern: ``recsup_dri_<short_uuid>`` (show driver's refs) or
-    ``recsup_back`` (back to drivers list). Runs OUTSIDE the receipt
-    ConversationHandler so navigation always works regardless of state.
+    Pattern: ``recsup_dri_<short_uuid>`` (show driver's refs),
+    ``recsup_back`` (back to drivers list) or ``recsup_all_<short_uuid>``
+    (the suspension alert's Show all — replies, never edits). Runs OUTSIDE the
+    receipt ConversationHandler so navigation always works regardless of state.
     """
     query = update.callback_query
     if not query:
@@ -20551,6 +21121,51 @@ async def handle_supervisor_receipts_nav(update: Update, context: ContextTypes.D
             )
         except Exception:
             pass
+        return
+
+    # The suspension alert's Show all: the driver's refs as they stand NOW, as a
+    # NEW message. Never edit here -- the tapped message is the suspension record,
+    # and its reference list is a snapshot of that moment.
+    if data.startswith(RECSUP_ALL_PREFIX):
+        # Through the bot, not query.message: an old alert can come back as an
+        # InaccessibleMessage, which still has .chat but no reply_text.
+        chat_id = query.message.chat.id if query.message is not None else user_id
+        token = data[len(RECSUP_ALL_PREFIX):]
+        try:
+            driver_id = _long_uuid(token)
+        except Exception:
+            try:
+                await context.bot.send_message(chat_id=chat_id, text="❌ Invalid driver link.")
+            except Exception:
+                pass
+            return
+        driver_row = await asyncio.to_thread(_driver_row_by_id, driver_id)
+        driver_name = (driver_row.get("driver_name") or "Driver") if driver_row else "Driver"
+        rows_for_driver = await asyncio.to_thread(db.get_driver_pending_receipts, driver_id) or []
+        if not rows_for_driver:
+            try:
+                await context.bot.send_message(
+                    chat_id=chat_id,
+                    text=f"✅ {html.escape(driver_name, quote=False)} has no outstanding receipts.",
+                    parse_mode="HTML",
+                )
+            except Exception:
+                pass
+            return
+        body = _supervisor_driver_refs_body(driver_name, len(rows_for_driver))
+        kb = _supervisor_driver_refs_keyboard(_pending_receipts_most_recent_first(rows_for_driver))
+        try:
+            await context.bot.send_message(
+                chat_id=chat_id, text=body, parse_mode="HTML", reply_markup=kb)
+        except BadRequest:
+            try:
+                await context.bot.send_message(
+                    chat_id=chat_id, text=body.replace("<b>", "").replace("</b>", ""),
+                    reply_markup=kb)
+            except Exception as e:
+                logger.warning("recsup_all: could not send %s's receipts: %s", driver_id, e)
+        except Exception as e:
+            logger.warning("recsup_all: could not send %s's receipts: %s", driver_id, e)
         return
 
     # Drill into one driver
@@ -24088,21 +24703,13 @@ async def handle_settings_cb(update: Update, context: ContextTypes.DEFAULT_TYPE)
         return SET_MENU
     if data.startswith("tset_dlift:"):
         did = data.split(":", 1)[1]
-        await asyncio.to_thread(db.set_driver_suspended, did, False)
-        # A receipt-debt suspension only lifts once the debt stops counting, so
-        # excuse the outstanding receipts exactly as an accepted appeal does.
-        waived = await asyncio.to_thread(db.waive_driver_pending_receipts, did)
-        _bust_driver_caches()
-        driver = await asyncio.to_thread(_driver_row_by_id, did)
-        if driver:
-            try:
-                pending_after = await asyncio.to_thread(db.get_driver_pending_receipts, did)
-                await _notify_suspension_lifted(
-                    context, driver=driver, pending_after=pending_after)
-            except Exception as e:
-                logger.warning("suspension-lift notice failed: %s", e)
-        if waived:
-            logger.info("Lifted suspension for %s and waived %s receipt(s)", did, waived)
+        lifted, waived = await _lift_driver_suspension(context, did)
+        logger.info("Lift %s: suspended=%s, waived %s receipt(s)", did, not lifted, waived)
+        if not lifted:
+            await query.message.reply_text(
+                "⚠️ Receipts excused, but this driver still reads as suspended — run "
+                "`database/migration_driver_manual_suspend.sql` in the Supabase SQL editor.",
+                parse_mode="Markdown")
         await _show_driver_detail(query, did)
         return SET_MENU
     if data == "tset_dadd":
@@ -24129,21 +24736,14 @@ async def handle_settings_cb(update: Update, context: ContextTypes.DEFAULT_TYPE)
         await _show_settings_view("tset_susp", query=query); return SET_MENU
     if data.startswith("tset_susplift:"):
         did = data.split(":", 1)[1]
-        await asyncio.to_thread(db.set_driver_suspended, did, False)
-        # A receipt-debt suspension only lifts once the debt stops counting, so
-        # excuse the outstanding receipts exactly as an accepted appeal does.
-        waived = await asyncio.to_thread(db.waive_driver_pending_receipts, did)
-        _bust_driver_caches()
-        driver = await asyncio.to_thread(_driver_row_by_id, did)
-        if driver:
-            try:
-                pending_after = await asyncio.to_thread(db.get_driver_pending_receipts, did)
-                await _notify_suspension_lifted(
-                    context, driver=driver, pending_after=pending_after)
-            except Exception as e:
-                logger.warning("suspension-lift notice failed: %s", e)
-        if waived:
+        lifted, waived = await _lift_driver_suspension(context, did)
+        if lifted:
             await query.message.reply_text(f"✅ Lifted — excused {waived} outstanding receipt(s).")
+        else:
+            await query.message.reply_text(
+                "⚠️ Receipts excused, but this driver still reads as suspended — run "
+                "`database/migration_driver_manual_suspend.sql` in the Supabase SQL editor.",
+                parse_mode="Markdown")
         await _show_settings_view("tset_susp", query=query); return SET_MENU
     # --- client sources ------------------------------------------------
     if data == "tset_srcs":
@@ -25078,7 +25678,19 @@ def main():
     # Top-level so the back/forward buttons work even while inside another
     # conversation; the actual upload flow still goes through receipt_handler.
     application.add_handler(
-        CallbackQueryHandler(handle_supervisor_receipts_nav, pattern=r"^recsup_(dri_.+|back)$")
+        CallbackQueryHandler(handle_supervisor_receipts_nav,
+                             pattern=r"^recsup_(dri_.+|all_[A-Za-z0-9_-]{22}|back)$")
+    )
+
+    # Suspension alert actions: view receipts, forgive one, lift. TOP-LEVEL on
+    # purpose -- an alert sits in a supervisor's chat for days, there is no PTB
+    # persistence, and a conversation-scoped button would be dead after the next
+    # redeploy. The supervisor gate lives inside the handler.
+    application.add_handler(
+        CallbackQueryHandler(
+            handle_suspension_actions,
+            pattern=r"^susp_(?:v|x|l|lc)_[A-Za-z0-9_-]{22}$"
+                    r"|^susp_(?:xl|xu)_[A-Za-z0-9_-]{44}$")
     )
 
     # Renewal accept / reassign handlers
