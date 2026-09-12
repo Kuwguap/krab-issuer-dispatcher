@@ -241,10 +241,11 @@ class WhichAlertsCarryActionsIsADecisionTest(unittest.TestCase):
     """Not "every alert" by reflex -- every alert that has something true to
     offer. Both halves of that are pinned here so neither drifts silently."""
 
-    CARRY = 8
+    CARRY = 11
 
     def test_the_count_is_what_was_decided(self):
-        self.assertEqual(self.CARRY, SRC.count("reply_markup=_lead_alert_keyboard("))
+        calls = SRC.count("_lead_alert_keyboard(") - SRC.count("def _lead_alert_keyboard(")
+        self.assertEqual(self.CARRY, calls)
 
     def test_release_appears_only_on_instant_tag_alerts(self):
         """instantpdf_ means "send the CASH tag now". On any other lead that
@@ -261,19 +262,51 @@ class WhichAlertsCarryActionsIsADecisionTest(unittest.TestCase):
         head = "\n".join(SRC.splitlines()[:lineno])
         return _re.findall(r"^(?:async )?def ([A-Za-z_][A-Za-z0-9_]*)\(", head, _re.M)[-1]
 
-    def test_the_four_deliberate_omissions_stay_bare(self):
-        """Each of these would be a lie or a hazard, and each was flagged to the
-        owner rather than quietly skipped. If one gains a keyboard, it should be
-        because somebody decided to, not because a sweep caught it."""
-        for marker in (
-            # fires BEFORE delivery, superseded seconds later -- a Release here
-            # forces a tag already in flight
-            "<b>Cash payment PAID</b>",
+    def test_the_last_four_carry_buttons_too(self):
+        """I had left these bare and said why; the owner overruled, so they
+        ship. Pinned so nobody quietly reverts the decision."""
+        for marker, must in (
+            ("<b>Cash payment PAID</b>", "reassign=True, receipt=True"),
+            ("<b>Tag emailed to the client</b>", "add=True, receipt=True"),
+            ("Informational copy", "reassign=True"),
         ):
             i = SRC.index(marker)
-            end = SRC.index("))", i)
             with self.subTest(marker=marker):
-                self.assertNotIn("_lead_alert_keyboard", SRC[i:end + 80], marker)
+                self.assertIn(must, SRC[i:i + 2000], marker)
+
+    def test_the_paid_sending_now_alert_still_has_no_release(self):
+        """The one hazard I kept out: this fires BEFORE delivery and is
+        superseded seconds later, so a Release here forces a tag already in
+        flight -- the exact double-delivery _PAID_INSTANT_ANNOUNCED guards. The
+        stuck-tag alert offers Release once forcing it IS the right move."""
+        i = SRC.index("<b>Cash payment PAID</b>")
+        window = SRC[i:i + 1200]
+        self.assertIn("_lead_alert_keyboard", window)
+        self.assertNotIn("release=True", window)
+
+    def test_low_paper_links_out_instead_of_lying(self):
+        """This bot cannot approve a resupply, so an Approve button would be a
+        lie. A URL to the bot that can is the only honest action."""
+        self.assertEqual(2, SRC.count("reply_markup=_paper_bot_keyboard()"))
+        i = SRC.index("def _paper_bot_keyboard")
+        body = SRC[i:SRC.index("\ndef ", i + 10)]
+        self.assertIn("PAPER_BOT_USERNAME", body)
+        self.assertNotIn("callback_data", body)
+
+    def test_no_paper_bot_configured_means_no_button(self):
+        """A dead link is worse than the sentence already in the message."""
+        with mock.patch.object(bot.Config, "PAPER_BOT_USERNAME", None):
+            self.assertIsNone(bot._paper_bot_keyboard())
+        with mock.patch.object(bot.Config, "PAPER_BOT_USERNAME", "   "):
+            self.assertIsNone(bot._paper_bot_keyboard())
+
+    def test_the_paper_link_is_a_real_telegram_url(self):
+        for handle in ("PaperInvestigatorBot", "@PaperInvestigatorBot"):
+            with self.subTest(handle=handle):
+                with mock.patch.object(bot.Config, "PAPER_BOT_USERNAME", handle):
+                    kb = bot._paper_bot_keyboard()
+                self.assertEqual("https://t.me/PaperInvestigatorBot",
+                                 kb.inline_keyboard[0][0].url)
 
 
 if __name__ == "__main__":

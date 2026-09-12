@@ -39,6 +39,10 @@ class Config:
     # Paper Investigator (shared Supabase tables; optional — used by main bot when drivers accept leads)
     LOW_PAPER_THRESHOLD = int(os.getenv("LOW_PAPER_THRESHOLD", "5"))
     PAPER_SUPERVISOR_TELEGRAM_ID = (os.getenv("PAPER_SUPERVISOR_TELEGRAM_ID") or "").strip() or None
+    # The Paper Investigator bot's @handle, for the one thing this bot cannot do
+    # itself: approve a resupply. Unset means the low-paper alert carries no
+    # button rather than a dead link.
+    PAPER_BOT_USERNAME = (os.getenv("PAPER_BOT_USERNAME") or "").strip().lstrip("@") or None
 
     # AI / Vision (optional – for image → structured Phase 1)
     OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip() or None

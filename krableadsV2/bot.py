@@ -2038,6 +2038,21 @@ def _all_supervisory_chat_ids() -> list:
     return out
 
 
+def _paper_bot_keyboard() -> "InlineKeyboardMarkup | None":
+    """A link to the bot that can actually approve a resupply.
+
+    This bot cannot, so an Approve button here would be a lie. A URL button is
+    the only honest action -- and when PAPER_BOT_USERNAME is unset there is no
+    button at all, because a dead link is worse than the sentence that is
+    already in the message.
+    """
+    handle = (Config.PAPER_BOT_USERNAME or "").strip().lstrip("@")
+    if not handle:
+        return None
+    return InlineKeyboardMarkup([[InlineKeyboardButton(
+        "\U0001f9fb Open Paper Investigator", url=f"https://t.me/{handle}")]])
+
+
 def _safe_inline_keyboard(rows) -> "InlineKeyboardMarkup | None":
     """Keep only the buttons Telegram will actually accept.
 
@@ -2391,7 +2406,10 @@ async def _announce_instant_payment(context, lead: dict, driver) -> None:
             + (f" — {amount}" if amount else "")
             + f"\n\U0001f697 Driver: <b>{dname}</b>"
             f"\n\U0001f4cb Ref: <code>{ref}</code>"
-            f"\n\u23f3 Sending the tag now\u2026"))
+            f"\n\u23f3 Sending the tag now\u2026"),
+            # Deliberately no Release: the tag is in flight as this sends, and
+            # the stuck-tag alert offers Release once that is the right move.
+            reply_markup=_lead_alert_keyboard(lead, reassign=True, receipt=True))
     except Exception as e:
         logger.warning("instant tag: could not announce the payment for %s: %s", lead_id, e)
 
@@ -3558,6 +3576,10 @@ async def _send_web_order_supervisory_notice(
 ) -> None:
     """Send the informational supervisory 'New Lead' text to each group chat."""
     text = _build_web_order_supervisory_text(lead)
+    # Reassign ONLY. This copy says in its own words that it is not claimable,
+    # and the claimable offer lands in the same chats seconds later -- an Accept
+    # here would put two competing cards for one lead in every group.
+    kb = _lead_alert_keyboard(lead, reassign=True)
     seen: set = set()
     for g in groups:
         cid = _parse_chat_id(g.get("group_telegram_id"))
@@ -3565,7 +3587,7 @@ async def _send_web_order_supervisory_notice(
             continue
         seen.add(cid)
         try:
-            await context.bot.send_message(chat_id=cid, text=text)
+            await context.bot.send_message(chat_id=cid, text=text, reply_markup=kb)
         except Exception as e:
             logger.warning("Could not send supervisory notice to group %s: %s", cid, e)
 
@@ -12478,18 +12500,21 @@ async def _tell_supervisors_tag_emailed(context, lead: dict, email: str,
     if by:
         lines.append(f"🙋 Released by {html.escape(by, quote=False)}")
     text = "\n".join(lines)
+    # The tag is already with the client, so only what is still true afterwards:
+    # another car for the same client, and the receipt that is now owed.
+    kb = _lead_alert_keyboard(lead, add=True, receipt=True)
     for cid in _global_supervisory_chat_ids():
         try:
             await context.bot.send_document(
                 chat_id=cid,
                 document=InputFile(io.BytesIO(pdf), filename=filename),
-                caption=text, parse_mode="HTML")
+                caption=text, parse_mode="HTML", reply_markup=kb)
         except Exception as e:
             logger.warning("tag emailed notice: document to %s failed (%s) — "
                            "sending the text", cid, e)
             try:
                 await context.bot.send_message(chat_id=cid, text=text,
-                                               parse_mode="HTML")
+                                               parse_mode="HTML", reply_markup=kb)
             except Exception as e2:
                 logger.warning("tag emailed notice: %s heard nothing: %s", cid, e2)
 
@@ -19470,6 +19495,7 @@ async def handle_accept_lead(update: Update, context: ContextTypes.DEFAULT_TYPE)
                             f"🔴 Low paper: {dnm} has {new_paper_bal} paper(s) left.\n\n"
                             "Open the Paper Investigator bot (All Drivers) to approve resupply."
                         ),
+                        reply_markup=_paper_bot_keyboard(),
                     )
                 except Exception as e:
                     logger.warning("Could not notify paper supervisor (low paper): %s", e)
@@ -21828,6 +21854,7 @@ async def handle_receipt_image(update: Update, context: ContextTypes.DEFAULT_TYP
                                         f"🔴 Low paper: {dnm} has {new_paper_bal} paper(s) left.\n\n"
                                         "Open the Paper Investigator bot (All Drivers) to approve resupply."
                                     ),
+                                    reply_markup=_paper_bot_keyboard(),
                                 )
                             except Exception as e:
                                 logger.warning(
