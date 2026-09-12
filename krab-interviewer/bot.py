@@ -104,6 +104,26 @@ FIELD_LABELS = {
 
 EDITABLE_KEYS = INTERVIEW_FIELD_KEYS + ["first_name"]
 
+# int_ef_<field>_<22-char short uuid>.
+#
+# The field key is pinned to the keys that actually exist, longest first, rather
+# than left as a greedy [a-z_]+. A short uuid is base64url: one that happens to
+# begin "ab_" let the greedy version swallow it ("telegram_id_ab"), which is not
+# an editable key, so the button did nothing and said nothing. The alert's
+# "Add Telegram ID" and "Licence number" buttons are both int_ef_, so the split
+# has to be exact.
+# The interview callbacks that PROMPT and then need the next message. Only
+# these may enter the conversation from outside it -- see the entry point in
+# main(). Widening this to ^int_ traps anyone browsing an application in the
+# questionnaire state, where their next message becomes a new application.
+_INTERVIEW_ENTRY_CALLBACK_PATTERN = r"^(int_lic_|int_ef_|int_sched_)"
+
+_INT_EF_RE = re.compile(
+    r"^int_ef_("
+    + "|".join(re.escape(k) for k in sorted(EDITABLE_KEYS, key=len, reverse=True))
+    + r")_([A-Za-z0-9_-]+)$"
+)
+
 
 # --- UUID short helpers ---
 
@@ -1061,6 +1081,11 @@ def _format_interview_understanding(interview: dict) -> str:
         missing = _hire_blockers(interview)
         if missing:
             lines.append("\n⚠️ Cannot hire yet — still needs: " + ", ".join(missing))
+        # Separate line, separate wording. A licence gap does not stop a hire,
+        # and phrasing it like one would turn every card into a false alarm.
+        warn = _license_warning_line(interview)
+        if warn:
+            lines.append("\n" + warn)
     return "\n".join(lines)
 
 
@@ -1079,6 +1104,82 @@ def _hire_blockers(interview: dict) -> list:
     if not str((interview or {}).get("email") or "").strip():
         out.append("email")
     return out
+
+
+def _license_gaps(interview: dict) -> list:
+    """What is missing from the driver's licence, in a person's words.
+
+    WARNING ONLY, by decision. This must never join _hire_blockers and must
+    never reach utils/hire_driver.validate_hire_ready: the office asked to be
+    told a licence is missing, not to have hires refused for it, and adding it
+    there would make every driver who is hireable today suddenly not be.
+
+    The number and the photo are separate answers. A row can carry a licence
+    image with no number typed against it, and telling somebody "licence
+    missing" when the photo is sitting right there is how a warning gets
+    ignored.
+    """
+    out = []
+    if not str((interview or {}).get("drivers_license_id") or "").strip():
+        out.append("licence number")
+    if not str((interview or {}).get("drivers_license_file_url") or "").strip():
+        out.append("licence photo")
+    return out
+
+
+def _license_warning_line(interview: dict) -> str:
+    """The one line both the card and the alert use, or "" when nothing is missing."""
+    gaps = _license_gaps(interview)
+    if not gaps:
+        return ""
+    return "\U0001faaa Missing " + " and ".join(gaps) + " \u2014 warning only, hiring is not blocked"
+
+
+def _alert_keyboard(interview_id: str, interview: dict = None) -> InlineKeyboardMarkup:
+    """The buttons under a new-application alert, for whoever it reached.
+
+    Deliberately not _review_keyboard. That one sits on the applicant's own card
+    in the applicant's chat, where "This application is mine" means something
+    completely different, and it is pinned by its own test. This is a
+    supervisor's surface: fix the two fields that hold a hire up, see the whole
+    thing, or edit any part of it, without leaving the alert.
+
+    Every prefix here is already routed. int_open_ posts the full card AND the
+    licence bundle (_send_interview_detail); int_edit_ opens one button per
+    editable field (_edit_fields_keyboard). Longest callback is
+    int_ef_drivers_license_id_ + 22 = 48 bytes, inside Telegram's 64 -- over it
+    and Telegram refuses the WHOLE keyboard, so the alert would arrive bare.
+    """
+    sid = _short_uuid(interview_id)
+    rows = []
+    # Only while the id is actually missing: it is the one field an applicant
+    # cannot look up, and the two ways to supply it are "it's me" and "here it is".
+    if interview is not None and not _clean_telegram_id(interview.get("telegram_id")):
+        rows.append([
+            InlineKeyboardButton("\U0001f64b It's me \u2014 use my ID",
+                                 callback_data=f"int_mine_{sid}"),
+            InlineKeyboardButton("\U0001f4ac Add Telegram ID",
+                                 callback_data=f"int_ef_telegram_id_{sid}"),
+        ])
+    has_photo = bool(str((interview or {}).get("drivers_license_file_url") or "").strip())
+    has_number = bool(str((interview or {}).get("drivers_license_id") or "").strip())
+    rows.append([
+        InlineKeyboardButton(
+            "\U0001faaa Replace licence photo" if has_photo else "\U0001faaa Upload licence photo",
+            callback_data=f"int_lic_{sid}"),
+        InlineKeyboardButton(
+            "#\ufe0f\u20e3 Licence number" if has_number else "#\ufe0f\u20e3 Add licence number",
+            callback_data=f"int_ef_drivers_license_id_{sid}"),
+    ])
+    rows.append([
+        InlineKeyboardButton("\U0001f441 View application", callback_data=f"int_open_{sid}"),
+        InlineKeyboardButton("\u270d\ufe0f Edit any field", callback_data=f"int_edit_{sid}"),
+    ])
+    rows.append([
+        InlineKeyboardButton("\U0001f4c6 Schedule", callback_data=f"int_sched_{sid}"),
+        InlineKeyboardButton("\u2705 Hire", callback_data=f"int_hire_{sid}"),
+    ])
+    return InlineKeyboardMarkup(rows)
 
 
 def _review_keyboard(interview_id: str, interview: dict = None) -> InlineKeyboardMarkup:
@@ -1119,8 +1220,16 @@ def _edit_fields_keyboard(interview_id: str) -> InlineKeyboardMarkup:
 async def _refresh_understanding_card(
     context: ContextTypes.DEFAULT_TYPE, interview: dict,
 ) -> None:
-    chat_id = context.user_data.get("understanding_chat_id")
-    mid = context.user_data.get("understanding_message_id")
+    # The ROW first, the session second. understanding_chat_id/message_id are
+    # columns on the application; context.user_data belongs to whoever happens
+    # to be looking. Reading the session first meant a supervisor acting from an
+    # alert refreshed nothing at all -- or worse, refreshed the last card they
+    # had open, which is somebody else's application. The session stays as the
+    # fallback for the applicant's own flow when the column write did not land.
+    chat_id = ((interview or {}).get("understanding_chat_id")
+               or context.user_data.get("understanding_chat_id"))
+    mid = ((interview or {}).get("understanding_message_id")
+           or context.user_data.get("understanding_message_id"))
     if not chat_id or not mid:
         return
     iid = interview.get("id")
@@ -1135,6 +1244,77 @@ async def _refresh_understanding_card(
         )
     except Exception as e:
         logger.warning("refresh understanding card: %s", e)
+
+
+def _filed_by_from_alert_text(text: str) -> str:
+    """Recover "Filed by" from an alert we are about to rewrite.
+
+    It is not a column -- it is worked out when the notice is sent -- so the
+    only place it survives is the message itself. Cheaper and more accurate
+    than adding a column for one line of text.
+    """
+    for line in str(text or "").splitlines():
+        stripped = line.strip()
+        if stripped.startswith("\U0001f64b Filed by "):
+            return stripped.split("Filed by ", 1)[1].strip()
+    return "\u2014"
+
+
+def _remember_acting_alert(context: ContextTypes.DEFAULT_TYPE, query, interview) -> None:
+    """Note the alert a supervisor is acting from, so it can be brought up to
+    date once the answer arrives.
+
+    Only when the tapped message is NOT the application's own card: that one is
+    refreshed by _refresh_understanding_card already, and rewriting it with the
+    alert's text would replace a card with a notice.
+
+    Keyed by application id. A supervisor works several alerts in a row, and a
+    stash left over from the previous one would rewrite the wrong message.
+    """
+    msg = getattr(query, "message", None)
+    iid = str((interview or {}).get("id") or "")
+    if not msg or not iid:
+        return
+    try:
+        if (msg.chat_id == (interview or {}).get("understanding_chat_id")
+                and msg.message_id == (interview or {}).get("understanding_message_id")):
+            context.user_data.pop("acting_alert", None)
+            return
+        context.user_data["acting_alert"] = {
+            "iid": iid,
+            "chat_id": msg.chat_id,
+            "message_id": msg.message_id,
+            "filed_by": _filed_by_from_alert_text(getattr(msg, "text", "") or ""),
+        }
+    except Exception as e:
+        logger.debug("remember acting alert: %s", e)
+
+
+async def _refresh_interview_surfaces(
+    context: ContextTypes.DEFAULT_TYPE, interview: dict,
+) -> None:
+    """Bring every visible copy of this application up to date.
+
+    The applicant's card always; the supervisor's alert as well when one was
+    acted from. Both are best effort -- a deleted message, or one older than
+    Telegram's 48-hour edit window, must never cost the action that just
+    succeeded.
+    """
+    await _refresh_understanding_card(context, interview)
+    stash = context.user_data.get("acting_alert") or {}
+    iid = str((interview or {}).get("id") or "")
+    if not iid or stash.get("iid") != iid:
+        return
+    try:
+        await context.bot.edit_message_text(
+            chat_id=stash["chat_id"],
+            message_id=stash["message_id"],
+            text=_format_new_application_alert(interview, stash.get("filed_by") or "\u2014"),
+            reply_markup=_alert_keyboard(iid, interview),
+        )
+    except Exception as e:
+        # "message is not modified" is the common one, and it is not a problem.
+        logger.debug("refresh acting alert: %s", e)
 
 
 def _resolve_interview_id_from_callback(data: str, prefix: str) -> Optional[str]:
@@ -1154,7 +1334,7 @@ def _interview_id_from_callback(data: str) -> Optional[str]:
     ):
         if data.startswith(prefix):
             return _resolve_interview_id_from_callback(data, prefix)
-    m = re.match(r"^int_ef_([a-z_]+)_([A-Za-z0-9_-]+)$", data)
+    m = _INT_EF_RE.match(data)
     if m:
         try:
             return _long_uuid(m.group(2))
@@ -2107,24 +2287,15 @@ def _startup_reenqueue_jobs(application: Application) -> None:
 
 # --- Interview flow helpers ---
 
-async def _notify_supervisors_new_interview(
-    context: ContextTypes.DEFAULT_TYPE, interview: dict, filed_by: str,
-) -> int:
-    """Tell the supervisors an application has arrived. Returns how many heard.
+def _format_new_application_alert(interview: dict, filed_by: str) -> str:
+    """The new-application notice, as text.
 
-    Nothing did this before. The card goes to whoever typed it -- an applicant
-    or a recruiter -- and the office got no message, no copy and no trace, so
-    the only way to learn an application existed was to think to type
-    /interviews. Fifty-seven are sitting pending that way.
-
-    Sent with the Application rather than api/notify.py's requests.post: that
-    one blocks for up to fifteen seconds per recipient, inside the event loop
-    every other applicant's messages are waiting in. One bad chat id must not
-    cost the applicant their reply either, so each send stands alone.
+    Its own function so the alert can be rebuilt and edited in place after a
+    supervisor fixes something from its buttons -- an alert that still says
+    "still needs: Telegram ID" after the ID was added is worse than one with no
+    buttons at all.
     """
     iid = str((interview or {}).get("id") or "")
-    if not iid:
-        return 0
     name = (str(interview.get("full_name") or "").strip()
             or str(interview.get("first_name") or "").strip() or "Driver")
     un = str(interview.get("telegram_username") or "").strip()
@@ -2143,16 +2314,51 @@ async def _notify_supervisors_new_interview(
     lines.append("")
     lines.append("⚠️ Cannot hire yet — still needs: " + ", ".join(missing)
                  if missing else "✅ Ready to hire")
+    # The licence, separately and in different words. It does NOT block a hire,
+    # so it must not be folded into the line above that says what does.
+    warn = _license_warning_line(interview)
+    if warn:
+        lines.append(warn)
     lines.append("")
     lines.append(f"Open: /open {iid}")
-    text = "\n".join(lines)
+    return "\n".join(lines)
+
+
+async def _notify_supervisors_new_interview(
+    context: ContextTypes.DEFAULT_TYPE, interview: dict, filed_by: str,
+) -> int:
+    """Tell the supervisors an application has arrived. Returns how many heard.
+
+    Nothing did this before. The card goes to whoever typed it -- an applicant
+    or a recruiter -- and the office got no message, no copy and no trace, so
+    the only way to learn an application existed was to think to type
+    /interviews. Fifty-seven are sitting pending that way.
+
+    Sent with the Application rather than api/notify.py's requests.post: that
+    one blocks for up to fifteen seconds per recipient, inside the event loop
+    every other applicant's messages are waiting in. One bad chat id must not
+    cost the applicant their reply either, so each send stands alone.
+    """
+    iid = str((interview or {}).get("id") or "")
+    if not iid:
+        return 0
+    text = _format_new_application_alert(interview, filed_by)
+    # Built once, outside the loop: the same keyboard for every supervisor, and
+    # no work repeated per chat.
+    try:
+        kb = _alert_keyboard(iid, interview)
+    except Exception as e:
+        # The buttons are a convenience; the notice is the point. A malformed id
+        # must not cost the office the alert entirely.
+        logger.warning("new-application keyboard for %s: %s", iid, e)
+        kb = None
     told, seen = 0, set()
     for cid in _global_supervisory_chat_ids():
         if cid in seen:
             continue
         seen.add(cid)
         try:
-            await context.bot.send_message(chat_id=cid, text=text)
+            await context.bot.send_message(chat_id=cid, text=text, reply_markup=kb)
             told += 1
         except Exception as e:
             logger.warning("new-application notice to %s: %s", cid, e)
@@ -2763,7 +2969,22 @@ async def handle_interview_callbacks(update: Update, context: ContextTypes.DEFAU
             await _send_appointment_prompt(query.message, context)
         return STATE_INT_SCHEDULE_APPT
 
-    iid = context.user_data.get("active_interview_id") or _interview_id_from_callback(data)
+    # The button wins over the session. context.user_data is per-USER, not
+    # per-chat: a supervisor who has ever typed an application keeps a stale
+    # active_interview_id, and reading it first meant a tap on somebody else's
+    # alert wrote to the application they last touched. The callback carries the
+    # truth -- every button here is built with _short_uuid -- so it is read
+    # first, and the session is only the fallback for older id-less buttons.
+    iid = _interview_id_from_callback(data) or context.user_data.get("active_interview_id")
+
+    # If this tap came from an alert rather than from the card, remember which
+    # message it was: the answer arrives later as a plain message with no query
+    # attached, and by then this is the only way back to it.
+    if iid:
+        try:
+            _remember_acting_alert(context, query, db.get_interview_by_id(iid))
+        except Exception as e:
+            logger.debug("acting alert lookup: %s", e)
 
     if data.startswith("int_open_"):
         oid = _resolve_interview_id_from_callback(data, "int_open_")
@@ -2786,7 +3007,7 @@ async def handle_interview_callbacks(update: Update, context: ContextTypes.DEFAU
         return STATE_INTERVIEW_INPUT
 
     if data.startswith("int_ef_"):
-        m = re.match(r"^int_ef_([a-z_]+)_([A-Za-z0-9_-]+)$", data)
+        m = _INT_EF_RE.match(data)
         if m:
             field_key = m.group(1)
             try:
@@ -2823,9 +3044,13 @@ async def handle_interview_callbacks(update: Update, context: ContextTypes.DEFAU
         iid = iid or _resolve_interview_id_from_callback(data, "int_edit_")
         if iid and query.message:
             context.user_data["active_interview_id"] = iid
+            # The message that was tapped, not whichever card this user last
+            # saw. chat_id here is the callback's chat, so pairing it with a
+            # message_id from another chat is an uncaught BadRequest -- and on
+            # the applicant's own card the two are the same message anyway.
             await context.bot.edit_message_reply_markup(
                 chat_id=chat_id,
-                message_id=context.user_data.get("understanding_message_id") or query.message.message_id,
+                message_id=query.message.message_id,
                 reply_markup=_edit_fields_keyboard(iid),
             )
         return STATE_INTERVIEW_INPUT
@@ -2834,7 +3059,7 @@ async def handle_interview_callbacks(update: Update, context: ContextTypes.DEFAU
         iid = iid or _resolve_interview_id_from_callback(data, "int_eback_")
         interview = db.get_interview_by_id(iid) if iid else None
         if interview:
-            await _refresh_understanding_card(context, interview)
+            await _refresh_interview_surfaces(context, interview)
         return STATE_INTERVIEW_INPUT
 
     if data.startswith("int_mine_"):
@@ -2855,7 +3080,7 @@ async def handle_interview_callbacks(update: Update, context: ContextTypes.DEFAU
         except Exception as e:
             logger.info("directory upsert on self-claim: %s", e)
         interview = db.get_interview_by_id(iid) or interview
-        await _refresh_understanding_card(context, interview)
+        await _refresh_interview_surfaces(context, interview)
         await query.message.reply_text(
             f"✅ Recorded — this application is yours ({_telegram_user_label(user)}).\n"
             "If you were filing it for somebody else, tap ✍️ Edit and put their "
@@ -2904,7 +3129,7 @@ async def handle_interview_callbacks(update: Update, context: ContextTypes.DEFAU
         except Exception as e:
             logger.info("hired_by not recorded for %s (column missing?): %s", iid, e)
         await _clear_pending_prompts(context, chat_id)
-        await _refresh_understanding_card(context, interview)
+        await _refresh_interview_surfaces(context, interview)
         hire_msg, warnings = await _run_hire_side_effects(
             context,
             interview,
@@ -3059,7 +3284,7 @@ async def _finalize_appointment(
     interview = db.get_interview_by_id(iid)
     if interview:
         interview["_appointment_display"] = when_label
-        await _refresh_understanding_card(context, interview)
+        await _refresh_interview_surfaces(context, interview)
     if msg:
         await msg.reply_text(f"✅ Appointment set for {when_label}.")
     return STATE_INTERVIEW_INPUT
@@ -3202,7 +3427,7 @@ async def handle_upload_license(update: Update, context: ContextTypes.DEFAULT_TY
         db.update_interview(iid, {"drivers_license_file_url": url})
     interview = db.get_interview_by_id(iid)
     if interview:
-        await _refresh_understanding_card(context, interview)
+        await _refresh_interview_surfaces(context, interview)
     return STATE_INTERVIEW_INPUT
 
 
@@ -3238,7 +3463,7 @@ async def handle_edit_field_text(update: Update, context: ContextTypes.DEFAULT_T
         pass
 
     if interview:
-        await _refresh_understanding_card(context, interview)
+        await _refresh_interview_surfaces(context, interview)
     return STATE_INTERVIEW_INPUT
 
 
@@ -4078,6 +4303,13 @@ def main() -> None:
             CommandHandler("training", cmd_set_training_video),
             CommandHandler("setemail", cmd_setemail),
             CallbackQueryHandler(handle_driver_callbacks, pattern=r"^drv_ef_"),
+            # The new-application alert's buttons, tapped in a supervisor's chat
+            # where no conversation is running. As an ENTRY POINT the state this
+            # returns is honoured, so the photo or text that follows is actually
+            # captured; registered top-level (below) the return value is thrown
+            # away and the prompt leads nowhere.
+            CallbackQueryHandler(handle_interview_callbacks,
+                                 pattern=_INTERVIEW_ENTRY_CALLBACK_PATTERN),
         ],
         states={
             STATE_INTERVIEW_INPUT: [
@@ -4172,6 +4404,10 @@ def main() -> None:
 
     # Everything above is group 0. The net goes in front of it, holding a
     # reference to exactly those handlers so it can ask them first.
+    # Snapshot for hint_no_handler: anything registered AFTER this line is
+    # invisible to it, so an unclaimed private message would be swallowed with
+    # a hint instead of reaching the handler. The interview alert buttons are
+    # safe because they ride on conv (an entry point), which is already here.
     _REAL_HANDLERS[:] = list(application.handlers.get(0, []))
     application.add_handler(
         MessageHandler(filters.ChatType.PRIVATE, hint_no_handler), group=-1,
